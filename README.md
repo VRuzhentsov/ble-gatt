@@ -19,19 +19,10 @@ This repo is a Cargo workspace with two published crates:
   wrapper around `ble-gatt`, following Tauri's own `tauri-plugin-*` naming
   convention for its mobile-plugin tooling.
 
-## Why hand-rolled, not an existing crate
-
-Checked directly (GitHub API + READMEs) before writing a line of this:
-
-| Crate | Central | Peripheral | Android | License | Maturity |
-|---|---|---|---|---|---|
-| `btleplug` / `tauri-plugin-blec` | Yes | **No** (host-side only, by design) | Yes | Apache-2.0 | Active, healthy |
-| `bluest` | Yes | **No** (explicit in README) | Not yet ("planned") | Apache-2.0 | Active |
-| `ble-peripheral-rust` | — | Yes (by design) | **No** Android backend in source tree | MIT | Reasonably active |
-| `blew` / `tauri-plugin-blew` | Yes | Yes | Yes | **AGPL-3.0** | Author-labeled "experimental"; stale |
-
-No existing crate does BLE peripheral mode on Android under a permissive
-license. `ble-gatt` exists to close that gap without taking on AGPL.
+**Why this split, why GATT-only, why hand-rolled instead of an existing
+crate, and what was deliberately left out of Stage 1** are recorded in
+[`docs/adr/0001-ble-gatt-tauri-plugin-split-and-scope.md`](docs/adr/0001-ble-gatt-tauri-plugin-split-and-scope.md) —
+this README stays focused on what the crates do and how to use them.
 
 ## Platform support
 
