@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-ble-write"
+description = "Enables the ble_write command without any pre-configured scope."
+commands.allow = ["ble_write"]
+
+[[permission]]
+identifier = "deny-ble-write"
+description = "Denies the ble_write command without any pre-configured scope."
+commands.deny = ["ble_write"]

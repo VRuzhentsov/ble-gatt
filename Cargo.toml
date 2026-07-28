@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["ble-gatt", "tauri-plugin-ble-gatt"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/VRuzhentsov/ble-gatt"
+
+[workspace.dependencies]
+async-trait = "0.1"
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+uuid = { version = "1", features = ["v4"] }

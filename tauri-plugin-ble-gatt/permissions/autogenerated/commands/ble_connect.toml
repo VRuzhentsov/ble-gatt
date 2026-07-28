@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-ble-connect"
+description = "Enables the ble_connect command without any pre-configured scope."
+commands.allow = ["ble_connect"]
+
+[[permission]]
+identifier = "deny-ble-connect"
+description = "Denies the ble_connect command without any pre-configured scope."
+commands.deny = ["ble_connect"]

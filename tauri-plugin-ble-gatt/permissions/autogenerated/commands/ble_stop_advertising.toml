@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-ble-stop-advertising"
+description = "Enables the ble_stop_advertising command without any pre-configured scope."
+commands.allow = ["ble_stop_advertising"]
+
+[[permission]]
+identifier = "deny-ble-stop-advertising"
+description = "Denies the ble_stop_advertising command without any pre-configured scope."
+commands.deny = ["ble_stop_advertising"]

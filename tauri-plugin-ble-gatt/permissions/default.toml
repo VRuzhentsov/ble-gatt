@@ -1,0 +1,15 @@
+"$schema" = "schemas/schema.json"
+
+[default]
+description = "Default permissions for the ble-gatt plugin: capability query, advertise/scan, and GATT client/server operations."
+permissions = [
+  "allow-ble-capabilities",
+  "allow-ble-advertise",
+  "allow-ble-stop-advertising",
+  "allow-ble-notify",
+  "allow-ble-scan-once",
+  "allow-ble-connect",
+  "allow-ble-read",
+  "allow-ble-write",
+  "allow-ble-disconnect",
+]

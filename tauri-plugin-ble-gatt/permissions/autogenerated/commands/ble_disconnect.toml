@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-ble-disconnect"
+description = "Enables the ble_disconnect command without any pre-configured scope."
+commands.allow = ["ble_disconnect"]
+
+[[permission]]
+identifier = "deny-ble-disconnect"
+description = "Denies the ble_disconnect command without any pre-configured scope."
+commands.deny = ["ble_disconnect"]
