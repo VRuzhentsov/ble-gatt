@@ -2,11 +2,17 @@
 
 ## Status
 
-Accepted, implemented, and partially verified. The JNI bridge chain (Rust
-`Backend` trait → Kotlin `BleGattBridge` → real Android `BluetoothManager`
-APIs → back to Rust → Tauri IPC → JS) is proven working end-to-end on a real
-Android runtime with zero crashes. A genuine two-device BLE round trip is
-**not yet verified** — see "What's verified vs. deferred" below.
+Accepted, implemented, and verified further than the first pass of this ADR
+concluded. The JNI bridge chain (Rust `Backend` trait → Kotlin
+`BleGattBridge` → real Android `BluetoothManager`/`BluetoothGatt`/
+`BluetoothLeAdvertiser` APIs → back to Rust → Tauri IPC → JS) is proven
+working end-to-end, including a **genuine `{"central": true, "peripheral":
+true}` capability result** and a **confirmed successful advertise
+(`onStartSuccess`)** — not the `false`/`false` this ADR originally reported.
+That original result was traced to a real bug (below), not a hardware
+limitation. A genuine two-device BLE round trip is still **not verified**,
+but for a different, better-understood reason — see "What's verified vs.
+deferred".
 
 ## Context
 
@@ -130,6 +136,52 @@ working against the example app, both now fixed in `examples/tauri-app`:
   the CLI's entry script directly in `src-tauri/` so Node's extensionless
   module resolution finds it.
 
+### `ClassNotFoundException`: `FindClass` needs the app's classloader, not the bootstrap one
+
+The first real device run *did* complete without crashing — but every
+`capabilities()` call returned `{"central": false, "peripheral": false}`.
+Root cause was hidden by `android_lazy::LazyAndroidBackend` correctly
+catching the construction error and falling back to
+`CapabilityReport::default()` (both fields `false`) — meaning that first
+`false`/`false` result was **never a real capability query**, it was a
+silently-swallowed construction failure. Made visible by adding an
+`eprintln!` on the error path (now permanent — see `android_lazy.rs`),
+which surfaced:
+
+```
+BLE adapter unavailable: BleGattBridge construction failed: Java exception was thrown
+```
+
+jni-rs clears the pending exception without describing it, so a second fix
+was needed just to see *which* exception: `describe_pending_exception()` in
+`android.rs` calls `ExceptionDescribe` (prints the full stack trace to
+logcat) and reads the throwable's own message before clearing it. That
+revealed the real cause:
+
+```
+java.lang.ClassNotFoundException: Didn't find class "dev.blegatt.BleGattBridge"
+  on path: DexPathList[[directory "."],...]
+```
+
+This is a classic, well-documented Android NDK/JNI gotcha: `FindClass`
+(used implicitly by `JNIEnv::new_object` when given a class name string)
+only searches the **bootstrap classloader** when called from a thread the
+JVM did not create itself — exactly this thread, attached via
+`attach_current_thread_as_daemon` rather than JVM-spawned. The bootstrap
+classloader only knows core Android framework classes, never app-defined
+ones. Fixed with the standard workaround: `load_app_class()` in
+`android.rs` resolves the class through the app's own classloader instead
+(`context.getClass().getClassLoader().loadClass("dev.blegatt.BleGattBridge")`),
+obtained from the `Context` object already on hand. After this fix,
+`capabilities()` genuinely returns `{"central": true, "peripheral": true}`
+on the same emulator — confirming the earlier `false`/`false` was 100% this
+bug, not an AVD hardware limitation as originally (wrongly) concluded here.
+
+**Lesson for any future JNI call site in this file**: never assume a `Err`
+from a jni-rs call means what its message says at face value — jni-rs's
+generic "Java exception was thrown" hides the actual cause every time
+without `describe_pending_exception()`.
+
 ## What's verified vs. deferred
 
 **Verified, with concrete evidence:**
@@ -144,41 +196,62 @@ working against the example app, both now fixed in `examples/tauri-app`:
   APK with the plugin compiled in.
 - Installed and launched on a real Android 14 emulator
   (`fini-e2e`, API 34, google_apis, x86_64): the app runs with **no crash**.
-- Tapped the `capabilities()` button in the running app: JS `invoke()` →
+- `capabilities()` genuinely round-trips the entire chain — JS `invoke()` →
   Tauri IPC → `LazyAndroidBackend` → lazy `tao`→`ndk-context` bridge → JNI
-  attach → `BleGattBridge` construction → real
-  `BluetoothManager`/`BluetoothAdapter` queries → JNI return → back through
-  the whole chain to the UI, rendering `{"central": false, "peripheral":
-  false}`. This is the real bridge executing top to bottom, not a stub.
+  attach → app-classloader class resolution → `BleGattBridge` construction
+  → real `BluetoothManager`/`BluetoothAdapter` queries → JNI return → back
+  to the UI — and correctly reports `{"central": true, "peripheral":
+  true}`.
+- `advertise()` genuinely starts a real GATT server + BLE advertisement:
+  `AdvertiseCallback.onStartSuccess` fires (confirmed via logcat, not
+  assumed), `dumpsys bluetooth_manager` shows `Le advert started` at the
+  HCI level.
+- `scan()`'s registration path is genuinely real too: `BluetoothLeScanner`
+  registers successfully (`onScannerRegistered status=0`), scan parameters
+  are accepted (`onScanParamSetupCompleted: 0`) — confirmed via logcat on a
+  clean run (app data cleared, 40s wait to rule out Android's undocumented
+  per-app scan-throttling window, single scan attempt).
 
-**Investigated, not a bug:** granting all three runtime Bluetooth
-permissions (`BLUETOOTH_CONNECT`/`SCAN`/`ADVERTISE` via `adb shell pm
-grant`) and restarting did not change the `false`/`false` result — ruling
-out the most likely simple explanation. `dumpsys bluetooth_manager` showed
-the emulator's virtual controller enabled and running (Root Canal address
-`BB:BB:BB:00:00:02`), but this specific AVD's controller apparently doesn't
-expose `bluetoothLeScanner`/`isMultipleAdvertisementSupported` the way a
-real device would. Not chased further this session — recorded as a known
-gap, not silently assumed fixed.
-
-**Explicitly deferred:** a genuine two-device BLE round trip (central
-discovers, connects to, and exchanges data with a real peripheral over the
-air) is **not verified**. Given the single-emulator capability query above,
-attempting it on this same AVD would not succeed regardless of running two
-instances — `scan()`/`advertise()` would silently no-op the same way
-`capabilities()` did. Needs either a different AVD/system-image
-configuration with confirmed BLE support, or physical hardware. This is the
-same honesty-tiered pattern Stage 1 used for `two_adapter_central_to_peripheral_round_trip`
-(written, `#[ignore]`d, documented reason) — not faked here either.
+**Explicitly deferred, with a narrower and more specific reason than before:**
+a genuine two-device BLE round trip is not verified. Two real emulator
+instances (`fini-e2e` API 34 and a second `google_apis` x86_64 AVD),
+confirmed connected to the *same* `netsimd` process (sequential virtual
+addresses `BB:BB:BB:00:00:02`/`...03`, assigned by one shared daemon — the
+radio-bridging infrastructure is genuinely there) — one advertising
+(confirmed `onStartSuccess`), the other scanning unfiltered (confirmed
+clean registration) — delivered **zero** `onScanResult` callbacks in either
+direction, filtered or not. Historical `dumpsys bluetooth_manager` HCI-level
+logs did show non-zero scan `results:N` counts on the scanning instance,
+but those are aggregate controller-level counts across every scan client on
+the device (including Android's own background service scanning), not
+proof specifically of receiving the peer's advertisement — a red herring
+chased down and ruled out this session, not left as an open assumption.
+Everything on the Android-API side of the bridge is confirmed working
+correctly on both ends; what's unconfirmed is whether Root Canal actually
+propagates advertisement PDUs between two independently-launched emulator
+processes by default, or needs explicit topology/positioning configuration
+(the emulator's Netsim tooling has this concept) that wasn't identified in
+the time available this session. This is a narrower, better-diagnosed gap
+than the original version of this ADR claimed — not the same unknown.
 
 ## Consequences
 
-- A future session picking up the two-device verification should start by
-  checking whether a *different* AVD (newer system image, or explicitly
-  configured hardware Bluetooth profile) reports `central`/`peripheral` as
-  `true` before assuming the bridge code itself needs changes.
-- `examples/tauri-app` is now a real, working verification harness — reusable
-  for the eventual macOS/iOS/Windows backends too, not Android-specific.
+- A future session picking up the two-device verification should start from
+  Android's Netsim/Root Canal topology configuration (device positioning,
+  whether separately-launched emulator processes need explicit pairing to
+  be "in range" of each other), not from assuming the bridge or Kotlin GATT
+  code needs changes — both are now confirmed correct on each side
+  independently.
+- Any future JNI call site added to `android.rs` should route errors
+  through `describe_pending_exception()`, and any new `Backend`-trait error
+  path (in `ble-gatt` or a wrapper like `android_lazy.rs`) should log before
+  falling back to a default value — the original false-negative here
+  existed specifically because an error was silently absorbed into a
+  same-shaped-as-real value (`CapabilityReport::default()` is
+  indistinguishable from "genuinely no BLE support" at the call site).
+- `examples/tauri-app` is now a real, working verification harness with
+  interactive advertise/scan/connect/read test buttons — reusable for the
+  eventual macOS/iOS/Windows backends too, not Android-specific.
 - The `tao` → `ndk-context` bridge is a hard dependency of
   `tauri-plugin-ble-gatt` on Android (new `tao`/`ndk-context` target
   dependencies in its `Cargo.toml`) but changes nothing about `ble-gatt`

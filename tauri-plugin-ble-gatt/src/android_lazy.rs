@@ -72,7 +72,10 @@ impl Backend for LazyAndroidBackend {
     async fn capabilities(&self) -> CapabilityReport {
         match self.inner().await {
             Ok(backend) => backend.capabilities().await,
-            Err(_) => CapabilityReport::default(),
+            Err(err) => {
+                eprintln!("[ble-gatt][android] backend construction failed: {err}");
+                CapabilityReport::default()
+            }
         }
     }
 

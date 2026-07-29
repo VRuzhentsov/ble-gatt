@@ -32,7 +32,7 @@ this README stays focused on what the crates do and how to use them.
 | Platform | Central | Peripheral | Status |
 |---|---|---|---|
 | Linux (BlueZ) | Yes | Yes | **M1 — implemented**, verified against real BlueZ hardware |
-| Android | Yes | Yes (where the chipset/driver allows — see `CapabilityReport`) | **M1 — implemented**; JNI bridge verified end-to-end on a real emulator (no crash, real `capabilities()` round trip); genuine two-device round trip not yet verified — see ADR-0002 |
+| Android | Yes | Yes (where the chipset/driver allows — see `CapabilityReport`) | **M1 — implemented**; verified end-to-end on a real emulator — real `capabilities()` returning `{central: true, peripheral: true}`, real GATT-server advertise start confirmed via callback; genuine two-device round trip not yet verified — see ADR-0002 |
 | Windows (WinRT) | — | — | M2 — reserved, not implemented |
 | macOS / iOS | — | — | M3 — reserved, not implemented |
 
@@ -58,10 +58,11 @@ crossing the `Backend`/`GattConnection` port boundary.
 ## Status
 
 Early, under active development. `ble-gatt`'s Linux backend is real and
-tested against BlueZ hardware. The Android backend's JNI bridge is real and
-verified end-to-end on a real emulator; a genuine two-device BLE round trip
-is the next verification step (see ADR-0002). Not yet published to
-crates.io/npm — consume as a git dependency.
+tested against BlueZ hardware. The Android backend is real and verified
+end-to-end on a real emulator (genuine `{central: true, peripheral: true}`,
+genuine advertise start); a genuine two-device BLE round trip is the next
+verification step (see ADR-0002). Not yet published to crates.io/npm —
+consume as a git dependency.
 
 ## License
 

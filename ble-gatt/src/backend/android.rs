@@ -45,7 +45,7 @@ use crate::models::{
     ServiceUuid,
 };
 
-const BRIDGE_CLASS: &str = "dev/blegatt/BleGattBridge";
+const BRIDGE_CLASS_BINARY_NAME: &str = "dev.blegatt.BleGattBridge";
 const CALLBACK_CLASS: &str = "dev/blegatt/NativeKt";
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
@@ -143,13 +143,21 @@ impl AndroidBackend {
         let mut env = inner
             .env()
             .map_err(|err| BleError::AdapterUnavailable(format!("JNI re-attach failed: {err}")))?;
+        let bridge_class = load_app_class(&mut env, inner.context.as_obj(), BRIDGE_CLASS_BINARY_NAME)
+            .map_err(|err| BleError::AdapterUnavailable(format!("failed to load BleGattBridge class: {err}")))?;
         let bridge_obj = env
             .new_object(
-                BRIDGE_CLASS,
+                &bridge_class,
                 "(Landroid/content/Context;J)V",
                 &[JValue::Object(inner.context.as_obj()), JValue::Long(native_handle)],
             )
-            .map_err(|err| BleError::AdapterUnavailable(format!("BleGattBridge construction failed: {err}")))?;
+            .map_err(|err| {
+                let detail = describe_pending_exception(&mut env);
+                BleError::AdapterUnavailable(format!(
+                    "BleGattBridge construction failed: {err}{}",
+                    detail.map(|d| format!(" ({d})")).unwrap_or_default()
+                ))
+            })?;
         let bridge_ref = env
             .new_global_ref(bridge_obj)
             .map_err(|err| BleError::AdapterUnavailable(format!("global ref of bridge failed: {err}")))?;
@@ -448,6 +456,58 @@ unsafe fn inner_from_handle(native_handle: jlong) -> Arc<Inner> {
     let ptr = native_handle as *const Inner;
     Arc::increment_strong_count(ptr);
     Arc::from_raw(ptr)
+}
+
+/// jni-rs's `Result::Err` for a JNI call that failed because Java threw
+/// just says "Java exception was thrown" — the crate does not surface the
+/// exception's own message. This pulls it out (and prints the full stack
+/// trace to logcat via `ExceptionDescribe`) before clearing it, since an
+/// uncleared pending exception would abort the next JNI call made on this
+/// thread.
+fn describe_pending_exception(env: &mut JNIEnv) -> Option<String> {
+    if !env.exception_check().ok()? {
+        return None;
+    }
+    let _ = env.exception_describe();
+    let throwable = env.exception_occurred().ok()?;
+    let _ = env.exception_clear();
+    let message = env
+        .call_method(&throwable, "toString", "()Ljava/lang/String;", &[])
+        .ok()?
+        .l()
+        .ok()?;
+    let message = JString::from(message);
+    Some(read_jstring(env, &message))
+}
+
+/// `FindClass` — used implicitly by `JNIEnv::new_object` when given a class
+/// name string — only searches the bootstrap classloader when called from a
+/// thread the JVM did not create itself, which is exactly this thread
+/// (attached via `attach_current_thread_as_daemon`, not JVM-spawned). The
+/// bootstrap classloader can only find core Android framework classes,
+/// never app-defined ones — confirmed directly, not assumed: an earlier
+/// build of this file failed with `ClassNotFoundException: Didn't find
+/// class "dev.blegatt.BleGattBridge"` at exactly this call site. The
+/// standard fix is to resolve the class through the app's own classloader,
+/// obtained from any object the app's classloader already loaded — the
+/// `Context` passed in at construction time.
+fn load_app_class<'a>(env: &mut JNIEnv<'a>, context: &JObject, binary_name: &str) -> Result<JClass<'a>> {
+    let context_class = env.get_object_class(context).map_err(|err| BleError::Gatt(err.to_string()))?;
+    let class_loader = env
+        .call_method(&context_class, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+        .and_then(|v| v.l())
+        .map_err(|err| BleError::Gatt(format!("getClassLoader failed: {err}")))?;
+    let name = env.new_string(binary_name).map_err(|err| BleError::Gatt(err.to_string()))?;
+    let class_obj = env
+        .call_method(
+            &class_loader,
+            "loadClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[JValue::Object(&name)],
+        )
+        .and_then(|v| v.l())
+        .map_err(|err| BleError::Gatt(format!("loadClass({binary_name}) failed: {err}")))?;
+    Ok(JClass::from(class_obj))
 }
 
 fn read_jstring(env: &mut JNIEnv, s: &JString) -> String {

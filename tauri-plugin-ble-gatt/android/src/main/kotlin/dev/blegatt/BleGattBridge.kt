@@ -18,8 +18,12 @@ import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
+import android.content.pm.PackageManager
 import android.os.ParcelUuid
+import android.util.Log
 import java.util.UUID
+
+private const val TAG = "BleGattBridge"
 
 /**
  * Real Android BLE GATT central + peripheral implementation. Called from
@@ -43,6 +47,22 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val adapter: BluetoothAdapter? = bluetoothManager.adapter
 
+    init {
+        try {
+            val hasBleFeature = context.packageManager.hasSystemFeature(PackageManager.FEATURE_BLUETOOTH_LE)
+            Log.d(
+                TAG,
+                "init: FEATURE_BLUETOOTH_LE=$hasBleFeature adapter=${adapter != null} " +
+                    "adapter.isEnabled=${adapter?.isEnabled} " +
+                    "bluetoothLeScanner=${adapter?.bluetoothLeScanner != null} " +
+                    "isMultipleAdvertisementSupported=${adapter?.isMultipleAdvertisementSupported} " +
+                    "bluetoothLeAdvertiser=${adapter?.bluetoothLeAdvertiser != null}"
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "init: capability probe threw", e)
+        }
+    }
+
     // --- Central role state ---
     private var scanCallback: ScanCallback? = null
     private val connectedGatts = HashMap<String, BluetoothGatt>()
@@ -65,19 +85,34 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
 
     fun startScan(serviceUuid: String) {
         val scanner = adapter?.bluetoothLeScanner ?: return
-        val filter = android.bluetooth.le.ScanFilter.Builder()
-            .setServiceUuid(ParcelUuid(UUID.fromString(serviceUuid)))
-            .build()
+        val target = UUID.fromString(serviceUuid)
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
         val callback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
-                onPeerDiscovered(nativeHandle, result.device.address, result.device.name)
+                val uuids = result.scanRecord?.serviceUuids
+                Log.d(TAG, "onScanResult: ${result.device.address} name=${result.device.name} advertisedUuids=$uuids")
+                if (uuids != null && uuids.contains(ParcelUuid(target))) {
+                    onPeerDiscovered(nativeHandle, result.device.address, result.device.name)
+                }
+            }
+
+            override fun onScanFailed(errorCode: Int) {
+                Log.e(TAG, "onScanFailed: errorCode=$errorCode")
             }
         }
+        Log.d(TAG, "startScan: serviceUuid=$serviceUuid scanner=${scanner != null}")
         scanCallback = callback
-        scanner.startScan(listOf(filter), settings, callback)
+        // Matching against the raw advertised UUID list in onScanResult
+        // above, rather than a native android.bluetooth.le.ScanFilter — a
+        // filtered scan against a Root Canal virtual controller (Android
+        // emulator's Bluetooth simulator) delivered zero results in testing
+        // even when the target peer was confirmed advertising and the
+        // filter parameters were accepted (status=0); an unfiltered scan
+        // with matching done here works identically on real adapters and
+        // sidesteps whatever that native-filter gap is. See docs/adr/0002.
+        scanner.startScan(emptyList(), settings, callback)
     }
 
     fun stopScan() {
@@ -273,8 +308,17 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             .addServiceUuid(ParcelUuid(UUID.fromString(serviceUuid)))
             .setIncludeDeviceName(false)
             .build()
-        val callback = object : AdvertiseCallback() {}
+        val callback = object : AdvertiseCallback() {
+            override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
+                Log.d(TAG, "advertise onStartSuccess: serviceUuid=$serviceUuid")
+            }
+
+            override fun onStartFailure(errorCode: Int) {
+                Log.e(TAG, "advertise onStartFailure: errorCode=$errorCode serviceUuid=$serviceUuid")
+            }
+        }
         advertiseCallback = callback
+        Log.d(TAG, "startAdvertising: serviceUuid=$serviceUuid advertiser=${advertiser != null}")
         advertiser.startAdvertising(settings, data, callback)
     }
 

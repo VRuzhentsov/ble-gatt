@@ -8,21 +8,83 @@
     <h1>ble-gatt example</h1>
     <p id="status">loading…</p>
     <button id="capabilities">capabilities()</button>
+    <br /><br />
+    <button id="advertise">advertise (peripheral role)</button>
+    <br /><br />
+    <button id="scan">scan + connect + read (central role)</button>
+    <br /><br />
     <pre id="output"></pre>
     <script>
       // Uses the global `window.__TAURI__` bridge (`app.withGlobalTauri` in
       // tauri.conf.json) rather than an ESM import from a CDN, so this
       // works with no network access — the emulator's webview only needs
       // to talk to the app's own IPC bridge, not fetch anything external.
+      const invoke = window.__TAURI__.core.invoke;
       const output = document.getElementById("output");
+
+      // Fixed test UUIDs shared by both roles for this manual two-device
+      // verification harness — not a real Fini/production UUID scheme.
+      const SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+      const CHARACTERISTIC_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+
+      function show(value) {
+        output.textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+      }
+
       document.getElementById("capabilities").addEventListener("click", async () => {
         try {
-          const result = await window.__TAURI__.core.invoke("plugin:ble-gatt|ble_capabilities");
-          output.textContent = JSON.stringify(result, null, 2);
+          show(await invoke("plugin:ble-gatt|ble_capabilities"));
         } catch (err) {
-          output.textContent = "error: " + err;
+          show("error: " + err);
         }
       });
+
+      document.getElementById("advertise").addEventListener("click", async () => {
+        try {
+          await invoke("plugin:ble-gatt|ble_advertise", {
+            serviceUuid: SERVICE_UUID,
+            characteristics: [
+              {
+                uuid: CHARACTERISTIC_UUID,
+                readable: true,
+                writable: true,
+                notifiable: true,
+                initial_value: Array.from(new TextEncoder().encode("hello-from-peripheral")),
+              },
+            ],
+          });
+          show("advertising started for service " + SERVICE_UUID);
+        } catch (err) {
+          show("error: " + err);
+        }
+      });
+
+      document.getElementById("scan").addEventListener("click", async () => {
+        try {
+          show("scanning...");
+          const peers = await invoke("plugin:ble-gatt|ble_scan_once", {
+            serviceUuid: SERVICE_UUID,
+            timeoutMs: 8000,
+          });
+          if (peers.length === 0) {
+            show("no peers found: " + JSON.stringify(peers));
+            return;
+          }
+          const address = peers[0].address;
+          show("found " + address + ", connecting...");
+          const handle = await invoke("plugin:ble-gatt|ble_connect", { address });
+          show("connected, handle=" + handle + ", reading...");
+          const value = await invoke("plugin:ble-gatt|ble_read", {
+            handle,
+            characteristicUuid: CHARACTERISTIC_UUID,
+          });
+          const text = new TextDecoder().decode(new Uint8Array(value));
+          show("read from peer: " + JSON.stringify(value) + " = \"" + text + "\"");
+        } catch (err) {
+          show("error: " + err);
+        }
+      });
+
       document.getElementById("status").textContent = "ready";
     </script>
   </body>
