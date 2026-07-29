@@ -21,7 +21,10 @@ This repo is a Cargo workspace with two published crates:
 
 **Why this split, why GATT-only, why hand-rolled instead of an existing
 crate, and what was deliberately left out of Stage 1** are recorded in
-[`docs/adr/0001-ble-gatt-tauri-plugin-split-and-scope.md`](docs/adr/0001-ble-gatt-tauri-plugin-split-and-scope.md) —
+[`docs/adr/0001-ble-gatt-tauri-plugin-split-and-scope.md`](docs/adr/0001-ble-gatt-tauri-plugin-split-and-scope.md).
+**The Android JNI bridge design, and exactly what is/isn't verified about
+it**, are in
+[`docs/adr/0002-android-jni-bridge.md`](docs/adr/0002-android-jni-bridge.md) —
 this README stays focused on what the crates do and how to use them.
 
 ## Platform support
@@ -29,7 +32,7 @@ this README stays focused on what the crates do and how to use them.
 | Platform | Central | Peripheral | Status |
 |---|---|---|---|
 | Linux (BlueZ) | Yes | Yes | **M1 — implemented**, verified against real BlueZ hardware |
-| Android | Yes | Yes (where the chipset/driver allows — see `CapabilityReport`) | **M1 — in progress** |
+| Android | Yes | Yes (where the chipset/driver allows — see `CapabilityReport`) | **M1 — implemented**; JNI bridge verified end-to-end on a real emulator (no crash, real `capabilities()` round trip); genuine two-device round trip not yet verified — see ADR-0002 |
 | Windows (WinRT) | — | — | M2 — reserved, not implemented |
 | macOS / iOS | — | — | M3 — reserved, not implemented |
 
@@ -42,7 +45,7 @@ peripheral mode reports that honestly instead of failing opaquely later.
 ```
 Backend trait (async, Tokio)
 ├── linux.rs    BlueZ via bluer — central + peripheral         (M1)
-├── android.rs  raw jni + ndk-context JNI bridge                (M1, in progress)
+├── android.rs  raw jni + ndk-context JNI bridge                (M1)
 ├── windows.rs  reserved                                        (M2)
 └── mock.rs     in-process, radio-free — CI-safe protocol tests
 ```
@@ -55,8 +58,10 @@ crossing the `Backend`/`GattConnection` port boundary.
 ## Status
 
 Early, under active development. `ble-gatt`'s Linux backend is real and
-tested against BlueZ hardware; the Android backend is the current work in
-progress. Not yet published to crates.io/npm — consume as a git dependency.
+tested against BlueZ hardware. The Android backend's JNI bridge is real and
+verified end-to-end on a real emulator; a genuine two-device BLE round trip
+is the next verification step (see ADR-0002). Not yet published to
+crates.io/npm — consume as a git dependency.
 
 ## License
 

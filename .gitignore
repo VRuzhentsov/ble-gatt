@@ -1,3 +1,8 @@
-/target
+target/
 Cargo.lock
 node_modules/
+
+# examples/tauri-app: generated Android project + build outputs
+examples/tauri-app/src-tauri/gen/
+examples/tauri-app/src-tauri/tauri.js
+examples/tauri-app/dist/*.bundle.*

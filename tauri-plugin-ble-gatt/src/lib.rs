@@ -4,6 +4,9 @@
 
 pub mod commands;
 
+#[cfg(target_os = "android")]
+mod android_lazy;
+
 use std::sync::Arc;
 
 use ble_gatt::Backend;
@@ -33,20 +36,33 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
         .build()
 }
 
-/// M1: Linux is the only implemented backend so far (see the workspace
-/// README's platform-support matrix). Every other target fails closed with
-/// an explicit error at plugin setup rather than silently no-opping —
-/// matches this project's convention of honest unimplemented-feature
-/// reporting over quiet failure.
+/// M1: Linux and Android are the only implemented backends so far (see the
+/// workspace README's platform-support matrix). Every other target fails
+/// closed with an explicit error at plugin setup rather than silently
+/// no-opping — matches this project's convention of honest
+/// unimplemented-feature reporting over quiet failure.
 #[cfg(target_os = "linux")]
 fn build_backend() -> Result<Arc<dyn Backend>, Box<dyn std::error::Error>> {
     let backend = tauri::async_runtime::block_on(ble_gatt::backend::linux::LinuxBackend::new())?;
     Ok(Arc::new(backend))
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Android, unlike Linux, cannot construct the real backend eagerly here:
+/// `.setup()` runs synchronously from inside `tao`'s own Android context
+/// bring-up (before the JNI/Activity handles this plugin needs are fully
+/// populated — confirmed by an actual crash: `ndk_context::android_context()`
+/// panicking at exactly this call site). `android_lazy::LazyAndroidBackend`
+/// defers the real `AndroidBackend::new()` (and the one-time
+/// `tao` → `ndk-context` bridge it needs) to the first command actually
+/// invoked from JS, by which point the WebView/Activity is definitely alive.
+#[cfg(target_os = "android")]
+fn build_backend() -> Result<Arc<dyn Backend>, Box<dyn std::error::Error>> {
+    Ok(Arc::new(android_lazy::LazyAndroidBackend::new()))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn build_backend() -> Result<Arc<dyn Backend>, Box<dyn std::error::Error>> {
     Err("ble-gatt: no backend implemented yet for this platform \
-         (Linux is the only implemented target so far — see the ble-gatt README)"
+         (Linux and Android are the only implemented targets so far — see the ble-gatt README)"
         .into())
 }

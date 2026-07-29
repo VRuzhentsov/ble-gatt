@@ -1,0 +1,29 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>ble-gatt example</title>
+  </head>
+  <body>
+    <h1>ble-gatt example</h1>
+    <p id="status">loading…</p>
+    <button id="capabilities">capabilities()</button>
+    <pre id="output"></pre>
+    <script>
+      // Uses the global `window.__TAURI__` bridge (`app.withGlobalTauri` in
+      // tauri.conf.json) rather than an ESM import from a CDN, so this
+      // works with no network access — the emulator's webview only needs
+      // to talk to the app's own IPC bridge, not fetch anything external.
+      const output = document.getElementById("output");
+      document.getElementById("capabilities").addEventListener("click", async () => {
+        try {
+          const result = await window.__TAURI__.core.invoke("plugin:ble-gatt|ble_capabilities");
+          output.textContent = JSON.stringify(result, null, 2);
+        } catch (err) {
+          output.textContent = "error: " + err;
+        }
+      });
+      document.getElementById("status").textContent = "ready";
+    </script>
+  </body>
+</html>
