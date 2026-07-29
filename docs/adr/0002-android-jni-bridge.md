@@ -2,17 +2,19 @@
 
 ## Status
 
-Accepted, implemented, and verified further than the first pass of this ADR
-concluded. The JNI bridge chain (Rust `Backend` trait → Kotlin
-`BleGattBridge` → real Android `BluetoothManager`/`BluetoothGatt`/
-`BluetoothLeAdvertiser` APIs → back to Rust → Tauri IPC → JS) is proven
-working end-to-end, including a **genuine `{"central": true, "peripheral":
-true}` capability result** and a **confirmed successful advertise
-(`onStartSuccess`)** — not the `false`/`false` this ADR originally reported.
-That original result was traced to a real bug (below), not a hardware
-limitation. A genuine two-device BLE round trip is still **not verified**,
-but for a different, better-understood reason — see "What's verified vs.
-deferred".
+Accepted and implemented. **Not verified as a working bridge** — that bar is
+a real device-to-device BLE round trip, which has not happened yet (physical
+Android hardware verification is planned for after the next minor
+patch/release, owner-driven). What emulator testing this session *did*
+establish, individually and with concrete evidence: the JNI plumbing itself
+works with no crashes, a `capabilities()` call genuinely reaches real
+Android `BluetoothAdapter` APIs and back (`{"central": true, "peripheral":
+true}`, not the `false`/`false` this ADR originally and wrongly reported —
+see below), and `advertise()` genuinely starts a real GATT server
+(`AdvertiseCallback.onStartSuccess` confirmed). None of that adds up to "the
+bridge works" — only real hardware, both roles, exchanging real data, does.
+Treat everything below as build-confidence evidence, not a substitute for
+that test.
 
 ## Context
 
@@ -233,6 +235,15 @@ processes by default, or needs explicit topology/positioning configuration
 (the emulator's Netsim tooling has this concept) that wasn't identified in
 the time available this session. This is a narrower, better-diagnosed gap
 than the original version of this ADR claimed — not the same unknown.
+
+Further emulator-side investigation was deliberately not pursued past this
+point: `netsimd`'s device-topology API is gRPC-only and undocumented
+(confirmed — a plain HTTP request to its frontend port just hangs), and
+chasing it further is open-ended with no guaranteed payoff. **Physical
+Android hardware is the actual verification bar for this bridge** and is
+planned for after the next minor patch/release (owner-driven, not scheduled
+here). Nothing above should be read as "the bridge works" — it's evidence
+the pieces are individually sound, not proof of the thing that matters.
 
 ## Consequences
 
