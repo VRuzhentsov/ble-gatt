@@ -1,6 +1,8 @@
+use std::collections::BTreeMap;
+
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ServiceUuid(pub Uuid);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -35,6 +37,37 @@ pub struct DiscoveredPeer {
     pub address: PeerAddress,
     pub name: Option<String>,
     pub services: Vec<ServiceUuid>,
+    /// Manufacturer-specific advertisement data, keyed by the Bluetooth SIG
+    /// assigned company identifier. Vendor devices routinely carry their
+    /// real identity here (a serial number, a device EUI) rather than in the
+    /// BLE name, so this is often the only way to tell two units of the same
+    /// product apart before connecting.
+    pub manufacturer_data: BTreeMap<u16, Vec<u8>>,
+    /// Service-specific advertisement data, keyed by service UUID. The
+    /// conventional place to publish a small identity payload alongside your
+    /// own service UUID — it lets a scanner recognise a *specific* peer
+    /// without paying for a connection first.
+    pub service_data: BTreeMap<ServiceUuid, Vec<u8>>,
+    /// Received signal strength in dBm, when the backend reports it. Useful
+    /// as a proximity gate (ignore peers below a threshold) — `None` when
+    /// the platform doesn't surface it.
+    pub rssi: Option<i16>,
+}
+
+/// How a characteristic write should be delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WriteType {
+    /// ATT Write Request: the peer acknowledges each write. Slower, but you
+    /// learn about failures. The right default for command/response
+    /// protocols.
+    #[default]
+    WithResponse,
+    /// ATT Write Command: fire-and-forget, no acknowledgement. Substantially
+    /// higher throughput — the reason bulk transfers (firmware upload) use
+    /// it — at the cost of the peer silently dropping writes it can't keep
+    /// up with. Callers taking this path are responsible for their own
+    /// pacing and integrity checking.
+    WithoutResponse,
 }
 
 #[derive(Debug, Clone)]

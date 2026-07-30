@@ -10,6 +10,6 @@ pub mod models;
 pub use backend::{Backend, BoxStream, GattConnection};
 pub use error::{BleError, Result};
 pub use models::{
-    CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattCharacteristicSpec, GattEvent,
+    CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattCharacteristicSpec, GattEvent, WriteType,
     GattServiceSpec, PeerAddress, Role, ServiceUuid,
 };

@@ -14,6 +14,7 @@
 //! precise link-level connect/disconnect timing.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
@@ -32,7 +33,7 @@ use crate::backend::{Backend, BoxStream, GattConnection};
 use crate::error::{BleError, Result};
 use crate::models::{
     CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress,
-    ServiceUuid,
+    ServiceUuid, WriteType,
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
@@ -118,10 +119,31 @@ impl Backend for LinuxBackend {
                     return None;
                 }
                 let name = device.name().await.ok().flatten();
+                let manufacturer_data = device
+                    .manufacturer_data()
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+                let service_data = device
+                    .service_data()
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(uuid, data)| (ServiceUuid(uuid), data))
+                    .collect();
+                let rssi = device.rssi().await.ok().flatten();
                 Some(DiscoveredPeer {
                     address: PeerAddress(address.to_string()),
                     name,
                     services: uuids.into_iter().map(ServiceUuid).collect(),
+                    manufacturer_data,
+                    service_data,
+                    rssi,
                 })
             }
         });
@@ -141,9 +163,35 @@ impl Backend for LinuxBackend {
             peer: peer.0.clone(),
             reason: err.to_string(),
         })?;
+        let _ = self.events_tx.send(GattEvent::Connected { peer: peer.clone() });
+
+        // Watch BlueZ's own Connected property so an *unsolicited* drop (peer
+        // out of range, powered off) reaches `events()`. Without this a
+        // caller mid-transfer has no way to distinguish "slow" from "gone" —
+        // see `Backend::events`. The task ends when the device disconnects or
+        // the property stream closes, so it does not leak per connection.
+        let watch_device = device.clone();
+        let watch_peer = peer.clone();
+        let events_tx = self.events_tx.clone();
+        tokio::spawn(async move {
+            let Ok(mut changes) = watch_device.events().await else {
+                return;
+            };
+            while let Some(event) = changes.next().await {
+                let bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::Connected(false)) =
+                    event
+                else {
+                    continue;
+                };
+                let _ = events_tx.send(GattEvent::Disconnected { peer: watch_peer });
+                return;
+            }
+        });
+
         Ok(Box::new(LinuxGattConnection {
             peer: peer.clone(),
             device,
+            att_mtu: AtomicU16::new(crate::backend::DEFAULT_ATT_MTU),
         }))
     }
 
@@ -282,6 +330,11 @@ impl Backend for LinuxBackend {
 struct LinuxGattConnection {
     peer: PeerAddress,
     device: bluer::Device,
+    /// Negotiated ATT MTU, refreshed from BlueZ whenever a characteristic
+    /// operation gives us a cheap opportunity to read it. Starts at the
+    /// spec-mandated minimum so `max_write_len()` is never optimistic before
+    /// the real value is known.
+    att_mtu: AtomicU16,
 }
 
 impl LinuxGattConnection {
@@ -312,14 +365,39 @@ impl GattConnection for LinuxGattConnection {
         self.peer.clone()
     }
 
+    fn att_mtu(&self) -> u16 {
+        self.att_mtu.load(Ordering::Relaxed)
+    }
+
     async fn read(&mut self, characteristic: CharacteristicUuid) -> Result<Vec<u8>> {
         let target = self.find_characteristic(characteristic).await?;
+        if let Ok(mtu) = target.mtu().await {
+            self.att_mtu.store(mtu as u16, Ordering::Relaxed);
+        }
         target.read().await.map_err(|err| BleError::Gatt(err.to_string()))
     }
 
-    async fn write(&mut self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
+    async fn write_with_type(
+        &mut self, characteristic: CharacteristicUuid, value: Vec<u8>, write_type: WriteType,
+    ) -> Result<()> {
         let target = self.find_characteristic(characteristic).await?;
-        target.write(&value).await.map_err(|err| BleError::Gatt(err.to_string()))
+        // Cache the negotiated MTU opportunistically: BlueZ only publishes a
+        // characteristic's MTU once the link is up, so this is the first
+        // point it can be observed without a speculative extra round trip.
+        if let Ok(mtu) = target.mtu().await {
+            self.att_mtu.store(mtu as u16, Ordering::Relaxed);
+        }
+        let request = bluer::gatt::remote::CharacteristicWriteRequest {
+            op_type: match write_type {
+                WriteType::WithResponse => bluer::gatt::WriteOp::Request,
+                WriteType::WithoutResponse => bluer::gatt::WriteOp::Command,
+            },
+            ..Default::default()
+        };
+        target
+            .write_ext(&value, &request)
+            .await
+            .map_err(|err| BleError::Gatt(err.to_string()))
     }
 
     async fn subscribe(&mut self, characteristic: CharacteristicUuid) -> Result<BoxStream<Vec<u8>>> {

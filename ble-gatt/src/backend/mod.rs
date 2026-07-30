@@ -22,17 +22,53 @@ use tokio_stream::Stream;
 use crate::error::Result;
 use crate::models::{
     CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress,
-    ServiceUuid,
+    ServiceUuid, WriteType,
 };
 
 pub type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
+
+/// The ATT MTU every BLE connection is required to support before any
+/// negotiation happens (Bluetooth Core spec). Backends report this until a
+/// larger MTU is actually agreed with the peer.
+pub const DEFAULT_ATT_MTU: u16 = 23;
+
+/// Bytes of ATT protocol header consumed by a write/notify PDU. Subtract
+/// from the negotiated ATT MTU to get the usable payload size — see
+/// `GattConnection::max_write_len`.
+pub const ATT_HEADER_LEN: usize = 3;
 
 /// One live GATT client connection to a remote peripheral (central role).
 #[async_trait]
 pub trait GattConnection: Send {
     fn peer(&self) -> PeerAddress;
+
+    /// The negotiated ATT MTU for this connection. Backends request a larger
+    /// MTU on connect where the platform allows it, but the peer decides —
+    /// never assume this is more than [`DEFAULT_ATT_MTU`].
+    fn att_mtu(&self) -> u16;
+
+    /// Largest payload that fits in a single write/notify on this
+    /// connection (`att_mtu` minus [`ATT_HEADER_LEN`]). Chunk bulk transfers
+    /// against *this*, not a hardcoded constant — the value is only known
+    /// after MTU negotiation and differs per peer and per platform.
+    fn max_write_len(&self) -> usize {
+        (self.att_mtu() as usize).saturating_sub(ATT_HEADER_LEN)
+    }
+
     async fn read(&mut self, characteristic: CharacteristicUuid) -> Result<Vec<u8>>;
-    async fn write(&mut self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()>;
+
+    /// Write acknowledged by the peer ([`WriteType::WithResponse`]).
+    async fn write(&mut self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
+        self.write_with_type(characteristic, value, WriteType::WithResponse)
+            .await
+    }
+
+    /// Write with an explicit delivery mode — see [`WriteType`]. Implementors
+    /// provide this; `write` is a convenience wrapper over it.
+    async fn write_with_type(
+        &mut self, characteristic: CharacteristicUuid, value: Vec<u8>, write_type: WriteType,
+    ) -> Result<()>;
+
     async fn subscribe(&mut self, characteristic: CharacteristicUuid) -> Result<BoxStream<Vec<u8>>>;
     async fn disconnect(&mut self) -> Result<()>;
 }
@@ -73,10 +109,18 @@ pub trait Backend: Send + Sync {
 
     // --- Lifecycle ---
 
-    /// Connection lifecycle + inbound-write events for the local GATT
-    /// server, fanned out to every subscriber (mirrors Fini's
-    /// `transport::selection::LifecycleBus` pattern). Never carries GATT
-    /// client (central-role) events — those come back through
-    /// `GattConnection::subscribe`.
+    /// Connection lifecycle events for **both** roles, plus inbound writes to
+    /// the local GATT server, fanned out to every subscriber (mirrors Fini's
+    /// `transport::selection::LifecycleBus` pattern).
+    ///
+    /// Crucially this includes *unsolicited* central-role disconnects — a
+    /// peripheral going out of range or powering off mid-conversation. There
+    /// is no other way to learn about that: `GattConnection`'s methods only
+    /// report failures of operations you initiated, so a caller partway
+    /// through a long transfer would otherwise just hang. Anything holding a
+    /// `GattConnection` open across time should watch this stream.
+    ///
+    /// Characteristic *values* are not carried here — client-side
+    /// notifications come back through `GattConnection::subscribe`.
     fn events(&self) -> BoxStream<GattEvent>;
 }

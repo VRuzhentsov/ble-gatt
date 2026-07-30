@@ -7,7 +7,7 @@
 //! Built entirely on `tokio::sync::{broadcast, Mutex}` rather than
 //! hand-rolled pub-sub plumbing.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -19,17 +19,25 @@ use crate::backend::{Backend, BoxStream, GattConnection};
 use crate::error::{BleError, Result};
 use crate::models::{
     CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress,
-    ServiceUuid,
+    ServiceUuid, WriteType,
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 const NOTIFY_CHANNEL_CAPACITY: usize = 64;
 
+/// ATT MTU the mock reports for every connection. Deliberately *not*
+/// `DEFAULT_ATT_MTU`: a realistic negotiated value, so tests that chunk
+/// against `max_write_len()` exercise a non-trivial size rather than
+/// accidentally passing because everything fit in one write.
+const MOCK_ATT_MTU: u16 = 247;
+
 struct PeripheralState {
     service: GattServiceSpec,
     values: HashMap<CharacteristicUuid, Vec<u8>>,
     notify_tx: HashMap<CharacteristicUuid, broadcast::Sender<Vec<u8>>>,
-    events_tx: broadcast::Sender<GattEvent>,
+    manufacturer_data: BTreeMap<u16, Vec<u8>>,
+    service_data: BTreeMap<ServiceUuid, Vec<u8>>,
+    rssi: Option<i16>,
 }
 
 /// Shared "radio" for a set of `MockBackend`s. Construct one per test and
@@ -38,11 +46,38 @@ struct PeripheralState {
 #[derive(Default)]
 pub struct MockNetwork {
     peripherals: Mutex<HashMap<PeerAddress, PeripheralState>>,
+    /// Every backend's own event sender, keyed by its address, so an event
+    /// can be delivered to the party that actually observes it — a
+    /// peripheral learns that a central connected to *it*, and a central
+    /// learns that its peer vanished. Mirrors how the real backends behave:
+    /// `events()` is this backend's view, not a global feed.
+    event_senders: Mutex<HashMap<PeerAddress, broadcast::Sender<GattEvent>>>,
 }
 
 impl MockNetwork {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    fn emit(&self, to: &PeerAddress, event: GattEvent) {
+        if let Some(tx) = self.event_senders.lock().unwrap().get(to) {
+            let _ = tx.send(event);
+        }
+    }
+
+    /// Attach advertisement payload to an already-advertising peer, so
+    /// scanners see it in `DiscoveredPeer`. Out-of-band because a real
+    /// advertisement carries this alongside — not inside — the GATT service
+    /// definition.
+    pub fn set_advertisement_data(
+        &self, peer: &PeerAddress, manufacturer_data: BTreeMap<u16, Vec<u8>>,
+        service_data: BTreeMap<ServiceUuid, Vec<u8>>, rssi: Option<i16>,
+    ) {
+        if let Some(state) = self.peripherals.lock().unwrap().get_mut(peer) {
+            state.manufacturer_data = manufacturer_data;
+            state.service_data = service_data;
+            state.rssi = rssi;
+        }
     }
 }
 
@@ -50,6 +85,7 @@ pub struct MockBackend {
     address: PeerAddress,
     network: Arc<MockNetwork>,
     capabilities: CapabilityReport,
+    events_tx: broadcast::Sender<GattEvent>,
 }
 
 impl MockBackend {
@@ -57,11 +93,31 @@ impl MockBackend {
     /// mode (e.g. most Android devices) without a second backend impl — see
     /// the plan's role-assignment-with-capability-fallback decision.
     pub fn new(address: PeerAddress, network: Arc<MockNetwork>, capabilities: CapabilityReport) -> Self {
+        let (events_tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        network
+            .event_senders
+            .lock()
+            .unwrap()
+            .insert(address.clone(), events_tx.clone());
         Self {
             address,
             network,
             capabilities,
+            events_tx,
         }
+    }
+
+    /// Simulate the peer dropping the link without warning — out of range,
+    /// battery dead, firmware crash. There is no API-initiated disconnect
+    /// involved, which is exactly the case `Backend::events()` exists to
+    /// surface; tests use this to prove a consumer learns about it.
+    pub fn simulate_peer_loss(&self, peer: &PeerAddress) {
+        self.network.emit(
+            &self.address,
+            GattEvent::Disconnected { peer: peer.clone() },
+        );
+        self.network
+            .emit(peer, GattEvent::Disconnected { peer: self.address.clone() });
     }
 }
 
@@ -80,6 +136,12 @@ impl Backend for MockBackend {
                 address: addr.clone(),
                 name: None,
                 services: vec![state.service.uuid],
+                // The mock has no real advertisement packet to parse. Tests
+                // that care about identity-in-advertisement drive it through
+                // `MockNetwork::set_advertisement_data`.
+                manufacturer_data: state.manufacturer_data.clone(),
+                service_data: state.service_data.clone(),
+                rssi: state.rssi,
             })
             .collect();
         drop(peripherals);
@@ -87,17 +149,23 @@ impl Backend for MockBackend {
     }
 
     async fn connect(&self, peer: &PeerAddress) -> Result<Box<dyn GattConnection>> {
-        let events_tx = {
+        {
             let peripherals = self.network.peripherals.lock().unwrap();
-            let state = peripherals.get(peer).ok_or_else(|| BleError::ConnectFailed {
+            peripherals.get(peer).ok_or_else(|| BleError::ConnectFailed {
                 peer: peer.0.clone(),
                 reason: "peer is not advertising".to_string(),
             })?;
-            state.events_tx.clone()
-        };
-        let _ = events_tx.send(GattEvent::Connected {
-            peer: self.address.clone(),
-        });
+        }
+        // The peripheral observes the central arriving; the central observes
+        // its own connection coming up. Each side sees its own view.
+        self.network.emit(
+            peer,
+            GattEvent::Connected {
+                peer: self.address.clone(),
+            },
+        );
+        self.network
+            .emit(&self.address, GattEvent::Connected { peer: peer.clone() });
         Ok(Box::new(MockGattConnection {
             central: self.address.clone(),
             peripheral: peer.clone(),
@@ -109,7 +177,6 @@ impl Backend for MockBackend {
         if !self.capabilities.peripheral {
             return Err(BleError::PeripheralUnsupported);
         }
-        let (events_tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let mut values = HashMap::new();
         let mut notify_tx = HashMap::new();
         for characteristic in &service.characteristics {
@@ -117,13 +184,24 @@ impl Backend for MockBackend {
             notify_tx.insert(characteristic.uuid, broadcast::channel(NOTIFY_CHANNEL_CAPACITY).0);
         }
         let mut peripherals = self.network.peripherals.lock().unwrap();
+        let previous = peripherals.remove(&self.address);
         peripherals.insert(
             self.address.clone(),
             PeripheralState {
                 service,
                 values,
                 notify_tx,
-                events_tx,
+                // Advertisement payload survives a re-advertise: it's set
+                // out-of-band by the test, not part of GattServiceSpec.
+                manufacturer_data: previous
+                    .as_ref()
+                    .map(|p| p.manufacturer_data.clone())
+                    .unwrap_or_default(),
+                service_data: previous
+                    .as_ref()
+                    .map(|p| p.service_data.clone())
+                    .unwrap_or_default(),
+                rssi: previous.as_ref().and_then(|p| p.rssi),
             },
         );
         Ok(())
@@ -148,14 +226,11 @@ impl Backend for MockBackend {
     }
 
     fn events(&self) -> BoxStream<GattEvent> {
-        let peripherals = self.network.peripherals.lock().unwrap();
-        match peripherals.get(&self.address) {
-            Some(state) => {
-                let rx = state.events_tx.subscribe();
-                Box::pin(BroadcastStream::new(rx).filter_map(|item| item.ok()))
-            }
-            None => Box::pin(tokio_stream::empty()),
-        }
+        // This backend's own view, in both roles — available immediately,
+        // not conditional on advertising, since a central-only consumer
+        // needs it to learn about unsolicited peer loss.
+        let rx = self.events_tx.subscribe();
+        Box::pin(BroadcastStream::new(rx).filter_map(|item| item.ok()))
     }
 }
 
@@ -171,6 +246,10 @@ impl GattConnection for MockGattConnection {
         self.peripheral.clone()
     }
 
+    fn att_mtu(&self) -> u16 {
+        MOCK_ATT_MTU
+    }
+
     async fn read(&mut self, characteristic: CharacteristicUuid) -> Result<Vec<u8>> {
         let peripherals = self.network.peripherals.lock().unwrap();
         let state = peripherals
@@ -183,20 +262,27 @@ impl GattConnection for MockGattConnection {
             .ok_or_else(|| BleError::Gatt("unknown characteristic".to_string()))
     }
 
-    async fn write(&mut self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
-        let events_tx = {
+    async fn write_with_type(
+        &mut self, characteristic: CharacteristicUuid, value: Vec<u8>, _write_type: WriteType,
+    ) -> Result<()> {
+        // The mock delivers both write types identically: it has no real
+        // link to drop packets on, so modelling WithoutResponse as lossy
+        // would invent a failure mode rather than reproduce one.
+        {
             let mut peripherals = self.network.peripherals.lock().unwrap();
             let state = peripherals
                 .get_mut(&self.peripheral)
                 .ok_or_else(|| BleError::NotConnected(self.peripheral.0.clone()))?;
             state.values.insert(characteristic, value.clone());
-            state.events_tx.clone()
-        };
-        let _ = events_tx.send(GattEvent::CharacteristicWritten {
-            peer: self.central.clone(),
-            characteristic,
-            value,
-        });
+        }
+        self.network.emit(
+            &self.peripheral,
+            GattEvent::CharacteristicWritten {
+                peer: self.central.clone(),
+                characteristic,
+                value,
+            },
+        );
         Ok(())
     }
 
@@ -214,15 +300,18 @@ impl GattConnection for MockGattConnection {
     }
 
     async fn disconnect(&mut self) -> Result<()> {
-        let events_tx = {
-            let peripherals = self.network.peripherals.lock().unwrap();
-            peripherals.get(&self.peripheral).map(|state| state.events_tx.clone())
-        };
-        if let Some(tx) = events_tx {
-            let _ = tx.send(GattEvent::Disconnected {
+        self.network.emit(
+            &self.peripheral,
+            GattEvent::Disconnected {
                 peer: self.central.clone(),
-            });
-        }
+            },
+        );
+        self.network.emit(
+            &self.central,
+            GattEvent::Disconnected {
+                peer: self.peripheral.clone(),
+            },
+        );
         Ok(())
     }
 }
