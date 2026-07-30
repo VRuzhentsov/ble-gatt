@@ -19,13 +19,19 @@ This repo is a Cargo workspace with two published crates:
   wrapper around `ble-gatt`, following Tauri's own `tauri-plugin-*` naming
   convention for its mobile-plugin tooling.
 
-**Why this split, why GATT-only, why hand-rolled instead of an existing
-crate, and what was deliberately left out of Stage 1** are recorded in
-[`docs/adr/0001-ble-gatt-tauri-plugin-split-and-scope.md`](docs/adr/0001-ble-gatt-tauri-plugin-split-and-scope.md).
-**The Android JNI bridge design, and exactly what is/isn't verified about
-it**, are in
-[`docs/adr/0002-android-jni-bridge.md`](docs/adr/0002-android-jni-bridge.md) —
-this README stays focused on what the crates do and how to use them.
+This library **carries bytes; it does not encrypt them.** Layering your own
+session protocol or end-to-end encryption on top is expected and
+supported — and staying out of the way is deliberate, so that consumers
+talking to third-party device firmware (which will never speak your
+protocol) can use the raw GATT API directly. See ADR-0003.
+
+Design decisions live in `docs/adr/`:
+[0001](docs/adr/0001-ble-gatt-tauri-plugin-split-and-scope.md) — why this
+split, why GATT-only, why hand-rolled instead of an existing crate.
+[0002](docs/adr/0002-android-jni-bridge.md) — the Android JNI bridge, and
+exactly what is and isn't verified about it.
+[0003](docs/adr/0003-carrier-not-crypto-and-the-two-api-tiers.md) — carrier
+vs. crypto, the two API tiers, and the no-AGPL constraint.
 
 ## Platform support
 
