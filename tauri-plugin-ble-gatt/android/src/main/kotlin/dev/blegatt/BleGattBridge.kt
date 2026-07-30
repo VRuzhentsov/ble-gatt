@@ -91,11 +91,44 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             .build()
         val callback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
-                val uuids = result.scanRecord?.serviceUuids
+                val record = result.scanRecord
+                val uuids = record?.serviceUuids
                 Log.d(TAG, "onScanResult: ${result.device.address} name=${result.device.name} advertisedUuids=$uuids")
-                if (uuids != null && uuids.contains(ParcelUuid(target))) {
-                    onPeerDiscovered(nativeHandle, result.device.address, result.device.name)
+                if (uuids == null || !uuids.contains(ParcelUuid(target))) {
+                    return
                 }
+
+                // Flatten both advertisement maps into parallel arrays — see
+                // Native.kt for why the JNI boundary takes them this way.
+                val manufacturer = record.manufacturerSpecificData
+                val manufacturerIds = IntArray(manufacturer?.size() ?: 0)
+                val manufacturerValues = arrayOfNulls<ByteArray>(manufacturer?.size() ?: 0)
+                if (manufacturer != null) {
+                    for (i in 0 until manufacturer.size()) {
+                        manufacturerIds[i] = manufacturer.keyAt(i)
+                        manufacturerValues[i] = manufacturer.valueAt(i) ?: ByteArray(0)
+                    }
+                }
+
+                val serviceData = record.serviceData ?: emptyMap()
+                val serviceDataUuids = arrayOfNulls<String>(serviceData.size)
+                val serviceDataValues = arrayOfNulls<ByteArray>(serviceData.size)
+                serviceData.entries.forEachIndexed { i, entry ->
+                    serviceDataUuids[i] = entry.key.uuid.toString()
+                    serviceDataValues[i] = entry.value ?: ByteArray(0)
+                }
+
+                @Suppress("UNCHECKED_CAST")
+                onPeerDiscovered(
+                    nativeHandle,
+                    result.device.address,
+                    result.device.name,
+                    result.rssi,
+                    manufacturerIds,
+                    manufacturerValues as Array<ByteArray>,
+                    serviceDataUuids as Array<String>,
+                    serviceDataValues as Array<ByteArray>,
+                )
             }
 
             override fun onScanFailed(errorCode: Int) {
@@ -126,13 +159,31 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         val callback = object : BluetoothGattCallback() {
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
                 when (newState) {
-                    BluetoothProfile.STATE_CONNECTED -> gatt.discoverServices()
+                    BluetoothProfile.STATE_CONNECTED -> {
+                        // Ask for the largest MTU the spec allows before
+                        // discovering services. The peer decides the real
+                        // value and reports it via onMtuChanged; until then
+                        // Rust keeps the conservative 23-byte default.
+                        gatt.requestMtu(MAX_ATT_MTU)
+                        gatt.discoverServices()
+                    }
                     BluetoothProfile.STATE_DISCONNECTED -> {
                         connectedGatts.remove(address)
                         pendingCharacteristics.remove(address)
+                        // Fires for unsolicited drops too (out of range,
+                        // peer powered off), which is the whole point of
+                        // surfacing this to Rust rather than only reporting
+                        // disconnects we initiated.
                         onDisconnected(nativeHandle, address)
                         gatt.close()
                     }
+                }
+            }
+
+            override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    Log.d(TAG, "onMtuChanged: $address negotiated mtu=$mtu")
+                    onMtuChanged(nativeHandle, address, mtu)
                 }
             }
 
@@ -199,10 +250,20 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         gatt.readCharacteristic(characteristic)
     }
 
+    /// `withoutResponse` selects ATT Write Command over Write Request —
+    /// materially faster for bulk transfer, at the cost of the peer silently
+    /// dropping writes it can't keep up with. See `models::WriteType`.
     @Suppress("DEPRECATION")
-    fun writeCharacteristic(address: String, characteristicUuid: String, value: ByteArray) {
+    fun writeCharacteristic(
+        address: String, characteristicUuid: String, value: ByteArray, withoutResponse: Boolean,
+    ) {
         val gatt = connectedGatts[address] ?: return
         val characteristic = findCharacteristic(address, characteristicUuid) ?: return
+        characteristic.writeType = if (withoutResponse) {
+            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        } else {
+            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        }
         characteristic.value = value
         gatt.writeCharacteristic(characteristic)
     }
@@ -346,5 +407,9 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     companion object {
         private val CLIENT_CHARACTERISTIC_CONFIG_UUID: UUID =
             UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
+        /// Largest ATT MTU the Bluetooth spec permits. Requested on every
+        /// connection; the peer negotiates it down to whatever it supports.
+        private const val MAX_ATT_MTU: Int = 517
     }
 }

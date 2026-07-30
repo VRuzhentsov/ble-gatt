@@ -14,11 +14,27 @@ package dev.blegatt
  * This is the standard stateful-JNI-callback pattern — see the module doc
  * comment on `android.rs` for the full contract.
  */
-external fun onPeerDiscovered(nativeHandle: Long, address: String, name: String?)
+/// `manufacturerData` and `serviceData` are passed pre-flattened rather than
+/// as Java maps: building a `java.util.HashMap` across JNI costs several
+/// reflective calls per entry, and the Rust side has to walk it back out
+/// again. Parallel key/value arrays keep the boundary to one array copy per
+/// side. `serviceDataUuids` holds UUID strings; the value arrays line up
+/// index-for-index with their key arrays.
+external fun onPeerDiscovered(
+    nativeHandle: Long, address: String, name: String?, rssi: Int,
+    manufacturerIds: IntArray, manufacturerValues: Array<ByteArray>,
+    serviceDataUuids: Array<String>, serviceDataValues: Array<ByteArray>,
+)
 
 external fun onConnected(nativeHandle: Long, address: String)
 
 external fun onDisconnected(nativeHandle: Long, address: String)
+
+/// Reports the ATT MTU actually negotiated for a connection. Fires from
+/// `BluetoothGattCallback.onMtuChanged` after the explicit `requestMtu`
+/// issued on connect — the peer decides the final value, so this is the
+/// only trustworthy source for it.
+external fun onMtuChanged(nativeHandle: Long, address: String, mtu: Int)
 
 external fun onCharacteristicRead(
     nativeHandle: Long, address: String, characteristicUuid: String, value: ByteArray, success: Boolean

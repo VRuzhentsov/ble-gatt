@@ -26,12 +26,12 @@
 //! honestly rather than silently assumed away, matching Fini's own
 //! don't-hide-hard-cases convention this project inherited.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use async_trait::async_trait;
-use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString, JValue};
-use jni::sys::{jboolean, jlong};
+use jni::objects::{GlobalRef, JByteArray, JClass, JIntArray, JObject, JObjectArray, JString, JValue};
+use jni::sys::{jboolean, jint, jlong};
 use jni::{JNIEnv, JavaVM};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -42,7 +42,7 @@ use crate::backend::{Backend, BoxStream, GattConnection};
 use crate::error::{BleError, Result};
 use crate::models::{
     CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress,
-    ServiceUuid,
+    ServiceUuid, WriteType,
 };
 
 const BRIDGE_CLASS_BINARY_NAME: &str = "dev.blegatt.BleGattBridge";
@@ -66,7 +66,15 @@ struct Inner {
     bridge: OnceLock<GlobalRef>,
     connections: StdMutex<HashMap<String, ConnectionState>>,
     discovery_tx: StdMutex<Option<mpsc::UnboundedSender<DiscoveredPeer>>>,
+    /// Named `server_events_tx` historically, but now carries both roles'
+    /// lifecycle events — including central-side link loss. See
+    /// `Backend::events`.
     server_events_tx: broadcast::Sender<GattEvent>,
+    /// Negotiated ATT MTU per peer address, populated from
+    /// `onMtuChanged`. Shared rather than held per-`AndroidGattConnection`
+    /// because the JNI callback arrives on a Binder thread with only the
+    /// address to key on.
+    att_mtus: StdMutex<HashMap<String, u16>>,
 }
 
 impl Inner {
@@ -134,6 +142,7 @@ impl AndroidBackend {
             connections: StdMutex::new(HashMap::new()),
             discovery_tx: StdMutex::new(None),
             server_events_tx,
+            att_mtus: StdMutex::new(HashMap::new()),
         });
 
         // See the module doc comment: this pointer must stay valid for as
@@ -347,6 +356,16 @@ impl GattConnection for AndroidGattConnection {
         PeerAddress(self.address.clone())
     }
 
+    fn att_mtu(&self) -> u16 {
+        self.inner
+            .att_mtus
+            .lock()
+            .unwrap()
+            .get(&self.address)
+            .copied()
+            .unwrap_or(crate::backend::DEFAULT_ATT_MTU)
+    }
+
     async fn read(&mut self, characteristic: CharacteristicUuid) -> Result<Vec<u8>> {
         let (tx, rx) = oneshot::channel();
         {
@@ -370,7 +389,9 @@ impl GattConnection for AndroidGattConnection {
         rx.await.map_err(|_| BleError::NotConnected(self.address.clone()))?
     }
 
-    async fn write(&mut self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
+    async fn write_with_type(
+        &mut self, characteristic: CharacteristicUuid, value: Vec<u8>, write_type: WriteType,
+    ) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         {
             let mut connections = self.inner.connections.lock().unwrap();
@@ -384,11 +405,17 @@ impl GattConnection for AndroidGattConnection {
                 .new_string(characteristic.0.to_string())
                 .map_err(|err| BleError::Gatt(err.to_string()))?;
             let bytes = env.byte_array_from_slice(&value).map_err(|err| BleError::Gatt(err.to_string()))?;
+            let without_response = matches!(write_type, WriteType::WithoutResponse);
             self.inner.call_void(
                 &mut env,
                 "writeCharacteristic",
-                "(Ljava/lang/String;Ljava/lang/String;[B)V",
-                &[JValue::Object(&address), JValue::Object(&uuid), JValue::Object(&bytes)],
+                "(Ljava/lang/String;Ljava/lang/String;[BZ)V",
+                &[
+                    JValue::Object(&address),
+                    JValue::Object(&uuid),
+                    JValue::Object(&bytes),
+                    JValue::Bool(without_response as jboolean),
+                ],
             )?;
         }
         rx.await.map_err(|_| BleError::NotConnected(self.address.clone()))?
@@ -526,22 +553,78 @@ fn read_optional_jstring(env: &mut JNIEnv, s: &JString) -> Option<String> {
     }
 }
 
+/// Reads the parallel key/value arrays `Native.kt` flattens advertisement
+/// maps into — see its doc comment for why the boundary looks like this.
+fn read_byte_array_array(env: &mut JNIEnv, array: &JObjectArray, len: i32) -> Vec<Vec<u8>> {
+    (0..len)
+        .map(|i| {
+            env.get_object_array_element(array, i)
+                .ok()
+                .map(JByteArray::from)
+                .and_then(|bytes| env.convert_byte_array(&bytes).ok())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
 #[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onPeerDiscovered<'local>(
     mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, address: JString<'local>,
-    name: JString<'local>,
+    name: JString<'local>, rssi: jint, manufacturer_ids: JIntArray<'local>,
+    manufacturer_values: JObjectArray<'local>, service_data_uuids: JObjectArray<'local>,
+    service_data_values: JObjectArray<'local>,
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
     let address = read_jstring(&mut env, &address);
     let name = read_optional_jstring(&mut env, &name);
+
+    let mut manufacturer_data = BTreeMap::new();
+    if let Ok(len) = env.get_array_length(&manufacturer_ids) {
+        let mut ids = vec![0i32; len as usize];
+        if env.get_int_array_region(&manufacturer_ids, 0, &mut ids).is_ok() {
+            let values = read_byte_array_array(&mut env, &manufacturer_values, len);
+            for (id, value) in ids.into_iter().zip(values) {
+                manufacturer_data.insert(id as u16, value);
+            }
+        }
+    }
+
+    let mut service_data = BTreeMap::new();
+    if let Ok(len) = env.get_array_length(&service_data_uuids) {
+        let values = read_byte_array_array(&mut env, &service_data_values, len);
+        for (i, value) in values.into_iter().enumerate() {
+            let Ok(uuid_obj) = env.get_object_array_element(&service_data_uuids, i as i32) else {
+                continue;
+            };
+            let uuid_str = read_jstring(&mut env, &JString::from(uuid_obj));
+            if let Ok(uuid) = Uuid::parse_str(&uuid_str) {
+                service_data.insert(ServiceUuid(uuid), value);
+            }
+        }
+    }
+
     let discovery_tx = inner.discovery_tx.lock().unwrap();
     if let Some(tx) = discovery_tx.as_ref() {
         let _ = tx.send(DiscoveredPeer {
             address: PeerAddress(address),
             name,
             services: Vec::new(),
+            manufacturer_data,
+            service_data,
+            rssi: Some(rssi as i16),
         });
     }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_blegatt_NativeKt_onMtuChanged<'local>(
+    mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, address: JString<'local>,
+    mtu: jint,
+) {
+    let inner = unsafe { inner_from_handle(native_handle) };
+    let address = read_jstring(&mut env, &address);
+    inner.att_mtus.lock().unwrap().insert(address, mtu as u16);
 }
 
 #[no_mangle]
@@ -564,16 +647,26 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onDisconnected<'local>(
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
     let address = read_jstring(&mut env, &address);
-    let mut connections = inner.connections.lock().unwrap();
-    if let Some(state) = connections.remove(&address) {
-        if let Some(tx) = state.disconnected_tx {
-            let _ = tx.send(());
+    inner.att_mtus.lock().unwrap().remove(&address);
+    {
+        let mut connections = inner.connections.lock().unwrap();
+        if let Some(state) = connections.remove(&address) {
+            if let Some(tx) = state.disconnected_tx {
+                let _ = tx.send(());
+            }
+            // A connect attempt that never reaches `onConnected` ends in
+            // `onDisconnected` instead — resolving `connected_tx` here (with no
+            // receiver-visible success value) makes the pending `connect()`
+            // call fail via the dropped-sender path in `Backend::connect`.
         }
-        // A connect attempt that never reaches `onConnected` ends in
-        // `onDisconnected` instead — resolving `connected_tx` here (with no
-        // receiver-visible success value) makes the pending `connect()`
-        // call fail via the dropped-sender path in `Backend::connect`.
     }
+    // Publish regardless of whether we had per-connection state: this fires
+    // for unsolicited drops (peer out of range, powered off) as well as
+    // disconnects we asked for, and `Backend::events()` is the only way a
+    // caller learns about the former.
+    let _ = inner.server_events_tx.send(GattEvent::Disconnected {
+        peer: PeerAddress(address),
+    });
 }
 
 #[no_mangle]
