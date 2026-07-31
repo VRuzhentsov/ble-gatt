@@ -258,13 +258,27 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                         }
                     }
                     BluetoothProfile.STATE_DISCONNECTED -> {
-                        connectedGatts.remove(address)
-                        pendingCharacteristics.remove(address)
-                        // Fires for unsolicited drops too (out of range,
-                        // peer powered off), which is the whole point of
-                        // surfacing this to Rust rather than only reporting
-                        // disconnects we initiated.
-                        onDisconnected(nativeHandle, address, false)
+                        // A cancelled connect can be retried before its old
+                        // GATT's disconnect callback arrives. Removing by
+                        // address alone would delete the *replacement* and
+                        // then clear its Rust state, tearing down a
+                        // connection that had just succeeded — so only the
+                        // GATT still owning this address may do so.
+                        val current = connectedGatts[address] === gatt
+                        if (current) {
+                            connectedGatts.remove(address)
+                            pendingCharacteristics.remove(address)
+                            // Fires for unsolicited drops too (out of range,
+                            // peer powered off), which is the whole point of
+                            // surfacing this to Rust rather than only
+                            // reporting disconnects we initiated.
+                            onDisconnected(nativeHandle, address, false)
+                        } else {
+                            Log.d(TAG, "onConnectionStateChange: $address superseded, not clearing state")
+                        }
+                        // Closed either way: a superseded GATT still needs
+                        // releasing, it just must not take the live one's
+                        // bookkeeping with it.
                         gatt.close()
                     }
                 }
@@ -453,6 +467,16 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             /// while centrals could see the advertisement but not the
             /// service it promised.
             override fun onServiceAdded(status: Int, service: BluetoothGattService) {
+                // `addService` completes asynchronously, so this can run
+                // after `stopAdvertising()` has already closed the server.
+                // Advertising anyway would violate a stop request that had
+                // completed, and during a rapid stop/start it would start
+                // the *old* service and resolve the new generation's
+                // advertise waiter with the old attempt's outcome.
+                if (serverGeneration != generation) {
+                    Log.d(TAG, "onServiceAdded: stale server generation, ignoring")
+                    return
+                }
                 if (status != BluetoothGatt.GATT_SUCCESS) {
                     Log.e(TAG, "onServiceAdded failed: status=$status")
                     failAdvertise(status)
@@ -684,6 +708,10 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             onDisconnected(nativeHandle, address, true)
         }
 
+        // Invalidate this generation *before* closing, so any callback
+        // already queued against it is ignored rather than acting on a
+        // server that is going away.
+        synchronized(this) { ++serverGeneration }
         failPendingNotifications()
 
         gattServer?.close()

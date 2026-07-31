@@ -740,3 +740,69 @@ async fn dropping_a_served_channel_frees_the_slot_for_the_next_central() {
         .expect("no error");
     assert_eq!(received, b"to-the-second");
 }
+
+#[tokio::test]
+async fn a_stale_channel_drop_does_not_evict_the_reconnected_peer() {
+    let config = config();
+    let network = MockNetwork::new();
+    let peripheral_addr = PeerAddress("peripheral-reuse".to_string());
+    let central_addr = PeerAddress("central-reuse".to_string());
+
+    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+        peripheral_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    ));
+    let first: Arc<MockBackend> = Arc::new(MockBackend::new(
+        central_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    ));
+
+    let mut incoming = datagram::serve(peripheral.clone(), &config)
+        .await
+        .expect("serve should start");
+    let first_client = datagram::connect(first.clone(), &peripheral_addr, &config)
+        .await
+        .expect("connect should succeed");
+    let stale = tokio::time::timeout(Duration::from_secs(2), incoming.next())
+        .await
+        .expect("serve should yield a channel")
+        .expect("channel stream should not be closed");
+
+    // The peer drops, and the caller keeps holding its now-dead channel.
+    drop(first_client);
+    peripheral.simulate_peer_loss(&central_addr);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // The *same address* reconnects and is served afresh.
+    let second: Arc<MockBackend> = Arc::new(MockBackend::new(
+        central_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    ));
+    let mut second_client = datagram::connect(second.clone(), &peripheral_addr, &config)
+        .await
+        .expect("reconnect should succeed");
+    let mut reconnected = tokio::time::timeout(Duration::from_secs(2), incoming.next())
+        .await
+        .expect("serve should yield a channel for the reconnected peer")
+        .expect("channel stream should not be closed");
+
+    // Only now is the stale channel dropped. Keyed on address alone, its
+    // release would evict the entry the reconnected peer now holds and
+    // disconnect a central that has done nothing wrong.
+    drop(stale);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    reconnected
+        .send(b"still-serving".to_vec())
+        .await
+        .expect("a reconnected peer must survive the previous channel being dropped");
+    let received = tokio::time::timeout(Duration::from_secs(2), second_client.recv())
+        .await
+        .expect("the reconnected central should receive it")
+        .expect("channel should be open")
+        .expect("no error");
+    assert_eq!(received, b"still-serving");
+}

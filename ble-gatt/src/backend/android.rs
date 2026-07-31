@@ -806,6 +806,17 @@ impl GattConnection for AndroidGattConnection {
             }
             state.read_tx = Some((characteristic, tx));
         }
+        // Armed *before* the fallible JNI setup below, not after. Installing
+        // the sender and then returning early on a transient failure — a JNI
+        // attach, a string allocation, a missing runtime permission — left
+        // the stale sender in place, so every later read on a perfectly live
+        // connection was refused as already in progress, long after the
+        // cause was fixed.
+        let guard = PendingOpGuard {
+            inner: self.inner.clone(),
+            address: self.address.clone(),
+            op: PendingOp::Read,
+        };
         {
             let mut env = self.inner.env()?;
             let address = env.new_string(&self.address).map_err(|err| BleError::Gatt(err.to_string()))?;
@@ -819,12 +830,9 @@ impl GattConnection for AndroidGattConnection {
                 &[JValue::Object(&address), JValue::Object(&uuid)],
             )?;
         }
-        // Clear ownership on every exit, including a dropped future, so a
-        // cancelled read cannot block later ones for the life of the link.
-        let guard = ReadGuard {
-            inner: self.inner.clone(),
-            address: self.address.clone(),
-        };
+        // The guard covers every exit from here too, including a dropped
+        // future, so a cancelled read cannot block later ones for the life
+        // of the link.
         let result = rx.await.map_err(|_| BleError::NotConnected(self.address.clone()));
         drop(guard);
         result?
@@ -839,6 +847,13 @@ impl GattConnection for AndroidGattConnection {
             let state = connections.entry(self.address.clone()).or_default();
             state.write_tx = Some(tx);
         }
+        // Same reasoning as `read`: armed before the fallible setup, so a
+        // transient JNI failure cannot strand the slot.
+        let guard = PendingOpGuard {
+            inner: self.inner.clone(),
+            address: self.address.clone(),
+            op: PendingOp::Write,
+        };
         {
             let mut env = self.inner.env()?;
             let address = env.new_string(&self.address).map_err(|err| BleError::Gatt(err.to_string()))?;
@@ -859,12 +874,6 @@ impl GattConnection for AndroidGattConnection {
                 ],
             )?;
         }
-        // Clear ownership on every exit, including a dropped future, so a
-        // cancelled read cannot block later ones for the life of the link.
-        let guard = ReadGuard {
-            inner: self.inner.clone(),
-            address: self.address.clone(),
-        };
         let result = rx.await.map_err(|_| BleError::NotConnected(self.address.clone()));
         drop(guard);
         result?
@@ -1395,19 +1404,32 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onServerSubscribed<'local>(
     });
 }
 
-/// Releases a pending read slot on every exit path, including a dropped
-/// future — otherwise a cancelled read would refuse every later read on that
-/// connection for the life of the link.
-struct ReadGuard {
-    inner: Arc<Inner>,
-    address: String,
+#[derive(Clone, Copy)]
+enum PendingOp {
+    Read,
+    Write,
 }
 
-impl Drop for ReadGuard {
+/// Releases a pending operation slot on every exit path, including a dropped
+/// future and a synchronous JNI failure.
+///
+/// Must be armed *before* the fallible setup it protects: a slot left
+/// occupied by a transient failure blocks every later operation on a live
+/// connection, long after the cause is gone.
+struct PendingOpGuard {
+    inner: Arc<Inner>,
+    address: String,
+    op: PendingOp,
+}
+
+impl Drop for PendingOpGuard {
     fn drop(&mut self) {
         let mut connections = self.inner.connections.lock().unwrap();
         if let Some(state) = connections.get_mut(&self.address) {
-            state.read_tx = None;
+            match self.op {
+                PendingOp::Read => state.read_tx = None,
+                PendingOp::Write => state.write_tx = None,
+            }
         }
     }
 }

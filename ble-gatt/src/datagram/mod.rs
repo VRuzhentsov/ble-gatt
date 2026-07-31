@@ -282,7 +282,7 @@ pub struct DatagramChannel {
     /// in `inbound`, so subsequent writes went to a closed receiver, the
     /// entry was never removed, and every other central was refused
     /// indefinitely.
-    release: Option<mpsc::Sender<PeerAddress>>,
+    release: Option<(mpsc::Sender<(PeerAddress, u64)>, u64)>,
     /// Raised when inbound data was dropped for this channel.
     ///
     /// Out-of-band rather than an error pushed onto the message queue:
@@ -310,8 +310,13 @@ impl Drop for DatagramChannel {
         // Tell `serve` the slot is free. try_send because Drop cannot await;
         // the queue is sized for the peers `serve` can hold, so it cannot
         // legitimately be full.
-        if let Some(release) = &self.release {
-            let _ = release.try_send(self.peer.clone());
+        //
+        // The generation is what makes this safe against address reuse: a
+        // stale channel held past its peer's disconnect would otherwise
+        // release whatever entry the *same address* currently occupies,
+        // disconnecting a central that had just reconnected.
+        if let Some((release, generation)) = &self.release {
+            let _ = release.try_send((self.peer.clone(), *generation));
         }
     }
 }
@@ -423,16 +428,30 @@ impl DatagramChannel {
 
 /// A served peer's fragment sender, channel-liveness flag, and overflow
 /// signal, as held by `serve` while that peer occupies the single slot.
-type ServedPeer = (mpsc::Sender<Vec<u8>>, Arc<AtomicBool>, Arc<OverflowSignal>);
+struct ServedPeer {
+    fragments: mpsc::Sender<Vec<u8>>,
+    active: Arc<AtomicBool>,
+    overflow: Arc<OverflowSignal>,
+    /// Distinguishes successive channels for the same address, so a release
+    /// from a superseded channel cannot evict its replacement.
+    generation: u64,
+}
 
 /// Free the single-central slot for a peer whose channel the caller dropped,
 /// and drop the peer so it is not left subscribed to a server that is no
 /// longer reading from it.
 async fn release_peer(
-    inbound: &mut HashMap<PeerAddress, ServedPeer>, peer: &PeerAddress, backend: &dyn Backend,
+    inbound: &mut HashMap<PeerAddress, ServedPeer>, peer: &PeerAddress, generation: u64,
+    backend: &dyn Backend,
 ) {
-    if let Some((_, active, _)) = inbound.remove(peer) {
-        active.store(false, Ordering::SeqCst);
+    // Only if this release belongs to the channel currently holding the
+    // slot. A late release from a superseded generation must not evict the
+    // peer that replaced it.
+    if inbound.get(peer).map(|served| served.generation) != Some(generation) {
+        return;
+    }
+    if let Some(served) = inbound.remove(peer) {
+        served.active.store(false, Ordering::SeqCst);
         if let Err(err) = backend.disconnect_peer(peer).await {
             eprintln!(
                 "[ble-gatt][datagram] could not disconnect released central {}: {err}",
@@ -658,7 +677,8 @@ pub async fn serve(
     backend.advertise(config.service_spec()).await?;
 
     let (channels_tx, channels_rx) = mpsc::channel(config.accept_queue_depth);
-    let (release_tx, mut release_rx) = mpsc::channel::<PeerAddress>(config.accept_queue_depth);
+    let (release_tx, mut release_rx) =
+        mpsc::channel::<(PeerAddress, u64)>(config.accept_queue_depth);
     let config = config.clone();
     // The peripheral has no `GattConnection` to ask for a negotiated MTU, so
     // it budgets against the spec-minimum. Conservative on purpose:
@@ -671,9 +691,10 @@ pub async fn serve(
     tokio::spawn(async move {
         // At most one entry: see the doc comment on why concurrent centrals
         // are refused rather than served.
-        // The fragment sender plus the liveness flag handed to that peer's
-    // channel, so a disconnect can invalidate the channel the caller holds.
-    let mut inbound: HashMap<PeerAddress, ServedPeer> = HashMap::new();
+        let mut inbound: HashMap<PeerAddress, ServedPeer> = HashMap::new();
+        // Monotonic across every channel this task hands out, so no two
+        // channels for the same address ever share an identity.
+        let mut next_generation: u64 = 0;
 
         // Dropping the accept stream means "no more *new* peers" — it does
         // not abandon the ones already handed over, which still need this
@@ -689,8 +710,8 @@ pub async fn serve(
             let event = if accept_closed {
                 tokio::select! {
                     released = release_rx.recv() => {
-                        let Some(peer) = released else { return };
-                        release_peer(&mut inbound, &peer, backend.as_ref()).await;
+                        let Some((peer, generation)) = released else { return };
+                        release_peer(&mut inbound, &peer, generation, backend.as_ref()).await;
                         if inbound.is_empty() {
                             return;
                         }
@@ -714,8 +735,8 @@ pub async fn serve(
                     // this the peer stayed in `inbound` forever, holding the
                     // single-central slot against everyone else.
                     released = release_rx.recv() => {
-                        if let Some(peer) = released {
-                            release_peer(&mut inbound, &peer, backend.as_ref()).await;
+                        if let Some((peer, generation)) = released {
+                            release_peer(&mut inbound, &peer, generation, backend.as_ref()).await;
                         }
                         continue;
                     }
@@ -742,8 +763,8 @@ pub async fn serve(
                     // the arriving central is refused *and disconnected* on
                     // behalf of a peer that is already gone, and the caller
                     // never learns why.
-                    while let Ok(released) = release_rx.try_recv() {
-                        release_peer(&mut inbound, &released, backend.as_ref()).await;
+                    while let Ok((released, generation)) = release_rx.try_recv() {
+                        release_peer(&mut inbound, &released, generation, backend.as_ref()).await;
                     }
 
                     // `Connected` is NOT once-per-connection. Both real
@@ -781,6 +802,8 @@ pub async fn serve(
                         disconnect_refused(backend.as_ref(), &peer).await;
                         continue;
                     }
+                    let generation = next_generation;
+                    next_generation += 1;
                     let active = Arc::new(AtomicBool::new(true));
                     let (frag_tx, frag_rx) = mpsc::channel(config.fragment_queue_depth);
                     let (msg_tx, msg_rx) = mpsc::channel(config.inbound_queue_depth);
@@ -800,7 +823,7 @@ pub async fn serve(
                             active: active.clone(),
                         }),
                         inbound: ReceiverStream::new(msg_rx),
-                        release: Some(release_tx.clone()),
+                        release: Some((release_tx.clone(), generation)),
                         overflow: overflow.clone(),
                         next_msg_id: 0,
                         max_message_len: effective_max_message_len(
@@ -818,7 +841,15 @@ pub async fn serve(
                     // not occupy the single-central slot.
                     match channels_tx.try_send(channel) {
                         Ok(()) => {
-                            inbound.insert(peer.clone(), (frag_tx, active, overflow.clone()));
+                            inbound.insert(
+                                peer.clone(),
+                                ServedPeer {
+                                    fragments: frag_tx,
+                                    active,
+                                    overflow: overflow.clone(),
+                                    generation,
+                                },
+                            );
                         }
                         Err(mpsc::error::TrySendError::Full(_)) => {
                             eprintln!(
@@ -856,7 +887,8 @@ pub async fn serve(
                     if characteristic != config.characteristic {
                         continue;
                     }
-                    if let Some((tx, _, overflow)) = inbound.get(&peer) {
+                    if let Some(served) = inbound.get(&peer) {
+                        let (tx, overflow) = (&served.fragments, &served.overflow);
                         // Try first, then apply real backpressure before
                         // considering a drop. The sender's ATT write has
                         // already been acknowledged by the stack by the time
@@ -902,8 +934,8 @@ pub async fn serve(
                     // Clearing the flag closes the *send* half: without it
                     // the caller could still push fragments into a broadcast
                     // that the next accepted central would receive.
-                    if let Some((_, active, _)) = inbound.remove(&peer) {
-                        active.store(false, Ordering::SeqCst);
+                    if let Some(served) = inbound.remove(&peer) {
+                        served.active.store(false, Ordering::SeqCst);
                     }
                     if accept_closed && inbound.is_empty() {
                         return;
@@ -919,8 +951,8 @@ pub async fn serve(
                         "[ble-gatt][datagram] lifecycle stream lagged by {dropped} events; \
                          reporting possible inbound loss to every served peer"
                     );
-                    for (_, _, overflow) in inbound.values() {
-                        overflow.raise();
+                    for served in inbound.values() {
+                        served.overflow.raise();
                     }
                 }
                 // Central-role lifecycle belongs to `connect`, not here.
