@@ -69,6 +69,15 @@ impl MockNetwork {
         Arc::new(Self::default())
     }
 
+    /// The lifecycle event stream dropped `dropped` events before a
+    /// subscriber could read them.
+    ///
+    /// Exists so the consequence is testable: among the lost events may be a
+    /// served peer's `Disconnected`, and no later event need ever replace it.
+    pub fn simulate_event_lag(&self, to: &PeerAddress, dropped: u64) {
+        self.emit(to, GattEvent::Lagged { dropped });
+    }
+
     /// The backend reports that it dropped notifications for `central` —
     /// Android's bounded notify queue overflowing, which the peer was
     /// already told had been delivered.

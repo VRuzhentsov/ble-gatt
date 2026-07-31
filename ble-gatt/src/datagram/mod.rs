@@ -570,18 +570,40 @@ pub async fn connect(
     // forever with nothing left to wake it.
     let events = backend.events();
     let mut connection = backend.connect(peer).await?;
-    let notifications = connection.subscribe(config.characteristic).await?;
 
-    let budget = connection
-        .max_write_len()
-        .checked_sub(FRAGMENT_HEADER_LEN)
-        .filter(|budget| *budget > 0)
-        .ok_or_else(|| {
-            BleError::Gatt(format!(
-                "negotiated MTU leaves no room for payload after the \
-                 {FRAGMENT_HEADER_LEN}-byte fragment header"
-            ))
-        })?;
+    // Past this point the platform connection exists, so every failure has
+    // to tear it down explicitly. Dropping the `GattConnection` does not:
+    // on Android it leaves `ConnectionState.live` set and the Kotlin GATT
+    // open, after which every retry to that address is refused as "already
+    // open" — a setup failure that should be retryable becomes permanent.
+    let setup = async {
+        let notifications = connection.subscribe(config.characteristic).await?;
+        let budget = connection
+            .max_write_len()
+            .checked_sub(FRAGMENT_HEADER_LEN)
+            .filter(|budget| *budget > 0)
+            .ok_or_else(|| {
+                BleError::Gatt(format!(
+                    "negotiated MTU leaves no room for payload after the \
+                     {FRAGMENT_HEADER_LEN}-byte fragment header"
+                ))
+            })?;
+        Ok::<_, BleError>((notifications, budget))
+    }
+    .await;
+
+    let (notifications, budget) = match setup {
+        Ok(ready) => ready,
+        Err(err) => {
+            if let Err(cleanup) = connection.disconnect().await {
+                eprintln!(
+                    "[ble-gatt][datagram] could not disconnect {} after failed setup: {cleanup}",
+                    peer.0
+                );
+            }
+            return Err(err);
+        }
+    };
 
     let (tx, rx) = mpsc::channel(config.inbound_queue_depth);
     let overflow = Arc::new(OverflowSignal::default());
@@ -948,12 +970,33 @@ pub async fn serve(
                 // which ones is unknowable, since the events are gone.
                 // Reporting to all of them is the only sound response.
                 GattEvent::Lagged { dropped } => {
+                    // Terminal for every served session, not merely a
+                    // payload-loss report. One of the discarded events may
+                    // have been the active peer's `Disconnected` — and this
+                    // very loop blocking for up to two seconds on fragment
+                    // backpressure is what makes lag likely in the first
+                    // place. Since no later disconnect need ever arrive,
+                    // treating it as recoverable leaves the peer in
+                    // `inbound` forever with its channel live, refusing every
+                    // replacement central. Ending the sessions is
+                    // recoverable; wrongly keeping one is not.
                     eprintln!(
                         "[ble-gatt][datagram] lifecycle stream lagged by {dropped} events; \
-                         reporting possible inbound loss to every served peer"
+                         ending every served session, since a disconnect may have been lost"
                     );
-                    for served in inbound.values() {
-                        served.overflow.raise();
+                    let served: Vec<PeerAddress> = inbound.keys().cloned().collect();
+                    for peer in served {
+                        if let Some(state) = inbound.remove(&peer) {
+                            // Report the gap first, so a receiver parked in
+                            // `recv()` gets an error rather than a silent
+                            // close, then invalidate the channel.
+                            state.overflow.raise();
+                            state.active.store(false, Ordering::SeqCst);
+                        }
+                        disconnect_refused(backend.as_ref(), &peer).await;
+                    }
+                    if accept_closed && inbound.is_empty() {
+                        return;
                     }
                 }
                 // Central-role lifecycle belongs to `connect`, not here.

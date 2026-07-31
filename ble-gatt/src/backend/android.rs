@@ -88,8 +88,15 @@ struct ConnectionState {
     /// read resolve whichever read replaced it — returning the earlier
     /// characteristic's bytes as the later one's result, which is silent
     /// data corruption rather than an error.
-    read_tx: Option<(CharacteristicUuid, oneshot::Sender<Result<Vec<u8>>>)>,
-    write_tx: Option<oneshot::Sender<Result<()>>>,
+    /// Pending read, tagged with the request id it was issued under.
+    ///
+    /// A request id rather than the characteristic: routing on address alone
+    /// let a delayed callback from a cancelled read resolve its replacement,
+    /// and the characteristic cannot disambiguate either, since successive
+    /// operations routinely target the same one.
+    read_tx: Option<(u64, oneshot::Sender<Result<Vec<u8>>>)>,
+    /// Pending write, tagged like `read_tx` and for the same reason.
+    write_tx: Option<(u64, oneshot::Sender<Result<()>>)>,
     subscribe_tx: HashMap<CharacteristicUuid, oneshot::Sender<bool>>,
     notify_tx: HashMap<CharacteristicUuid, (mpsc::Sender<Vec<u8>>, Arc<AtomicBool>)>,
     disconnected_tx: Option<oneshot::Sender<()>>,
@@ -144,6 +151,10 @@ struct Inner {
     /// must wait for it rather than trusting the initiating call.
     notify_waiters: StdMutex<HashMap<u64, oneshot::Sender<bool>>>,
     next_notify_id: AtomicU64,
+    /// Request ids for reads and writes, so a completion can be matched to
+    /// the operation that issued it rather than to whatever now occupies the
+    /// slot.
+    next_op_id: AtomicU64,
 }
 
 impl Inner {
@@ -283,6 +294,7 @@ impl AndroidBackend {
             advertise_tx: StdMutex::new(None),
             notify_waiters: StdMutex::new(HashMap::new()),
             next_notify_id: AtomicU64::new(1),
+            next_op_id: AtomicU64::new(1),
         });
 
         // See the module doc comment: this pointer must stay valid for as
@@ -791,6 +803,7 @@ impl GattConnection for AndroidGattConnection {
     }
 
     async fn read(&mut self, characteristic: CharacteristicUuid) -> Result<Vec<u8>> {
+        let request_id = self.inner.next_op_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         {
             let mut connections = self.inner.connections.lock().unwrap();
@@ -804,7 +817,7 @@ impl GattConnection for AndroidGattConnection {
                     self.address
                 )));
             }
-            state.read_tx = Some((characteristic, tx));
+            state.read_tx = Some((request_id, tx));
         }
         // Armed *before* the fallible JNI setup below, not after. Installing
         // the sender and then returning early on a transient failure — a JNI
@@ -826,8 +839,12 @@ impl GattConnection for AndroidGattConnection {
             self.inner.call_void(
                 &mut env,
                 "readCharacteristic",
-                "(Ljava/lang/String;Ljava/lang/String;)V",
-                &[JValue::Object(&address), JValue::Object(&uuid)],
+                "(Ljava/lang/String;Ljava/lang/String;J)V",
+                &[
+                    JValue::Object(&address),
+                    JValue::Object(&uuid),
+                    JValue::Long(request_id as i64),
+                ],
             )?;
         }
         // The guard covers every exit from here too, including a dropped
@@ -841,11 +858,12 @@ impl GattConnection for AndroidGattConnection {
     async fn write_with_type(
         &mut self, characteristic: CharacteristicUuid, value: Vec<u8>, write_type: WriteType,
     ) -> Result<()> {
+        let request_id = self.inner.next_op_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         {
             let mut connections = self.inner.connections.lock().unwrap();
             let state = connections.entry(self.address.clone()).or_default();
-            state.write_tx = Some(tx);
+            state.write_tx = Some((request_id, tx));
         }
         // Same reasoning as `read`: armed before the fallible setup, so a
         // transient JNI failure cannot strand the slot.
@@ -865,12 +883,13 @@ impl GattConnection for AndroidGattConnection {
             self.inner.call_void(
                 &mut env,
                 "writeCharacteristic",
-                "(Ljava/lang/String;Ljava/lang/String;[BZ)V",
+                "(Ljava/lang/String;Ljava/lang/String;[BZJ)V",
                 &[
                     JValue::Object(&address),
                     JValue::Object(&uuid),
                     JValue::Object(&bytes),
                     JValue::Bool(without_response as jboolean),
+                    JValue::Long(request_id as i64),
                 ],
             )?;
         }
@@ -1246,49 +1265,50 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onDisconnected<'local>(
 
 #[no_mangle]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onCharacteristicRead<'local>(
-    mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, address: JString<'local>,
-    characteristic_uuid: JString<'local>, value: JByteArray<'local>, success: jboolean,
+    mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, request_id: jlong,
+    address: JString<'local>, _characteristic_uuid: JString<'local>, value: JByteArray<'local>,
+    success: jboolean,
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
     let address = read_jstring(&mut env, &address);
-    let uuid = read_jstring(&mut env, &characteristic_uuid);
     let bytes = env.convert_byte_array(&value).unwrap_or_default();
     let mut connections = inner.connections.lock().unwrap();
     if let Some(state) = connections.get_mut(&address) {
-        // Only resolve the pending read if this callback is *for* it. A
-        // delayed callback from a cancelled read would otherwise hand the
-        // waiting caller the wrong characteristic's bytes — a wrong answer
-        // rather than a failure, which is the harder kind to notice.
-        let matches = match (&state.read_tx, Uuid::parse_str(&uuid)) {
-            (Some((pending, _)), Ok(parsed)) => pending.0 == parsed,
-            // No UUID to compare against: fall back to address routing
-            // rather than stranding the caller forever.
-            (Some(_), Err(_)) => true,
-            (None, _) => false,
-        };
-        if matches {
-            if let Some((_, tx)) = state.read_tx.take() {
-                let result = if success != 0 {
-                    Ok(bytes)
-                } else {
-                    Err(BleError::Gatt("characteristic read failed".to_string()))
-                };
-                let _ = tx.send(result);
-            }
+        // Only resolve the read this callback belongs to. A delayed callback
+        // from a cancelled read would otherwise hand the waiting caller
+        // another operation's bytes — a wrong answer rather than a failure,
+        // which is the harder kind to notice.
+        if state.read_tx.as_ref().map(|(id, _)| *id) != Some(request_id as u64) {
+            return;
+        }
+        if let Some((_, tx)) = state.read_tx.take() {
+            let result = if success != 0 {
+                Ok(bytes)
+            } else {
+                Err(BleError::Gatt("characteristic read failed".to_string()))
+            };
+            let _ = tx.send(result);
         }
     }
 }
 
 #[no_mangle]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onCharacteristicWriteResult<'local>(
-    mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, address: JString<'local>,
-    _characteristic_uuid: JString<'local>, success: jboolean,
+    mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, request_id: jlong,
+    address: JString<'local>, _characteristic_uuid: JString<'local>, success: jboolean,
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
     let address = read_jstring(&mut env, &address);
     let mut connections = inner.connections.lock().unwrap();
     if let Some(state) = connections.get_mut(&address) {
-        if let Some(tx) = state.write_tx.take() {
+        // Same tagging as reads. Untagged, a cancelled write's completion
+        // resolved the *next* write — reporting the old operation's status
+        // and letting the following datagram fragment start before the real
+        // write had finished.
+        if state.write_tx.as_ref().map(|(id, _)| *id) != Some(request_id as u64) {
+            return;
+        }
+        if let Some((_, tx)) = state.write_tx.take() {
             let result = if success != 0 {
                 Ok(())
             } else {

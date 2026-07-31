@@ -77,6 +77,16 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     @Volatile
     private var scanCallback: ScanCallback? = null
     private val connectedGatts = ConcurrentHashMap<String, BluetoothGatt>()
+    /// Request ids for the one outstanding read and write Android allows per
+    /// connection, echoed back on completion.
+    ///
+    /// Needed because Android's completion callbacks carry no identity of
+    /// their own: routing on address alone let a delayed callback from a
+    /// *cancelled* operation resolve whichever operation replaced it, and
+    /// the characteristic UUID is no help — every datagram fragment targets
+    /// the same characteristic.
+    private val pendingReadIds = ConcurrentHashMap<String, Long>()
+    private val pendingWriteIds = ConcurrentHashMap<String, Long>()
     private val pendingCharacteristics =
         ConcurrentHashMap<String, ConcurrentHashMap<String, BluetoothGattCharacteristic>>()
 
@@ -332,8 +342,9 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             override fun onCharacteristicRead(
                 gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int
             ) {
+                val requestId = pendingReadIds.remove(address) ?: return
                 onCharacteristicRead(
-                    nativeHandle, address, characteristic.uuid.toString(),
+                    nativeHandle, requestId, address, characteristic.uuid.toString(),
                     characteristic.value ?: ByteArray(0), status == BluetoothGatt.GATT_SUCCESS
                 )
             }
@@ -341,8 +352,10 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             override fun onCharacteristicWrite(
                 gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int
             ) {
+                val requestId = pendingWriteIds.remove(address) ?: return
                 onCharacteristicWriteResult(
-                    nativeHandle, address, characteristic.uuid.toString(), status == BluetoothGatt.GATT_SUCCESS
+                    nativeHandle, requestId, address, characteristic.uuid.toString(),
+                    status == BluetoothGatt.GATT_SUCCESS
                 )
             }
 
@@ -381,12 +394,14 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     /// the Rust side's oneshot unresolved and its caller awaiting forever —
     /// and unknown UUIDs or incomplete service discovery are ordinary
     /// errors, not exotic ones.
-    fun readCharacteristic(address: String, characteristicUuid: String) {
+    fun readCharacteristic(address: String, characteristicUuid: String, requestId: Long) {
         val gatt = connectedGatts[address]
         val characteristic = findCharacteristic(address, characteristicUuid)
+        pendingReadIds[address] = requestId
         if (gatt == null || characteristic == null || !gatt.readCharacteristic(characteristic)) {
             Log.w(TAG, "readCharacteristic could not start: $address/$characteristicUuid")
-            onCharacteristicRead(nativeHandle, address, characteristicUuid, ByteArray(0), false)
+            pendingReadIds.remove(address)
+            onCharacteristicRead(nativeHandle, requestId, address, characteristicUuid, ByteArray(0), false)
         }
     }
 
@@ -396,12 +411,15 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     @Suppress("DEPRECATION")
     fun writeCharacteristic(
         address: String, characteristicUuid: String, value: ByteArray, withoutResponse: Boolean,
+        requestId: Long,
     ) {
         val gatt = connectedGatts[address]
         val characteristic = findCharacteristic(address, characteristicUuid)
+        pendingWriteIds[address] = requestId
         if (gatt == null || characteristic == null) {
             Log.w(TAG, "writeCharacteristic could not start: $address/$characteristicUuid")
-            onCharacteristicWriteResult(nativeHandle, address, characteristicUuid, false)
+            pendingWriteIds.remove(address)
+            onCharacteristicWriteResult(nativeHandle, requestId, address, characteristicUuid, false)
             return
         }
         characteristic.writeType = if (withoutResponse) {
@@ -412,7 +430,8 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         characteristic.value = value
         if (!gatt.writeCharacteristic(characteristic)) {
             Log.w(TAG, "writeCharacteristic rejected by the stack: $address/$characteristicUuid")
-            onCharacteristicWriteResult(nativeHandle, address, characteristicUuid, false)
+            pendingWriteIds.remove(address)
+            onCharacteristicWriteResult(nativeHandle, requestId, address, characteristicUuid, false)
         }
     }
 
@@ -498,10 +517,24 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
                 when (newState) {
                     BluetoothProfile.STATE_CONNECTED -> {
+                        if (serverGeneration != generation) {
+                            Log.d(TAG, "server: stale generation connect, ignoring")
+                            return
+                        }
                         Log.d(TAG, "server: central connected ${device.address}")
                         onConnected(nativeHandle, device.address, true)
                     }
                     BluetoothProfile.STATE_DISCONNECTED -> {
+                        // A queued callback from a stopped server can run
+                        // after the same central has subscribed to its
+                        // replacement. Without this it would strip that
+                        // central from the *new* generation's subscriber set
+                        // and report it disconnected, tearing down a served
+                        // channel that had only just been established.
+                        if (serverGeneration != generation) {
+                            Log.d(TAG, "server: stale generation disconnect, ignoring")
+                            return
+                        }
                         Log.d(TAG, "server: central disconnected ${device.address}")
                         for (subscribers in subscribedDevices.values) {
                             subscribers.remove(device)

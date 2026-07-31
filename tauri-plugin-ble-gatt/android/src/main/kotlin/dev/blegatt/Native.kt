@@ -41,11 +41,13 @@ external fun onDisconnected(nativeHandle: Long, address: String, fromServer: Boo
 external fun onMtuChanged(nativeHandle: Long, address: String, mtu: Int)
 
 external fun onCharacteristicRead(
-    nativeHandle: Long, address: String, characteristicUuid: String, value: ByteArray, success: Boolean
+    nativeHandle: Long,
+    requestId: Long, address: String, characteristicUuid: String, value: ByteArray, success: Boolean
 )
 
 external fun onCharacteristicWriteResult(
-    nativeHandle: Long, address: String, characteristicUuid: String, success: Boolean
+    nativeHandle: Long,
+    requestId: Long, address: String, characteristicUuid: String, success: Boolean
 )
 
 external fun onCharacteristicChanged(

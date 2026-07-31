@@ -882,3 +882,69 @@ async fn a_release_survives_a_saturated_accept_queue() {
         .expect("the slot must be free after the live channel's release")
         .expect("stream open");
 }
+
+#[tokio::test]
+async fn a_lagged_lifecycle_stream_ends_the_served_session_rather_than_stranding_it() {
+    let config = config();
+    let network = MockNetwork::new();
+    let peripheral_addr = PeerAddress("peripheral-lag".to_string());
+    let first_addr = PeerAddress("central-lag".to_string());
+
+    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+        peripheral_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    ));
+    let first: Arc<MockBackend> = Arc::new(MockBackend::new(
+        first_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    ));
+
+    let mut incoming = datagram::serve(peripheral.clone(), &config)
+        .await
+        .expect("serve should start");
+    let _first_client = datagram::connect(first.clone(), &peripheral_addr, &config)
+        .await
+        .expect("connect should succeed");
+    let mut served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
+        .await
+        .expect("serve should yield a channel")
+        .expect("stream open");
+    served.send(b"while-healthy".to_vec()).await.expect("send while healthy");
+
+    // Events were dropped. One of them may have been this peer's
+    // `Disconnected`, and nothing will ever resend it — so treating the lag
+    // as recoverable would hold the slot against every future central.
+    network.simulate_event_lag(&peripheral_addr, 12);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The holder of the stale channel must be told, not left guessing.
+    assert!(
+        served.send(b"after-lag".to_vec()).await.is_err(),
+        "a session ended by lag must stop accepting sends"
+    );
+
+    // And the slot must be free for the next central.
+    let second_addr = PeerAddress("central-lag-2".to_string());
+    let second: Arc<MockBackend> = Arc::new(MockBackend::new(
+        second_addr,
+        network.clone(),
+        full_capabilities(),
+    ));
+    let mut second_client = datagram::connect(second.clone(), &peripheral_addr, &config)
+        .await
+        .expect("connect should succeed");
+    let mut second_served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
+        .await
+        .expect("the slot must be free after a lag ends the previous session")
+        .expect("stream open");
+
+    second_served.send(b"to-the-second".to_vec()).await.expect("send to new central");
+    let received = tokio::time::timeout(Duration::from_secs(2), second_client.recv())
+        .await
+        .expect("second central should receive it")
+        .expect("channel open")
+        .expect("no error");
+    assert_eq!(received, b"to-the-second");
+}
