@@ -63,6 +63,12 @@ external fun onAdvertiseResult(nativeHandle: Long, success: Boolean, errorCode: 
 /// Asynchronous scan-start failure, for the same reason.
 external fun onScanFailed(nativeHandle: Long, errorCode: Int)
 
+/// A remote central enabled notifications on one of our server
+/// characteristics. This — not the physical connection — is when the
+/// peripheral-role peer becomes usable, because it is the point at which
+/// the notify path back to it exists.
+external fun onServerSubscribed(nativeHandle: Long, address: String)
+
 external fun onSubscribed(
     nativeHandle: Long, address: String, characteristicUuid: String, success: Boolean,
 )

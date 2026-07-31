@@ -46,6 +46,7 @@ pub mod fragment;
 pub mod reassembly;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -191,7 +192,18 @@ enum Sink {
     },
     /// Peripheral: notify subscribed centrals. See the module-level note on
     /// this being a broadcast.
-    Notify { backend: Arc<dyn Backend> },
+    Notify {
+        backend: Arc<dyn Backend>,
+        /// Cleared when this channel's peer disconnects.
+        ///
+        /// Because notify is a broadcast that cannot be addressed to one
+        /// peer on BlueZ, a stale channel is not merely useless — it is
+        /// dangerous. Once its peer has gone and a *different* central has
+        /// been accepted, a `send` on the old channel would deliver this
+        /// peer's fragments to the new one, interleaved into its stream,
+        /// while `peer()` still reported the departed address.
+        active: Arc<AtomicBool>,
+    },
 }
 
 /// An ordered, opaque-bytes channel to one peer.
@@ -268,7 +280,10 @@ impl DatagramChannel {
                         .write_with_type(characteristic, fragment, *write_type)
                         .await?;
                 }
-                Sink::Notify { backend } => {
+                Sink::Notify { backend, active } => {
+                    if !active.load(Ordering::SeqCst) {
+                        return Err(BleError::NotConnected(self.peer.0.clone()));
+                    }
                     backend.notify(characteristic, fragment).await?;
                 }
             }
@@ -478,10 +493,17 @@ pub async fn serve(
     backend: Arc<dyn Backend>, config: &DatagramConfig,
 ) -> Result<BoxStream<DatagramChannel>> {
     config.validate()?;
+    // Subscribe *before* advertising. `events()` is a broadcast subscription,
+    // so anything emitted before this call is lost — and both backends can
+    // emit a peripheral-role `Connected` during `advertise`: Android can
+    // accept a central before its advertise callback returns, and Linux
+    // starts its inbound watcher inside `advertise`. With a central that
+    // waits for the server to speak first there is no later write to
+    // recreate the event, so losing it hangs `serve` forever.
+    let mut events = backend.events();
     backend.advertise(config.service_spec()).await?;
 
     let (channels_tx, channels_rx) = mpsc::channel(config.accept_queue_depth);
-    let mut events = backend.events();
     let config = config.clone();
     // The peripheral has no `GattConnection` to ask for a negotiated MTU, so
     // it budgets against the spec-minimum. Conservative on purpose:
@@ -494,9 +516,42 @@ pub async fn serve(
     tokio::spawn(async move {
         // At most one entry: see the doc comment on why concurrent centrals
         // are refused rather than served.
-        let mut inbound: HashMap<PeerAddress, mpsc::Sender<Vec<u8>>> = HashMap::new();
+        // The fragment sender plus the liveness flag handed to that peer's
+    // channel, so a disconnect can invalidate the channel the caller holds.
+    let mut inbound: HashMap<PeerAddress, (mpsc::Sender<Vec<u8>>, Arc<AtomicBool>)> =
+            HashMap::new();
 
-        while let Some(event) = events.next().await {
+        // Dropping the accept stream means "no more *new* peers" — it does
+        // not abandon the ones already handed over, which still need this
+        // loop to deliver their inbound fragments. So the task ends only
+        // once the stream is closed *and* no channel is still being served;
+        // until then it would otherwise sit on `events.next()` forever,
+        // holding the backend `Arc` and the event subscription alive with
+        // nothing able to wake it (`stop_advertising` does not close the
+        // event stream).
+        let mut accept_closed = false;
+
+        loop {
+            let event = if accept_closed {
+                match events.next().await {
+                    Some(event) => event,
+                    None => return,
+                }
+            } else {
+                tokio::select! {
+                    _ = channels_tx.closed() => {
+                        accept_closed = true;
+                        if inbound.is_empty() {
+                            return;
+                        }
+                        continue;
+                    }
+                    event = events.next() => match event {
+                        Some(event) => event,
+                        None => return,
+                    },
+                }
+            };
             match event {
                 // Only inbound connections belong to the peripheral role.
                 // Without the role check, this backend's own *outbound*
@@ -536,6 +591,7 @@ pub async fn serve(
                         disconnect_refused(backend.as_ref(), &peer).await;
                         continue;
                     }
+                    let active = Arc::new(AtomicBool::new(true));
                     let (frag_tx, frag_rx) = mpsc::channel(config.fragment_queue_depth);
                     let (msg_tx, msg_rx) = mpsc::channel(config.inbound_queue_depth);
                     let reassembly = spawn_reassembly(
@@ -549,6 +605,7 @@ pub async fn serve(
                         characteristic: config.characteristic,
                         sink: Mutex::new(Sink::Notify {
                             backend: backend.clone(),
+                            active: active.clone(),
                         }),
                         inbound: ReceiverStream::new(msg_rx),
                         next_msg_id: 0,
@@ -567,7 +624,7 @@ pub async fn serve(
                     // not occupy the single-central slot.
                     match channels_tx.try_send(channel) {
                         Ok(()) => {
-                            inbound.insert(peer.clone(), frag_tx);
+                            inbound.insert(peer.clone(), (frag_tx, active));
                         }
                         Err(mpsc::error::TrySendError::Full(_)) => {
                             eprintln!(
@@ -583,7 +640,16 @@ pub async fn serve(
                             // too.
                             disconnect_refused(backend.as_ref(), &peer).await;
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => return,
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            // The caller stopped accepting. This peer gets
+                            // the same exclusion as any other refusal, and
+                            // the task ends once nothing is left to serve.
+                            accept_closed = true;
+                            disconnect_refused(backend.as_ref(), &peer).await;
+                            if inbound.is_empty() {
+                                return;
+                            }
+                        }
                     }
                 }
                 GattEvent::CharacteristicWritten {
@@ -594,7 +660,7 @@ pub async fn serve(
                     if characteristic != config.characteristic {
                         continue;
                     }
-                    if let Some(tx) = inbound.get(&peer) {
+                    if let Some((tx, _)) = inbound.get(&peer) {
                         // try_send, not send: this loop also carries
                         // disconnects, so blocking it on a backed-up peer
                         // would stall cleanup for everyone. A dropped
@@ -616,7 +682,15 @@ pub async fn serve(
                 } => {
                     // Dropping the fragment sender ends that peer's
                     // reassembly task, which closes its channel's `recv()`.
-                    inbound.remove(&peer);
+                    // Clearing the flag closes the *send* half: without it
+                    // the caller could still push fragments into a broadcast
+                    // that the next accepted central would receive.
+                    if let Some((_, active)) = inbound.remove(&peer) {
+                        active.store(false, Ordering::SeqCst);
+                    }
+                    if accept_closed && inbound.is_empty() {
+                        return;
+                    }
                 }
                 // Central-role lifecycle belongs to `connect`, not here.
                 GattEvent::Connected { .. } | GattEvent::Disconnected { .. } => {}

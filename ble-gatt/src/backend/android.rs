@@ -296,6 +296,14 @@ impl Backend for AndroidBackend {
         let restore = |inner: &Arc<Inner>, previous| {
             *inner.discovery_tx.lock().unwrap() = previous;
         };
+        // Both of these must happen *before* `startScan`, because Android may
+        // call `onScanFailed` before it returns. Clearing the error slot
+        // afterwards would erase that failure, and installing the sender
+        // afterwards would leave the callback with nothing to close — the
+        // caller would then block until its timeout and get an empty Ok for
+        // what was a controller failure.
+        *self.inner.scan_error.lock().unwrap() = None;
+        *self.inner.discovery_tx.lock().unwrap() = Some(tx);
         {
             let mut env = match self.inner.env() {
                 Ok(env) => env,
@@ -338,6 +346,9 @@ impl Backend for AndroidBackend {
                     return Err(mapped);
                 }
                 Ok(false) => {
+                    // Rejected: hand ownership back to the in-flight scan.
+                    // `previous` was moved out, never dropped, so that
+                    // scan's stream is untouched.
                     restore(&self.inner, previous);
                     return Err(BleError::Gatt(
                         "a scan is already active; concurrent scans are not supported".to_string(),
@@ -346,8 +357,6 @@ impl Backend for AndroidBackend {
                 Ok(true) => {}
             }
         }
-        *self.inner.scan_error.lock().unwrap() = None;
-        *self.inner.discovery_tx.lock().unwrap() = Some(tx);
         Ok(Box::pin(ScanStream {
             inner: self.inner.clone(),
             rx: ReceiverStream::new(rx),
@@ -889,14 +898,18 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onConnected<'local>(
     }
     // Publish regardless of whether a client connect was pending: Linux
     // already does this, and `Backend::events` documents both roles.
-    let _ = inner.server_events_tx.send(GattEvent::Connected {
-        peer: PeerAddress(address),
-        local_role: if from_server != 0 {
-            Role::Peripheral
-        } else {
-            Role::Central
-        },
-    });
+    //
+    // Deliberately NOT emitting a peripheral-role `Connected` for
+    // `from_server`. A central is connected long before it writes the CCCD,
+    // and a server that greeted it at this point would notify with no
+    // subscriber. The peripheral-role announcement comes from
+    // `onServerSubscribed` instead.
+    if from_server == 0 {
+        let _ = inner.server_events_tx.send(GattEvent::Connected {
+            peer: PeerAddress(address.clone()),
+            local_role: Role::Central,
+        });
+    }
 }
 
 #[no_mangle]
@@ -1058,4 +1071,23 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onSubscribed<'local>(
 #[allow(dead_code)]
 fn _callback_class_name() -> &'static str {
     CALLBACK_CLASS
+}
+
+/// A central enabled notifications on one of our server characteristics.
+///
+/// This is the peripheral-role equivalent of "connected", and deliberately
+/// later than the physical connection: it is the first moment the notify
+/// path back to that peer exists, so a server that greets on this event
+/// cannot lose the greeting. It also attributes the peer to *this* service,
+/// which a bare connection does not.
+#[no_mangle]
+pub extern "system" fn Java_dev_blegatt_NativeKt_onServerSubscribed<'local>(
+    mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, address: JString<'local>,
+) {
+    let inner = unsafe { inner_from_handle(native_handle) };
+    let address = read_jstring(&mut env, &address);
+    let _ = inner.server_events_tx.send(GattEvent::Connected {
+        peer: PeerAddress(address),
+        local_role: Role::Peripheral,
+    });
 }

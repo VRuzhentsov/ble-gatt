@@ -328,3 +328,58 @@ async fn serving_and_dialling_on_one_backend_do_not_cross_over() {
         "serve() yielded a channel for our own outbound connection"
     );
 }
+
+#[tokio::test]
+async fn a_served_channel_stops_sending_once_its_peer_disconnects() {
+    let config = config();
+    let network = MockNetwork::new();
+    let peripheral_addr = PeerAddress("peripheral-stale".to_string());
+    let central_addr = PeerAddress("central-stale".to_string());
+
+    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+        peripheral_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    ));
+    let central: Arc<MockBackend> = Arc::new(MockBackend::new(
+        central_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    ));
+
+    let mut incoming = datagram::serve(peripheral.clone(), &config)
+        .await
+        .expect("serve should start");
+    let central_channel = datagram::connect(central.clone(), &peripheral_addr, &config)
+        .await
+        .expect("connect should succeed");
+    let mut served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
+        .await
+        .expect("serve should yield a channel")
+        .expect("channel stream should not be closed");
+
+    served.send(b"while-connected".to_vec()).await.expect("send while connected");
+
+    // The peer vanishes, but the caller still holds its channel. Because
+    // notify is a broadcast that cannot be addressed to one peer on BlueZ, a
+    // send here would reach whichever central is subscribed *next* — leaking
+    // this peer's fragments into that peer's stream while `peer()` still
+    // reports the departed address.
+    drop(central_channel);
+    peripheral.simulate_peer_loss(&central_addr);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match served.send(b"after-disconnect".to_vec()).await {
+            Err(_) => break,
+            Ok(()) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "a channel whose peer has gone must refuse to send, not broadcast \
+                     to whoever subscribes next"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+}

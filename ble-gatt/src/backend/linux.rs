@@ -61,6 +61,14 @@ pub struct LinuxBackend {
     /// initiated, so without this an outbound connection would be
     /// misreported as a central arriving at our server.
     dialed: Arc<StdMutex<HashSet<PeerAddress>>>,
+    /// Devices currently connected that this backend did not dial.
+    ///
+    /// Candidates only — a shared adapter carries connections for unrelated
+    /// services and other processes, and BlueZ's `Device1.Connected` cannot
+    /// say which GATT service a peer is using. Nothing is announced from
+    /// this set on its own; it exists solely to put an address on a
+    /// `StartNotify`, which BlueZ delivers without one.
+    inbound_candidates: Arc<StdMutex<HashSet<PeerAddress>>>,
 }
 
 impl LinuxBackend {
@@ -94,6 +102,7 @@ impl LinuxBackend {
             adv_handle: AsyncMutex::new(None),
             server_watch: AsyncMutex::new(None),
             dialed: Arc::new(StdMutex::new(HashSet::new())),
+            inbound_candidates: Arc::new(StdMutex::new(HashSet::new())),
         })
     }
 }
@@ -111,8 +120,8 @@ impl LinuxBackend {
 /// - **Deduplicate.** `served_peers` is shared with the write path, so a
 ///   peer that connects and then writes is announced once, not twice.
 async fn watch_inbound_connections(
-    adapter: Adapter, events_tx: broadcast::Sender<GattEvent>,
-    served_peers: Arc<StdMutex<HashSet<PeerAddress>>>, dialed: Arc<StdMutex<HashSet<PeerAddress>>>,
+    adapter: Adapter, candidates: Arc<StdMutex<HashSet<PeerAddress>>>,
+    dialed: Arc<StdMutex<HashSet<PeerAddress>>>,
 ) {
     // Children live in a JoinSet owned by this task, so aborting it (from
     // `stop_advertising`) drops the set and aborts every per-device watcher
@@ -121,39 +130,31 @@ async fn watch_inbound_connections(
     let mut watching: HashSet<PeerAddress> = HashSet::new();
 
     // Subscribe *before* enumerating, so a device appearing between the two
-    // is caught by the stream rather than falling into the gap.
+    // is caught by the stream rather than falling in the gap.
     let Ok(mut events) = adapter.events().await else {
         return;
     };
     for address in adapter.device_addresses().await.unwrap_or_default() {
-        spawn_connect_watch(
-            &mut watchers, &mut watching, &adapter, address, &events_tx, &served_peers, &dialed,
-        );
+        spawn_connect_watch(&mut watchers, &mut watching, &adapter, address, &candidates, &dialed);
     }
 
     while let Some(event) = events.next().await {
         let AdapterEvent::DeviceAdded(address) = event else {
             continue;
         };
-        spawn_connect_watch(
-            &mut watchers, &mut watching, &adapter, address, &events_tx, &served_peers, &dialed,
-        );
+        spawn_connect_watch(&mut watchers, &mut watching, &adapter, address, &candidates, &dialed);
     }
 }
 
-/// Watch one device's `Connected` property for an inbound connection.
+/// Track one device's `Connected` property.
 ///
 /// Per-device rather than adapter-wide because `AdapterEvent::DeviceAdded`
-/// fires when BlueZ *creates* the device object, not when it connects. A
-/// central this backend has already scanned therefore has a device object
-/// already, and connecting produces no `DeviceAdded` at all — which left
-/// `serve()` yielding nothing until that central wrote, the exact deadlock
-/// the adapter-only watcher was meant to fix.
-#[allow(clippy::too_many_arguments)]
+/// fires when BlueZ *creates* the device object, not when it connects — a
+/// central this backend has already scanned has a device object already, so
+/// its connection produces no `DeviceAdded` at all.
 fn spawn_connect_watch(
     watchers: &mut JoinSet<()>, watching: &mut HashSet<PeerAddress>, adapter: &Adapter,
-    address: bluer::Address, events_tx: &broadcast::Sender<GattEvent>,
-    served_peers: &Arc<StdMutex<HashSet<PeerAddress>>>,
+    address: bluer::Address, candidates: &Arc<StdMutex<HashSet<PeerAddress>>>,
     dialed: &Arc<StdMutex<HashSet<PeerAddress>>>,
 ) {
     let peer = PeerAddress(address.to_string());
@@ -161,8 +162,7 @@ fn spawn_connect_watch(
         return;
     }
     let adapter = adapter.clone();
-    let events_tx = events_tx.clone();
-    let served_peers = served_peers.clone();
+    let candidates = candidates.clone();
     let dialed = dialed.clone();
     watchers.spawn(async move {
         let Ok(device) = adapter.device(address) else {
@@ -171,55 +171,24 @@ fn spawn_connect_watch(
         let Ok(mut changes) = device.events().await else {
             return;
         };
-        // Check the current value after subscribing: a device already
-        // connected when this watcher started emits no property change, so
-        // polling once is the only way to see it.
-        let mut connected = device.is_connected().await.unwrap_or(false);
-        if connected {
-            announce_inbound(&adapter, address, &peer, &events_tx, &served_peers, &dialed);
-        }
-        // Edge-triggered. Announcing on every event while `connected` held
-        // would re-announce on unrelated property changes, and — once the
-        // disconnect watcher had cleared `served_peers` — would resurrect a
-        // peer that had already left.
-        while let Some(event) = changes.next().await {
-            let bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::Connected(value)) = event
-            else {
-                continue;
-            };
-            if value && !connected {
-                announce_inbound(&adapter, address, &peer, &events_tx, &served_peers, &dialed);
+        let record = |connected: bool| {
+            if connected && !dialed.lock().unwrap().contains(&peer) {
+                candidates.lock().unwrap().insert(peer.clone());
+            } else {
+                candidates.lock().unwrap().remove(&peer);
             }
-            connected = value;
+        };
+        // Poll once after subscribing: a device already connected when this
+        // watcher starts emits no property change.
+        record(device.is_connected().await.unwrap_or(false));
+        while let Some(event) = changes.next().await {
+            if let bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::Connected(value)) =
+                event
+            {
+                record(value);
+            }
         }
     });
-}
-
-/// Emit `Connected { local_role: Peripheral }` for a central that connected
-/// to our server, unless it is one of our own outbound dials or is already
-/// being served.
-fn announce_inbound(
-    adapter: &Adapter, address: bluer::Address, peer: &PeerAddress,
-    events_tx: &broadcast::Sender<GattEvent>, served_peers: &Arc<StdMutex<HashSet<PeerAddress>>>,
-    dialed: &Arc<StdMutex<HashSet<PeerAddress>>>,
-) {
-    if dialed.lock().unwrap().contains(peer) {
-        return;
-    }
-    if !served_peers.lock().unwrap().insert(peer.clone()) {
-        return;
-    }
-    let _ = events_tx.send(GattEvent::Connected {
-        peer: peer.clone(),
-        local_role: Role::Peripheral,
-    });
-    spawn_peripheral_disconnect_watch(
-        adapter.clone(),
-        address,
-        peer.clone(),
-        events_tx.clone(),
-        served_peers.clone(),
-    );
 }
 
 /// Emit `Disconnected { local_role: Peripheral }` once `address` drops its
@@ -392,6 +361,7 @@ impl Backend for LinuxBackend {
         let values = self.values.clone();
         let served_peers = self.served_peers.clone();
         let adapter = self.adapter.clone();
+        let inbound_candidates = self.inbound_candidates.clone();
         let notifiers = self.notifiers.clone();
         let events_tx = self.events_tx.clone();
 
@@ -474,22 +444,65 @@ impl Backend for LinuxBackend {
 
             let notify = spec.notifiable.then(|| {
                 let notifiers = notifiers.clone();
+                let events_tx = events_tx.clone();
+                let served_peers = served_peers.clone();
+                let candidates = inbound_candidates.clone();
+                let adapter = adapter.clone();
                 CharacteristicNotify {
                     notify: true,
                     method: CharacteristicNotifyMethod::Fun(Box::new(move |notifier| {
                         let notifiers = notifiers.clone();
+                        let events_tx = events_tx.clone();
+                        let served_peers = served_peers.clone();
+                        let candidates = candidates.clone();
+                        let adapter = adapter.clone();
                         Box::pin(async move {
-                            // NOTE: BlueZ's StartNotify does not identify the
-                            // subscribing device — `CharacteristicNotifier`
-                            // carries no address — so this cannot emit a
-                            // `Connected` for the subscriber the way the
-                            // write path does, and cannot be addressed to one
-                            // peer later. That single platform gap is why
-                            // `Backend::notify` is documented as an
-                            // unavoidable broadcast on Linux and why
-                            // single-peer servers must exclude extra centrals
-                            // via `disconnect_peer`.
                             notifiers.lock().await.entry(uuid).or_default().push(notifier);
+
+                            // A central subscribing to *our* characteristic
+                            // is the peripheral-role arrival signal: unlike a
+                            // bare `Device1.Connected`, it is attributable to
+                            // this service, and it guarantees the notify path
+                            // back to the peer already exists — so a server
+                            // that greets on this event cannot lose the
+                            // greeting.
+                            //
+                            // BlueZ does not say *who* subscribed
+                            // (`CharacteristicNotifier` carries no address),
+                            // so the address comes from the one connected
+                            // device this backend did not dial. When that is
+                            // ambiguous nothing is announced and the write
+                            // path remains the fallback — a wrong address
+                            // would be worse than a late one.
+                            let peer = {
+                                let candidates = candidates.lock().unwrap();
+                                let mut iter = candidates.iter();
+                                match (iter.next(), iter.next()) {
+                                    (Some(peer), None) => Some(peer.clone()),
+                                    _ => None,
+                                }
+                            };
+                            let Some(peer) = peer else {
+                                return;
+                            };
+                            let newly_served =
+                                served_peers.lock().unwrap().insert(peer.clone());
+                            if !newly_served {
+                                return;
+                            }
+                            let _ = events_tx.send(GattEvent::Connected {
+                                peer: peer.clone(),
+                                local_role: Role::Peripheral,
+                            });
+                            if let Ok(address) = peer.0.parse() {
+                                spawn_peripheral_disconnect_watch(
+                                    adapter,
+                                    address,
+                                    peer,
+                                    events_tx,
+                                    served_peers,
+                                );
+                            }
                         })
                     })),
                     ..Default::default()
@@ -543,8 +556,7 @@ impl Backend for LinuxBackend {
         // this closes that divergence.
         let watch = tokio::spawn(watch_inbound_connections(
             self.adapter.clone(),
-            self.events_tx.clone(),
-            self.served_peers.clone(),
+            self.inbound_candidates.clone(),
             self.dialed.clone(),
         ));
         if let Some(previous) = self.server_watch.lock().await.replace(watch.abort_handle()) {

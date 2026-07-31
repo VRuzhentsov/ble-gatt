@@ -445,7 +445,16 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             ) {
                 val characteristicUuid = descriptor.characteristic.uuid.toString()
                 if (value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)) {
-                    subscribedDevices.getOrPut(characteristicUuid) { mutableSetOf() }.add(device)
+                    val added = subscribedDevices
+                        .getOrPut(characteristicUuid) { mutableSetOf() }
+                        .add(device)
+                    // Report only the transition. This is what tells Rust the
+                    // peer is reachable by notify — announcing at connection
+                    // time was too early, since a greeting sent before the
+                    // CCCD write has nowhere to go.
+                    if (added) {
+                        onServerSubscribed(nativeHandle, device.address)
+                    }
                 } else {
                     subscribedDevices[characteristicUuid]?.remove(device)
                 }
