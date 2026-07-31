@@ -32,6 +32,7 @@
 //! don't-hide-hard-cases convention this project inherited.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use async_trait::async_trait;
@@ -70,6 +71,11 @@ const EVENT_CHANNEL_CAPACITY: usize = 64;
 
 #[derive(Default)]
 struct ConnectionState {
+    /// A `BluetoothGatt` for this address is open. Distinct from
+    /// `connected_tx`, which only covers a connect still in flight — once
+    /// `onConnected` takes that sender, only this flag still says the link
+    /// exists.
+    live: bool,
     connected_tx: Option<oneshot::Sender<()>>,
     read_tx: Option<oneshot::Sender<Result<Vec<u8>>>>,
     write_tx: Option<oneshot::Sender<Result<()>>>,
@@ -116,6 +122,11 @@ struct Inner {
     /// whether an advertisement actually started, so `advertise()` must wait
     /// for it rather than reporting success the moment the JNI call returns.
     advertise_tx: StdMutex<Option<oneshot::Sender<std::result::Result<(), i32>>>>,
+    /// Outstanding server notifications, keyed by request id. Android
+    /// reports the real send status on `onNotificationSent`, so `notify`
+    /// must wait for it rather than trusting the initiating call.
+    notify_waiters: StdMutex<HashMap<u64, oneshot::Sender<bool>>>,
+    next_notify_id: AtomicU64,
 }
 
 impl Inner {
@@ -123,6 +134,18 @@ impl Inner {
         self.vm
             .attach_current_thread_as_daemon()
             .map_err(|err| BleError::Gatt(format!("JNI attach failed: {err}")))
+    }
+
+    /// Drop a failed connect attempt's slot, and the whole entry if nothing
+    /// else is using it, so a retry is not rejected as already in progress.
+    fn clear_pending_connect(&self, address: &str) {
+        let mut connections = self.connections.lock().unwrap();
+        if let Some(state) = connections.get_mut(address) {
+            state.connected_tx = None;
+            if !state.live && state.disconnected_tx.is_none() && state.notify_tx.is_empty() {
+                connections.remove(address);
+            }
+        }
     }
 
     fn bridge(&self) -> Result<&GlobalRef> {
@@ -177,6 +200,37 @@ pub struct AndroidBackend {
 }
 
 impl AndroidBackend {
+    /// Addresses currently subscribed to `characteristic` on our server.
+    fn subscribed_peers(&self, characteristic: CharacteristicUuid) -> Result<Vec<PeerAddress>> {
+        let mut env = self.inner.env()?;
+        let uuid = env
+            .new_string(characteristic.0.to_string())
+            .map_err(|err| BleError::Gatt(err.to_string()))?;
+        let bridge = self.inner.bridge()?;
+        let result = env.call_method(
+            bridge.as_obj(),
+            "subscribedAddresses",
+            "(Ljava/lang/String;)[Ljava/lang/String;",
+            &[JValue::Object(&uuid)],
+        );
+        let array = match result {
+            Ok(value) => value.l().map_err(|err| BleError::Gatt(err.to_string()))?,
+            Err(err) => return Err(jni_error(&mut env, "subscribedAddresses", err)),
+        };
+        let array = JObjectArray::from(array);
+        let len = env.get_array_length(&array).unwrap_or(0);
+        let mut peers = Vec::with_capacity(len as usize);
+        for i in 0..len {
+            let Ok(item) = env.get_object_array_element(&array, i) else {
+                continue;
+            };
+            peers.push(PeerAddress(read_jstring(&mut env, &JString::from(item))));
+        }
+        Ok(peers)
+    }
+}
+
+impl AndroidBackend {
     pub async fn new() -> Result<Self> {
         let ctx = ndk_context::android_context();
         let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }
@@ -205,6 +259,8 @@ impl AndroidBackend {
             server_events_tx,
             att_mtus: StdMutex::new(HashMap::new()),
             advertise_tx: StdMutex::new(None),
+            notify_waiters: StdMutex::new(HashMap::new()),
+            next_notify_id: AtomicU64::new(1),
         });
 
         // See the module doc comment: this pointer must stay valid for as
@@ -358,30 +414,50 @@ impl Backend for AndroidBackend {
         {
             let mut connections = self.inner.connections.lock().unwrap();
             let state = connections.entry(peer.0.clone()).or_default();
-            // Reject rather than overwrite. Both this map and the Kotlin
-            // bridge hold exactly one GATT per address, so a second
-            // concurrent connect to the same peer would drop the first
-            // caller's `connected_tx` — and that caller would then wait
-            // forever while the single callback resolved only the second.
+            // Reject rather than overwrite, for *both* an in-flight connect
+            // and one that already succeeded. The Kotlin bridge keeps one
+            // `BluetoothGatt` per address: a second connect would replace it
+            // without closing the first, leave two Rust handles sharing the
+            // replacement's callback state, and let a stale callback from the
+            // old GATT delete the new map entry — breaking both handles.
             if state.connected_tx.is_some() {
                 return Err(BleError::ConnectFailed {
                     peer: peer.0.clone(),
                     reason: "a connection to this peer is already in progress".to_string(),
                 });
             }
+            if state.live {
+                return Err(BleError::ConnectFailed {
+                    peer: peer.0.clone(),
+                    reason: "a connection to this peer is already open".to_string(),
+                });
+            }
             state.connected_tx = Some(connected_tx);
         }
-        {
+
+        // Every failure below must clear `connected_tx`. Leaving it set once
+        // its receiver is gone makes the guard above reject every retry for
+        // the lifetime of the backend — so a transient cause (a missing
+        // runtime permission, a powered-down adapter) would become permanent
+        // even after it was fixed.
+        let dial = (|| -> Result<()> {
             let mut env = self.inner.env()?;
             let address = env.new_string(&peer.0).map_err(|err| BleError::Gatt(err.to_string()))?;
             self.inner
-                .call_void(&mut env, "connect", "(Ljava/lang/String;)V", &[JValue::Object(&address)])?;
+                .call_void(&mut env, "connect", "(Ljava/lang/String;)V", &[JValue::Object(&address)])
+        })();
+        if let Err(err) = dial {
+            self.inner.clear_pending_connect(&peer.0);
+            return Err(err);
         }
 
-        connected_rx.await.map_err(|_| BleError::ConnectFailed {
-            peer: peer.0.clone(),
-            reason: "disconnected before connection completed".to_string(),
-        })?;
+        if connected_rx.await.is_err() {
+            self.inner.clear_pending_connect(&peer.0);
+            return Err(BleError::ConnectFailed {
+                peer: peer.0.clone(),
+                reason: "disconnected before connection completed".to_string(),
+            });
+        }
 
         Ok(Box::new(AndroidGattConnection {
             inner: self.inner.clone(),
@@ -465,32 +541,92 @@ impl Backend for AndroidBackend {
     }
 
     async fn notify(&self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
-        let mut env = self.inner.env()?;
-        let uuid = env
-            .new_string(characteristic.0.to_string())
-            .map_err(|err| BleError::Gatt(err.to_string()))?;
-        let bytes = env.byte_array_from_slice(&value).map_err(|err| BleError::Gatt(err.to_string()))?;
-        let bridge = self.inner.bridge()?;
-        let delivered = env
-            .call_method(
-                bridge.as_obj(),
-                "notifyCharacteristic",
-                "(Ljava/lang/String;[B)Z",
-                &[JValue::Object(&uuid), JValue::Object(&bytes)],
-            )
-            .and_then(|v| v.z());
-        let delivered = match delivered {
-            Ok(value) => value,
-            Err(err) => return Err(jni_error(&mut env, "notifyCharacteristic", err)),
-        };
-        if !delivered {
+        // Broadcast is expressed as one addressed send per subscriber, so
+        // every payload goes through the same queued, completion-confirmed
+        // path — Android has no atomic multi-device notify anyway.
+        let subscribers = self.subscribed_peers(characteristic)?;
+        if subscribers.is_empty() {
             return Err(BleError::Gatt(
-                "notify delivered to nobody — not advertising, unknown characteristic, \
-                 or no subscriber"
+                "notify reached no subscriber — not advertising, unknown characteristic, \
+                 or nobody subscribed"
                     .to_string(),
             ));
         }
+        let mut delivered = false;
+        let mut last_error = None;
+        for peer in subscribers {
+            match self.notify_peer(&peer, characteristic, value.clone()).await {
+                Ok(()) => delivered = true,
+                Err(err) => last_error = Some(err),
+            }
+        }
+        if !delivered {
+            return Err(last_error
+                .unwrap_or_else(|| BleError::Gatt("notify reached no subscriber".to_string())));
+        }
         Ok(())
+    }
+
+    async fn notify_peer(
+        &self, peer: &PeerAddress, characteristic: CharacteristicUuid, value: Vec<u8>,
+    ) -> Result<()> {
+        let request_id = self.inner.next_notify_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.inner.notify_waiters.lock().unwrap().insert(request_id, tx);
+
+        let queued = (|| -> Result<bool> {
+            let mut env = self.inner.env()?;
+            let address = env.new_string(&peer.0).map_err(|err| BleError::Gatt(err.to_string()))?;
+            let uuid = env
+                .new_string(characteristic.0.to_string())
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
+            let bytes =
+                env.byte_array_from_slice(&value).map_err(|err| BleError::Gatt(err.to_string()))?;
+            let bridge = self.inner.bridge()?;
+            let result = env
+                .call_method(
+                    bridge.as_obj(),
+                    "notifyCharacteristicTo",
+                    "(Ljava/lang/String;Ljava/lang/String;[BJ)Z",
+                    &[
+                        JValue::Object(&address),
+                        JValue::Object(&uuid),
+                        JValue::Object(&bytes),
+                        JValue::Long(request_id as i64),
+                    ],
+                )
+                .and_then(|v| v.z());
+            match result {
+                Ok(value) => Ok(value),
+                Err(err) => Err(jni_error(&mut env, "notifyCharacteristicTo", err)),
+            }
+        })();
+
+        match queued {
+            // Nothing was queued, so no callback is coming — drop the waiter
+            // rather than leaving this future to hang forever.
+            Ok(false) | Err(_) => {
+                self.inner.notify_waiters.lock().unwrap().remove(&request_id);
+                queued?;
+                return Err(BleError::Gatt(format!(
+                    "{} has no live notify session for this characteristic",
+                    peer.0
+                )));
+            }
+            Ok(true) => {}
+        }
+
+        // Android reports the real status here, not from the call above.
+        // Returning Ok on initiation alone would tell a reliable caller a
+        // fragment was sent when transmission had actually failed.
+        match rx.await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(BleError::Gatt(format!("notify to {} failed", peer.0))),
+            Err(_) => Err(BleError::Gatt(format!(
+                "notify to {} was abandoned before completion",
+                peer.0
+            ))),
+        }
     }
 
     async fn disconnect_peer(&self, peer: &PeerAddress) -> Result<()> {
@@ -893,10 +1029,10 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onConnected<'local>(
     // connection with no characteristics.
     if from_server == 0 {
         let mut connections = inner.connections.lock().unwrap();
-        if let Some(state) = connections.get_mut(&address) {
-            if let Some(tx) = state.connected_tx.take() {
-                let _ = tx.send(());
-            }
+        let state = connections.entry(address.clone()).or_default();
+        state.live = true;
+        if let Some(tx) = state.connected_tx.take() {
+            let _ = tx.send(());
         }
     }
     // Publish regardless of whether a client connect was pending: Linux
@@ -929,7 +1065,8 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onDisconnected<'local>(
     if from_server == 0 {
         inner.att_mtus.lock().unwrap().remove(&address);
         let mut connections = inner.connections.lock().unwrap();
-        if let Some(state) = connections.remove(&address) {
+        if let Some(mut state) = connections.remove(&address) {
+            state.live = false;
             if let Some(tx) = state.disconnected_tx {
                 let _ = tx.send(());
             }
@@ -1093,4 +1230,17 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onServerSubscribed<'local>(
         peer: PeerAddress(address),
         local_role: Role::Peripheral,
     });
+}
+
+/// Completion of a queued server notification.
+#[no_mangle]
+pub extern "system" fn Java_dev_blegatt_NativeKt_onNotifySent<'local>(
+    _env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, request_id: jlong,
+    success: jboolean,
+) {
+    let inner = unsafe { inner_from_handle(native_handle) };
+    let waiter = inner.notify_waiters.lock().unwrap().remove(&(request_id as u64));
+    if let Some(tx) = waiter {
+        let _ = tx.send(success != 0);
+    }
 }

@@ -284,7 +284,12 @@ impl DatagramChannel {
                     if !active.load(Ordering::SeqCst) {
                         return Err(BleError::NotConnected(self.peer.0.clone()));
                     }
-                    backend.notify(characteristic, fragment).await?;
+                    // Addressed, not broadcast. Refusing a second central is
+                    // asynchronous — it subscribes, `serve` sees it, then
+                    // disconnects it — and a broadcast in that window would
+                    // hand it this peer's fragments. Addressing closes the
+                    // window entirely rather than narrowing it.
+                    backend.notify_peer(&self.peer, characteristic, fragment).await?;
                 }
             }
         }

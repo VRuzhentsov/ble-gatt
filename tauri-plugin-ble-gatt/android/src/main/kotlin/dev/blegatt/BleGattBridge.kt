@@ -74,6 +74,23 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     private val serverCharacteristics = HashMap<String, BluetoothGattCharacteristic>()
     private val subscribedDevices = HashMap<String, MutableSet<BluetoothDevice>>()
 
+    /// Android allows exactly one outstanding server notification at a time:
+    /// `notifyCharacteristicChanged` only reports that a send was
+    /// *initiated*, and the real status arrives on `onNotificationSent`.
+    /// Issuing the next fragment before that lands makes the stack either
+    /// reject it or transmit the characteristic's already-overwritten value,
+    /// which silently corrupts a multi-fragment datagram. So notifications
+    /// are queued and drained strictly one at a time.
+    private class PendingNotify(
+        val device: BluetoothDevice,
+        val characteristicUuid: String,
+        val value: ByteArray,
+        val requestId: Long,
+    )
+
+    private val notifyQueue = ArrayDeque<PendingNotify>()
+    private var notifyInFlight: PendingNotify? = null
+
     fun hasCentralSupport(): Boolean = adapter?.bluetoothLeScanner != null
 
     fun hasPeripheralSupport(): Boolean =
@@ -439,6 +456,22 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 onServerCharacteristicWritten(nativeHandle, device.address, characteristic.uuid.toString(), value)
             }
 
+            override fun onNotificationSent(device: BluetoothDevice, status: Int) {
+                val completed = synchronized(this@BleGattBridge) {
+                    val done = notifyInFlight
+                    notifyInFlight = null
+                    done
+                }
+                if (completed != null) {
+                    onNotifySent(
+                        nativeHandle,
+                        completed.requestId,
+                        status == BluetoothGatt.GATT_SUCCESS,
+                    )
+                }
+                pumpNotifications()
+            }
+
             override fun onDescriptorWriteRequest(
                 device: BluetoothDevice, requestId: Int, descriptor: BluetoothGattDescriptor,
                 preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray,
@@ -579,6 +612,8 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             onDisconnected(nativeHandle, address, true)
         }
 
+        failPendingNotifications()
+
         gattServer?.close()
         gattServer = null
         serverCharacteristics.clear()
@@ -597,29 +632,84 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         onAdvertiseResult(nativeHandle, false, errorCode)
     }
 
-    /// Returns false when the payload could not be delivered to anyone —
-    /// not advertising, unknown characteristic, or nobody subscribed. Rust
-    /// turns that into an error; silently returning normally made
-    /// `Backend::notify` and `DatagramChannel::send` report success while
-    /// dropping the data.
-    fun notifyCharacteristic(characteristicUuid: String, value: ByteArray): Boolean {
-        val server = gattServer ?: return false
-        val characteristic = serverCharacteristics[characteristicUuid] ?: return false
-        @Suppress("DEPRECATION")
-        characteristic.value = value
-        val subscribers = subscribedDevices[characteristicUuid]
-        if (subscribers.isNullOrEmpty()) {
+    /// Addresses currently subscribed to a characteristic. Rust expresses a
+    /// broadcast as one addressed send per subscriber, so every payload goes
+    /// through the same completion-confirmed queue.
+    fun subscribedAddresses(characteristicUuid: String): Array<String> =
+        subscribedDevices[characteristicUuid]
+            ?.map { it.address }
+            ?.distinct()
+            ?.toTypedArray()
+            ?: emptyArray()
+
+    /// Drain the notification queue, one outstanding send at a time.
+    ///
+    /// Failures are reported to Rust here rather than swallowed: a caller
+    /// that believes a fragment was sent when it was not will wait for a
+    /// reply that can never come.
+    private fun pumpNotifications() {
+        while (true) {
+            val next = synchronized(this) {
+                if (notifyInFlight != null) return
+                val candidate = notifyQueue.removeFirstOrNull() ?: return
+                notifyInFlight = candidate
+                candidate
+            }
+            val server = gattServer
+            val characteristic = serverCharacteristics[next.characteristicUuid]
+            val initiated = if (server != null && characteristic != null) {
+                @Suppress("DEPRECATION")
+                characteristic.value = next.value
+                @Suppress("DEPRECATION")
+                server.notifyCharacteristicChanged(next.device, characteristic, false)
+            } else {
+                false
+            }
+            if (initiated) {
+                // onNotificationSent resumes the pump.
+                return
+            }
+            synchronized(this) { notifyInFlight = null }
+            onNotifySent(nativeHandle, next.requestId, false)
+        }
+    }
+
+    /// Queue a notification for exactly one subscribed central, resolved
+    /// asynchronously through `onNotifySent(requestId, ...)`.
+    ///
+    /// Returns false only for a synchronous impossibility (no server, or the
+    /// peer is not subscribed); anything queued is answered by the callback.
+    fun notifyCharacteristicTo(
+        address: String, characteristicUuid: String, value: ByteArray, requestId: Long,
+    ): Boolean {
+        if (gattServer == null || serverCharacteristics[characteristicUuid] == null) {
             return false
         }
-        var delivered = false
-        for (device in subscribers) {
-            @Suppress("DEPRECATION")
-            if (server.notifyCharacteristicChanged(device, characteristic, false)) {
-                delivered = true
-            }
+        val device = subscribedDevices[characteristicUuid]
+            ?.firstOrNull { it.address == address }
+            ?: return false
+        synchronized(this) {
+            notifyQueue.addLast(PendingNotify(device, characteristicUuid, value, requestId))
         }
-        return delivered
+        pumpNotifications()
+        return true
     }
+
+    /// Fail every queued and in-flight notification. Called when the server
+    /// goes away, so Rust callers are not left waiting on sends that can no
+    /// longer complete.
+    private fun failPendingNotifications() {
+        val abandoned = synchronized(this) {
+            val all = notifyQueue.toList() + listOfNotNull(notifyInFlight)
+            notifyQueue.clear()
+            notifyInFlight = null
+            all
+        }
+        for (pending in abandoned) {
+            onNotifySent(nativeHandle, pending.requestId, false)
+        }
+    }
+
 
     /// Drop a central's connection to our GATT server, and forget its
     /// subscriptions so `notifyCharacteristic` stops broadcasting to it even

@@ -426,3 +426,69 @@ async fn a_central_refused_by_a_single_peer_server_stops_receiving_notifications
         "a disconnected central must not receive the served peer's fragments"
     );
 }
+
+#[tokio::test]
+async fn an_addressed_notify_reaches_only_its_peer() {
+    let network = MockNetwork::new();
+    let service_uuid = ServiceUuid(Uuid::new_v4());
+    let characteristic_uuid = CharacteristicUuid(Uuid::new_v4());
+    let peripheral_addr = PeerAddress("peripheral-addressed".to_string());
+
+    let peripheral = MockBackend::new(peripheral_addr.clone(), network.clone(), full_capabilities());
+    peripheral
+        .advertise(GattServiceSpec {
+            uuid: service_uuid,
+            characteristics: vec![GattCharacteristicSpec {
+                uuid: characteristic_uuid,
+                readable: false,
+                writable: false,
+                notifiable: true,
+                initial_value: Vec::new(),
+            }],
+        })
+        .await
+        .expect("advertise should succeed");
+
+    let served_addr = PeerAddress("central-served".to_string());
+    let served = MockBackend::new(served_addr.clone(), network.clone(), full_capabilities());
+    let mut served_conn = served.connect(&peripheral_addr).await.expect("connect");
+    let mut served_rx = served_conn.subscribe(characteristic_uuid).await.expect("subscribe");
+
+    // A second central subscribes. It needs no server consent to do so, and
+    // disconnecting it is asynchronous — so during that window a *broadcast*
+    // would hand it the served peer's traffic. Addressing is what closes the
+    // window rather than narrowing it.
+    let other_addr = PeerAddress("central-other".to_string());
+    let other = MockBackend::new(other_addr.clone(), network.clone(), full_capabilities());
+    let mut other_conn = other.connect(&peripheral_addr).await.expect("connect");
+    let mut other_rx = other_conn.subscribe(characteristic_uuid).await.expect("subscribe");
+
+    peripheral
+        .notify_peer(&served_addr, characteristic_uuid, b"for-the-served-peer".to_vec())
+        .await
+        .expect("addressed notify should succeed");
+
+    assert_eq!(
+        served_rx.next().await.as_deref(),
+        Some(b"for-the-served-peer".as_slice())
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), other_rx.next())
+            .await
+            .is_err(),
+        "an addressed notify must not reach a peer it was not addressed to"
+    );
+
+    // And addressing a peer with no session is an error, not a silent no-op.
+    assert!(
+        peripheral
+            .notify_peer(
+                &PeerAddress("nobody".to_string()),
+                characteristic_uuid,
+                b"x".to_vec()
+            )
+            .await
+            .is_err(),
+        "notifying an unsubscribed peer must report failure"
+    );
+}

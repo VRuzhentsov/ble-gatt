@@ -351,6 +351,24 @@ impl Backend for MockBackend {
         Ok(())
     }
 
+    async fn notify_peer(
+        &self, peer: &PeerAddress, characteristic: CharacteristicUuid, value: Vec<u8>,
+    ) -> Result<()> {
+        let peripherals = self.network.peripherals.lock().unwrap();
+        let state = peripherals
+            .get(&self.address)
+            .ok_or_else(|| BleError::Gatt("not advertising".to_string()))?;
+        let peers = state
+            .subscribers
+            .get(&characteristic)
+            .ok_or_else(|| BleError::Gatt("unknown characteristic".to_string()))?;
+        let tx = peers.get(peer).ok_or_else(|| {
+            BleError::Gatt(format!("{} has no live notify session", peer.0))
+        })?;
+        tx.send(value)
+            .map_err(|_| BleError::Gatt(format!("{} has no live notify session", peer.0)))
+    }
+
     fn events(&self) -> BoxStream<GattEvent> {
         // This backend's own view, in both roles — available immediately,
         // not conditional on advertising, since a central-only consumer

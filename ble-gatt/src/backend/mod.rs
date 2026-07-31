@@ -109,38 +109,37 @@ pub trait Backend: Send + Sync {
 
     async fn stop_advertising(&self) -> Result<()>;
 
-    /// Push a value to every central currently subscribed to `characteristic`
-    /// on the local GATT server (the server-initiated half of GATT notify —
-    /// the client-initiated half is `GattConnection::subscribe`). Errors if
-    /// not currently advertising.
+    /// Push a value to **every** central currently subscribed to
+    /// `characteristic` on the local GATT server. Errors if it reached
+    /// nobody — a reliable caller must not be told a dropped payload was
+    /// sent.
     ///
-    /// **This is a broadcast**: every subscribed central receives it,
-    /// including one a higher layer believes it has refused, since
-    /// subscribing is a client-side act needing no server consent. A server
-    /// that must not mix two peers' traffic keeps a second central from
-    /// being subscribed at all — see [`Backend::disconnect_peer`].
-    ///
-    /// An earlier revision of this comment claimed per-peer addressing was
-    /// impossible on Linux. That was wrong, and worth recording: it is true
-    /// of BlueZ's `StartNotify`, which carries no device address, but not of
-    /// `AcquireNotify`, which does — so the Linux backend now uses
-    /// `CharacteristicNotifyMethod::Io` and holds one writer per subscriber.
-    /// Both backends could therefore support a `notify_peer` today (Android
-    /// via `notifyCharacteristicChanged`, which takes a device). It is not
-    /// added here because `disconnect_peer` already enforces the invariant
-    /// the datagram layer needs; it is a live option if multi-peer serving
-    /// is ever wanted.
+    /// Prefer [`Backend::notify_peer`] for anything carrying per-peer data.
+    /// Subscribing is a client-side act needing no server consent, so a
+    /// central a higher layer believes it refused is still subscribed until
+    /// it is disconnected, and this delivers to it.
     async fn notify(&self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()>;
+
+    /// Push a value to exactly one subscribed central.
+    ///
+    /// Both platforms can address a notification: Android's
+    /// `notifyCharacteristicChanged` takes a device, and on Linux the
+    /// peripheral acquires one writer per subscriber via `AcquireNotify`
+    /// (which, unlike `StartNotify`, carries the device address).
+    ///
+    /// This is what makes a single-peer server safe against the *window*
+    /// between a second central subscribing and being disconnected:
+    /// disconnecting is asynchronous, and a broadcast during that window
+    /// would hand the refused peer the served peer's traffic. Errors if
+    /// `peer` has no live notify session.
+    async fn notify_peer(
+        &self, peer: &PeerAddress, characteristic: CharacteristicUuid, value: Vec<u8>,
+    ) -> Result<()>;
 
     /// Drop a remote central's connection to the local GATT server.
     ///
-    /// The enforcement half of a single-peer server. Refusing a second
-    /// central at the protocol layer is not enough: subscribing is a purely
-    /// client-side act needing no server consent, so a refused peer stays
-    /// subscribed and — because [`Backend::notify`] is a broadcast — keeps
-    /// receiving the accepted peer's traffic. Disconnecting is the only
-    /// portable way to actually exclude it.
-    ///
+    /// The enforcement half of a single-peer server: a refused central stays
+    /// subscribed until it is dropped, so this is what actually excludes it.
     /// Best-effort and idempotent: a peer that is already gone is `Ok`.
     async fn disconnect_peer(&self, peer: &PeerAddress) -> Result<()>;
 

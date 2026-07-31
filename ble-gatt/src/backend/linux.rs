@@ -170,23 +170,71 @@ fn spawn_peripheral_disconnect_watch(
         let _ = async {
             let device = adapter.device(address).ok()?;
             let mut changes = device.events().await.ok()?;
-            while let Some(event) = changes.next().await {
-                if matches!(
-                    event,
-                    bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::Connected(false))
-                ) {
-                    let _ = events_tx.send(GattEvent::Disconnected {
-                        peer: peer.clone(),
-                        local_role: Role::Peripheral,
-                    });
-                    break;
+            // Poll once after subscribing, as the central-role watcher does.
+            // A central that dropped between acquiring its notify session and
+            // this subscription taking effect has already emitted its
+            // `Connected(false)`, and waiting for a change that has been and
+            // gone means no peripheral-role `Disconnected` is ever produced —
+            // `serve()` then holds the stale peer forever and refuses every
+            // reconnect.
+            if device.is_connected().await.unwrap_or(false) {
+                while let Some(event) = changes.next().await {
+                    if matches!(
+                        event,
+                        bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::Connected(false))
+                    ) {
+                        break;
+                    }
                 }
             }
+            let _ = events_tx.send(GattEvent::Disconnected {
+                peer: peer.clone(),
+                local_role: Role::Peripheral,
+            });
             Some(())
         }
         .await;
         served_peers.lock().unwrap().remove(&peer);
     });
+}
+
+impl LinuxBackend {
+    /// Deliver to every live notify session matching `want`.
+    ///
+    /// Sessions are pruned before *and* after writing, because one can close
+    /// mid-write. Reaching nobody is an error: a reliable `send` must never
+    /// be told a dropped payload was delivered.
+    async fn notify_matching(
+        &self, characteristic: CharacteristicUuid, value: Vec<u8>,
+        want: impl Fn(&CharacteristicWriter) -> bool, nobody: &str,
+    ) -> Result<()> {
+        let mut writers = self.notify_writers.lock().await;
+        let Some(sessions) = writers.get_mut(&characteristic) else {
+            return Err(BleError::Gatt("no active notify session for characteristic".to_string()));
+        };
+        sessions.retain(|w| !w.is_closed().unwrap_or(true));
+
+        let mut delivered = false;
+        let mut last_error = None;
+        for writer in sessions.iter_mut().filter(|w| want(w)) {
+            // write_all, not write: a short write would truncate a fragment,
+            // and reassembly would then fail on the far side with nothing
+            // reported here.
+            match writer.write_all(&value).await {
+                Ok(()) => delivered = true,
+                Err(err) => last_error = Some(err),
+            }
+        }
+        sessions.retain(|w| !w.is_closed().unwrap_or(true));
+
+        if !delivered {
+            return Err(BleError::Gatt(match last_error {
+                Some(err) => format!("notify reached {nobody}: {err}"),
+                None => format!("notify reached {nobody}"),
+            }));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -519,38 +567,20 @@ impl Backend for LinuxBackend {
     }
 
     async fn notify(&self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
-        let mut writers = self.notify_writers.lock().await;
-        let Some(sessions) = writers.get_mut(&characteristic) else {
-            return Err(BleError::Gatt("no active notify session for characteristic".to_string()));
-        };
-        sessions.retain(|w| !w.is_closed().unwrap_or(true));
+        self.notify_matching(characteristic, value, |_| true, "no subscriber").await
+    }
 
-        // Track whether the payload actually reached anyone. Reporting `Ok`
-        // after delivering to nobody — a central that disabled its CCCD
-        // without disconnecting leaves exactly that state — made
-        // `DatagramChannel::send` claim success while dropping fragments on
-        // the floor, which for a reliable channel is the worst failure mode
-        // available.
-        let mut delivered = false;
-        let mut last_error = None;
-        for writer in sessions.iter_mut() {
-            // write_all, not write: a short write would silently truncate
-            // a fragment, and a truncated fragment fails reassembly on the
-            // far side with no error reported here.
-            match writer.write_all(&value).await {
-                Ok(()) => delivered = true,
-                Err(err) => last_error = Some(err),
-            }
-        }
-        sessions.retain(|w| !w.is_closed().unwrap_or(true));
-
-        if !delivered {
-            return Err(BleError::Gatt(match last_error {
-                Some(err) => format!("notify reached no subscriber: {err}"),
-                None => "notify reached no subscriber".to_string(),
-            }));
-        }
-        Ok(())
+    async fn notify_peer(
+        &self, peer: &PeerAddress, characteristic: CharacteristicUuid, value: Vec<u8>,
+    ) -> Result<()> {
+        let wanted = peer.0.clone();
+        self.notify_matching(
+            characteristic,
+            value,
+            move |writer: &CharacteristicWriter| writer.device_address().to_string() == wanted,
+            &format!("{} has no live notify session", peer.0),
+        )
+        .await
     }
 
     async fn disconnect_peer(&self, peer: &PeerAddress) -> Result<()> {

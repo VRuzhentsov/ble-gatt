@@ -67,6 +67,10 @@ external fun onScanFailed(nativeHandle: Long, errorCode: Int)
 /// characteristics. This — not the physical connection — is when the
 /// peripheral-role peer becomes usable, because it is the point at which
 /// the notify path back to it exists.
+/// Completion of a queued server notification. Android reports the real
+/// send status here, not from `notifyCharacteristicChanged`.
+external fun onNotifySent(nativeHandle: Long, requestId: Long, success: Boolean)
+
 external fun onServerSubscribed(nativeHandle: Long, address: String)
 
 external fun onSubscribed(

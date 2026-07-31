@@ -130,6 +130,12 @@ impl Backend for LazyAndroidBackend {
         self.inner().await?.notify(characteristic, value).await
     }
 
+    async fn notify_peer(
+        &self, peer: &PeerAddress, characteristic: CharacteristicUuid, value: Vec<u8>,
+    ) -> Result<()> {
+        self.inner().await?.notify_peer(peer, characteristic, value).await
+    }
+
     async fn disconnect_peer(&self, peer: &PeerAddress) -> Result<()> {
         self.inner().await?.disconnect_peer(peer).await
     }
