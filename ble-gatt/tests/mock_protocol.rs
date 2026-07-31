@@ -48,7 +48,11 @@ async fn central_discovers_and_reads_the_peripherals_advertised_service() {
     let central = MockBackend::new(PeerAddress("central-1".to_string()), network.clone(), full_capabilities());
 
     let mut discovered = central.scan(service_uuid).await.expect("scan should succeed");
-    let peer = discovered.next().await.expect("peripheral should be discovered");
+    let peer = discovered
+        .next()
+        .await
+        .expect("peripheral should be discovered")
+        .expect("discovery should not error");
     assert_eq!(peer.address, PeerAddress("peripheral-1".to_string()));
 
     let mut connection = central.connect(&peer.address).await.expect("connect should succeed");
@@ -209,7 +213,11 @@ async fn advertisement_payload_identifies_a_specific_peer_before_connecting() {
 
     let central = MockBackend::new(PeerAddress("central-adv".to_string()), network.clone(), full_capabilities());
     let mut discovered = central.scan(service_uuid).await.expect("scan should succeed");
-    let peer = discovered.next().await.expect("peripheral should be discovered");
+    let peer = discovered
+        .next()
+        .await
+        .expect("peripheral should be discovered")
+        .expect("discovery should not error");
 
     assert_eq!(peer.manufacturer_data.get(&0x1234), Some(&device_eui));
     assert_eq!(
@@ -315,4 +323,30 @@ async fn central_learns_about_unsolicited_peer_loss_through_the_event_stream() {
         GattEvent::Disconnected { peer, .. } => assert_eq!(peer, peripheral_addr),
         other => panic!("expected Disconnected, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn an_asynchronous_scan_failure_is_reported_instead_of_looking_like_no_peers() {
+    let network = MockNetwork::new();
+    let service_uuid = ServiceUuid(Uuid::new_v4());
+
+    // The failure mode this guards: Android's `onScanFailed` arrives *after*
+    // `scan()` has already returned Ok, so a caller that only sees the stream
+    // end would report "no devices found" when Bluetooth is actually off or
+    // the scan permission was denied.
+    network.arm_scan_failure("scan failed (ScanCallback error code 2)");
+
+    let central = MockBackend::new(
+        PeerAddress("central-scanfail".to_string()),
+        network.clone(),
+        full_capabilities(),
+    );
+    let mut discovered = central.scan(service_uuid).await.expect("scan starts successfully");
+
+    let item = discovered.next().await.expect("the failure must surface as an item");
+    assert!(
+        item.is_err(),
+        "a failed scan must be distinguishable from an empty one, got {item:?}"
+    );
+    assert!(discovered.next().await.is_none(), "an error item ends the scan");
 }

@@ -39,7 +39,20 @@ use jni::objects::{GlobalRef, JByteArray, JClass, JIntArray, JObject, JObjectArr
 use jni::sys::{jboolean, jint, jlong};
 use jni::{JNIEnv, JavaVM};
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
+
+/// Scan results buffered before the oldest are dropped. Advertisements are
+/// periodic, so dropping one costs at most a short delay before that peer is
+/// seen again — whereas an unbounded queue grows for as long as a busy radio
+/// environment outpaces the consumer.
+const DISCOVERY_QUEUE_DEPTH: usize = 64;
+
+/// Notification payloads buffered per characteristic. Dropping one is real
+/// data loss (the datagram layer's reassembly timeout reaps the affected
+/// message), but a JVM callback thread cannot block waiting for the
+/// consumer, and unbounded growth costs the whole process rather than one
+/// message.
+const NOTIFY_QUEUE_DEPTH: usize = 256;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
@@ -61,7 +74,7 @@ struct ConnectionState {
     read_tx: Option<oneshot::Sender<Result<Vec<u8>>>>,
     write_tx: Option<oneshot::Sender<Result<()>>>,
     subscribe_tx: HashMap<CharacteristicUuid, oneshot::Sender<bool>>,
-    notify_tx: HashMap<CharacteristicUuid, mpsc::UnboundedSender<Vec<u8>>>,
+    notify_tx: HashMap<CharacteristicUuid, mpsc::Sender<Vec<u8>>>,
     disconnected_tx: Option<oneshot::Sender<()>>,
 }
 
@@ -70,7 +83,7 @@ struct Inner {
     context: GlobalRef,
     bridge: OnceLock<GlobalRef>,
     connections: StdMutex<HashMap<String, ConnectionState>>,
-    discovery_tx: StdMutex<Option<mpsc::UnboundedSender<DiscoveredPeer>>>,
+    discovery_tx: StdMutex<Option<mpsc::Sender<Result<DiscoveredPeer>>>>,
     /// Named `server_events_tx` historically, but now carries both roles'
     /// lifecycle events — including central-side link loss. See
     /// `Backend::events`.
@@ -84,9 +97,6 @@ struct Inner {
     /// whether an advertisement actually started, so `advertise()` must wait
     /// for it rather than reporting success the moment the JNI call returns.
     advertise_tx: StdMutex<Option<oneshot::Sender<std::result::Result<(), i32>>>>,
-    /// Set by `onScanFailed` so a scan that never started is distinguishable
-    /// from one that simply found nothing.
-    scan_failed_tx: StdMutex<Option<oneshot::Sender<i32>>>,
 }
 
 impl Inner {
@@ -110,17 +120,37 @@ impl Inner {
     /// non-`Send`, which the trait's `Send` supertrait bound forbids.
     fn call_void(&self, env: &mut JNIEnv, method: &str, sig: &str, args: &[JValue]) -> Result<()> {
         let bridge = self.bridge()?;
-        env.call_method(bridge.as_obj(), method, sig, args)
-            .map_err(|err| BleError::Gatt(format!("{method} failed: {err}")))?;
-        Ok(())
+        let result = env.call_method(bridge.as_obj(), method, sig, args);
+        match result {
+            Ok(_) => Ok(()),
+            Err(err) => Err(jni_error(env, method, err)),
+        }
     }
 
     fn call_bool(&self, env: &mut JNIEnv, method: &str, sig: &str) -> Result<bool> {
         let bridge = self.bridge()?;
-        env.call_method(bridge.as_obj(), method, sig, &[])
-            .and_then(|v| v.z())
-            .map_err(|err| BleError::Gatt(format!("{method} failed: {err}")))
+        let result = env.call_method(bridge.as_obj(), method, sig, &[]).and_then(|v| v.z());
+        match result {
+            Ok(value) => Ok(value),
+            Err(err) => Err(jni_error(env, method, err)),
+        }
     }
+}
+
+/// Turn a failed JNI call into a `BleError`, **describing and clearing any
+/// pending Java exception first**.
+///
+/// This is not just for nicer messages. `attach_current_thread_as_daemon`
+/// leaves the Tokio worker attached to the JVM, so an uncleared exception
+/// stays pending on that worker and makes every later JNI call scheduled
+/// there fail too — long after the original cause (a missing runtime
+/// Bluetooth permission, say) has been fixed.
+fn jni_error(env: &mut JNIEnv, method: &str, err: jni::errors::Error) -> BleError {
+    let detail = describe_pending_exception(env);
+    BleError::Gatt(format!(
+        "{method} failed: {err}{}",
+        detail.map(|d| format!(" ({d})")).unwrap_or_default()
+    ))
 }
 
 pub struct AndroidBackend {
@@ -156,7 +186,6 @@ impl AndroidBackend {
             server_events_tx,
             att_mtus: StdMutex::new(HashMap::new()),
             advertise_tx: StdMutex::new(None),
-            scan_failed_tx: StdMutex::new(None),
         });
 
         // See the module doc comment: this pointer must stay valid for as
@@ -247,8 +276,8 @@ impl Backend for AndroidBackend {
         CapabilityReport { central, peripheral }
     }
 
-    async fn scan(&self, service: ServiceUuid) -> Result<BoxStream<DiscoveredPeer>> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    async fn scan(&self, service: ServiceUuid) -> Result<BoxStream<Result<DiscoveredPeer>>> {
+        let (tx, rx) = mpsc::channel(DISCOVERY_QUEUE_DEPTH);
         *self.inner.discovery_tx.lock().unwrap() = Some(tx);
         {
             let mut env = self.inner.env()?;
@@ -273,7 +302,7 @@ impl Backend for AndroidBackend {
         }
         Ok(Box::pin(ScanStream {
             inner: self.inner.clone(),
-            rx: UnboundedReceiverStream::new(rx),
+            rx: ReceiverStream::new(rx),
         }))
     }
 
@@ -413,11 +442,11 @@ impl Backend for AndroidBackend {
 /// `LinuxBackend::scan`'s stream-owns-the-scan-lifetime contract.
 struct ScanStream {
     inner: Arc<Inner>,
-    rx: UnboundedReceiverStream<DiscoveredPeer>,
+    rx: ReceiverStream<Result<DiscoveredPeer>>,
 }
 
 impl tokio_stream::Stream for ScanStream {
-    type Item = DiscoveredPeer;
+    type Item = Result<DiscoveredPeer>;
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
@@ -512,7 +541,7 @@ impl GattConnection for AndroidGattConnection {
 
     async fn subscribe(&mut self, characteristic: CharacteristicUuid) -> Result<BoxStream<Vec<u8>>> {
         let (confirm_tx, confirm_rx) = oneshot::channel();
-        let (notify_tx, notify_rx) = mpsc::unbounded_channel();
+        let (notify_tx, notify_rx) = mpsc::channel(NOTIFY_QUEUE_DEPTH);
         {
             let mut connections = self.inner.connections.lock().unwrap();
             let state = connections.entry(self.address.clone()).or_default();
@@ -541,7 +570,7 @@ impl GattConnection for AndroidGattConnection {
                 characteristic.0
             )));
         }
-        Ok(Box::pin(UnboundedReceiverStream::new(notify_rx)))
+        Ok(Box::pin(ReceiverStream::new(notify_rx)))
     }
 
     async fn disconnect(&mut self) -> Result<()> {
@@ -703,14 +732,23 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onPeerDiscovered<'local>(
 
     let discovery_tx = inner.discovery_tx.lock().unwrap();
     if let Some(tx) = discovery_tx.as_ref() {
-        let _ = tx.send(DiscoveredPeer {
+        // try_send on a bounded queue: this runs on a JVM callback thread
+        // that must not block, and in a dense advertising environment the
+        // radio can outpace any consumer indefinitely.
+        let peer = DiscoveredPeer {
             address: PeerAddress(address),
             name,
             services: Vec::new(),
             manufacturer_data,
             service_data,
             rssi: Some(rssi as i16),
-        });
+        };
+        if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(Ok(peer)) {
+            eprintln!(
+                "[ble-gatt][android] discovery queue full, dropping scan result; \
+                 the peer will reappear on its next advertisement"
+            );
+        }
     }
 }
 
@@ -731,14 +769,17 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onScanFailed<'local>(
     _env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, error_code: jint,
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
-    let pending = inner.scan_failed_tx.lock().unwrap().take();
+    // Deliver the failure *as a stream item* before closing, then drop the
+    // sender to end the stream. Closing alone would make a scan that never
+    // started indistinguishable from a scan that found nothing — the caller
+    // would report "no peers" when the real answer is a permission denial or
+    // a powered-off adapter.
+    let pending = inner.discovery_tx.lock().unwrap().take();
     if let Some(tx) = pending {
-        let _ = tx.send(error_code);
+        let _ = tx.try_send(Err(BleError::Gatt(format!(
+            "Android scan failed (ScanCallback error code {error_code})"
+        ))));
     }
-    // Close the discovery stream: a scan that never started must not look
-    // like a scan that found nothing.
-    let mut discovery = inner.discovery_tx.lock().unwrap();
-    *discovery = None;
 }
 
 #[no_mangle]
@@ -758,7 +799,11 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onConnected<'local>(
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
     let address = read_jstring(&mut env, &address);
-    {
+    // Only the *client* path may resolve a pending outbound connect. A
+    // server-side callback for the same address would otherwise complete it
+    // before client-side service discovery had run, handing back a
+    // connection with no characteristics.
+    if from_server == 0 {
         let mut connections = inner.connections.lock().unwrap();
         if let Some(state) = connections.get_mut(&address) {
             if let Some(tx) = state.connected_tx.take() {
@@ -785,8 +830,12 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onDisconnected<'local>(
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
     let address = read_jstring(&mut env, &address);
-    inner.att_mtus.lock().unwrap().remove(&address);
-    {
+    // Likewise: a central leaving our GATT server says nothing about an
+    // outbound connection we hold to that same address. Tearing down the
+    // client state here would kill reads, writes and subscriptions on a
+    // still-live link.
+    if from_server == 0 {
+        inner.att_mtus.lock().unwrap().remove(&address);
         let mut connections = inner.connections.lock().unwrap();
         if let Some(state) = connections.remove(&address) {
             if let Some(tx) = state.disconnected_tx {
@@ -868,7 +917,15 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onCharacteristicChanged<'local>
     let connections = inner.connections.lock().unwrap();
     if let Some(state) = connections.get(&address) {
         if let Some(tx) = state.notify_tx.get(&CharacteristicUuid(uuid)) {
-            let _ = tx.send(bytes);
+            // JVM callback thread: cannot block, so a saturated consumer
+            // costs the affected message (reaped by the reassembly timeout)
+            // rather than unbounded heap growth.
+            if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(bytes) {
+                eprintln!(
+                    "[ble-gatt][android] notification queue full for {address}, dropping \
+                     payload; any message it belonged to will time out"
+                );
+            }
         }
     }
 }

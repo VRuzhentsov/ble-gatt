@@ -52,11 +52,26 @@ pub struct MockNetwork {
     /// learns that its peer vanished. Mirrors how the real backends behave:
     /// `events()` is this backend's view, not a global feed.
     event_senders: Mutex<HashMap<PeerAddress, broadcast::Sender<GattEvent>>>,
+    /// Armed by `arm_scan_failure`, consumed by the next `scan`. Exists so
+    /// the asynchronous scan-failure path — the one that makes "Bluetooth is
+    /// off" distinguishable from "no peers nearby" — is reachable in tests
+    /// without a radio.
+    armed_scan_failure: Mutex<Option<String>>,
 }
 
 impl MockNetwork {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Make the next `scan` on any backend in this network end with an
+    /// error item, the way Android's `onScanFailed` does.
+    pub fn arm_scan_failure(&self, message: impl Into<String>) {
+        *self.armed_scan_failure.lock().unwrap() = Some(message.into());
+    }
+
+    fn take_armed_scan_failure(&self) -> Option<String> {
+        self.armed_scan_failure.lock().unwrap().take()
     }
 
     fn emit(&self, to: &PeerAddress, event: GattEvent) {
@@ -135,7 +150,7 @@ impl Backend for MockBackend {
         self.capabilities
     }
 
-    async fn scan(&self, service: ServiceUuid) -> Result<BoxStream<DiscoveredPeer>> {
+    async fn scan(&self, service: ServiceUuid) -> Result<BoxStream<Result<DiscoveredPeer>>> {
         let peripherals = self.network.peripherals.lock().unwrap();
         let matches: Vec<DiscoveredPeer> = peripherals
             .iter()
@@ -153,7 +168,17 @@ impl Backend for MockBackend {
             })
             .collect();
         drop(peripherals);
-        Ok(Box::pin(tokio_stream::iter(matches)))
+        // Mirrors the real backends' asynchronous-failure contract: an
+        // armed failure is delivered as an error *item*, after any peers
+        // already matched, rather than as an error from `scan` itself.
+        if let Some(message) = self.network.take_armed_scan_failure() {
+            let items = matches
+                .into_iter()
+                .map(Ok)
+                .chain(std::iter::once(Err(BleError::Gatt(message))));
+            return Ok(Box::pin(tokio_stream::iter(items)));
+        }
+        Ok(Box::pin(tokio_stream::iter(matches.into_iter().map(Ok))))
     }
 
     async fn connect(&self, peer: &PeerAddress) -> Result<Box<dyn GattConnection>> {

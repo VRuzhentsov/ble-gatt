@@ -13,7 +13,7 @@
 //! handshake over the link, not by this event), revisit if a consumer needs
 //! precise link-level connect/disconnect timing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -45,6 +45,10 @@ pub struct LinuxBackend {
     _session: Session,
     adapter: Adapter,
     values: Arc<StdMutex<HashMap<CharacteristicUuid, Vec<u8>>>>,
+    /// Centrals currently being watched for a peripheral-role disconnect.
+    /// Doubles as a spawn guard: writes are frequent, and a watcher per
+    /// write would spawn an unbounded number of tasks per peer.
+    served_peers: Arc<StdMutex<HashSet<PeerAddress>>>,
     notifiers: Arc<AsyncMutex<HashMap<CharacteristicUuid, Vec<CharacteristicNotifier>>>>,
     events_tx: broadcast::Sender<GattEvent>,
     app_handle: AsyncMutex<Option<ApplicationHandle>>,
@@ -75,12 +79,49 @@ impl LinuxBackend {
             _session: session,
             adapter,
             values: Arc::new(StdMutex::new(HashMap::new())),
+            served_peers: Arc::new(StdMutex::new(HashSet::new())),
             notifiers: Arc::new(AsyncMutex::new(HashMap::new())),
             events_tx,
             app_handle: AsyncMutex::new(None),
             adv_handle: AsyncMutex::new(None),
         })
     }
+}
+
+/// Emit `Disconnected { local_role: Peripheral }` once `address` drops its
+/// connection, then forget it so a later reconnect re-arms a fresh watcher.
+///
+/// Separate from the central-role watcher in `connect` because the two carry
+/// different roles and different cleanup: `datagram::serve` filters strictly
+/// on `local_role`, so emitting the central variant here would be silently
+/// ignored.
+fn spawn_peripheral_disconnect_watch(
+    adapter: Adapter, address: bluer::Address, peer: PeerAddress,
+    events_tx: broadcast::Sender<GattEvent>, served_peers: Arc<StdMutex<HashSet<PeerAddress>>>,
+) {
+    tokio::spawn(async move {
+        // Any exit path must clear the guard, or a peer that failed to be
+        // watched once could never be watched again.
+        let _ = async {
+            let device = adapter.device(address).ok()?;
+            let mut changes = device.events().await.ok()?;
+            while let Some(event) = changes.next().await {
+                if matches!(
+                    event,
+                    bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::Connected(false))
+                ) {
+                    let _ = events_tx.send(GattEvent::Disconnected {
+                        peer: peer.clone(),
+                        local_role: Role::Peripheral,
+                    });
+                    break;
+                }
+            }
+            Some(())
+        }
+        .await;
+        served_peers.lock().unwrap().remove(&peer);
+    });
 }
 
 #[async_trait]
@@ -99,7 +140,7 @@ impl Backend for LinuxBackend {
         }
     }
 
-    async fn scan(&self, service: ServiceUuid) -> Result<BoxStream<DiscoveredPeer>> {
+    async fn scan(&self, service: ServiceUuid) -> Result<BoxStream<Result<DiscoveredPeer>>> {
         let adapter = self.adapter.clone();
         let events = adapter
             .discover_devices()
@@ -137,14 +178,14 @@ impl Backend for LinuxBackend {
                     .map(|(uuid, data)| (ServiceUuid(uuid), data))
                     .collect();
                 let rssi = device.rssi().await.ok().flatten();
-                Some(DiscoveredPeer {
+                Some(Ok(DiscoveredPeer {
                     address: PeerAddress(address.to_string()),
                     name,
                     services: uuids.into_iter().map(ServiceUuid).collect(),
                     manufacturer_data,
                     service_data,
                     rssi,
-                })
+                }))
             }
         });
         Ok(Box::pin(discovered))
@@ -203,6 +244,8 @@ impl Backend for LinuxBackend {
 
     async fn advertise(&self, service: GattServiceSpec) -> Result<()> {
         let values = self.values.clone();
+        let served_peers = self.served_peers.clone();
+        let adapter = self.adapter.clone();
         let notifiers = self.notifiers.clone();
         let events_tx = self.events_tx.clone();
 
@@ -229,19 +272,48 @@ impl Backend for LinuxBackend {
             let write = spec.writable.then(|| {
                 let values = values.clone();
                 let events_tx = events_tx.clone();
+                let served_peers = served_peers.clone();
+                let adapter = adapter.clone();
                 CharacteristicWrite {
                     write: true,
                     write_without_response: true,
                     method: CharacteristicWriteMethod::Fun(Box::new(move |value, req| {
                         let values = values.clone();
                         let events_tx = events_tx.clone();
-                        let peer = PeerAddress(req.device_address.to_string());
+                        let served_peers = served_peers.clone();
+                        let adapter = adapter.clone();
+                        let address = req.device_address;
+                        let peer = PeerAddress(address.to_string());
                         Box::pin(async move {
                             values.lock().unwrap().insert(uuid, value.clone());
                             let _ = events_tx.send(GattEvent::Connected {
                                 peer: peer.clone(),
                                 local_role: Role::Peripheral,
                             });
+                            // BlueZ gives a GATT *server* no connection
+                            // callback at all — the write itself is the only
+                            // signal that a central is present. So the first
+                            // write from a peer arms the same Connected-
+                            // property watcher the central role uses.
+                            //
+                            // Without this there is no peripheral-role
+                            // disconnect producer on Linux, and the stale
+                            // entry in `datagram::serve`'s single-central map
+                            // is never cleared — permanently refusing every
+                            // reconnect after the first central leaves.
+                            let newly_served = served_peers
+                                .lock()
+                                .unwrap()
+                                .insert(peer.clone());
+                            if newly_served {
+                                spawn_peripheral_disconnect_watch(
+                                    adapter,
+                                    address,
+                                    peer.clone(),
+                                    events_tx.clone(),
+                                    served_peers,
+                                );
+                            }
                             let _ = events_tx.send(GattEvent::CharacteristicWritten {
                                 peer,
                                 characteristic: uuid,

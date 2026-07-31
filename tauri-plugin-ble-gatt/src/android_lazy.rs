@@ -110,7 +110,7 @@ impl Backend for LazyAndroidBackend {
         }
     }
 
-    async fn scan(&self, service: ServiceUuid) -> Result<BoxStream<DiscoveredPeer>> {
+    async fn scan(&self, service: ServiceUuid) -> Result<BoxStream<Result<DiscoveredPeer>>> {
         self.inner().await?.scan(service).await
     }
 

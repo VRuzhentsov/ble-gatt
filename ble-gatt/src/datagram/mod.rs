@@ -50,7 +50,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, Mutex};
-use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
 use crate::backend::{Backend, BoxStream, GattConnection};
@@ -72,6 +72,12 @@ pub const DEFAULT_INBOUND_QUEUE_DEPTH: usize = 32;
 /// Raw fragments buffered per peer. Sized to comfortably hold one
 /// maximum-fragment-count message in flight without being a memory lever.
 pub const DEFAULT_FRAGMENT_QUEUE_DEPTH: usize = 256;
+
+/// Default [`DatagramConfig::accept_queue_depth`]. Small on purpose: the
+/// single-central rule means at most one channel is usefully live at a time,
+/// so anything beyond a short burst allowance is a caller that has stopped
+/// accepting.
+pub const DEFAULT_ACCEPT_QUEUE_DEPTH: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct DatagramConfig {
@@ -95,6 +101,12 @@ pub struct DatagramConfig {
     /// blocks on a full completed queue it stops draining fragments, and an
     /// unbounded fragment queue then grows without limit instead.
     pub fragment_queue_depth: usize,
+    /// Accepted-but-not-yet-taken peripheral channels buffered by [`serve`]
+    /// before further centrals are refused. Each queued channel pins a
+    /// backend `Arc`, its reassembly buffers and a live task, so an
+    /// unbounded queue lets a peer that connects and disconnects in a loop
+    /// grow the process without limit while the caller is slow to accept.
+    pub accept_queue_depth: usize,
 }
 
 impl DatagramConfig {
@@ -108,6 +120,7 @@ impl DatagramConfig {
             write_type: WriteType::WithResponse,
             inbound_queue_depth: DEFAULT_INBOUND_QUEUE_DEPTH,
             fragment_queue_depth: DEFAULT_FRAGMENT_QUEUE_DEPTH,
+            accept_queue_depth: DEFAULT_ACCEPT_QUEUE_DEPTH,
         }
     }
 
@@ -124,6 +137,11 @@ impl DatagramConfig {
         if self.fragment_queue_depth == 0 {
             return Err(BleError::Gatt(
                 "fragment_queue_depth must be at least 1".to_string(),
+            ));
+        }
+        if self.accept_queue_depth == 0 {
+            return Err(BleError::Gatt(
+                "accept_queue_depth must be at least 1".to_string(),
             ));
         }
         Ok(())
@@ -446,7 +464,7 @@ pub async fn serve(
     config.validate()?;
     backend.advertise(config.service_spec()).await?;
 
-    let (channels_tx, channels_rx) = mpsc::unbounded_channel();
+    let (channels_tx, channels_rx) = mpsc::channel(config.accept_queue_depth);
     let mut events = backend.events();
     let config = config.clone();
     // The peripheral has no `GattConnection` to ask for a negotiated MTU, so
@@ -501,7 +519,6 @@ pub async fn serve(
                         config.limits(),
                         msg_tx,
                     );
-                    inbound.insert(peer.clone(), frag_tx);
 
                     let channel = DatagramChannel {
                         peer: peer.clone(),
@@ -518,8 +535,24 @@ pub async fn serve(
                         fragment_budget: peripheral_budget,
                         tasks: vec![reassembly],
                     };
-                    if channels_tx.send(channel).is_err() {
-                        return; // consumer stopped accepting channels
+                    // try_send, not send: awaiting here would stall the one
+                    // loop that also delivers writes and disconnects, so a
+                    // caller slow to accept would freeze the peers it has
+                    // already accepted. `inbound` is only populated once the
+                    // channel is safely handed over — a refused central must
+                    // not occupy the single-central slot.
+                    match channels_tx.try_send(channel) {
+                        Ok(()) => {
+                            inbound.insert(peer.clone(), frag_tx);
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            eprintln!(
+                                "[ble-gatt][datagram] accept queue full, refusing central {} \
+                                 — the caller is not draining `serve`'s stream",
+                                peer.0
+                            );
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => return,
                     }
                 }
                 GattEvent::CharacteristicWritten {
@@ -560,5 +593,5 @@ pub async fn serve(
         }
     });
 
-    Ok(Box::pin(UnboundedReceiverStream::new(channels_rx)))
+    Ok(Box::pin(ReceiverStream::new(channels_rx)))
 }

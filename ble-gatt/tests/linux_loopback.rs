@@ -6,11 +6,10 @@
 //! honestly split into two tiers rather than pretending a single-adapter
 //! machine can prove peer-to-peer connectivity:
 //!
-//! - `peripheral_advertise_and_serve_smoke_test` — real, runs on this
-//!   machine's one adapter (`88:D8:2E:BA:72:27` at plan time). Proves the
-//!   `Application`/`Advertisement` D-Bus registration this crate builds is
-//!   accepted by the real `org.bluez` daemon, not just internally
-//!   consistent Rust.
+//! - `peripheral_advertise_and_serve_smoke_test` — real, runs against the
+//!   machine's default adapter. Proves the `Application`/`Advertisement`
+//!   D-Bus registration this crate builds is accepted by the real
+//!   `org.bluez` daemon, not just internally consistent Rust.
 //! - `two_adapter_central_to_peripheral_round_trip` — the true loopback the
 //!   plan calls for (one `LinuxBackend` as central, a second as
 //!   peripheral, over real BLE). `#[ignore]`d with a reason explaining the
@@ -18,6 +17,10 @@
 //!   or a second Linux machine is required; this is the documented,
 //!   non-blocking follow-up the plan already anticipated for real-hardware
 //!   verification.
+
+// `backend::linux` only exists on Linux, so without this gate the whole
+// crate fails to build under `--all-targets` for the Android targets.
+#![cfg(target_os = "linux")]
 
 use std::time::Duration;
 

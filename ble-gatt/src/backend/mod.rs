@@ -88,7 +88,15 @@ pub trait Backend: Send + Sync {
     /// Stream of peers advertising `service`, until the returned stream is
     /// dropped. Discovery is untrusted metadata (mirrors Fini's Sim/TcpWs
     /// discovery contract) — no authentication has happened yet.
-    async fn scan(&self, service: ServiceUuid) -> Result<BoxStream<DiscoveredPeer>>;
+    ///
+    /// Items are `Result` because scanning fails *asynchronously*: the
+    /// initial call only reports that the scan was accepted, and the reason
+    /// it later stopped (Android's `onScanFailed`, an adapter powered off
+    /// mid-scan) arrives on the stream. Without this, a failed scan is
+    /// indistinguishable from an empty one — the caller silently reports
+    /// "no peers found" when the real answer is "Bluetooth is off".
+    /// An error item is terminal for that scan.
+    async fn scan(&self, service: ServiceUuid) -> Result<BoxStream<Result<DiscoveredPeer>>>;
 
     async fn connect(&self, peer: &PeerAddress) -> Result<Box<dyn GattConnection>>;
 

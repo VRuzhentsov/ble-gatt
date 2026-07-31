@@ -218,7 +218,13 @@ pub async fn ble_scan_once(
         tokio::select! {
             _ = &mut deadline => break,
             item = stream.next() => match item {
-                Some(peer) => found.push(DiscoveredPeerDto {
+                // A scan failure arriving mid-stream is returned as an error
+                // even though some peers may already have been collected:
+                // reporting a truncated list as success would tell the user
+                // "these are the devices nearby" when the scan was actually
+                // cut short by a powered-off adapter or a denied permission.
+                Some(Err(err)) => return Err(err.to_string()),
+                Some(Ok(peer)) => found.push(DiscoveredPeerDto {
                     address: peer.address.0,
                     name: peer.name,
                     manufacturer_data: peer
