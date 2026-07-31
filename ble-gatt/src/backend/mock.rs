@@ -30,13 +30,16 @@ const EVENT_CHANNEL_CAPACITY: usize = 64;
 /// accidentally passing because everything fit in one write.
 const MOCK_ATT_MTU: u16 = 247;
 
+/// Live notify sessions for one characteristic, keyed by subscriber.
+type NotifySessions = HashMap<PeerAddress, mpsc::UnboundedSender<Result<Vec<u8>>>>;
+
 struct PeripheralState {
     service: GattServiceSpec,
     values: HashMap<CharacteristicUuid, Vec<u8>>,
     /// One sender per *subscriber*, not one per characteristic. Modelling
     /// notify as a single broadcast made the cross-peer leak that
     /// `disconnect_peer` prevents impossible to express, let alone test.
-    subscribers: HashMap<CharacteristicUuid, HashMap<PeerAddress, mpsc::UnboundedSender<Vec<u8>>>>,
+    subscribers: HashMap<CharacteristicUuid, NotifySessions>,
     manufacturer_data: BTreeMap<u16, Vec<u8>>,
     service_data: BTreeMap<ServiceUuid, Vec<u8>>,
     rssi: Option<i16>,
@@ -64,6 +67,27 @@ pub struct MockNetwork {
 impl MockNetwork {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// The backend reports that it dropped notifications for `central` —
+    /// Android's bounded notify queue overflowing, which the peer was
+    /// already told had been delivered.
+    ///
+    /// Exists so the receiver-side consequence is testable without a radio:
+    /// the fragment that went missing may be the one a pending message
+    /// needed, in which case nothing further will ever arrive to wake a
+    /// receiver parked in `recv()`.
+    pub fn simulate_notification_gap(&self, peripheral: &PeerAddress, central: &PeerAddress) {
+        let peripherals = self.peripherals.lock().unwrap();
+        if let Some(state) = peripherals.get(peripheral) {
+            for peers in state.subscribers.values() {
+                if let Some(tx) = peers.get(central) {
+                    let _ = tx.send(Err(BleError::Gatt(
+                        "notification queue overflowed: payloads were dropped".to_string(),
+                    )));
+                }
+            }
+        }
     }
 
     /// A central drops its notify subscription without disconnecting.
@@ -327,7 +351,7 @@ impl Backend for MockBackend {
         // believes it refused. That is the whole hazard.
         let mut delivered = false;
         for tx in peers.values() {
-            if tx.send(value.clone()).is_ok() {
+            if tx.send(Ok(value.clone())).is_ok() {
                 delivered = true;
             }
         }
@@ -376,7 +400,7 @@ impl Backend for MockBackend {
         let tx = peers.get(peer).ok_or_else(|| {
             BleError::Gatt(format!("{} has no live notify session", peer.0))
         })?;
-        tx.send(value)
+        tx.send(Ok(value))
             .map_err(|_| BleError::Gatt(format!("{} has no live notify session", peer.0)))
     }
 
@@ -484,7 +508,7 @@ impl GattConnection for MockGattConnection {
                 local_role: Role::Peripheral,
             },
         );
-        Ok(Box::pin(UnboundedReceiverStream::new(rx).map(Ok)))
+        Ok(Box::pin(UnboundedReceiverStream::new(rx)))
     }
 
     async fn disconnect(&mut self) -> Result<()> {

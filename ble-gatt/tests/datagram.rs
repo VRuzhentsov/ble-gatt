@@ -632,3 +632,52 @@ async fn a_server_can_greet_the_moment_it_is_handed_a_channel() {
         .expect("no error");
     assert_eq!(received, b"hello-from-the-server");
 }
+
+#[tokio::test]
+async fn a_receiver_already_waiting_is_woken_when_inbound_data_is_lost() {
+    let config = config();
+    let network = MockNetwork::new();
+    let peripheral_addr = PeerAddress("peripheral-wake".to_string());
+    let central_addr = PeerAddress("central-wake".to_string());
+
+    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+        peripheral_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    ));
+    let central: Arc<MockBackend> = Arc::new(MockBackend::new(
+        central_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    ));
+
+    let mut incoming = datagram::serve(peripheral.clone(), &config)
+        .await
+        .expect("serve should start");
+    let mut client = datagram::connect(central.clone(), &peripheral_addr, &config)
+        .await
+        .expect("connect should succeed");
+    let _served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
+        .await
+        .expect("serve should yield a channel")
+        .expect("channel stream should not be closed");
+
+    // Park in `recv()` first. This is the case a bare flag cannot reach: the
+    // receiver is already blocked, and the dropped payload may be the
+    // fragment a pending message needed — so nothing further will ever
+    // arrive to wake it and make it re-check.
+    let receiver = tokio::spawn(async move {
+        matches!(client.recv().await, Some(Err(_)))
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The backend reports a gap: payloads it dropped after the peer had
+    // already been told they were sent.
+    network.simulate_notification_gap(&peripheral_addr, &central_addr);
+
+    let woken = tokio::time::timeout(Duration::from_secs(5), receiver)
+        .await
+        .expect("a parked receiver must be woken by a reported gap, not left hanging")
+        .expect("receiver task should not panic");
+    assert!(woken, "the wakeup must deliver the loss as an error, not close the channel");
+}

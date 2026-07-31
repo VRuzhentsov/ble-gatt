@@ -153,7 +153,12 @@ impl Inner {
         let mut connections = self.connections.lock().unwrap();
         if let Some(state) = connections.get_mut(address) {
             state.connected_tx = None;
-            if !state.live && state.disconnected_tx.is_none() && state.notify_tx.is_empty() {
+            // Also clear `live`: a callback that landed while the attempt was
+            // being abandoned would otherwise leave the address marked open
+            // with no Rust handle owning it, and every later connect refused
+            // as "already open".
+            state.live = false;
+            if state.disconnected_tx.is_none() && state.notify_tx.is_empty() {
                 connections.remove(address);
             }
         }
@@ -1355,7 +1360,16 @@ impl Drop for ConnectGuard {
         if !self.armed {
             return;
         }
-        self.inner.clear_pending_connect(&self.address);
+        // Close *before* releasing ownership, not after.
+        //
+        // Both this map and the Kotlin bridge key connections by address
+        // alone, so the ordering is what makes the cleanup unambiguous: while
+        // the pending slot is still set, `connect` rejects any retry for this
+        // address, so no replacement GATT can exist yet and
+        // `closeConnection` can only be closing the attempt this guard owns.
+        // Clearing first opened a window where a retry installs its own GATT
+        // under the same key and this close destroys *that* one instead,
+        // leaving the retry failed or hung.
         if let Ok(mut env) = self.inner.env() {
             if let Ok(address) = env.new_string(&self.address) {
                 let _ = self.inner.call_void(
@@ -1366,6 +1380,7 @@ impl Drop for ConnectGuard {
                 );
             }
         }
+        self.inner.clear_pending_connect(&self.address);
     }
 }
 

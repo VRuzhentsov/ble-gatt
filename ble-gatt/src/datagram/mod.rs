@@ -48,6 +48,39 @@ pub mod reassembly;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+/// A reported gap in the inbound stream, plus the means to wake a receiver
+/// that is already blocked.
+///
+/// The flag alone is not enough: `recv()` spends most of its life parked on
+/// the message queue, and setting a flag it will only look at on its *next*
+/// call is invisible to it. When the dropped data was a fragment some
+/// pending message needed, that next call never comes — the message can no
+/// longer complete, so nothing else will ever arrive to wake it. The
+/// `Notify` is what turns the flag into something a parked receiver sees.
+#[derive(Default)]
+pub(crate) struct OverflowSignal {
+    flagged: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl OverflowSignal {
+    fn raise(&self) {
+        self.flagged.store(true, Ordering::SeqCst);
+        // notify_one, not notify_waiters: `notify_waiters` only wakes
+        // receivers already registered, so a gap raised between `recv`
+        // checking the flag and its `notified()` future being polled would
+        // be lost — and the receiver would park forever on data that can no
+        // longer arrive. `notify_one` stores a permit, so that ordering
+        // still wakes it. A single channel has one receiver, so waking one
+        // is waking all of them.
+        self.notify.notify_one();
+    }
+
+    fn take(&self) -> bool {
+        self.flagged.swap(false, Ordering::SeqCst)
+    }
+}
 use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, Mutex};
@@ -241,13 +274,13 @@ pub struct DatagramChannel {
     characteristic: CharacteristicUuid,
     sink: Mutex<Sink>,
     inbound: ReceiverStream<Result<Vec<u8>>>,
-    /// Set when inbound data was dropped for this channel.
+    /// Raised when inbound data was dropped for this channel.
     ///
-    /// A dedicated flag rather than an error pushed onto the message queue:
+    /// Out-of-band rather than an error pushed onto the message queue:
     /// overflow happens precisely when that queue is full, so the report
     /// would be the first thing discarded — the failure would silence its
     /// own alarm.
-    overflow: Arc<AtomicBool>,
+    overflow: Arc<OverflowSignal>,
     next_msg_id: u16,
     max_message_len: usize,
     /// Fixed at construction from the negotiated MTU. BLE does not
@@ -337,18 +370,28 @@ impl DatagramChannel {
     /// `close()`. Without that, a caller mid-conversation would block
     /// forever on a dead link.
     pub async fn recv(&mut self) -> Option<Result<Vec<u8>>> {
-        // Checked ahead of the queue so the report is prompt. It is
-        // deliberately out of order with respect to messages still buffered:
-        // "you have lost data" is more useful now than after draining
-        // everything that survived.
-        if self.overflow.swap(false, Ordering::SeqCst) {
-            return Some(Err(BleError::Gatt(format!(
-                "inbound overflow from {}: fragments were dropped and at least one \
-                 message is lost",
-                self.peer.0
-            ))));
+        loop {
+            // Checked ahead of the queue so the report is prompt. It is
+            // deliberately out of order with respect to messages still
+            // buffered: "you have lost data" is more useful now than after
+            // draining everything that survived.
+            if self.overflow.take() {
+                return Some(Err(BleError::Gatt(format!(
+                    "inbound overflow from {}: fragments were dropped and at least one \
+                     message is lost",
+                    self.peer.0
+                ))));
+            }
+            // Waiting on both is what makes a gap reachable by a receiver
+            // that is *already* parked here. Registering the notification
+            // before polling the queue means a gap raised in between is not
+            // lost — it fires this arm immediately and the loop re-checks.
+            let notified = self.overflow.notify.notified();
+            tokio::select! {
+                item = self.inbound.next() => return item,
+                _ = notified => continue,
+            }
         }
-        self.inbound.next().await
     }
 
     pub async fn close(&mut self) -> Result<()> {
@@ -389,7 +432,7 @@ async fn disconnect_refused(backend: &dyn Backend, peer: &PeerAddress) {
 /// and `recv()` hung forever on a dead link.
 fn spawn_reassembly<S>(
     mut fragments: S, limits: ReassemblyLimits, out: mpsc::Sender<Result<Vec<u8>>>,
-    overflow: Arc<AtomicBool>,
+    overflow: Arc<OverflowSignal>,
 ) -> tokio::task::JoinHandle<()>
 where
     S: tokio_stream::Stream<Item = Result<Vec<u8>>> + Send + Unpin + 'static,
@@ -418,7 +461,7 @@ where
                     let raw = match raw {
                         Ok(raw) => raw,
                         Err(_) => {
-                            overflow.store(true, Ordering::SeqCst);
+                            overflow.raise();
                             reassembler = Reassembler::new(limits);
                             continue;
                         }
@@ -484,7 +527,7 @@ pub async fn connect(
         })?;
 
     let (tx, rx) = mpsc::channel(config.inbound_queue_depth);
-    let overflow = Arc::new(AtomicBool::new(false));
+    let overflow = Arc::new(OverflowSignal::default());
     let reassembly =
         spawn_reassembly(notifications, config.limits(), tx, overflow.clone());
     // The watcher gets an *AbortHandle*, not the JoinHandle. Handing over
@@ -593,7 +636,7 @@ pub async fn serve(
     #[allow(clippy::type_complexity)]
     let mut inbound: HashMap<
         PeerAddress,
-        (mpsc::Sender<Vec<u8>>, Arc<AtomicBool>, Arc<AtomicBool>),
+        (mpsc::Sender<Vec<u8>>, Arc<AtomicBool>, Arc<OverflowSignal>),
     > = HashMap::new();
 
         // Dropping the accept stream means "no more *new* peers" — it does
@@ -676,7 +719,7 @@ pub async fn serve(
                     let active = Arc::new(AtomicBool::new(true));
                     let (frag_tx, frag_rx) = mpsc::channel(config.fragment_queue_depth);
                     let (msg_tx, msg_rx) = mpsc::channel(config.inbound_queue_depth);
-                    let overflow = Arc::new(AtomicBool::new(false));
+                    let overflow = Arc::new(OverflowSignal::default());
                     let reassembly = spawn_reassembly(
                         ReceiverStream::new(frag_rx).map(Ok),
                         config.limits(),
@@ -773,7 +816,7 @@ pub async fn serve(
                                     // than letting the message quietly time
                                     // out. It is the only endpoint that can
                                     // still be told.
-                                    overflow.store(true, Ordering::SeqCst);
+                                    overflow.raise();
                                     eprintln!(
                                         "[ble-gatt][datagram] fragment queue full for {} after \
                                          backpressure; dropping fragment and reporting loss",
