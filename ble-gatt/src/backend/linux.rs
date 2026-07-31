@@ -28,6 +28,7 @@ use bluer::gatt::local::{ApplicationHandle, ReqResult};
 use bluer::{Adapter, AdapterEvent, Session};
 use futures::stream::StreamExt;
 use tokio::sync::{broadcast, Mutex as AsyncMutex};
+use tokio::task::JoinSet;
 
 use crate::backend::{Backend, BoxStream, GattConnection};
 use crate::error::{BleError, Result};
@@ -113,39 +114,112 @@ async fn watch_inbound_connections(
     adapter: Adapter, events_tx: broadcast::Sender<GattEvent>,
     served_peers: Arc<StdMutex<HashSet<PeerAddress>>>, dialed: Arc<StdMutex<HashSet<PeerAddress>>>,
 ) {
+    // Children live in a JoinSet owned by this task, so aborting it (from
+    // `stop_advertising`) drops the set and aborts every per-device watcher
+    // with it — no leaked tasks per advertise cycle.
+    let mut watchers = JoinSet::new();
+    let mut watching: HashSet<PeerAddress> = HashSet::new();
+
+    // Subscribe *before* enumerating, so a device appearing between the two
+    // is caught by the stream rather than falling into the gap.
     let Ok(mut events) = adapter.events().await else {
         return;
     };
+    for address in adapter.device_addresses().await.unwrap_or_default() {
+        spawn_connect_watch(
+            &mut watchers, &mut watching, &adapter, address, &events_tx, &served_peers, &dialed,
+        );
+    }
+
     while let Some(event) = events.next().await {
         let AdapterEvent::DeviceAdded(address) = event else {
             continue;
         };
-        let peer = PeerAddress(address.to_string());
-        if dialed.lock().unwrap().contains(&peer) {
-            continue;
-        }
-        let Ok(device) = adapter.device(address) else {
-            continue;
-        };
-        if !device.is_connected().await.unwrap_or(false) {
-            continue;
-        }
-        let newly_served = served_peers.lock().unwrap().insert(peer.clone());
-        if !newly_served {
-            continue;
-        }
-        let _ = events_tx.send(GattEvent::Connected {
-            peer: peer.clone(),
-            local_role: Role::Peripheral,
-        });
-        spawn_peripheral_disconnect_watch(
-            adapter.clone(),
-            address,
-            peer,
-            events_tx.clone(),
-            served_peers.clone(),
+        spawn_connect_watch(
+            &mut watchers, &mut watching, &adapter, address, &events_tx, &served_peers, &dialed,
         );
     }
+}
+
+/// Watch one device's `Connected` property for an inbound connection.
+///
+/// Per-device rather than adapter-wide because `AdapterEvent::DeviceAdded`
+/// fires when BlueZ *creates* the device object, not when it connects. A
+/// central this backend has already scanned therefore has a device object
+/// already, and connecting produces no `DeviceAdded` at all — which left
+/// `serve()` yielding nothing until that central wrote, the exact deadlock
+/// the adapter-only watcher was meant to fix.
+#[allow(clippy::too_many_arguments)]
+fn spawn_connect_watch(
+    watchers: &mut JoinSet<()>, watching: &mut HashSet<PeerAddress>, adapter: &Adapter,
+    address: bluer::Address, events_tx: &broadcast::Sender<GattEvent>,
+    served_peers: &Arc<StdMutex<HashSet<PeerAddress>>>,
+    dialed: &Arc<StdMutex<HashSet<PeerAddress>>>,
+) {
+    let peer = PeerAddress(address.to_string());
+    if !watching.insert(peer.clone()) {
+        return;
+    }
+    let adapter = adapter.clone();
+    let events_tx = events_tx.clone();
+    let served_peers = served_peers.clone();
+    let dialed = dialed.clone();
+    watchers.spawn(async move {
+        let Ok(device) = adapter.device(address) else {
+            return;
+        };
+        let Ok(mut changes) = device.events().await else {
+            return;
+        };
+        // Check the current value after subscribing: a device already
+        // connected when this watcher started emits no property change, so
+        // polling once is the only way to see it.
+        let mut connected = device.is_connected().await.unwrap_or(false);
+        if connected {
+            announce_inbound(&adapter, address, &peer, &events_tx, &served_peers, &dialed);
+        }
+        // Edge-triggered. Announcing on every event while `connected` held
+        // would re-announce on unrelated property changes, and — once the
+        // disconnect watcher had cleared `served_peers` — would resurrect a
+        // peer that had already left.
+        while let Some(event) = changes.next().await {
+            let bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::Connected(value)) = event
+            else {
+                continue;
+            };
+            if value && !connected {
+                announce_inbound(&adapter, address, &peer, &events_tx, &served_peers, &dialed);
+            }
+            connected = value;
+        }
+    });
+}
+
+/// Emit `Connected { local_role: Peripheral }` for a central that connected
+/// to our server, unless it is one of our own outbound dials or is already
+/// being served.
+fn announce_inbound(
+    adapter: &Adapter, address: bluer::Address, peer: &PeerAddress,
+    events_tx: &broadcast::Sender<GattEvent>, served_peers: &Arc<StdMutex<HashSet<PeerAddress>>>,
+    dialed: &Arc<StdMutex<HashSet<PeerAddress>>>,
+) {
+    if dialed.lock().unwrap().contains(peer) {
+        return;
+    }
+    if !served_peers.lock().unwrap().insert(peer.clone()) {
+        return;
+    }
+    let _ = events_tx.send(GattEvent::Connected {
+        peer: peer.clone(),
+        local_role: Role::Peripheral,
+    });
+    spawn_peripheral_disconnect_watch(
+        adapter.clone(),
+        address,
+        peer.clone(),
+        events_tx.clone(),
+        served_peers.clone(),
+    );
 }
 
 /// Emit `Disconnected { local_role: Peripheral }` once `address` drops its

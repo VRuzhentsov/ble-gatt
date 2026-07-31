@@ -163,9 +163,22 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     }
 
     fun stopScan() {
-        val scanner = adapter?.bluetoothLeScanner ?: return
-        scanCallback?.let { scanner.stopScan(it) }
+        // Clear ownership unconditionally. Returning early when the scanner
+        // is gone (Bluetooth switched off before the scan stream was
+        // dropped) left `scanCallback` set forever, and every later
+        // `startScan` then rejected the scan as already active — scanning
+        // stayed dead for the lifetime of this bridge even after Bluetooth
+        // came back.
+        val scanner = adapter?.bluetoothLeScanner
+        val callback = scanCallback
         scanCallback = null
+        if (scanner != null && callback != null) {
+            try {
+                scanner.stopScan(callback)
+            } catch (e: Exception) {
+                Log.w(TAG, "stopScan: error stopping scan", e)
+            }
+        }
     }
 
     fun connect(address: String) {
@@ -367,7 +380,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             // silently left Rust's oneshot pending forever, which is worse
             // than the unsupported error the backend contract asks for.
             Log.w(TAG, "startAdvertising: no BLE advertiser available")
-            onAdvertiseResult(nativeHandle, false, ADVERTISE_ERROR_UNAVAILABLE)
+            failAdvertise(ADVERTISE_ERROR_UNAVAILABLE)
             return
         }
 
@@ -380,7 +393,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             override fun onServiceAdded(status: Int, service: BluetoothGattService) {
                 if (status != BluetoothGatt.GATT_SUCCESS) {
                     Log.e(TAG, "onServiceAdded failed: status=$status")
-                    onAdvertiseResult(nativeHandle, false, status)
+                    failAdvertise(status)
                     return
                 }
                 Log.d(TAG, "onServiceAdded ok, starting advertisement")
@@ -485,7 +498,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         }
         if (!server.addService(service)) {
             Log.e(TAG, "addService was rejected outright for $serviceUuid")
-            onAdvertiseResult(nativeHandle, false, ADVERTISE_ERROR_SERVICE_REJECTED)
+            failAdvertise(ADVERTISE_ERROR_SERVICE_REJECTED)
             return
         }
         // Advertising now starts from onServiceAdded, once registration has
@@ -513,7 +526,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 // back is what stops Rust claiming the service is reachable
                 // when no advertisement exists.
                 Log.e(TAG, "advertise onStartFailure: errorCode=$errorCode serviceUuid=$serviceUuid")
-                onAdvertiseResult(nativeHandle, false, errorCode)
+                failAdvertise(errorCode)
             }
         }
         advertiseCallback = callback
@@ -548,6 +561,19 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         gattServer = null
         serverCharacteristics.clear()
         subscribedDevices.clear()
+    }
+
+    /// Report an advertise failure *and* release everything the attempt
+    /// opened.
+    ///
+    /// Reporting alone left `gattServer` and its registered service live. A
+    /// retry then overwrote the sole `gattServer` reference, so the first
+    /// server could never be closed by `closeAll()` — leaking the Bluetooth
+    /// resource and, worse, leaving its callback holding `nativeHandle`
+    /// after Rust had freed that state.
+    private fun failAdvertise(errorCode: Int) {
+        stopAdvertising()
+        onAdvertiseResult(nativeHandle, false, errorCode)
     }
 
     /// Returns false when the payload could not be delivered to anyone —

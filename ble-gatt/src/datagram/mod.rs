@@ -296,6 +296,22 @@ impl DatagramChannel {
     }
 }
 
+/// Exclude a central this server has refused.
+///
+/// Every refusal path must go through this. Refusing to allocate state does
+/// not stop the peer receiving traffic: it is still subscribed, and
+/// `Backend::notify` is a broadcast that cannot be addressed to one peer on
+/// BlueZ. Disconnecting is the only portable exclusion.
+async fn disconnect_refused(backend: &dyn Backend, peer: &PeerAddress) {
+    if let Err(err) = backend.disconnect_peer(peer).await {
+        eprintln!(
+            "[ble-gatt][datagram] could not disconnect refused central {}: {err} \
+             — it may still receive broadcast notifications",
+            peer.0
+        );
+    }
+}
+
 /// Feed inbound fragments through a reassembler and forward whole messages.
 /// Shared by both roles — the only difference is where fragments come from.
 ///
@@ -517,13 +533,7 @@ pub async fn serve(
                         // peer's fragments, interleaved into its own stream.
                         // Disconnecting is the only portable exclusion: BlueZ
                         // cannot address a notification to one peer at all.
-                        if let Err(err) = backend.disconnect_peer(&peer).await {
-                            eprintln!(
-                                "[ble-gatt][datagram] could not disconnect refused central \
-                                 {}: {err} — it may still receive broadcast notifications",
-                                peer.0
-                            );
-                        }
+                        disconnect_refused(backend.as_ref(), &peer).await;
                         continue;
                     }
                     let (frag_tx, frag_rx) = mpsc::channel(config.fragment_queue_depth);
@@ -565,6 +575,13 @@ pub async fn serve(
                                  — the caller is not draining `serve`'s stream",
                                 peer.0
                             );
+                            // Same exclusion as the already-serving branch,
+                            // and for the same reason: leaving this peer
+                            // connected leaves it *subscribed*, so once the
+                            // queue drains and another central is accepted,
+                            // every broadcast notification reaches this one
+                            // too.
+                            disconnect_refused(backend.as_ref(), &peer).await;
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => return,
                     }
