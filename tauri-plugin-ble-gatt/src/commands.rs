@@ -4,16 +4,17 @@
 //! deferred until Fini's Stage 3 integration defines the exact shape it
 //! needs, per the plan's staged-delivery decision.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use ble_gatt::{
-    Backend, CharacteristicUuid, GattCharacteristicSpec, GattConnection, GattServiceSpec, PeerAddress,
-    ServiceUuid,
+    Backend, CharacteristicUuid, GattCharacteristicSpec, GattConnection, GattEvent, GattServiceSpec,
+    PeerAddress, ServiceUuid, WriteType,
 };
 use serde::{Deserialize, Serialize};
+use tauri::ipc::Channel;
 use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
@@ -48,6 +49,13 @@ pub struct CapabilitiesResponse {
 pub struct DiscoveredPeerDto {
     pub address: String,
     pub name: Option<String>,
+    /// Manufacturer-specific advertisement data, keyed by company ID as a
+    /// decimal string — JSON object keys must be strings, and JS would
+    /// silently stringify a numeric key anyway.
+    pub manufacturer_data: BTreeMap<String, Vec<u8>>,
+    /// Service advertisement data, keyed by service UUID string.
+    pub service_data: BTreeMap<String, Vec<u8>>,
+    pub rssi: Option<i16>,
 }
 
 #[derive(Deserialize)]
@@ -57,6 +65,42 @@ pub struct CharacteristicSpecDto {
     pub writable: bool,
     pub notifiable: bool,
     pub initial_value: Vec<u8>,
+}
+
+/// Connection lifecycle as delivered to JS. Mirrors `ble_gatt::GattEvent`
+/// but flattened into a tagged shape that is natural to `switch` on from
+/// TypeScript.
+#[derive(Serialize, Clone)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum GattEventDto {
+    #[serde(rename_all = "camelCase")]
+    Connected { address: String },
+    #[serde(rename_all = "camelCase")]
+    Disconnected { address: String },
+    #[serde(rename_all = "camelCase")]
+    CharacteristicWritten {
+        address: String,
+        characteristic_uuid: String,
+        value: Vec<u8>,
+    },
+}
+
+impl From<GattEvent> for GattEventDto {
+    fn from(event: GattEvent) -> Self {
+        match event {
+            GattEvent::Connected { peer } => Self::Connected { address: peer.0 },
+            GattEvent::Disconnected { peer } => Self::Disconnected { address: peer.0 },
+            GattEvent::CharacteristicWritten {
+                peer,
+                characteristic,
+                value,
+            } => Self::CharacteristicWritten {
+                address: peer.0,
+                characteristic_uuid: characteristic.0.to_string(),
+                value,
+            },
+        }
+    }
 }
 
 #[tauri::command]
@@ -130,7 +174,21 @@ pub async fn ble_scan_once(
         tokio::select! {
             _ = &mut deadline => break,
             item = stream.next() => match item {
-                Some(peer) => found.push(DiscoveredPeerDto { address: peer.address.0, name: peer.name }),
+                Some(peer) => found.push(DiscoveredPeerDto {
+                    address: peer.address.0,
+                    name: peer.name,
+                    manufacturer_data: peer
+                        .manufacturer_data
+                        .into_iter()
+                        .map(|(id, value)| (id.to_string(), value))
+                        .collect(),
+                    service_data: peer
+                        .service_data
+                        .into_iter()
+                        .map(|(uuid, value)| (uuid.0.to_string(), value))
+                        .collect(),
+                    rssi: peer.rssi,
+                }),
                 None => break,
             }
         }
@@ -160,17 +218,75 @@ pub async fn ble_read(
     connection.read(CharacteristicUuid(uuid)).await.map_err(|err| err.to_string())
 }
 
+/// `without_response` opts into ATT Write Command: much faster for bulk
+/// transfer, but the peer silently drops what it can't keep up with. Absent
+/// or `false` means the acknowledged write, which is the safe default.
 #[tauri::command]
 pub async fn ble_write(
     state: tauri::State<'_, PluginState>, handle: u64, characteristic_uuid: String, value: Vec<u8>,
+    without_response: Option<bool>,
 ) -> Result<(), String> {
     let uuid = parse_uuid(&characteristic_uuid)?;
+    let write_type = if without_response.unwrap_or(false) {
+        WriteType::WithoutResponse
+    } else {
+        WriteType::WithResponse
+    };
     let mut connections = state.connections.lock().await;
     let connection = connections.get_mut(&handle).ok_or("unknown connection handle")?;
     connection
-        .write(CharacteristicUuid(uuid), value)
+        .write_with_type(CharacteristicUuid(uuid), value, write_type)
         .await
         .map_err(|err| err.to_string())
+}
+
+#[derive(Serialize)]
+pub struct ConnectionMtuResponse {
+    /// Negotiated ATT MTU for this connection.
+    pub att_mtu: u16,
+    /// Largest payload that fits in one write. Chunk bulk transfers against
+    /// this rather than a hardcoded constant — it is only known after
+    /// negotiation and differs per peer and platform.
+    pub max_write_len: usize,
+}
+
+#[tauri::command]
+pub async fn ble_connection_mtu(
+    state: tauri::State<'_, PluginState>, handle: u64,
+) -> Result<ConnectionMtuResponse, String> {
+    let connections = state.connections.lock().await;
+    let connection = connections.get(&handle).ok_or("unknown connection handle")?;
+    Ok(ConnectionMtuResponse {
+        att_mtu: connection.att_mtu(),
+        max_write_len: connection.max_write_len(),
+    })
+}
+
+/// Stream connection lifecycle events to the frontend over a `Channel`
+/// supplied by the caller.
+///
+/// A per-subscriber `Channel` rather than a global emitted event name: it
+/// scopes delivery to the caller that asked, needs no agreed-upon event
+/// string, and stops cleanly when the JS side drops it.
+///
+/// This is the only way the frontend learns about a peer disappearing
+/// without warning — every other command reports failures of operations you
+/// initiated, so a UI mid-transfer would otherwise just appear to stall.
+#[tauri::command]
+pub async fn ble_watch_events(
+    state: tauri::State<'_, PluginState>, on_event: Channel<GattEventDto>,
+) -> Result<(), String> {
+    let mut events = state.backend.events();
+    tokio::spawn(async move {
+        while let Some(event) = events.next().await {
+            // Send failure means the JS side dropped the channel; stop
+            // rather than spin forwarding into nothing.
+            if on_event.send(GattEventDto::from(event)).is_err() {
+                return;
+            }
+        }
+    });
+    Ok(())
 }
 
 #[tauri::command]

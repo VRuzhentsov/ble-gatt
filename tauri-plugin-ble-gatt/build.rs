@@ -8,6 +8,8 @@ const COMMANDS: &[&str] = &[
     "ble_read",
     "ble_write",
     "ble_disconnect",
+    "ble_connection_mtu",
+    "ble_watch_events",
 ];
 
 fn main() {

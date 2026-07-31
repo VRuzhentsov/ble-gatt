@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-ble-watch-events"
+description = "Enables the ble_watch_events command without any pre-configured scope."
+commands.allow = ["ble_watch_events"]
+
+[[permission]]
+identifier = "deny-ble-watch-events"
+description = "Denies the ble_watch_events command without any pre-configured scope."
+commands.deny = ["ble_watch_events"]

@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-ble-connection-mtu"
+description = "Enables the ble_connection_mtu command without any pre-configured scope."
+commands.allow = ["ble_connection_mtu"]
+
+[[permission]]
+identifier = "deny-ble-connection-mtu"
+description = "Denies the ble_connection_mtu command without any pre-configured scope."
+commands.deny = ["ble_connection_mtu"]
