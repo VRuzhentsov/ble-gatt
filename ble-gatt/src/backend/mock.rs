@@ -220,17 +220,11 @@ impl Backend for MockBackend {
                 reason: "peer is not advertising".to_string(),
             })?;
         }
-        // The peripheral observes the central arriving; the central observes
-        // its own connection coming up. Each side sees its own view.
-        // The peripheral sees a central arrive; the central sees its own
-        // outbound link come up. Each side reports the role it played.
-        self.network.emit(
-            peer,
-            GattEvent::Connected {
-                peer: self.address.clone(),
-                local_role: Role::Peripheral,
-            },
-        );
+        // Only the central's own view is emitted here. The *peripheral*
+        // learns about this peer from `subscribe`, matching both real
+        // backends: announcing at connection time would let `serve` yield a
+        // channel before the notify path exists, so a server that greets
+        // immediately would fail with "no live notify session".
         self.network.emit(
             &self.address,
             GattEvent::Connected {
@@ -460,7 +454,9 @@ impl GattConnection for MockGattConnection {
         Ok(())
     }
 
-    async fn subscribe(&mut self, characteristic: CharacteristicUuid) -> Result<BoxStream<Vec<u8>>> {
+    async fn subscribe(
+        &mut self, characteristic: CharacteristicUuid,
+    ) -> Result<BoxStream<Result<Vec<u8>>>> {
         let mut peripherals = self.network.peripherals.lock().unwrap();
         let state = peripherals
             .get_mut(&self.peripheral)
@@ -474,7 +470,21 @@ impl GattConnection for MockGattConnection {
         // stop it receiving broadcasts.
         let (tx, rx) = mpsc::unbounded_channel();
         peers.insert(self.central.clone(), tx);
-        Ok(Box::pin(UnboundedReceiverStream::new(rx)))
+        drop(peripherals);
+
+        // The peripheral-role arrival signal, emitted only now that the
+        // notify path back to this central exists. Both real backends do the
+        // same — Android from the CCCD write, Linux from AcquireNotify — and
+        // the mock announcing at connect made a server-first greeting look
+        // safe in tests while it could still race in production.
+        self.network.emit(
+            &self.peripheral,
+            GattEvent::Connected {
+                peer: self.central.clone(),
+                local_role: Role::Peripheral,
+            },
+        );
+        Ok(Box::pin(UnboundedReceiverStream::new(rx).map(Ok)))
     }
 
     async fn disconnect(&mut self) -> Result<()> {

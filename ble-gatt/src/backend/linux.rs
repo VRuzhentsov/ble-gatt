@@ -729,7 +729,9 @@ impl GattConnection for LinuxGattConnection {
             .map_err(|err| BleError::Gatt(err.to_string()))
     }
 
-    async fn subscribe(&mut self, characteristic: CharacteristicUuid) -> Result<BoxStream<Vec<u8>>> {
+    async fn subscribe(
+        &mut self, characteristic: CharacteristicUuid,
+    ) -> Result<BoxStream<Result<Vec<u8>>>> {
         let target = self.find_characteristic(characteristic).await?;
         // Refresh here too. `datagram::connect` only subscribes before it
         // fixes its fragment budget, so without this a Linux datagram
@@ -739,7 +741,10 @@ impl GattConnection for LinuxGattConnection {
             self.att_mtu.store(mtu as u16, Ordering::Relaxed);
         }
         let notify_stream = target.notify().await.map_err(|err| BleError::Gatt(err.to_string()))?;
-        Ok(Box::pin(notify_stream))
+        // BlueZ delivers notifications over a socket this stream reads
+        // directly, so there is no library-side queue to overflow — nothing
+        // here can silently drop a payload.
+        Ok(Box::pin(notify_stream.map(Ok)))
     }
 
     async fn disconnect(&mut self) -> Result<()> {

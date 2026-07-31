@@ -144,7 +144,11 @@ async fn server_initiated_notify_is_delivered_to_a_subscribed_central() {
         .await
         .expect("notify should succeed");
 
-    let received = notifications.next().await.expect("notification should arrive");
+    let received = notifications
+        .next()
+        .await
+        .expect("notification should arrive")
+        .expect("no gap");
     assert_eq!(received, b"push");
 }
 
@@ -391,14 +395,14 @@ async fn a_central_refused_by_a_single_peer_server_stops_receiving_notifications
         .await
         .expect("notify should succeed");
     assert_eq!(
-        refused_rx.next().await.as_deref(),
+        refused_rx.next().await.and_then(|item| item.ok()).as_deref(),
         Some(b"for-the-served-peer".as_slice()),
         "precondition: notify is a broadcast, so an un-excluded peer does receive it"
     );
     // The served peer received it too — drain so the assertion below reads
     // the notification sent *after* exclusion, not this one.
     assert_eq!(
-        first_rx.next().await.as_deref(),
+        first_rx.next().await.and_then(|item| item.ok()).as_deref(),
         Some(b"for-the-served-peer".as_slice())
     );
 
@@ -414,7 +418,7 @@ async fn a_central_refused_by_a_single_peer_server_stops_receiving_notifications
         .expect("notify should succeed");
 
     assert_eq!(
-        first_rx.next().await.as_deref(),
+        first_rx.next().await.and_then(|item| item.ok()).as_deref(),
         Some(b"private-payload".as_slice()),
         "the served central must still receive its own traffic"
     );
@@ -469,7 +473,7 @@ async fn an_addressed_notify_reaches_only_its_peer() {
         .expect("addressed notify should succeed");
 
     assert_eq!(
-        served_rx.next().await.as_deref(),
+        served_rx.next().await.and_then(|item| item.ok()).as_deref(),
         Some(b"for-the-served-peer".as_slice())
     );
     assert!(

@@ -583,3 +583,52 @@ async fn a_central_that_unsubscribes_frees_the_single_central_slot() {
         .expect("no error");
     assert_eq!(received, b"to-the-second");
 }
+
+#[tokio::test]
+async fn a_server_can_greet_the_moment_it_is_handed_a_channel() {
+    let config = config();
+    let network = MockNetwork::new();
+    let peripheral_addr = PeerAddress("peripheral-greet".to_string());
+
+    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+        peripheral_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    ));
+    let central: Arc<MockBackend> = Arc::new(MockBackend::new(
+        PeerAddress("central-greet".to_string()),
+        network.clone(),
+        full_capabilities(),
+    ));
+
+    let mut incoming = datagram::serve(peripheral.clone(), &config)
+        .await
+        .expect("serve should start");
+
+    // The central connects and then waits. It sends nothing — this is the
+    // server-speaks-first shape that the whole announce-on-subscribe design
+    // exists to support.
+    let mut client = datagram::connect(central.clone(), &peripheral_addr, &config)
+        .await
+        .expect("connect should succeed");
+
+    let mut served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
+        .await
+        .expect("serve should yield a channel")
+        .expect("channel stream should not be closed");
+
+    // No delay, no retry. A channel handed over before the notify path
+    // exists would fail here with "no live notify session" — which is what
+    // makes announcing at connection time wrong.
+    served
+        .send(b"hello-from-the-server".to_vec())
+        .await
+        .expect("a freshly accepted channel must be immediately usable");
+
+    let received = tokio::time::timeout(Duration::from_secs(2), client.recv())
+        .await
+        .expect("the greeting should arrive")
+        .expect("channel should be open")
+        .expect("no error");
+    assert_eq!(received, b"hello-from-the-server");
+}

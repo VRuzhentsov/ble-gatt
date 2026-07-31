@@ -69,7 +69,18 @@ pub trait GattConnection: Send {
         &mut self, characteristic: CharacteristicUuid, value: Vec<u8>, write_type: WriteType,
     ) -> Result<()>;
 
-    async fn subscribe(&mut self, characteristic: CharacteristicUuid) -> Result<BoxStream<Vec<u8>>>;
+    /// Stream of server-initiated notifications for `characteristic`.
+    ///
+    /// Items are `Result` for the same reason `scan`'s are: the failure is
+    /// asynchronous. A backend that must bound its inbound buffering drops
+    /// payloads when the consumer falls behind, and the peer has *already*
+    /// been told the notification was delivered — so unless the loss is
+    /// reported here, neither endpoint ever learns, and a message either
+    /// vanishes or expires with no error. An error item does not end the
+    /// stream; it reports a gap.
+    async fn subscribe(
+        &mut self, characteristic: CharacteristicUuid,
+    ) -> Result<BoxStream<Result<Vec<u8>>>>;
     async fn disconnect(&mut self) -> Result<()>;
 }
 

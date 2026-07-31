@@ -32,7 +32,7 @@
 //! don't-hide-hard-cases convention this project inherited.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use async_trait::async_trait;
@@ -54,6 +54,11 @@ const DISCOVERY_QUEUE_DEPTH: usize = 64;
 /// consumer, and unbounded growth costs the whole process rather than one
 /// message.
 const NOTIFY_QUEUE_DEPTH: usize = 256;
+
+/// How long to wait for Android to confirm a disconnect before reporting it
+/// as failed. Generous: a real disconnect is fast, and a caller that gets an
+/// error here is expected to retry rather than assume the link is gone.
+const DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
@@ -80,7 +85,7 @@ struct ConnectionState {
     read_tx: Option<oneshot::Sender<Result<Vec<u8>>>>,
     write_tx: Option<oneshot::Sender<Result<()>>>,
     subscribe_tx: HashMap<CharacteristicUuid, oneshot::Sender<bool>>,
-    notify_tx: HashMap<CharacteristicUuid, mpsc::Sender<Vec<u8>>>,
+    notify_tx: HashMap<CharacteristicUuid, (mpsc::Sender<Vec<u8>>, Arc<AtomicBool>)>,
     disconnected_tx: Option<oneshot::Sender<()>>,
 }
 
@@ -722,6 +727,32 @@ impl Drop for ScanStream {
     }
 }
 
+/// Notification stream that reports dropped payloads.
+///
+/// The flag is checked ahead of the queue for the same reason the datagram
+/// layer's is: overflow happens exactly when the queue is full, so an error
+/// pushed onto it would be the first thing discarded.
+struct NotifyStream {
+    rx: ReceiverStream<Vec<u8>>,
+    overflow: Arc<AtomicBool>,
+}
+
+impl tokio_stream::Stream for NotifyStream {
+    type Item = Result<Vec<u8>>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.overflow.swap(false, Ordering::SeqCst) {
+            return std::task::Poll::Ready(Some(Err(BleError::Gatt(
+                "notification queue overflowed: payloads were dropped and at least one \
+                 message is lost"
+                    .to_string(),
+            ))));
+        }
+        std::pin::Pin::new(&mut self.rx).poll_next(cx).map(|item| item.map(Ok))
+    }
+}
+
 struct AndroidGattConnection {
     inner: Arc<Inner>,
     address: String,
@@ -798,14 +829,17 @@ impl GattConnection for AndroidGattConnection {
         rx.await.map_err(|_| BleError::NotConnected(self.address.clone()))?
     }
 
-    async fn subscribe(&mut self, characteristic: CharacteristicUuid) -> Result<BoxStream<Vec<u8>>> {
+    async fn subscribe(
+        &mut self, characteristic: CharacteristicUuid,
+    ) -> Result<BoxStream<Result<Vec<u8>>>> {
         let (confirm_tx, confirm_rx) = oneshot::channel();
         let (notify_tx, notify_rx) = mpsc::channel(NOTIFY_QUEUE_DEPTH);
+        let overflow = Arc::new(AtomicBool::new(false));
         {
             let mut connections = self.inner.connections.lock().unwrap();
             let state = connections.entry(self.address.clone()).or_default();
             state.subscribe_tx.insert(characteristic, confirm_tx);
-            state.notify_tx.insert(characteristic, notify_tx);
+            state.notify_tx.insert(characteristic, (notify_tx, overflow.clone()));
         }
         {
             let mut env = self.inner.env()?;
@@ -829,7 +863,10 @@ impl GattConnection for AndroidGattConnection {
                 characteristic.0
             )));
         }
-        Ok(Box::pin(ReceiverStream::new(notify_rx)))
+        Ok(Box::pin(NotifyStream {
+            rx: ReceiverStream::new(notify_rx),
+            overflow,
+        }))
     }
 
     async fn disconnect(&mut self) -> Result<()> {
@@ -848,8 +885,24 @@ impl GattConnection for AndroidGattConnection {
                 &[JValue::Object(&address)],
             )?;
         }
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
-        Ok(())
+        // Report a disconnect that never completed. Swallowing the timeout
+        // told the caller cleanup had succeeded when `ConnectionState.live`
+        // and the Kotlin GATT entry were both still set — so the connection
+        // handle was dropped as done, while the live-connection guard went on
+        // refusing reconnects to that address with nothing left able to close
+        // it. An error keeps the handle in the caller's hands to retry.
+        match tokio::time::timeout(DISCONNECT_TIMEOUT, rx).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(BleError::Gatt(format!(
+                "disconnect from {} was abandoned before the platform confirmed it",
+                self.address
+            ))),
+            Err(_) => Err(BleError::Gatt(format!(
+                "disconnect from {} timed out after {:?}; the platform connection may still \
+                 be open",
+                self.address, DISCONNECT_TIMEOUT
+            ))),
+        }
     }
 }
 
@@ -1196,14 +1249,18 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onCharacteristicChanged<'local>
     };
     let connections = inner.connections.lock().unwrap();
     if let Some(state) = connections.get(&address) {
-        if let Some(tx) = state.notify_tx.get(&CharacteristicUuid(uuid)) {
+        if let Some((tx, overflow)) = state.notify_tx.get(&CharacteristicUuid(uuid)) {
             // JVM callback thread: cannot block, so a saturated consumer
-            // costs the affected message (reaped by the reassembly timeout)
-            // rather than unbounded heap growth.
+            // costs the payload rather than unbounded heap growth. But the
+            // peer has already had this notification confirmed as sent, so
+            // the drop must be *reported* — otherwise a single-fragment
+            // message vanishes and a fragmented one merely expires, with
+            // neither endpoint ever learning why.
             if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(bytes) {
+                overflow.store(true, Ordering::SeqCst);
                 eprintln!(
                     "[ble-gatt][android] notification queue full for {address}, dropping \
-                     payload; any message it belonged to will time out"
+                     payload and reporting the gap to the subscriber"
                 );
             }
         }

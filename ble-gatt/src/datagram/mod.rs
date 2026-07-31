@@ -389,9 +389,10 @@ async fn disconnect_refused(backend: &dyn Backend, peer: &PeerAddress) {
 /// and `recv()` hung forever on a dead link.
 fn spawn_reassembly<S>(
     mut fragments: S, limits: ReassemblyLimits, out: mpsc::Sender<Result<Vec<u8>>>,
+    overflow: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()>
 where
-    S: tokio_stream::Stream<Item = Vec<u8>> + Send + Unpin + 'static,
+    S: tokio_stream::Stream<Item = Result<Vec<u8>>> + Send + Unpin + 'static,
 {
     tokio::spawn(async move {
         let mut reassembler = Reassembler::new(limits);
@@ -408,6 +409,19 @@ where
                         // Fragment source ended: the link is gone. Dropping
                         // `out` here is what makes `recv()` return `None`.
                         return;
+                    };
+                    // A gap reported by the backend — payloads the peer was
+                    // told were delivered but that never reached us. Surface
+                    // it rather than letting the affected message expire
+                    // unexplained, and discard partial sets, since any of
+                    // them may be missing the fragment that was lost.
+                    let raw = match raw {
+                        Ok(raw) => raw,
+                        Err(_) => {
+                            overflow.store(true, Ordering::SeqCst);
+                            reassembler = Reassembler::new(limits);
+                            continue;
+                        }
                     };
                     let Some((header, payload)) = FragmentHeader::parse(&raw) else {
                         // Too short to be ours — a foreign write to our
@@ -470,7 +484,9 @@ pub async fn connect(
         })?;
 
     let (tx, rx) = mpsc::channel(config.inbound_queue_depth);
-    let reassembly = spawn_reassembly(notifications, config.limits(), tx);
+    let overflow = Arc::new(AtomicBool::new(false));
+    let reassembly =
+        spawn_reassembly(notifications, config.limits(), tx, overflow.clone());
     // The watcher gets an *AbortHandle*, not the JoinHandle. Handing over
     // the JoinHandle meant aborting the watcher merely dropped it — and
     // dropping a Tokio JoinHandle detaches its task rather than cancelling
@@ -485,10 +501,9 @@ pub async fn connect(
             write_type: config.write_type,
         }),
         inbound: ReceiverStream::new(rx),
-        // A central's inbound path is a notify subscription, which the
-        // backend bounds itself; `serve`'s fragment queue is the only place
-        // this library drops inbound data.
-        overflow: Arc::new(AtomicBool::new(false)),
+        // Set when the backend reports it dropped notifications — the
+        // central-side equivalent of `serve`'s fragment-queue overflow.
+        overflow,
         next_msg_id: 0,
         max_message_len: effective_max_message_len(config.max_message_len, budget),
         fragment_budget: budget,
@@ -663,9 +678,10 @@ pub async fn serve(
                     let (msg_tx, msg_rx) = mpsc::channel(config.inbound_queue_depth);
                     let overflow = Arc::new(AtomicBool::new(false));
                     let reassembly = spawn_reassembly(
-                        ReceiverStream::new(frag_rx),
+                        ReceiverStream::new(frag_rx).map(Ok),
                         config.limits(),
                         msg_tx,
+                        overflow.clone(),
                     );
 
                     let channel = DatagramChannel {
