@@ -556,6 +556,36 @@ where
     })
 }
 
+/// Holds a freshly established connection until datagram setup succeeds.
+///
+/// Its `Drop` is the only thing that covers a *cancelled* setup: an async fn
+/// whose future is dropped runs none of its remaining code, so error
+/// handling alone cannot close the connection. Disconnecting needs to await,
+/// which `Drop` cannot, so it hands the connection to a detached task —
+/// short-lived and self-terminating, unlike the address it would otherwise
+/// strand.
+struct PendingConnection {
+    connection: Option<Box<dyn GattConnection>>,
+    peer: PeerAddress,
+}
+
+impl Drop for PendingConnection {
+    fn drop(&mut self) {
+        let Some(mut connection) = self.connection.take() else {
+            return; // setup succeeded; ownership moved on
+        };
+        let peer = self.peer.clone();
+        tokio::spawn(async move {
+            if let Err(err) = connection.disconnect().await {
+                eprintln!(
+                    "[ble-gatt][datagram] could not disconnect {} after abandoned setup: {err}",
+                    peer.0
+                );
+            }
+        });
+    }
+}
+
 /// Central role: connect to `peer` and bring up a channel over `config`'s
 /// service.
 pub async fn connect(
@@ -569,14 +599,20 @@ pub async fn connect(
     // stream closes with the link, so losing it leaves `recv()` pending
     // forever with nothing left to wake it.
     let events = backend.events();
-    let mut connection = backend.connect(peer).await?;
+    // Past this point the platform connection exists, so *every* way out has
+    // to tear it down — including the caller dropping this future mid-setup,
+    // where no code on this path runs at all. Dropping the `GattConnection`
+    // cleans up nothing: on Android it leaves `ConnectionState.live` set and
+    // the Kotlin GATT open, after which every retry to that address is
+    // refused as "already open". A retryable setup failure, or a plain
+    // timeout, would otherwise kill the address permanently.
+    let mut pending = PendingConnection {
+        connection: Some(backend.connect(peer).await?),
+        peer: peer.clone(),
+    };
 
-    // Past this point the platform connection exists, so every failure has
-    // to tear it down explicitly. Dropping the `GattConnection` does not:
-    // on Android it leaves `ConnectionState.live` set and the Kotlin GATT
-    // open, after which every retry to that address is refused as "already
-    // open" — a setup failure that should be retryable becomes permanent.
     let setup = async {
+        let connection = pending.connection.as_mut().expect("armed above");
         let notifications = connection.subscribe(config.characteristic).await?;
         let budget = connection
             .max_write_len()
@@ -594,16 +630,11 @@ pub async fn connect(
 
     let (notifications, budget) = match setup {
         Ok(ready) => ready,
-        Err(err) => {
-            if let Err(cleanup) = connection.disconnect().await {
-                eprintln!(
-                    "[ble-gatt][datagram] could not disconnect {} after failed setup: {cleanup}",
-                    peer.0
-                );
-            }
-            return Err(err);
-        }
+        // Returning here drops `pending`, which disconnects.
+        Err(err) => return Err(err),
     };
+    // Setup succeeded: take ownership back so the guard becomes inert.
+    let connection = pending.connection.take().expect("armed above");
 
     let (tx, rx) = mpsc::channel(config.inbound_queue_depth);
     let overflow = Arc::new(OverflowSignal::default());

@@ -57,6 +57,11 @@ pub struct MockNetwork {
     /// learns that its peer vanished. Mirrors how the real backends behave:
     /// `events()` is this backend's view, not a global feed.
     event_senders: Mutex<HashMap<PeerAddress, broadcast::Sender<GattEvent>>>,
+    /// Every `GattConnection::disconnect` this network has seen, so a test
+    /// can assert that an abandoned setup actually released the platform
+    /// connection rather than merely dropping the Rust handle.
+    disconnect_log: Mutex<Vec<PeerAddress>>,
+    subscribe_delay: Mutex<Option<std::time::Duration>>,
     /// Armed by `arm_scan_failure`, consumed by the next `scan`. Exists so
     /// the asynchronous scan-failure path — the one that makes "Bluetooth is
     /// off" distinguishable from "no peers nearby" — is reachable in tests
@@ -67,6 +72,11 @@ pub struct MockNetwork {
 impl MockNetwork {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Peers this network has seen an explicit `disconnect()` for.
+    pub fn disconnected_peers(&self) -> Vec<PeerAddress> {
+        self.disconnect_log.lock().unwrap().clone()
     }
 
     /// The lifecycle event stream dropped `dropped` events before a
@@ -114,6 +124,12 @@ impl MockNetwork {
                 local_role: Role::Peripheral,
             },
         );
+    }
+
+    /// Delay every `subscribe` on this network, so a test can cancel
+    /// `datagram::connect` while setup is genuinely in flight.
+    pub fn stall_subscribe(&self, delay: std::time::Duration) {
+        *self.subscribe_delay.lock().unwrap() = Some(delay);
     }
 
     /// Make the next `scan` on any backend in this network end with an
@@ -495,6 +511,10 @@ impl GattConnection for MockGattConnection {
     async fn subscribe(
         &mut self, characteristic: CharacteristicUuid,
     ) -> Result<BoxStream<Result<Vec<u8>>>> {
+        let delay = *self.network.subscribe_delay.lock().unwrap();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         let mut peripherals = self.network.peripherals.lock().unwrap();
         let state = peripherals
             .get_mut(&self.peripheral)
@@ -526,6 +546,11 @@ impl GattConnection for MockGattConnection {
     }
 
     async fn disconnect(&mut self) -> Result<()> {
+        self.network
+            .disconnect_log
+            .lock()
+            .unwrap()
+            .push(self.peripheral.clone());
         self.network.emit(
             &self.peripheral,
             GattEvent::Disconnected {

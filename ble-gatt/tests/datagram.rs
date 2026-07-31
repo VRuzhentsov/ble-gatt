@@ -948,3 +948,55 @@ async fn a_lagged_lifecycle_stream_ends_the_served_session_rather_than_stranding
         .expect("no error");
     assert_eq!(received, b"to-the-second");
 }
+
+#[tokio::test]
+async fn abandoning_connect_mid_setup_still_releases_the_connection() {
+    let config = config();
+    let network = MockNetwork::new();
+    let peripheral_addr = PeerAddress("peripheral-cancel".to_string());
+
+    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+        peripheral_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    ));
+    peripheral
+        .advertise(config.service_spec())
+        .await
+        .expect("advertise should succeed");
+
+    let central: Arc<MockBackend> = Arc::new(MockBackend::new(
+        PeerAddress("central-cancel".to_string()),
+        network.clone(),
+        full_capabilities(),
+    ));
+
+    // Stall setup so the caller's timeout lands while `subscribe` is still
+    // pending — after the platform connection exists but before the channel
+    // does. Nothing on `connect`'s own path runs from here on.
+    network.stall_subscribe(Duration::from_secs(30));
+
+    let outcome = tokio::time::timeout(
+        Duration::from_millis(200),
+        datagram::connect(central.clone(), &peripheral_addr, &config),
+    )
+    .await;
+    assert!(outcome.is_err(), "the connect future should have been cancelled");
+
+    // The established connection must still be released. Without this, on
+    // Android the platform GATT stays open and every retry to the address is
+    // refused as already open — a timeout permanently killing the peer.
+    let mut released = false;
+    for _ in 0..40 {
+        if network.disconnected_peers().contains(&peripheral_addr) {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        released,
+        "an abandoned setup must disconnect the connection it established, not just \
+         drop the handle"
+    );
+}
