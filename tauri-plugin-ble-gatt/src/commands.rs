@@ -19,9 +19,15 @@ use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
+/// One live GATT connection, individually locked.
+type SharedConnection = Arc<Mutex<Box<dyn GattConnection>>>;
+
 pub struct PluginState {
     backend: Arc<dyn Backend>,
-    connections: Mutex<HashMap<u64, Box<dyn GattConnection>>>,
+    /// Each connection gets its own lock. A single map-wide mutex was held
+    /// across `.await`, so one slow or hung GATT operation blocked every
+    /// command on every other connection.
+    connections: Mutex<HashMap<u64, SharedConnection>>,
     next_handle: AtomicU64,
 }
 
@@ -35,17 +41,32 @@ impl PluginState {
     }
 }
 
+impl PluginState {
+    /// Look up a connection and release the map lock immediately, so a slow
+    /// operation on one connection cannot block commands on another.
+    async fn connection(&self, handle: u64) -> Result<SharedConnection, String> {
+        self.connections
+            .lock()
+            .await
+            .get(&handle)
+            .cloned()
+            .ok_or_else(|| "unknown connection handle".to_string())
+    }
+}
+
 fn parse_uuid(raw: &str) -> Result<Uuid, String> {
     Uuid::parse_str(raw).map_err(|err| format!("invalid UUID '{raw}': {err}"))
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CapabilitiesResponse {
     pub central: bool,
     pub peripheral: bool,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DiscoveredPeerDto {
     pub address: String,
     pub name: Option<String>,
@@ -59,6 +80,7 @@ pub struct DiscoveredPeerDto {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CharacteristicSpecDto {
     pub uuid: String,
     pub readable: bool,
@@ -204,7 +226,11 @@ pub async fn ble_connect(state: tauri::State<'_, PluginState>, address: String) 
         .await
         .map_err(|err| err.to_string())?;
     let handle = state.next_handle.fetch_add(1, Ordering::SeqCst);
-    state.connections.lock().await.insert(handle, connection);
+    state
+        .connections
+        .lock()
+        .await
+        .insert(handle, Arc::new(Mutex::new(connection)));
     Ok(handle)
 }
 
@@ -213,8 +239,8 @@ pub async fn ble_read(
     state: tauri::State<'_, PluginState>, handle: u64, characteristic_uuid: String,
 ) -> Result<Vec<u8>, String> {
     let uuid = parse_uuid(&characteristic_uuid)?;
-    let mut connections = state.connections.lock().await;
-    let connection = connections.get_mut(&handle).ok_or("unknown connection handle")?;
+    let connection = state.connection(handle).await?;
+    let mut connection = connection.lock().await;
     connection.read(CharacteristicUuid(uuid)).await.map_err(|err| err.to_string())
 }
 
@@ -232,8 +258,8 @@ pub async fn ble_write(
     } else {
         WriteType::WithResponse
     };
-    let mut connections = state.connections.lock().await;
-    let connection = connections.get_mut(&handle).ok_or("unknown connection handle")?;
+    let connection = state.connection(handle).await?;
+    let mut connection = connection.lock().await;
     connection
         .write_with_type(CharacteristicUuid(uuid), value, write_type)
         .await
@@ -241,6 +267,7 @@ pub async fn ble_write(
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ConnectionMtuResponse {
     /// Negotiated ATT MTU for this connection.
     pub att_mtu: u16,
@@ -254,8 +281,8 @@ pub struct ConnectionMtuResponse {
 pub async fn ble_connection_mtu(
     state: tauri::State<'_, PluginState>, handle: u64,
 ) -> Result<ConnectionMtuResponse, String> {
-    let connections = state.connections.lock().await;
-    let connection = connections.get(&handle).ok_or("unknown connection handle")?;
+    let connection = state.connection(handle).await?;
+    let connection = connection.lock().await;
     Ok(ConnectionMtuResponse {
         att_mtu: connection.att_mtu(),
         max_write_len: connection.max_write_len(),
@@ -291,9 +318,14 @@ pub async fn ble_watch_events(
 
 #[tauri::command]
 pub async fn ble_disconnect(state: tauri::State<'_, PluginState>, handle: u64) -> Result<(), String> {
-    let mut connections = state.connections.lock().await;
-    if let Some(mut connection) = connections.remove(&handle) {
-        connection.disconnect().await.map_err(|err| err.to_string())?;
+    let entry = state.connections.lock().await.remove(&handle);
+    if let Some(connection) = entry {
+        connection
+            .lock()
+            .await
+            .disconnect()
+            .await
+            .map_err(|err| err.to_string())?;
     }
     Ok(())
 }

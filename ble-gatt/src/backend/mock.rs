@@ -275,6 +275,18 @@ impl GattConnection for MockGattConnection {
                 .ok_or_else(|| BleError::NotConnected(self.peripheral.0.clone()))?;
             state.values.insert(characteristic, value.clone());
         }
+        // Mirrors what the real backends do: both re-emit `Connected` ahead
+        // of every write, because neither has a true server-side connection
+        // signal. Reproducing that here is deliberate — the mock previously
+        // emitted `Connected` only from `connect()`, which made
+        // `datagram::serve` look correct in tests while it was broken on
+        // every real backend.
+        self.network.emit(
+            &self.peripheral,
+            GattEvent::Connected {
+                peer: self.central.clone(),
+            },
+        );
         self.network.emit(
             &self.peripheral,
             GattEvent::CharacteristicWritten {

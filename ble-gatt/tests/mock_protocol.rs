@@ -82,15 +82,21 @@ async fn write_from_central_is_readable_back_and_fires_a_lifecycle_event() {
     let central = MockBackend::new(PeerAddress("central-2".to_string()), network.clone(), full_capabilities());
     let mut connection = central.connect(&peripheral_addr).await.expect("connect should succeed");
 
-    // `connect` itself fires a `Connected` event — drain it before the write.
-    let _connected = events.next().await.expect("connected event");
-
     connection
         .write(characteristic_uuid, b"updated".to_vec())
         .await
         .expect("write should succeed");
 
-    let written_event = events.next().await.expect("write event");
+    // `Connected` is not once-per-connection: it fires on `connect` *and*
+    // again ahead of every write, because neither real backend has a
+    // server-side connection signal to key off. Consumers must tolerate
+    // repeats, so this skips them rather than asserting a fixed sequence.
+    let written_event = loop {
+        match events.next().await.expect("write event should arrive") {
+            ble_gatt::GattEvent::Connected { .. } => continue,
+            other => break other,
+        }
+    };
     match written_event {
         ble_gatt::GattEvent::CharacteristicWritten { characteristic, value, .. } => {
             assert_eq!(characteristic, characteristic_uuid);

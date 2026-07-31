@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, Mutex};
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 use tokio_stream::StreamExt;
 
 use crate::backend::{Backend, BoxStream, GattConnection};
@@ -59,6 +59,10 @@ use crate::models::{
 pub const DEFAULT_MAX_MESSAGE_LEN: usize = 1024 * 1024;
 pub const DEFAULT_REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_MAX_CONCURRENT_REASSEMBLIES: usize = 4;
+/// Completed messages buffered before the reassembler applies backpressure.
+/// Bounded deliberately: an unbounded queue lets a peer sending valid
+/// messages faster than the consumer reads them grow memory without limit.
+pub const DEFAULT_INBOUND_QUEUE_DEPTH: usize = 32;
 
 #[derive(Debug, Clone)]
 pub struct DatagramConfig {
@@ -72,6 +76,11 @@ pub struct DatagramConfig {
     /// throughput and will silently drop under load — opt in only where the
     /// layer above tolerates loss.
     pub write_type: WriteType,
+    /// How many *completed* messages may sit unread before the reassembler
+    /// stops accepting more. The reassembly limits bound only partial
+    /// messages, so without this a slow or stalled consumer is a memory
+    /// exhaustion vector.
+    pub inbound_queue_depth: usize,
 }
 
 impl DatagramConfig {
@@ -83,6 +92,7 @@ impl DatagramConfig {
             reassembly_timeout: DEFAULT_REASSEMBLY_TIMEOUT,
             max_concurrent_reassemblies: DEFAULT_MAX_CONCURRENT_REASSEMBLIES,
             write_type: WriteType::WithResponse,
+            inbound_queue_depth: DEFAULT_INBOUND_QUEUE_DEPTH,
         }
     }
 
@@ -128,7 +138,7 @@ pub struct DatagramChannel {
     peer: PeerAddress,
     characteristic: CharacteristicUuid,
     sink: Mutex<Sink>,
-    inbound: UnboundedReceiverStream<Result<Vec<u8>>>,
+    inbound: ReceiverStream<Result<Vec<u8>>>,
     next_msg_id: u16,
     max_message_len: usize,
     /// Fixed at construction from the negotiated MTU. BLE does not
@@ -214,35 +224,57 @@ impl DatagramChannel {
 /// link-loss watcher as well, so dropping the watcher's copy closed nothing
 /// and `recv()` hung forever on a dead link.
 fn spawn_reassembly<S>(
-    mut fragments: S, limits: ReassemblyLimits, out: mpsc::UnboundedSender<Result<Vec<u8>>>,
+    mut fragments: S, limits: ReassemblyLimits, out: mpsc::Sender<Result<Vec<u8>>>,
 ) -> tokio::task::JoinHandle<()>
 where
     S: tokio_stream::Stream<Item = Vec<u8>> + Send + Unpin + 'static,
 {
     tokio::spawn(async move {
         let mut reassembler = Reassembler::new(limits);
-        while let Some(raw) = fragments.next().await {
-            let Some((header, payload)) = FragmentHeader::parse(&raw) else {
-                // Too short to be ours — a foreign write to our
-                // characteristic, not a reason to kill the channel.
-                continue;
-            };
-            match reassembler.accept(header, payload, Instant::now()) {
-                Accept::Complete(message) => {
-                    if out.send(Ok(message)).is_err() {
-                        return; // receiver dropped; stop reassembling
+        // `Reassembler::expire` only runs from inside `accept`, so a peer
+        // that sends half a message and then goes quiet would otherwise pin
+        // its partial sets for the life of the link — `reassembly_timeout`
+        // would silently never fire. Ticking here is what makes the
+        // configured timeout real on an idle connection.
+        let tick = (limits.reassembly_timeout / 4).max(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                incoming = fragments.next() => {
+                    let Some(raw) = incoming else {
+                        // Fragment source ended: the link is gone. Dropping
+                        // `out` here is what makes `recv()` return `None`.
+                        return;
+                    };
+                    let Some((header, payload)) = FragmentHeader::parse(&raw) else {
+                        // Too short to be ours — a foreign write to our
+                        // characteristic, not a reason to kill the channel.
+                        continue;
+                    };
+                    match reassembler.accept(header, payload, Instant::now()) {
+                        Accept::Complete(message) => {
+                            // Bounded, and awaited rather than dropped: an
+                            // unbounded queue let a peer sending valid
+                            // single-fragment messages faster than the
+                            // consumer reads grow memory without limit.
+                            // Blocking here pushes back through the BLE
+                            // stack, which is where backpressure belongs.
+                            if out.send(Ok(message)).await.is_err() {
+                                return; // receiver dropped; stop reassembling
+                            }
+                        }
+                        Accept::Pending => {}
+                        Accept::Rejected(_) => {
+                            // Dropped by policy (bounds breach or malformed).
+                            // The channel stays usable: one bad message must
+                            // not deny service for the rest of the session.
+                        }
                     }
                 }
-                Accept::Pending => {}
-                Accept::Rejected(_) => {
-                    // Dropped by policy (bounds breach or malformed). The
-                    // channel stays usable: one bad message from a peer must
-                    // not deny service for the rest of the session.
+                _ = tokio::time::sleep(tick) => {
+                    reassembler.expire(Instant::now());
                 }
             }
         }
-        // Fragment source ended: the link is gone. Dropping `out` here is
-        // what makes `recv()` return `None`.
     })
 }
 
@@ -271,7 +303,7 @@ pub async fn connect(
     // `recv()` pending forever on a link that is already gone.
     let events = backend.events();
 
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(config.inbound_queue_depth);
     let reassembly = spawn_reassembly(notifications, config.limits(), tx);
     spawn_link_loss_watch(events, peer.clone(), reassembly);
 
@@ -282,7 +314,7 @@ pub async fn connect(
             connection,
             write_type: config.write_type,
         }),
-        inbound: UnboundedReceiverStream::new(rx),
+        inbound: ReceiverStream::new(rx),
         next_msg_id: 0,
         max_message_len: config.max_message_len,
         fragment_budget: budget,
@@ -329,8 +361,19 @@ pub async fn serve(
         while let Some(event) = events.next().await {
             match event {
                 GattEvent::Connected { peer } => {
+                    // `Connected` is NOT once-per-connection. Both real
+                    // backends re-emit it ahead of every characteristic
+                    // write, because neither has a true server-side
+                    // connection signal to key off (see `Backend::events`).
+                    // Rebuilding the channel each time would drop the
+                    // previous fragment sender, killing the channel already
+                    // handed to the caller and making any multi-fragment
+                    // message impossible to reassemble.
+                    if inbound.contains_key(&peer) {
+                        continue;
+                    }
                     let (frag_tx, frag_rx) = mpsc::unbounded_channel();
-                    let (msg_tx, msg_rx) = mpsc::unbounded_channel();
+                    let (msg_tx, msg_rx) = mpsc::channel(config.inbound_queue_depth);
                     spawn_reassembly(
                         UnboundedReceiverStream::new(frag_rx),
                         config.limits(),
@@ -344,7 +387,7 @@ pub async fn serve(
                         sink: Mutex::new(Sink::Notify {
                             backend: backend.clone(),
                         }),
-                        inbound: UnboundedReceiverStream::new(msg_rx),
+                        inbound: ReceiverStream::new(msg_rx),
                         next_msg_id: 0,
                         max_message_len: config.max_message_len,
                         // The peripheral has no `GattConnection` to ask for a

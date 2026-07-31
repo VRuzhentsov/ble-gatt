@@ -67,7 +67,7 @@ export async function advertise(
       readable: c.readable,
       writable: c.writable,
       notifiable: c.notifiable,
-      initial_value: c.initialValue,
+      initialValue: c.initialValue,
     })),
   });
 }

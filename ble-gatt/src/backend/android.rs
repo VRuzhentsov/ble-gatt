@@ -55,7 +55,7 @@ struct ConnectionState {
     connected_tx: Option<oneshot::Sender<()>>,
     read_tx: Option<oneshot::Sender<Result<Vec<u8>>>>,
     write_tx: Option<oneshot::Sender<Result<()>>>,
-    subscribe_tx: HashMap<CharacteristicUuid, oneshot::Sender<()>>,
+    subscribe_tx: HashMap<CharacteristicUuid, oneshot::Sender<bool>>,
     notify_tx: HashMap<CharacteristicUuid, mpsc::UnboundedSender<Vec<u8>>>,
     disconnected_tx: Option<oneshot::Sender<()>>,
 }
@@ -443,7 +443,15 @@ impl GattConnection for AndroidGattConnection {
                 &[JValue::Object(&address), JValue::Object(&uuid)],
             )?;
         }
-        confirm_rx.await.map_err(|_| BleError::NotConnected(self.address.clone()))?;
+        let subscribed = confirm_rx
+            .await
+            .map_err(|_| BleError::NotConnected(self.address.clone()))?;
+        if !subscribed {
+            return Err(BleError::Gatt(format!(
+                "peer refused notifications on characteristic {}",
+                characteristic.0
+            )));
+        }
         Ok(Box::pin(UnboundedReceiverStream::new(notify_rx)))
     }
 
@@ -755,7 +763,7 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onServerCharacteristicWritten<'
 #[no_mangle]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onSubscribed<'local>(
     mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, address: JString<'local>,
-    characteristic_uuid: JString<'local>,
+    characteristic_uuid: JString<'local>, success: jboolean,
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
     let address = read_jstring(&mut env, &address);
@@ -766,7 +774,7 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onSubscribed<'local>(
     let mut connections = inner.connections.lock().unwrap();
     if let Some(state) = connections.get_mut(&address) {
         if let Some(tx) = state.subscribe_tx.remove(&CharacteristicUuid(uuid)) {
-            let _ = tx.send(());
+            let _ = tx.send(success != 0);
         }
     }
 }

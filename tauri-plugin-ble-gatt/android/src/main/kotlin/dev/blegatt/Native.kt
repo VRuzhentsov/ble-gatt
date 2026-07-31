@@ -52,4 +52,6 @@ external fun onServerCharacteristicWritten(
     nativeHandle: Long, address: String, characteristicUuid: String, value: ByteArray
 )
 
-external fun onSubscribed(nativeHandle: Long, address: String, characteristicUuid: String)
+external fun onSubscribed(
+    nativeHandle: Long, address: String, characteristicUuid: String, success: Boolean,
+)

@@ -120,6 +120,13 @@ pub trait Backend: Send + Sync {
     /// through a long transfer would otherwise just hang. Anything holding a
     /// `GattConnection` open across time should watch this stream.
     ///
+    /// **`Connected` is not once-per-connection — treat it as idempotent.**
+    /// Neither platform backend has a reliable server-side connection
+    /// signal, so both re-emit `Connected` for a peer ahead of every
+    /// characteristic write. A consumer that allocates per-peer state on
+    /// each `Connected` will tear down and replace that state mid-session;
+    /// key off the peer address and ignore repeats.
+    ///
     /// Characteristic *values* are not carried here — client-side
     /// notifications come back through `GattConnection::subscribe`.
     fn events(&self) -> BoxStream<GattEvent>;

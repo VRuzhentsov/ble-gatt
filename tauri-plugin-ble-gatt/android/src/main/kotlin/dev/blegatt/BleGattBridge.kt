@@ -228,9 +228,12 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             override fun onDescriptorWrite(
                 gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int
             ) {
-                if (status == BluetoothGatt.GATT_SUCCESS) {
-                    onSubscribed(nativeHandle, address, descriptor.characteristic.uuid.toString())
-                }
+                onSubscribed(
+                    nativeHandle,
+                    address,
+                    descriptor.characteristic.uuid.toString(),
+                    status == BluetoothGatt.GATT_SUCCESS,
+                )
             }
         }
         val gatt = device.connectGatt(context, false, callback)
@@ -244,10 +247,17 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     private fun findCharacteristic(address: String, characteristicUuid: String): BluetoothGattCharacteristic? =
         pendingCharacteristics[address]?.get(characteristicUuid)
 
+    /// Every failure path must report back. An early `return` here leaves
+    /// the Rust side's oneshot unresolved and its caller awaiting forever —
+    /// and unknown UUIDs or incomplete service discovery are ordinary
+    /// errors, not exotic ones.
     fun readCharacteristic(address: String, characteristicUuid: String) {
-        val gatt = connectedGatts[address] ?: return
-        val characteristic = findCharacteristic(address, characteristicUuid) ?: return
-        gatt.readCharacteristic(characteristic)
+        val gatt = connectedGatts[address]
+        val characteristic = findCharacteristic(address, characteristicUuid)
+        if (gatt == null || characteristic == null || !gatt.readCharacteristic(characteristic)) {
+            Log.w(TAG, "readCharacteristic could not start: $address/$characteristicUuid")
+            onCharacteristicRead(nativeHandle, address, characteristicUuid, ByteArray(0), false)
+        }
     }
 
     /// `withoutResponse` selects ATT Write Command over Write Request —
@@ -257,26 +267,42 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     fun writeCharacteristic(
         address: String, characteristicUuid: String, value: ByteArray, withoutResponse: Boolean,
     ) {
-        val gatt = connectedGatts[address] ?: return
-        val characteristic = findCharacteristic(address, characteristicUuid) ?: return
+        val gatt = connectedGatts[address]
+        val characteristic = findCharacteristic(address, characteristicUuid)
+        if (gatt == null || characteristic == null) {
+            Log.w(TAG, "writeCharacteristic could not start: $address/$characteristicUuid")
+            onCharacteristicWriteResult(nativeHandle, address, characteristicUuid, false)
+            return
+        }
         characteristic.writeType = if (withoutResponse) {
             BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
         } else {
             BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
         }
         characteristic.value = value
-        gatt.writeCharacteristic(characteristic)
+        if (!gatt.writeCharacteristic(characteristic)) {
+            Log.w(TAG, "writeCharacteristic rejected by the stack: $address/$characteristicUuid")
+            onCharacteristicWriteResult(nativeHandle, address, characteristicUuid, false)
+        }
     }
 
     fun subscribeCharacteristic(address: String, characteristicUuid: String) {
-        val gatt = connectedGatts[address] ?: return
-        val characteristic = findCharacteristic(address, characteristicUuid) ?: return
+        val gatt = connectedGatts[address]
+        val characteristic = findCharacteristic(address, characteristicUuid)
+        val cccd = characteristic?.getDescriptor(CLIENT_CHARACTERISTIC_CONFIG_UUID)
+        if (gatt == null || characteristic == null || cccd == null) {
+            Log.w(TAG, "subscribeCharacteristic could not start: $address/$characteristicUuid")
+            onSubscribed(nativeHandle, address, characteristicUuid, false)
+            return
+        }
         gatt.setCharacteristicNotification(characteristic, true)
-        val cccd = characteristic.getDescriptor(CLIENT_CHARACTERISTIC_CONFIG_UUID) ?: return
         @Suppress("DEPRECATION")
         cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
         @Suppress("DEPRECATION")
-        gatt.writeDescriptor(cccd)
+        if (!gatt.writeDescriptor(cccd)) {
+            Log.w(TAG, "subscribe descriptor write rejected: $address/$characteristicUuid")
+            onSubscribed(nativeHandle, address, characteristicUuid, false)
+        }
     }
 
     // ---------------------------------------------------------------

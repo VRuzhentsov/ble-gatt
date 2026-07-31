@@ -24,7 +24,11 @@ use ble_gatt::{
     Backend, BleError, BoxStream, CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattConnection,
     GattEvent, GattServiceSpec, PeerAddress, Result, ServiceUuid,
 };
-use tokio::sync::OnceCell;
+use tokio::sync::{broadcast, OnceCell};
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamExt;
+
+const EVENT_CHANNEL_CAPACITY: usize = 64;
 
 /// Populates the `ndk-context` crate's global `AndroidContext` from `tao`'s
 /// own, if it hasn't been already. Safe to call more than once — only the
@@ -50,18 +54,41 @@ fn bridge_ndk_context_from_tao() -> Result<()> {
 
 pub struct LazyAndroidBackend {
     cell: OnceCell<AndroidBackend>,
+    /// Events are republished through a channel owned by *this* wrapper, not
+    /// borrowed from the inner backend. That is what lets a caller subscribe
+    /// before the backend exists: `watchEvents()` first is a natural setup
+    /// order for a lifecycle listener, and returning the inner backend's
+    /// stream directly meant subscribing early got a permanently empty one —
+    /// a silent, successful-looking no-op.
+    events_tx: broadcast::Sender<GattEvent>,
 }
 
 impl LazyAndroidBackend {
     pub fn new() -> Self {
-        Self { cell: OnceCell::new() }
+        let (events_tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        Self {
+            cell: OnceCell::new(),
+            events_tx,
+        }
     }
 
     async fn inner(&self) -> Result<&AndroidBackend> {
         self.cell
             .get_or_try_init(|| async {
                 bridge_ndk_context_from_tao()?;
-                AndroidBackend::new().await
+                let backend = AndroidBackend::new().await?;
+                // Pump the real backend's events into our channel, so
+                // subscriptions taken out before this point keep working.
+                let mut source = backend.events();
+                let sink = self.events_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(event) = source.next().await {
+                        if sink.send(event).is_err() {
+                            return; // no subscribers left
+                        }
+                    }
+                });
+                Ok(backend)
             })
             .await
     }
@@ -100,11 +127,9 @@ impl Backend for LazyAndroidBackend {
     }
 
     fn events(&self) -> BoxStream<GattEvent> {
-        match self.cell.get() {
-            Some(backend) => backend.events(),
-            // Nothing has been constructed yet, so there is genuinely
-            // nothing to report — honest empty stream, not a fabricated one.
-            None => Box::pin(tokio_stream::empty()),
-        }
+        // Always a live subscription, whether or not the backend exists yet.
+        // Once it is built, `inner()` starts forwarding into this channel.
+        let rx = self.events_tx.subscribe();
+        Box::pin(BroadcastStream::new(rx).filter_map(|item| item.ok()))
     }
 }
