@@ -383,3 +383,64 @@ async fn a_served_channel_stops_sending_once_its_peer_disconnects() {
         }
     }
 }
+
+#[tokio::test]
+async fn stopping_the_server_invalidates_the_channel_it_was_serving() {
+    let config = config();
+    let network = MockNetwork::new();
+    let peripheral_addr = PeerAddress("peripheral-restart".to_string());
+
+    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+        peripheral_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    ));
+    let first_central: Arc<MockBackend> = Arc::new(MockBackend::new(
+        PeerAddress("central-before".to_string()),
+        network.clone(),
+        full_capabilities(),
+    ));
+
+    let mut incoming = datagram::serve(peripheral.clone(), &config)
+        .await
+        .expect("serve should start");
+    let _first = datagram::connect(first_central.clone(), &peripheral_addr, &config)
+        .await
+        .expect("connect should succeed");
+    let mut served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
+        .await
+        .expect("serve should yield a channel")
+        .expect("channel stream should not be closed");
+
+    served.send(b"while-serving".to_vec()).await.expect("send while serving");
+
+    // The server goes away while that central is still attached. Neither
+    // platform delivers a disconnect callback for a server teardown, so a
+    // backend that stays silent leaves this channel live.
+    peripheral.stop_advertising().await.expect("stop_advertising");
+    drop(incoming);
+
+    // Restart the server, so the *backend* would happily accept a notify
+    // again. That isolates what is under test: a send failing here can only
+    // mean the channel itself was invalidated, not that nothing is
+    // advertising. Without the disconnect, this send succeeds and the stale
+    // generation is still broadcasting into the new server's session.
+    let _restarted = datagram::serve(peripheral.clone(), &config)
+        .await
+        .expect("serve should restart");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match served.send(b"after-stop".to_vec()).await {
+            Err(_) => break,
+            Ok(()) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "a channel whose server has stopped must not keep sending into \
+                     the server that replaced it"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+}

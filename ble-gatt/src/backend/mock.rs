@@ -7,7 +7,7 @@
 //! Built entirely on `tokio::sync::{broadcast, Mutex}` rather than
 //! hand-rolled pub-sub plumbing.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -263,7 +263,42 @@ impl Backend for MockBackend {
     }
 
     async fn stop_advertising(&self) -> Result<()> {
+        // Announce every subscribed central as gone before tearing the
+        // server down. Both real backends now do this — neither platform
+        // delivers a disconnect callback when the *server* goes away, so
+        // without it `datagram::serve` keeps serving peers that no longer
+        // have a server to talk to, and locks out the next `serve`.
+        let served: Vec<PeerAddress> = {
+            let peripherals = self.network.peripherals.lock().unwrap();
+            match peripherals.get(&self.address) {
+                Some(state) => {
+                    let unique: HashSet<PeerAddress> = state
+                        .subscribers
+                        .values()
+                        .flat_map(|peers| peers.keys().cloned())
+                        .collect();
+                    unique.into_iter().collect()
+                }
+                None => Vec::new(),
+            }
+        };
         self.network.peripherals.lock().unwrap().remove(&self.address);
+        for peer in served {
+            self.network.emit(
+                &self.address,
+                GattEvent::Disconnected {
+                    peer: peer.clone(),
+                    local_role: Role::Peripheral,
+                },
+            );
+            self.network.emit(
+                &peer,
+                GattEvent::Disconnected {
+                    peer: self.address.clone(),
+                    local_role: Role::Central,
+                },
+            );
+        }
         Ok(())
     }
 

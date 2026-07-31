@@ -78,19 +78,31 @@ struct ConnectionState {
     disconnected_tx: Option<oneshot::Sender<()>>,
 }
 
+/// State of the one scan this backend allows at a time.
+#[derive(Default)]
+struct ScanState {
+    /// Where results go. `None` means no scan is active.
+    tx: Option<mpsc::Sender<Result<DiscoveredPeer>>>,
+    /// Terminal failure, delivered out-of-band from the result queue: if the
+    /// queue is saturated when `onScanFailed` arrives, an error pushed onto
+    /// it would be dropped, and a slow consumer would then drain the
+    /// buffered successes and see an ordinary end-of-stream — reporting a
+    /// truncated peer list as success for a controller failure.
+    error: Option<BleError>,
+}
+
 struct Inner {
     vm: JavaVM,
     context: GlobalRef,
     bridge: OnceLock<GlobalRef>,
     connections: StdMutex<HashMap<String, ConnectionState>>,
-    discovery_tx: StdMutex<Option<mpsc::Sender<Result<DiscoveredPeer>>>>,
-    /// Terminal scan failure, delivered out-of-band from the result queue.
-    /// It cannot ride the queue: if the queue is saturated when
-    /// `onScanFailed` arrives the error would be dropped, and a slow
-    /// consumer would then drain the buffered successes and see a normal
-    /// end-of-stream — reporting a truncated peer list as success when the
-    /// controller had actually failed.
-    scan_error: StdMutex<Option<BleError>>,
+    /// Sender and terminal error for the active scan, under **one** lock.
+    ///
+    /// They cannot be separate mutexes: `scan()` and `onScanFailed` would
+    /// acquire them in opposite orders. And the lock is deliberately held
+    /// across the `startScan` JNI call, which is what makes the exclusivity
+    /// check atomic — see `scan()`.
+    scan: StdMutex<ScanState>,
     /// Named `server_events_tx` historically, but now carries both roles'
     /// lifecycle events — including central-side link loss. See
     /// `Backend::events`.
@@ -189,8 +201,7 @@ impl AndroidBackend {
             context,
             bridge: OnceLock::new(),
             connections: StdMutex::new(HashMap::new()),
-            discovery_tx: StdMutex::new(None),
-            scan_error: StdMutex::new(None),
+            scan: StdMutex::new(ScanState::default()),
             server_events_tx,
             att_mtus: StdMutex::new(HashMap::new()),
             advertise_tx: StdMutex::new(None),
@@ -287,45 +298,23 @@ impl Backend for AndroidBackend {
     async fn scan(&self, service: ServiceUuid) -> Result<BoxStream<Result<DiscoveredPeer>>> {
         let (tx, rx) = mpsc::channel(DISCOVERY_QUEUE_DEPTH);
         // Install the new sender only *after* the platform confirms the scan
-        // started. Installing first would drop the in-flight scan's sole
-        // sender and close its stream, so merely attempting a concurrent
-        // scan would cancel the original one — the opposite of the
-        // exclusivity this check exists to enforce. On any failure the
-        // previous sender is put back untouched.
-        let previous = self.inner.discovery_tx.lock().unwrap().take();
-        let restore = |inner: &Arc<Inner>, previous| {
-            *inner.discovery_tx.lock().unwrap() = previous;
-        };
-        // Both of these must happen *before* `startScan`, because Android may
-        // call `onScanFailed` before it returns. Clearing the error slot
-        // afterwards would erase that failure, and installing the sender
-        // afterwards would leave the callback with nothing to close — the
-        // caller would then block until its timeout and get an empty Ok for
-        // what was a controller failure.
-        *self.inner.scan_error.lock().unwrap() = None;
-        *self.inner.discovery_tx.lock().unwrap() = Some(tx);
+        // started, and hold that lock across the JNI call.
+        //
+        // Holding it is what makes this atomic. `onScanFailed` for the
+        // *existing* scan can fire while we are inside `startScan`; if we
+        // had swapped our sender in first it would close ours instead of the
+        // active scan's, and the active scan's stream would then hang
+        // forever with its error never surfaced. Blocking that callback for
+        // the duration of one JNI call is cheap, and Android posts
+        // `ScanCallback` through a handler rather than calling it inline on
+        // this thread, so it cannot deadlock us.
+        let mut scan = self.inner.scan.lock().unwrap();
         {
-            let mut env = match self.inner.env() {
-                Ok(env) => env,
-                Err(err) => {
-                    restore(&self.inner, previous);
-                    return Err(err);
-                }
-            };
-            let uuid = match env.new_string(service.0.to_string()) {
-                Ok(uuid) => uuid,
-                Err(err) => {
-                    restore(&self.inner, previous);
-                    return Err(BleError::Gatt(err.to_string()));
-                }
-            };
-            let bridge = match self.inner.bridge() {
-                Ok(bridge) => bridge,
-                Err(err) => {
-                    restore(&self.inner, previous);
-                    return Err(err);
-                }
-            };
+            let mut env = self.inner.env()?;
+            let uuid = env
+                .new_string(service.0.to_string())
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
+            let bridge = self.inner.bridge()?;
             let started = env
                 .call_method(
                     bridge.as_obj(),
@@ -340,23 +329,24 @@ impl Backend for AndroidBackend {
                 // permission is the common case) would otherwise leave the
                 // exception pending on the daemon-attached Tokio worker and
                 // poison every later JNI call scheduled there.
-                Err(err) => {
-                    let mapped = jni_error(&mut env, "startScan", err);
-                    restore(&self.inner, previous);
-                    return Err(mapped);
-                }
+                Err(err) => return Err(jni_error(&mut env, "startScan", err)),
+                // Rejected. The active scan keeps ownership untouched — we
+                // never took it away.
                 Ok(false) => {
-                    // Rejected: hand ownership back to the in-flight scan.
-                    // `previous` was moved out, never dropped, so that
-                    // scan's stream is untouched.
-                    restore(&self.inner, previous);
                     return Err(BleError::Gatt(
                         "a scan is already active; concurrent scans are not supported".to_string(),
-                    ));
+                    ))
                 }
                 Ok(true) => {}
             }
         }
+        // Ours now. Installed before the lock is released, so an
+        // `onScanFailed` that fired during `startScan` — and is blocked on
+        // this lock — finds our sender and records against our scan.
+        scan.tx = Some(tx);
+        scan.error = None;
+        drop(scan);
+
         Ok(Box::pin(ScanStream {
             inner: self.inner.clone(),
             rx: ReceiverStream::new(rx),
@@ -528,7 +518,7 @@ impl tokio_stream::Stream for ScanStream {
             // now surface any terminal failure — taking it so the stream
             // ends on the poll after.
             std::task::Poll::Ready(None) => {
-                let error = self.inner.scan_error.lock().unwrap().take();
+                let error = self.inner.scan.lock().unwrap().error.take();
                 std::task::Poll::Ready(error.map(Err))
             }
             other => other,
@@ -541,7 +531,7 @@ impl Drop for ScanStream {
         if let Ok(mut env) = self.inner.env() {
             let _ = self.inner.call_void(&mut env, "stopScan", "()V", &[]);
         }
-        *self.inner.discovery_tx.lock().unwrap() = None;
+        self.inner.scan.lock().unwrap().tx = None;
     }
 }
 
@@ -812,8 +802,8 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onPeerDiscovered<'local>(
         }
     }
 
-    let discovery_tx = inner.discovery_tx.lock().unwrap();
-    if let Some(tx) = discovery_tx.as_ref() {
+    let scan = inner.scan.lock().unwrap();
+    if let Some(tx) = scan.tx.as_ref() {
         // try_send on a bounded queue: this runs on a JVM callback thread
         // that must not block, and in a dense advertising environment the
         // radio can outpace any consumer indefinitely.
@@ -859,12 +849,13 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onScanFailed<'local>(
     // Recorded in a dedicated slot rather than pushed onto the result queue:
     // a saturated queue would swallow the error, and the consumer would then
     // drain the buffered successes and see an ordinary end-of-stream.
-    *inner.scan_error.lock().unwrap() = Some(BleError::Gatt(format!(
+    let mut scan = inner.scan.lock().unwrap();
+    scan.error = Some(BleError::Gatt(format!(
         "Android scan failed (ScanCallback error code {error_code})"
     )));
     // Dropping the sender ends the queue; `ScanStream` yields the recorded
     // error as its final item.
-    inner.discovery_tx.lock().unwrap().take();
+    scan.tx.take();
 }
 
 #[no_mangle]

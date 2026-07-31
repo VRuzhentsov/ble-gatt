@@ -14,6 +14,9 @@
 //! precise link-level connect/disconnect timing.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
+
+use uuid::Uuid;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -61,14 +64,16 @@ pub struct LinuxBackend {
     /// initiated, so without this an outbound connection would be
     /// misreported as a central arriving at our server.
     dialed: Arc<StdMutex<HashSet<PeerAddress>>>,
-    /// Devices currently connected that this backend did not dial.
+    /// Devices currently connected that this backend did not dial, with
+    /// when each connected.
     ///
     /// Candidates only — a shared adapter carries connections for unrelated
     /// services and other processes, and BlueZ's `Device1.Connected` cannot
     /// say which GATT service a peer is using. Nothing is announced from
-    /// this set on its own; it exists solely to put an address on a
-    /// `StartNotify`, which BlueZ delivers without one.
-    inbound_candidates: Arc<StdMutex<HashSet<PeerAddress>>>,
+    /// this map on its own; it exists solely to put an address on a
+    /// `StartNotify`, which BlueZ delivers without one. The timestamp breaks
+    /// ties — see `resolve_subscriber`.
+    inbound_candidates: Arc<StdMutex<HashMap<PeerAddress, Instant>>>,
 }
 
 impl LinuxBackend {
@@ -102,9 +107,64 @@ impl LinuxBackend {
             adv_handle: AsyncMutex::new(None),
             server_watch: AsyncMutex::new(None),
             dialed: Arc::new(StdMutex::new(HashSet::new())),
-            inbound_candidates: Arc::new(StdMutex::new(HashSet::new())),
+            inbound_candidates: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
+}
+
+/// Decide which connected device just subscribed to our characteristic.
+///
+/// BlueZ delivers `StartNotify` without an address, so this has to be
+/// inferred. Returning `None` when the answer is ambiguous is not an option:
+/// the whole point of announcing on subscription is to support a central
+/// that waits for the server to speak first, and such a central never
+/// writes — so "fall back to the write path" would mean waiting forever the
+/// moment any unrelated device shares the adapter.
+///
+/// So it always answers if there is any candidate at all, narrowing first
+/// and only then breaking the tie:
+///
+/// 1. Prefer candidates advertising the service we serve. A peer of this
+///    application advertises it; headphones and unrelated peripherals do
+///    not, which removes the common source of ambiguity outright.
+/// 2. Among those, take the most recently connected — the connection that
+///    just produced this subscription is overwhelmingly the newest one.
+async fn resolve_subscriber(
+    adapter: &Adapter, service: Uuid, candidates: &Arc<StdMutex<HashMap<PeerAddress, Instant>>>,
+) -> Option<PeerAddress> {
+    let snapshot: Vec<(PeerAddress, Instant)> = {
+        let candidates = candidates.lock().unwrap();
+        candidates.iter().map(|(k, v)| (k.clone(), *v)).collect()
+    };
+    if snapshot.len() <= 1 {
+        return snapshot.into_iter().next().map(|(peer, _)| peer);
+    }
+
+    let mut advertising_our_service = Vec::new();
+    for (peer, at) in &snapshot {
+        let Ok(address) = peer.0.parse() else {
+            continue;
+        };
+        let Ok(device) = adapter.device(address) else {
+            continue;
+        };
+        if device
+            .uuids()
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|uuids| uuids.contains(&service))
+        {
+            advertising_our_service.push((peer.clone(), *at));
+        }
+    }
+
+    let pool = if advertising_our_service.is_empty() {
+        snapshot
+    } else {
+        advertising_our_service
+    };
+    pool.into_iter().max_by_key(|(_, at)| *at).map(|(peer, _)| peer)
 }
 
 /// Watch for centrals connecting to our GATT server and surface each as
@@ -120,7 +180,7 @@ impl LinuxBackend {
 /// - **Deduplicate.** `served_peers` is shared with the write path, so a
 ///   peer that connects and then writes is announced once, not twice.
 async fn watch_inbound_connections(
-    adapter: Adapter, candidates: Arc<StdMutex<HashSet<PeerAddress>>>,
+    adapter: Adapter, candidates: Arc<StdMutex<HashMap<PeerAddress, Instant>>>,
     dialed: Arc<StdMutex<HashSet<PeerAddress>>>,
 ) {
     // Children live in a JoinSet owned by this task, so aborting it (from
@@ -154,7 +214,7 @@ async fn watch_inbound_connections(
 /// its connection produces no `DeviceAdded` at all.
 fn spawn_connect_watch(
     watchers: &mut JoinSet<()>, watching: &mut HashSet<PeerAddress>, adapter: &Adapter,
-    address: bluer::Address, candidates: &Arc<StdMutex<HashSet<PeerAddress>>>,
+    address: bluer::Address, candidates: &Arc<StdMutex<HashMap<PeerAddress, Instant>>>,
     dialed: &Arc<StdMutex<HashSet<PeerAddress>>>,
 ) {
     let peer = PeerAddress(address.to_string());
@@ -172,10 +232,11 @@ fn spawn_connect_watch(
             return;
         };
         let record = |connected: bool| {
+            let mut candidates = candidates.lock().unwrap();
             if connected && !dialed.lock().unwrap().contains(&peer) {
-                candidates.lock().unwrap().insert(peer.clone());
+                candidates.entry(peer.clone()).or_insert_with(Instant::now);
             } else {
-                candidates.lock().unwrap().remove(&peer);
+                candidates.remove(&peer);
             }
         };
         // Poll once after subscribing: a device already connected when this
@@ -448,6 +509,7 @@ impl Backend for LinuxBackend {
                 let served_peers = served_peers.clone();
                 let candidates = inbound_candidates.clone();
                 let adapter = adapter.clone();
+                let service_uuid = service.uuid.0;
                 CharacteristicNotify {
                     notify: true,
                     method: CharacteristicNotifyMethod::Fun(Box::new(move |notifier| {
@@ -474,15 +536,9 @@ impl Backend for LinuxBackend {
                             // ambiguous nothing is announced and the write
                             // path remains the fallback — a wrong address
                             // would be worse than a late one.
-                            let peer = {
-                                let candidates = candidates.lock().unwrap();
-                                let mut iter = candidates.iter();
-                                match (iter.next(), iter.next()) {
-                                    (Some(peer), None) => Some(peer.clone()),
-                                    _ => None,
-                                }
-                            };
-                            let Some(peer) = peer else {
+                            let Some(peer) =
+                                resolve_subscriber(&adapter, service_uuid, &candidates).await
+                            else {
                                 return;
                             };
                             let newly_served =
@@ -569,7 +625,20 @@ impl Backend for LinuxBackend {
         if let Some(watch) = self.server_watch.lock().await.take() {
             watch.abort();
         }
-        self.served_peers.lock().unwrap().clear();
+        // Announce the departure of every central we were serving *before*
+        // forgetting them. Silently clearing the set left `datagram::serve`
+        // holding those peers in its single-central map with their channels
+        // still live, so a later `advertise` had the old task disconnecting
+        // the new server's central as an interloper — locking the new
+        // `serve` out until the stale peer happened to drop physically.
+        let served: Vec<PeerAddress> = self.served_peers.lock().unwrap().drain().collect();
+        for peer in served {
+            let _ = self.events_tx.send(GattEvent::Disconnected {
+                peer,
+                local_role: Role::Peripheral,
+            });
+        }
+        self.inbound_candidates.lock().unwrap().clear();
         *self.app_handle.lock().await = None;
         *self.adv_handle.lock().await = None;
         self.notifiers.lock().await.clear();

@@ -566,10 +566,22 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         val advertiser = adapter?.bluetoothLeAdvertiser
         advertiseCallback?.let { advertiser?.stopAdvertising(it) }
         advertiseCallback = null
+
+        // Report every served central as gone *before* dropping the server.
+        // Closing a GATT server delivers no onConnectionStateChange for the
+        // centrals attached to it, so without this Rust keeps them in its
+        // single-central map with their channels live — and a later
+        // advertise has the stale generation disconnecting the new server's
+        // central as an interloper.
+        val served = subscribedDevices.values.flatten().map { it.address }.distinct()
+        subscribedDevices.clear()
+        for (address in served) {
+            onDisconnected(nativeHandle, address, true)
+        }
+
         gattServer?.close()
         gattServer = null
         serverCharacteristics.clear()
-        subscribedDevices.clear()
     }
 
     /// Report an advertise failure *and* release everything the attempt
