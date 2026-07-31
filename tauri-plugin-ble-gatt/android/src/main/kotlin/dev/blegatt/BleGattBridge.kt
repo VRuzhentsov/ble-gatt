@@ -1,6 +1,7 @@
 package dev.blegatt
 
 import android.bluetooth.BluetoothAdapter
+import java.util.concurrent.ConcurrentHashMap
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
@@ -64,15 +65,30 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     }
 
     // --- Central role state ---
+    // Concurrency note: JNI calls arrive on whichever Tokio worker thread
+    // made them, and Bluetooth callbacks arrive on Binder threads. The JVM
+    // does not serialize calls on a shared object, so every mutable
+    // collection below is concurrent — plain HashMaps here could lose a GATT
+    // entry or corrupt their internal state outright, leaving a Rust
+    // connection that had connected successfully unable to read, write or
+    // disconnect. Concurrent collections rather than a lock because several
+    // of these are touched around blocking Android calls, where holding one
+    // invites deadlock.
+    @Volatile
     private var scanCallback: ScanCallback? = null
-    private val connectedGatts = HashMap<String, BluetoothGatt>()
-    private val pendingCharacteristics = HashMap<String, HashMap<String, BluetoothGattCharacteristic>>()
+    private val connectedGatts = ConcurrentHashMap<String, BluetoothGatt>()
+    private val pendingCharacteristics =
+        ConcurrentHashMap<String, ConcurrentHashMap<String, BluetoothGattCharacteristic>>()
 
     // --- Peripheral role state ---
+    @Volatile
     private var gattServer: BluetoothGattServer? = null
+    @Volatile
     private var advertiseCallback: AdvertiseCallback? = null
-    private val serverCharacteristics = HashMap<String, BluetoothGattCharacteristic>()
-    private val subscribedDevices = HashMap<String, MutableSet<BluetoothDevice>>()
+    private val serverCharacteristics = ConcurrentHashMap<String, BluetoothGattCharacteristic>()
+    /// Values are concurrent sets: a CCCD write and a notify can touch the
+    /// same characteristic's subscriber set from different threads.
+    private val subscribedDevices = ConcurrentHashMap<String, MutableSet<BluetoothDevice>>()
 
     /// Android allows exactly one outstanding server notification at a time:
     /// `notifyCharacteristicChanged` only reports that a send was
@@ -258,7 +274,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                     gatt.close()
                     return
                 }
-                val byUuid = HashMap<String, BluetoothGattCharacteristic>()
+                val byUuid = ConcurrentHashMap<String, BluetoothGattCharacteristic>()
                 for (service in gatt.services) {
                     for (characteristic in service.characteristics) {
                         byUuid[characteristic.uuid.toString()] = characteristic
@@ -479,7 +495,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 val characteristicUuid = descriptor.characteristic.uuid.toString()
                 if (value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)) {
                     val added = subscribedDevices
-                        .getOrPut(characteristicUuid) { mutableSetOf() }
+                        .getOrPut(characteristicUuid) { ConcurrentHashMap.newKeySet() }
                         .add(device)
                     // Report only the transition. This is what tells Rust the
                     // peer is reachable by notify — announcing at connection

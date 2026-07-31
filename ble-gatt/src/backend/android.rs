@@ -95,6 +95,12 @@ struct ScanState {
     /// buffered successes and see an ordinary end-of-stream — reporting a
     /// truncated peer list as success for a controller failure.
     error: Option<BleError>,
+    /// Which scan owns the fields above. A dropped stream must only tear
+    /// down *its own* generation: without this, a stream dropped after a
+    /// replacement scan had already installed itself would stop the new
+    /// scan's platform session and clear its sender, leaving a scan that
+    /// returned successfully with an immediately-closed result stream.
+    generation: u64,
 }
 
 struct Inner {
@@ -401,11 +407,14 @@ impl Backend for AndroidBackend {
         // this lock — finds our sender and records against our scan.
         scan.tx = Some(tx);
         scan.error = None;
+        scan.generation += 1;
+        let generation = scan.generation;
         drop(scan);
 
         Ok(Box::pin(ScanStream {
             inner: self.inner.clone(),
             rx: ReceiverStream::new(rx),
+            generation,
         }))
     }
 
@@ -654,6 +663,7 @@ impl Backend for AndroidBackend {
 struct ScanStream {
     inner: Arc<Inner>,
     rx: ReceiverStream<Result<DiscoveredPeer>>,
+    generation: u64,
 }
 
 impl tokio_stream::Stream for ScanStream {
@@ -676,10 +686,21 @@ impl tokio_stream::Stream for ScanStream {
 
 impl Drop for ScanStream {
     fn drop(&mut self) {
+        // Take the lock first and keep it across the platform stop, the same
+        // way `scan()` holds it across `startScan`. Stopping and clearing as
+        // two unlocked steps let a replacement scan install itself in
+        // between, after which this drop would stop *its* session and clear
+        // *its* sender.
+        let mut scan = self.inner.scan.lock().unwrap();
+        if scan.generation != self.generation {
+            // Superseded: a newer scan owns the platform session now, and
+            // tearing it down is not this stream's business.
+            return;
+        }
         if let Ok(mut env) = self.inner.env() {
             let _ = self.inner.call_void(&mut env, "stopScan", "()V", &[]);
         }
-        self.inner.scan.lock().unwrap().tx = None;
+        scan.tx = None;
     }
 }
 

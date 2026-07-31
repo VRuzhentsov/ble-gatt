@@ -457,3 +457,68 @@ async fn stopping_the_server_releases_the_peer_it_was_serving() {
         "a channel whose server has stopped must not keep sending"
     );
 }
+
+#[tokio::test]
+async fn inbound_overflow_is_reported_to_the_receiver_rather_than_lost_silently() {
+    // Tiny queues so the receiver can be overwhelmed deterministically.
+    let mut config = config();
+    config.fragment_queue_depth = 1;
+    config.inbound_queue_depth = 1;
+
+    let network = MockNetwork::new();
+    let peripheral_addr = PeerAddress("peripheral-overflow".to_string());
+    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+        peripheral_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    ));
+    let central: Arc<MockBackend> = Arc::new(MockBackend::new(
+        PeerAddress("central-overflow".to_string()),
+        network.clone(),
+        full_capabilities(),
+    ));
+
+    let mut incoming = datagram::serve(peripheral.clone(), &config)
+        .await
+        .expect("serve should start");
+    let mut sender = datagram::connect(central.clone(), &peripheral_addr, &config)
+        .await
+        .expect("connect should succeed");
+    let mut served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
+        .await
+        .expect("serve should yield a channel")
+        .expect("channel stream should not be closed");
+
+    // Flood without draining. The sender's writes are acknowledged by the
+    // stack before the datagram layer sees them, so `send` cannot be failed
+    // — which is exactly why the loss must reach the receiver instead of
+    // disappearing into a reassembly timeout.
+    for i in 0..20u8 {
+        if sender.send(vec![i; 8]).await.is_err() {
+            break;
+        }
+    }
+
+    // Let `serve` work through the backlog against a receiver that is not
+    // draining, so it actually reaches the drop path. Comfortably longer
+    // than the backpressure window it waits before giving up.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let mut saw_error = false;
+    for _ in 0..64 {
+        match tokio::time::timeout(Duration::from_secs(2), served.recv()).await {
+            Ok(Some(Err(_))) => {
+                saw_error = true;
+                break;
+            }
+            Ok(Some(Ok(_))) => continue,
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    assert!(
+        saw_error,
+        "a receiver that overflows must be told its stream lost data, not left to \
+         infer it from a message that never arrives"
+    );
+}

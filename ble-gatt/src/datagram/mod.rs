@@ -80,6 +80,14 @@ pub const DEFAULT_FRAGMENT_QUEUE_DEPTH: usize = 256;
 /// accepting.
 pub const DEFAULT_ACCEPT_QUEUE_DEPTH: usize = 8;
 
+/// How long `serve` will block on a full fragment queue before dropping a
+/// fragment and reporting the loss.
+///
+/// Bounded rather than unbounded because the same loop carries disconnects:
+/// waiting forever on a peer that has stopped draining would stall cleanup
+/// for every peer, including that one.
+const FRAGMENT_BACKPRESSURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[derive(Debug, Clone)]
 pub struct DatagramConfig {
     pub service: ServiceUuid,
@@ -87,7 +95,7 @@ pub struct DatagramConfig {
     pub max_message_len: usize,
     pub reassembly_timeout: Duration,
     pub max_concurrent_reassemblies: usize,
-    /// Defaults to `WithResponse`: this is a reliable channel, and ATT write
+    /// Defaults to `WithResponse`: ATT write
     /// requests are acknowledged. `WithoutResponse` trades that for
     /// throughput and will silently drop under load — opt in only where the
     /// layer above tolerates loss.
@@ -207,11 +215,39 @@ enum Sink {
 }
 
 /// An ordered, opaque-bytes channel to one peer.
+///
+/// # Delivery guarantees — read before relying on `send`
+///
+/// `send` returning `Ok` means every fragment was accepted by the local
+/// stack and, where the transport confirms it, acknowledged at the link
+/// layer by the peer's controller. **It does not mean the peer's
+/// application received the message.**
+///
+/// The gap is not an implementation shortcut, it is structural. A
+/// `WithResponse` write is acknowledged by the receiving *stack* before this
+/// library ever sees the payload, so when the receiver is not draining fast
+/// enough there is no longer any way to fail the sender's write: the ack has
+/// already gone out. `serve` applies backpressure for
+/// [`FRAGMENT_BACKPRESSURE_TIMEOUT`] before giving up, and reports the loss
+/// to the *receiving* side as an error item from [`Self::recv`] — the only
+/// endpoint that can still be told.
+///
+/// So: this is a reliable *link*, not a reliable *protocol*. Consumers
+/// needing end-to-end delivery guarantees must acknowledge at their own
+/// layer, exactly as they would over UDP. That is consistent with this
+/// tier's job — carrying bytes it does not interpret.
 pub struct DatagramChannel {
     peer: PeerAddress,
     characteristic: CharacteristicUuid,
     sink: Mutex<Sink>,
     inbound: ReceiverStream<Result<Vec<u8>>>,
+    /// Set when inbound data was dropped for this channel.
+    ///
+    /// A dedicated flag rather than an error pushed onto the message queue:
+    /// overflow happens precisely when that queue is full, so the report
+    /// would be the first thing discarded — the failure would silence its
+    /// own alarm.
+    overflow: Arc<AtomicBool>,
     next_msg_id: u16,
     max_message_len: usize,
     /// Fixed at construction from the negotiated MTU. BLE does not
@@ -301,6 +337,17 @@ impl DatagramChannel {
     /// `close()`. Without that, a caller mid-conversation would block
     /// forever on a dead link.
     pub async fn recv(&mut self) -> Option<Result<Vec<u8>>> {
+        // Checked ahead of the queue so the report is prompt. It is
+        // deliberately out of order with respect to messages still buffered:
+        // "you have lost data" is more useful now than after draining
+        // everything that survived.
+        if self.overflow.swap(false, Ordering::SeqCst) {
+            return Some(Err(BleError::Gatt(format!(
+                "inbound overflow from {}: fragments were dropped and at least one \
+                 message is lost",
+                self.peer.0
+            ))));
+        }
         self.inbound.next().await
     }
 
@@ -438,6 +485,10 @@ pub async fn connect(
             write_type: config.write_type,
         }),
         inbound: ReceiverStream::new(rx),
+        // A central's inbound path is a notify subscription, which the
+        // backend bounds itself; `serve`'s fragment queue is the only place
+        // this library drops inbound data.
+        overflow: Arc::new(AtomicBool::new(false)),
         next_msg_id: 0,
         max_message_len: effective_max_message_len(config.max_message_len, budget),
         fragment_budget: budget,
@@ -524,8 +575,11 @@ pub async fn serve(
         // are refused rather than served.
         // The fragment sender plus the liveness flag handed to that peer's
     // channel, so a disconnect can invalidate the channel the caller holds.
-    let mut inbound: HashMap<PeerAddress, (mpsc::Sender<Vec<u8>>, Arc<AtomicBool>)> =
-            HashMap::new();
+    #[allow(clippy::type_complexity)]
+    let mut inbound: HashMap<
+        PeerAddress,
+        (mpsc::Sender<Vec<u8>>, Arc<AtomicBool>, Arc<AtomicBool>),
+    > = HashMap::new();
 
         // Dropping the accept stream means "no more *new* peers" — it does
         // not abandon the ones already handed over, which still need this
@@ -607,6 +661,7 @@ pub async fn serve(
                     let active = Arc::new(AtomicBool::new(true));
                     let (frag_tx, frag_rx) = mpsc::channel(config.fragment_queue_depth);
                     let (msg_tx, msg_rx) = mpsc::channel(config.inbound_queue_depth);
+                    let overflow = Arc::new(AtomicBool::new(false));
                     let reassembly = spawn_reassembly(
                         ReceiverStream::new(frag_rx),
                         config.limits(),
@@ -621,6 +676,7 @@ pub async fn serve(
                             active: active.clone(),
                         }),
                         inbound: ReceiverStream::new(msg_rx),
+                        overflow: overflow.clone(),
                         next_msg_id: 0,
                         max_message_len: effective_max_message_len(
                             config.max_message_len,
@@ -637,7 +693,7 @@ pub async fn serve(
                     // not occupy the single-central slot.
                     match channels_tx.try_send(channel) {
                         Ok(()) => {
-                            inbound.insert(peer.clone(), (frag_tx, active));
+                            inbound.insert(peer.clone(), (frag_tx, active, overflow.clone()));
                         }
                         Err(mpsc::error::TrySendError::Full(_)) => {
                             eprintln!(
@@ -675,19 +731,40 @@ pub async fn serve(
                     if characteristic != config.characteristic {
                         continue;
                     }
-                    if let Some((tx, _)) = inbound.get(&peer) {
-                        // try_send, not send: this loop also carries
-                        // disconnects, so blocking it on a backed-up peer
-                        // would stall cleanup for everyone. A dropped
-                        // fragment costs one message, which the reassembly
-                        // timeout then reaps — unbounded growth would cost
-                        // the process.
-                        if tx.try_send(value).is_err() {
-                            eprintln!(
-                                "[ble-gatt][datagram] fragment queue full for {}, dropping \
-                                 fragment; the affected message will time out",
-                                peer.0
-                            );
+                    if let Some((tx, _, overflow)) = inbound.get(&peer) {
+                        // Try first, then apply real backpressure before
+                        // considering a drop. The sender's ATT write has
+                        // already been acknowledged by the stack by the time
+                        // this event exists, so a dropped fragment is loss
+                        // that the *sender* cannot be told about — worth
+                        // waiting to avoid.
+                        //
+                        // The wait is bounded because this loop also carries
+                        // disconnects: blocking it indefinitely on a peer
+                        // that has stopped draining would stall cleanup for
+                        // everyone, including the peer that is stuck.
+                        match tx.try_send(value) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Closed(_)) => {}
+                            Err(mpsc::error::TrySendError::Full(value)) => {
+                                let queued = tokio::time::timeout(
+                                    FRAGMENT_BACKPRESSURE_TIMEOUT,
+                                    tx.send(value),
+                                )
+                                .await;
+                                if queued.is_err() {
+                                    // Report the loss to the receiver rather
+                                    // than letting the message quietly time
+                                    // out. It is the only endpoint that can
+                                    // still be told.
+                                    overflow.store(true, Ordering::SeqCst);
+                                    eprintln!(
+                                        "[ble-gatt][datagram] fragment queue full for {} after \
+                                         backpressure; dropping fragment and reporting loss",
+                                        peer.0
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -700,7 +777,7 @@ pub async fn serve(
                     // Clearing the flag closes the *send* half: without it
                     // the caller could still push fragments into a broadcast
                     // that the next accepted central would receive.
-                    if let Some((_, active)) = inbound.remove(&peer) {
+                    if let Some((_, active, _)) = inbound.remove(&peer) {
                         active.store(false, Ordering::SeqCst);
                     }
                     if accept_closed && inbound.is_empty() {
