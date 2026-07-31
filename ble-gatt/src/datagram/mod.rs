@@ -21,20 +21,26 @@
 //! - central → peripheral: characteristic write
 //! - peripheral → central: notify on that same characteristic
 //!
-//! ## Known limitation: peripheral sends are broadcast
+//! ## Known limitation: the peripheral role serves one central at a time
 //!
-//! `Backend::notify` pushes to *every* subscribed central, because that is
-//! the only per-characteristic primitive both platform backends expose
-//! today. With a single connected central — the common case, and the only
-//! one either current consumer exercises — this is exactly point-to-point.
-//! With several, each `DatagramChannel::send` from the peripheral side
-//! reaches all of them, and peers other than the intended one will see
-//! payloads they cannot make sense of (harmless if encrypted, but wasteful
-//! and not what the API appears to promise). Fixing it needs a per-peer
-//! notify on the `Backend` port: straightforward on Android
-//! (`notifyCharacteristicChanged` already takes a device) but unresolved on
-//! BlueZ, where `bluer`'s notifier does not obviously identify its
-//! subscriber. Documented rather than silently shipped.
+//! `Backend::notify` pushes to *every* subscribed central — the only
+//! per-characteristic primitive both platform backends expose today. With a
+//! single connected central this is exactly point-to-point, which is what
+//! both current consumers need.
+//!
+//! With several it would be actively unsafe rather than merely wasteful:
+//! each central receives the others' fragments, and since every channel
+//! starts its `msg_id` at 0, the first message on two channels shares both
+//! `msg_id` and usually `total`. The `InconsistentTotal` guard only fires
+//! when `total` differs, so those fragments interleave in a third party's
+//! reassembler and complete into a blend of two messages — delivered as
+//! valid, with no error.
+//!
+//! `serve` therefore refuses additional centrals while one is active.
+//! Lifting that needs a per-peer notify on the `Backend` port:
+//! straightforward on Android (`notifyCharacteristicChanged` already takes a
+//! device), unresolved on BlueZ where `bluer`'s notifier does not identify
+//! its subscriber.
 
 pub mod fragment;
 pub mod reassembly;
@@ -48,7 +54,7 @@ use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 use tokio_stream::StreamExt;
 
 use crate::backend::{Backend, BoxStream, GattConnection};
-use crate::datagram::fragment::{split, FragmentHeader, FRAGMENT_HEADER_LEN};
+use crate::datagram::fragment::{split, FragmentHeader, FRAGMENT_HEADER_LEN, MAX_FRAGMENTS};
 use crate::datagram::reassembly::{Accept, Reassembler, ReassemblyLimits};
 use crate::error::{BleError, Result};
 use crate::models::{
@@ -120,6 +126,16 @@ impl DatagramConfig {
     }
 }
 
+/// The configured ceiling, lowered to whatever the fragment budget can
+/// actually carry. Without this the two limits disagree: a peripheral
+/// budgets 14-byte fragments against the spec-minimum MTU, capping a
+/// message at ~896 KiB, while `max_message_len` defaults to 1 MiB — so
+/// messages in the gap passed the size check and then failed inside
+/// `split()` one call later.
+fn effective_max_message_len(configured: usize, fragment_budget: usize) -> usize {
+    configured.min(fragment_budget.saturating_mul(MAX_FRAGMENTS))
+}
+
 /// How a channel pushes bytes at its peer — the only thing that differs
 /// between the two roles once fragmentation is factored out.
 enum Sink {
@@ -144,6 +160,19 @@ pub struct DatagramChannel {
     /// Fixed at construction from the negotiated MTU. BLE does not
     /// renegotiate mid-session in practice, so this is not refreshed.
     fragment_budget: usize,
+    /// Background tasks owned by this channel, aborted on drop. Without
+    /// this, dropping a channel without calling `close()` leaves the
+    /// reassembly and link-loss tasks running until the peer or the OS
+    /// happens to end the link.
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for DatagramChannel {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
 }
 
 impl DatagramChannel {
@@ -151,7 +180,14 @@ impl DatagramChannel {
         self.peer.clone()
     }
 
-    /// Largest payload a single `send` will accept.
+    /// Largest payload a single `send` will accept on *this* channel.
+    ///
+    /// May be lower than the configured `max_message_len`: a message also
+    /// has to fit in `MAX_FRAGMENTS` fragments of `fragment_budget` bytes.
+    /// The peripheral role budgets against the spec-minimum MTU, so its
+    /// real ceiling is well under the 1 MiB default — reporting the
+    /// configured value there would promise a size that `send` then
+    /// refuses.
     pub fn max_message_len(&self) -> usize {
         self.max_message_len
     }
@@ -305,7 +341,10 @@ pub async fn connect(
 
     let (tx, rx) = mpsc::channel(config.inbound_queue_depth);
     let reassembly = spawn_reassembly(notifications, config.limits(), tx);
-    spawn_link_loss_watch(events, peer.clone(), reassembly);
+    // The watcher owns the reassembly handle so it can abort it on link
+    // loss; the channel keeps the watcher's handle so dropping the channel
+    // tears both down.
+    let watcher = spawn_link_loss_watch(events, peer.clone(), reassembly);
 
     Ok(DatagramChannel {
         peer: peer.clone(),
@@ -316,8 +355,9 @@ pub async fn connect(
         }),
         inbound: ReceiverStream::new(rx),
         next_msg_id: 0,
-        max_message_len: config.max_message_len,
+        max_message_len: effective_max_message_len(config.max_message_len, budget),
         fragment_budget: budget,
+        tasks: vec![watcher],
     })
 }
 
@@ -331,7 +371,7 @@ pub async fn connect(
 /// would be waiting forever.
 fn spawn_link_loss_watch(
     mut events: BoxStream<GattEvent>, peer: PeerAddress, reassembly: tokio::task::JoinHandle<()>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(event) = events.next().await {
             if matches!(&event, GattEvent::Disconnected { peer: lost } if *lost == peer) {
@@ -339,11 +379,34 @@ fn spawn_link_loss_watch(
                 return;
             }
         }
-    });
+        // Event stream ended: nothing more can arrive, so the reassembly
+        // task would otherwise linger for the life of the process.
+        reassembly.abort();
+    })
 }
 
-/// Peripheral role: advertise `config`'s service and yield one channel per
-/// central that connects.
+/// Peripheral role: advertise `config`'s service and serve **one** central
+/// at a time.
+///
+/// # Why one, and not many
+///
+/// `Backend::notify` broadcasts to every subscribed central — it is the only
+/// per-characteristic primitive both platforms expose. That makes serving
+/// two centrals concurrently actively unsafe, not merely wasteful:
+///
+/// - every central receives every other central's fragments, and
+/// - each `DatagramChannel` starts its `msg_id` counter at 0, so the very
+///   first message on two channels shares both `msg_id` and often `total`.
+///   The `InconsistentTotal` guard only fires when `total` differs, so those
+///   fragments interleave inside a third party's reassembler and complete
+///   into a message that is a blend of two — delivered to `recv()` as valid,
+///   with no error.
+///
+/// Silent corruption is worse than a missing feature, so additional centrals
+/// are refused while one is active rather than served incorrectly. Lifting
+/// this needs a per-peer notify on the `Backend` port: straightforward on
+/// Android (`notifyCharacteristicChanged` already takes a device),
+/// unresolved on BlueZ.
 pub async fn serve(
     backend: Arc<dyn Backend>, config: &DatagramConfig,
 ) -> Result<BoxStream<DatagramChannel>> {
@@ -352,10 +415,17 @@ pub async fn serve(
     let (channels_tx, channels_rx) = mpsc::unbounded_channel();
     let mut events = backend.events();
     let config = config.clone();
+    // The peripheral has no `GattConnection` to ask for a negotiated MTU, so
+    // it budgets against the spec-minimum. Conservative on purpose:
+    // undersized fragments always fit, oversized ones would be truncated by
+    // the stack with no error.
+    let peripheral_budget = crate::backend::DEFAULT_ATT_MTU as usize
+        - crate::backend::ATT_HEADER_LEN
+        - FRAGMENT_HEADER_LEN;
 
     tokio::spawn(async move {
-        // One fragment sink per connected central, so two peers writing
-        // concurrently cannot interleave into each other's reassembler.
+        // At most one entry: see the doc comment on why concurrent centrals
+        // are refused rather than served.
         let mut inbound: HashMap<PeerAddress, mpsc::UnboundedSender<Vec<u8>>> = HashMap::new();
 
         while let Some(event) = events.next().await {
@@ -372,9 +442,18 @@ pub async fn serve(
                     if inbound.contains_key(&peer) {
                         continue;
                     }
+                    if let Some(active) = inbound.keys().next() {
+                        eprintln!(
+                            "[ble-gatt][datagram] refusing central {} — already serving {} \
+                             and notify is a broadcast, so serving both would corrupt \
+                             each other's messages",
+                            peer.0, active.0
+                        );
+                        continue;
+                    }
                     let (frag_tx, frag_rx) = mpsc::unbounded_channel();
                     let (msg_tx, msg_rx) = mpsc::channel(config.inbound_queue_depth);
-                    spawn_reassembly(
+                    let reassembly = spawn_reassembly(
                         UnboundedReceiverStream::new(frag_rx),
                         config.limits(),
                         msg_tx,
@@ -389,15 +468,12 @@ pub async fn serve(
                         }),
                         inbound: ReceiverStream::new(msg_rx),
                         next_msg_id: 0,
-                        max_message_len: config.max_message_len,
-                        // The peripheral has no `GattConnection` to ask for a
-                        // negotiated MTU, so it budgets against the
-                        // spec-minimum. Conservative on purpose: undersized
-                        // fragments always fit, oversized ones would be
-                        // truncated by the stack with no error.
-                        fragment_budget: crate::backend::DEFAULT_ATT_MTU as usize
-                            - crate::backend::ATT_HEADER_LEN
-                            - FRAGMENT_HEADER_LEN,
+                        max_message_len: effective_max_message_len(
+                            config.max_message_len,
+                            peripheral_budget,
+                        ),
+                        fragment_budget: peripheral_budget,
+                        tasks: vec![reassembly],
                     };
                     if channels_tx.send(channel).is_err() {
                         return; // consumer stopped accepting channels

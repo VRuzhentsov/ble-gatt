@@ -192,12 +192,41 @@ impl Drop for AndroidBackend {
 
 #[async_trait]
 impl Backend for AndroidBackend {
+    /// Every failure path here logs before falling back. `false`/`false` is
+    /// indistinguishable from "this device genuinely has no BLE support", so
+    /// a silent fallback turns a real bug into a plausible-looking hardware
+    /// limitation — which is exactly what happened once already in this
+    /// codebase and cost a whole debugging session. See docs/adr/0002.
     async fn capabilities(&self) -> CapabilityReport {
-        let Ok(mut env) = self.inner.env() else {
-            return CapabilityReport::default();
+        let mut env = match self.inner.env() {
+            Ok(env) => env,
+            Err(err) => {
+                eprintln!("[ble-gatt][android] capabilities: JNI attach failed: {err}");
+                return CapabilityReport::default();
+            }
         };
-        let central = self.inner.call_bool(&mut env, "hasCentralSupport", "()Z").unwrap_or(false);
-        let peripheral = self.inner.call_bool(&mut env, "hasPeripheralSupport", "()Z").unwrap_or(false);
+        let central = match self.inner.call_bool(&mut env, "hasCentralSupport", "()Z") {
+            Ok(value) => value,
+            Err(err) => {
+                let detail = describe_pending_exception(&mut env);
+                eprintln!(
+                    "[ble-gatt][android] capabilities: hasCentralSupport failed: {err}{}",
+                    detail.map(|d| format!(" ({d})")).unwrap_or_default()
+                );
+                false
+            }
+        };
+        let peripheral = match self.inner.call_bool(&mut env, "hasPeripheralSupport", "()Z") {
+            Ok(value) => value,
+            Err(err) => {
+                let detail = describe_pending_exception(&mut env);
+                eprintln!(
+                    "[ble-gatt][android] capabilities: hasPeripheralSupport failed: {err}{}",
+                    detail.map(|d| format!(" ({d})")).unwrap_or_default()
+                );
+                false
+            }
+        };
         CapabilityReport { central, peripheral }
     }
 

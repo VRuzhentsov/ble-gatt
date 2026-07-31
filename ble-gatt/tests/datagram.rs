@@ -240,3 +240,25 @@ async fn losing_the_peer_closes_the_channel_instead_of_hanging_forever() {
         .expect("recv must resolve rather than hang");
     assert!(closed.is_none(), "channel should report closed, not a message");
 }
+
+#[tokio::test]
+async fn the_reported_message_limit_is_one_the_channel_can_actually_send() {
+    let config = config();
+    let (mut central, mut peripheral, _c, _p) = connected_pair(&config).await;
+
+    // Regression guard: `max_message_len` used to report the configured
+    // ceiling (1 MiB) while the peripheral could only fit ~896 KiB into
+    // MAX_FRAGMENTS fragments of its spec-minimum budget. Anything in the
+    // gap passed the size check and then failed inside split() one call
+    // later. Whatever the channel reports must be genuinely sendable.
+    for channel in [&mut central, &mut peripheral] {
+        let limit = channel.max_message_len();
+        let capacity = channel.fragment_budget() * 65_535;
+        assert!(
+            limit <= capacity,
+            "reported limit {limit} exceeds what {} fragments of {} bytes can carry ({capacity})",
+            65_535,
+            channel.fragment_budget(),
+        );
+    }
+}
