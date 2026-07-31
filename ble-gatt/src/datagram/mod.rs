@@ -396,6 +396,13 @@ pub async fn connect(
     backend: Arc<dyn Backend>, peer: &PeerAddress, config: &DatagramConfig,
 ) -> Result<DatagramChannel> {
     config.validate()?;
+    // Subscribe before connecting, for the same reason `serve` subscribes
+    // before advertising: `events()` is a broadcast, so a disconnect landing
+    // between `connect`/`subscribe` succeeding and this call is lost. The
+    // backend contract explicitly does not promise that a notification
+    // stream closes with the link, so losing it leaves `recv()` pending
+    // forever with nothing left to wake it.
+    let events = backend.events();
     let mut connection = backend.connect(peer).await?;
     let notifications = connection.subscribe(config.characteristic).await?;
 
@@ -409,12 +416,6 @@ pub async fn connect(
                  {FRAGMENT_HEADER_LEN}-byte fragment header"
             ))
         })?;
-
-    // Subscribe to events *before* spawning the watcher. `events()` is a
-    // broadcast subscription, so a disconnect emitted between here and the
-    // task's first poll would otherwise be missed entirely — leaving
-    // `recv()` pending forever on a link that is already gone.
-    let events = backend.events();
 
     let (tx, rx) = mpsc::channel(config.inbound_queue_depth);
     let reassembly = spawn_reassembly(notifications, config.limits(), tx);
@@ -574,6 +575,13 @@ pub async fn serve(
                     if inbound.contains_key(&peer) {
                         continue;
                     }
+                    // Shutting down: service what we still hold, but take on
+                    // nothing new — and in particular do not refuse-and-
+                    // disconnect, which would evict a peer belonging to a
+                    // newer generation on this same backend.
+                    if accept_closed {
+                        continue;
+                    }
                     if let Some(active) = inbound.keys().next() {
                         eprintln!(
                             "[ble-gatt][datagram] refusing central {} — already serving {} \
@@ -641,11 +649,13 @@ pub async fn serve(
                             disconnect_refused(backend.as_ref(), &peer).await;
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
-                            // The caller stopped accepting. This peer gets
-                            // the same exclusion as any other refusal, and
-                            // the task ends once nothing is left to serve.
+                            // Do NOT disconnect here. A generation that is
+                            // shutting down must not touch peers it is not
+                            // serving: the same backend may already have a
+                            // *newer* `serve` that legitimately owns this
+                            // peer, and disconnecting it would kill the new
+                            // session on behalf of a dead one.
                             accept_closed = true;
-                            disconnect_refused(backend.as_ref(), &peer).await;
                             if inbound.is_empty() {
                                 return;
                             }

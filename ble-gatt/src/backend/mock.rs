@@ -314,8 +314,17 @@ impl Backend for MockBackend {
         // Faithful to both real backends: notify is a broadcast, so every
         // subscriber gets it — including a central the protocol layer
         // believes it refused. That is the whole hazard.
+        let mut delivered = false;
         for tx in peers.values() {
-            let _ = tx.send(value.clone());
+            if tx.send(value.clone()).is_ok() {
+                delivered = true;
+            }
+        }
+        // Reaching nobody is an error, not success. Both real backends now
+        // report it: a reliable `send` that claims success while dropping
+        // the payload is the worst failure mode this API can have.
+        if !delivered {
+            return Err(BleError::Gatt("notify reached no subscriber".to_string()));
         }
         Ok(())
     }

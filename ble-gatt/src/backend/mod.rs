@@ -114,13 +114,22 @@ pub trait Backend: Send + Sync {
     /// the client-initiated half is `GattConnection::subscribe`). Errors if
     /// not currently advertising.
     ///
-    /// **This is a broadcast, and on Linux it cannot be anything else.**
-    /// BlueZ's `StartNotify` does not identify the subscribing device —
-    /// `bluer`'s `CharacteristicNotifier` carries no address — so a
-    /// peripheral genuinely cannot address a notification to one peer there.
-    /// (Android can: `notifyCharacteristicChanged` takes a device.) A server
-    /// that must not mix two peers' traffic therefore has to keep a second
-    /// central from being subscribed at all — see [`Backend::disconnect_peer`].
+    /// **This is a broadcast**: every subscribed central receives it,
+    /// including one a higher layer believes it has refused, since
+    /// subscribing is a client-side act needing no server consent. A server
+    /// that must not mix two peers' traffic keeps a second central from
+    /// being subscribed at all — see [`Backend::disconnect_peer`].
+    ///
+    /// An earlier revision of this comment claimed per-peer addressing was
+    /// impossible on Linux. That was wrong, and worth recording: it is true
+    /// of BlueZ's `StartNotify`, which carries no device address, but not of
+    /// `AcquireNotify`, which does — so the Linux backend now uses
+    /// `CharacteristicNotifyMethod::Io` and holds one writer per subscriber.
+    /// Both backends could therefore support a `notify_peer` today (Android
+    /// via `notifyCharacteristicChanged`, which takes a device). It is not
+    /// added here because `disconnect_peer` already enforces the invariant
+    /// the datagram layer needs; it is a live option if multi-peer serving
+    /// is ever wanted.
     async fn notify(&self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()>;
 
     /// Drop a remote central's connection to the local GATT server.

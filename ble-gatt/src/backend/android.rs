@@ -357,7 +357,19 @@ impl Backend for AndroidBackend {
         let (connected_tx, connected_rx) = oneshot::channel();
         {
             let mut connections = self.inner.connections.lock().unwrap();
-            connections.entry(peer.0.clone()).or_default().connected_tx = Some(connected_tx);
+            let state = connections.entry(peer.0.clone()).or_default();
+            // Reject rather than overwrite. Both this map and the Kotlin
+            // bridge hold exactly one GATT per address, so a second
+            // concurrent connect to the same peer would drop the first
+            // caller's `connected_tx` — and that caller would then wait
+            // forever while the single callback resolved only the second.
+            if state.connected_tx.is_some() {
+                return Err(BleError::ConnectFailed {
+                    peer: peer.0.clone(),
+                    reason: "a connection to this peer is already in progress".to_string(),
+                });
+            }
+            state.connected_tx = Some(connected_tx);
         }
         {
             let mut env = self.inner.env()?;

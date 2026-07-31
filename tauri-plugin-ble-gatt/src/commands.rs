@@ -211,7 +211,12 @@ pub async fn ble_scan_once(
         .await
         .map_err(|err| err.to_string())?;
 
-    let mut found = Vec::new();
+    // Keyed by address, not appended. Android re-reports a matching
+    // advertiser on every advertising interval, so appending returned the
+    // same device many times and let the vector grow with the timeout rather
+    // than with the number of peers — the backend's bounded queue does not
+    // bound it, because this loop drains that queue continuously.
+    let mut found: BTreeMap<String, DiscoveredPeerDto> = BTreeMap::new();
     let deadline = tokio::time::sleep(Duration::from_millis(timeout_ms));
     tokio::pin!(deadline);
     loop {
@@ -224,7 +229,9 @@ pub async fn ble_scan_once(
                 // "these are the devices nearby" when the scan was actually
                 // cut short by a powered-off adapter or a denied permission.
                 Some(Err(err)) => return Err(err.to_string()),
-                Some(Ok(peer)) => found.push(DiscoveredPeerDto {
+                // Latest observation wins: RSSI and advertisement payload
+                // change between intervals, and the freshest is the useful one.
+                Some(Ok(peer)) => { found.insert(peer.address.0.clone(), DiscoveredPeerDto {
                     address: peer.address.0,
                     name: peer.name,
                     manufacturer_data: peer
@@ -238,12 +245,12 @@ pub async fn ble_scan_once(
                         .map(|(uuid, value)| (uuid.0.to_string(), value))
                         .collect(),
                     rssi: peer.rssi,
-                }),
+                }); }
                 None => break,
             }
         }
     }
-    Ok(found)
+    Ok(found.into_values().collect())
 }
 
 #[tauri::command]
