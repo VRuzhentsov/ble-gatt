@@ -31,6 +31,11 @@ use bluer::gatt::local::{
 use bluer::gatt::CharacteristicWriter;
 use bluer::{Adapter, AdapterEvent, Session};
 use futures::stream::StreamExt;
+/// How often a served peer's notify sessions are checked for closure. A
+/// central can unsubscribe without disconnecting, which ends the session as
+/// surely as a link drop but produces no device property change.
+const NOTIFY_SESSION_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
@@ -149,6 +154,7 @@ async fn watch_notify_sessions(
             peer,
             events_tx.clone(),
             served_peers.clone(),
+            writers.clone(),
         );
     }
 }
@@ -163,6 +169,7 @@ async fn watch_notify_sessions(
 fn spawn_peripheral_disconnect_watch(
     adapter: Adapter, address: bluer::Address, peer: PeerAddress,
     events_tx: broadcast::Sender<GattEvent>, served_peers: Arc<StdMutex<HashSet<PeerAddress>>>,
+    writers: Arc<AsyncMutex<HashMap<CharacteristicUuid, Vec<CharacteristicWriter>>>>,
 ) {
     tokio::spawn(async move {
         // Any exit path must clear the guard, or a peer that failed to be
@@ -178,24 +185,64 @@ fn spawn_peripheral_disconnect_watch(
             // `serve()` then holds the stale peer forever and refuses every
             // reconnect.
             if device.is_connected().await.unwrap_or(false) {
-                while let Some(event) = changes.next().await {
-                    if matches!(
-                        event,
-                        bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::Connected(false))
-                    ) {
-                        break;
+                loop {
+                    // The session ends on *either* signal. A central that
+                    // disables its CCCD while staying connected is just as
+                    // gone from this server's point of view: it can no longer
+                    // be reached by notify, so leaving it in `serve`'s
+                    // single-central slot would fail every send while locking
+                    // every other central out.
+                    let disconnected = async {
+                        while let Some(event) = changes.next().await {
+                            if matches!(
+                                event,
+                                bluer::DeviceEvent::PropertyChanged(
+                                    bluer::DeviceProperty::Connected(false)
+                                )
+                            ) {
+                                return;
+                            }
+                        }
+                    };
+                    tokio::select! {
+                        _ = disconnected => break,
+                        _ = tokio::time::sleep(NOTIFY_SESSION_POLL) => {
+                            if !has_live_session(&writers, &peer).await {
+                                break;
+                            }
+                        }
                     }
                 }
             }
-            let _ = events_tx.send(GattEvent::Disconnected {
-                peer: peer.clone(),
-                local_role: Role::Peripheral,
-            });
             Some(())
         }
         .await;
+        let _ = events_tx.send(GattEvent::Disconnected {
+            peer: peer.clone(),
+            local_role: Role::Peripheral,
+        });
         served_peers.lock().unwrap().remove(&peer);
     });
+}
+
+/// Whether `peer` still holds any open notify session.
+///
+/// Polled rather than awaited on `CharacteristicWriter::closed()` because the
+/// writers live in a shared map that `notify` needs concurrent access to —
+/// taking one out to await its closure would block sends to everyone else.
+async fn has_live_session(
+    writers: &Arc<AsyncMutex<HashMap<CharacteristicUuid, Vec<CharacteristicWriter>>>>,
+    peer: &PeerAddress,
+) -> bool {
+    let mut writers = writers.lock().await;
+    let mut live = false;
+    for sessions in writers.values_mut() {
+        sessions.retain(|w| !w.is_closed().unwrap_or(true));
+        if sessions.iter().any(|w| w.device_address().to_string() == peer.0) {
+            live = true;
+        }
+    }
+    live
 }
 
 impl LinuxBackend {
@@ -414,6 +461,7 @@ impl Backend for LinuxBackend {
                 let events_tx = events_tx.clone();
                 let served_peers = served_peers.clone();
                 let adapter = adapter.clone();
+                let notify_writers = notify_writers.clone();
                 CharacteristicWrite {
                     write: true,
                     write_without_response: true,
@@ -422,6 +470,7 @@ impl Backend for LinuxBackend {
                         let events_tx = events_tx.clone();
                         let served_peers = served_peers.clone();
                         let adapter = adapter.clone();
+                        let notify_writers = notify_writers.clone();
                         let address = req.device_address;
                         let peer = PeerAddress(address.to_string());
                         Box::pin(async move {
@@ -452,6 +501,7 @@ impl Backend for LinuxBackend {
                                     peer.clone(),
                                     events_tx.clone(),
                                     served_peers,
+                                    notify_writers,
                                 );
                             }
                             let _ = events_tx.send(GattEvent::CharacteristicWritten {

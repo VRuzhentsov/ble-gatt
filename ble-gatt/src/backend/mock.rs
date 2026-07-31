@@ -66,6 +66,23 @@ impl MockNetwork {
         Arc::new(Self::default())
     }
 
+    /// A central drops its notify subscription without disconnecting.
+    ///
+    /// Both real backends treat this as the end of the served session — a
+    /// peer that cannot be reached by notify is gone as far as the server is
+    /// concerned, even with the link still up — so the mock must too, or the
+    /// lockout it causes is untestable here.
+    pub fn simulate_unsubscribe(&self, peripheral: &PeerAddress, central: &PeerAddress) {
+        self.drop_subscriptions(peripheral, central);
+        self.emit(
+            peripheral,
+            GattEvent::Disconnected {
+                peer: central.clone(),
+                local_role: Role::Peripheral,
+            },
+        );
+    }
+
     /// Make the next `scan` on any backend in this network end with an
     /// error item, the way Android's `onScanFailed` does.
     pub fn arm_scan_failure(&self, message: impl Into<String>) {

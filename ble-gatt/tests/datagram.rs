@@ -522,3 +522,64 @@ async fn inbound_overflow_is_reported_to_the_receiver_rather_than_lost_silently(
          infer it from a message that never arrives"
     );
 }
+
+#[tokio::test]
+async fn a_central_that_unsubscribes_frees_the_single_central_slot() {
+    let config = config();
+    let network = MockNetwork::new();
+    let peripheral_addr = PeerAddress("peripheral-unsub".to_string());
+    let first_addr = PeerAddress("central-unsub".to_string());
+
+    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+        peripheral_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    ));
+    let first: Arc<MockBackend> = Arc::new(MockBackend::new(
+        first_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    ));
+
+    let mut incoming = datagram::serve(peripheral.clone(), &config)
+        .await
+        .expect("serve should start");
+    let _first_channel = datagram::connect(first.clone(), &peripheral_addr, &config)
+        .await
+        .expect("connect should succeed");
+    let mut served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
+        .await
+        .expect("serve should yield a channel")
+        .expect("channel stream should not be closed");
+    served.send(b"while-subscribed".to_vec()).await.expect("send while subscribed");
+
+    // The central stops listening but stays connected. It can no longer be
+    // reached by notify, so holding it in the single-central slot would fail
+    // every send while refusing every other central.
+    network.simulate_unsubscribe(&peripheral_addr, &first_addr);
+
+    let second_addr = PeerAddress("central-unsub-2".to_string());
+    let second: Arc<MockBackend> = Arc::new(MockBackend::new(
+        second_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    ));
+    let mut second_channel = datagram::connect(second.clone(), &peripheral_addr, &config)
+        .await
+        .expect("connect should succeed");
+    let mut second_served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
+        .await
+        .expect("the slot must be free for the next central")
+        .expect("channel stream should not be closed");
+
+    second_served
+        .send(b"to-the-second".to_vec())
+        .await
+        .expect("the newly served central must be reachable");
+    let received = tokio::time::timeout(Duration::from_secs(2), second_channel.recv())
+        .await
+        .expect("second central should receive it")
+        .expect("its channel should still be open")
+        .expect("no error");
+    assert_eq!(received, b"to-the-second");
+}

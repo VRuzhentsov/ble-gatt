@@ -366,14 +366,21 @@ pub async fn ble_unwatch_events(
 
 #[tauri::command]
 pub async fn ble_disconnect(state: tauri::State<'_, PluginState>, handle: u64) -> Result<(), String> {
-    let entry = state.connections.lock().await.remove(&handle);
-    if let Some(connection) = entry {
-        connection
-            .lock()
-            .await
-            .disconnect()
-            .await
-            .map_err(|err| err.to_string())?;
-    }
+    // Look up without removing. Removing first made a failed disconnect
+    // unrecoverable: the caller loses the handle it would retry or clean up
+    // with, while on Android the platform GATT may well still be live — so
+    // the backend's live-connection guard then refuses a fresh connection to
+    // that address, and the dropped Rust handle is no longer able to close
+    // the one holding it open.
+    let Some(connection) = state.connection(handle).await.ok() else {
+        return Ok(());
+    };
+    connection
+        .lock()
+        .await
+        .disconnect()
+        .await
+        .map_err(|err| err.to_string())?;
+    state.connections.lock().await.remove(&handle);
     Ok(())
 }

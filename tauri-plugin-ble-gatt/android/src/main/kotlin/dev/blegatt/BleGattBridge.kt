@@ -121,7 +121,11 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     /// would silently replace the first — and dropping either stream would
     /// then cancel the wrong one. Refusing is honest; per-scan ownership can
     /// come later if a caller genuinely needs concurrent scans.
-    fun startScan(serviceUuid: String): Boolean {
+    /// `generation` is echoed back on every callback so Rust can discard
+    /// results from a scan it has already replaced. A callback already
+    /// executing when a scan is stopped can otherwise land after the next
+    /// scan installs itself, and be attributed to it.
+    fun startScan(serviceUuid: String, generation: Long): Boolean {
         if (scanCallback != null) {
             Log.w(TAG, "startScan refused: a scan is already active")
             return false
@@ -163,6 +167,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 @Suppress("UNCHECKED_CAST")
                 onPeerDiscovered(
                     nativeHandle,
+                    generation,
                     result.device.address,
                     result.device.name,
                     result.rssi,
@@ -178,7 +183,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 // discovery stream. Without forwarding it, a scan that never
                 // started is indistinguishable from one that found nothing.
                 Log.e(TAG, "onScanFailed: errorCode=$errorCode")
-                onScanFailed(nativeHandle, errorCode)
+                onScanFailed(nativeHandle, generation, errorCode)
             }
         }
         Log.d(TAG, "startScan: serviceUuid=$serviceUuid scanner=${scanner != null}")
@@ -505,7 +510,16 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                         onServerSubscribed(nativeHandle, device.address)
                     }
                 } else {
-                    subscribedDevices[characteristicUuid]?.remove(device)
+                    val removed = subscribedDevices[characteristicUuid]?.remove(device) ?: false
+                    // Unsubscribing ends the served session even though the
+                    // link is still up. Rust's `serve` keys its single-central
+                    // slot on connect/disconnect, so without this the peer
+                    // stays "served" while being unreachable by notify —
+                    // sends fail, `recv()` never closes, and every other
+                    // central is refused until it physically disconnects.
+                    if (removed && !isSubscribedAnywhere(device)) {
+                        onDisconnected(nativeHandle, device.address, true)
+                    }
                 }
                 if (responseNeeded) {
                     gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
@@ -596,6 +610,20 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     /// holding a callback that captures `nativeHandle`. Rust calls this
     /// before the last `Arc<Inner>` can be freed; without it a later
     /// link-state callback would reconstruct an `Arc` from freed memory.
+    /// Close and forget one client GATT, for a connect attempt Rust
+    /// abandoned. Leaving it open would keep the address occupied here while
+    /// no Rust handle owns it.
+    fun closeConnection(address: String) {
+        val gatt = connectedGatts.remove(address) ?: return
+        pendingCharacteristics.remove(address)
+        try {
+            gatt.disconnect()
+            gatt.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "closeConnection: error closing gatt for $address", e)
+        }
+    }
+
     fun closeAll() {
         for (gatt in connectedGatts.values) {
             try {
@@ -647,6 +675,12 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         stopAdvertising()
         onAdvertiseResult(nativeHandle, false, errorCode)
     }
+
+    /// Whether this device still holds any notify subscription. Checked
+    /// before reporting a disable as the end of the session, since a peer may
+    /// be subscribed to several characteristics.
+    private fun isSubscribedAnywhere(device: BluetoothDevice): Boolean =
+        subscribedDevices.values.any { peers -> peers.any { it.address == device.address } }
 
     /// Addresses currently subscribed to a characteristic. Rust expresses a
     /// broadcast as one addressed send per subscriber, so every payload goes

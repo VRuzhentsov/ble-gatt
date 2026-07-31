@@ -21,7 +21,8 @@ package dev.blegatt
 /// side. `serviceDataUuids` holds UUID strings; the value arrays line up
 /// index-for-index with their key arrays.
 external fun onPeerDiscovered(
-    nativeHandle: Long, address: String, name: String?, rssi: Int,
+    nativeHandle: Long,
+    generation: Long, address: String, name: String?, rssi: Int,
     manufacturerIds: IntArray, manufacturerValues: Array<ByteArray>,
     serviceDataUuids: Array<String>, serviceDataValues: Array<ByteArray>,
 )
@@ -61,7 +62,7 @@ external fun onServerCharacteristicWritten(
 external fun onAdvertiseResult(nativeHandle: Long, success: Boolean, errorCode: Int)
 
 /// Asynchronous scan-start failure, for the same reason.
-external fun onScanFailed(nativeHandle: Long, errorCode: Int)
+external fun onScanFailed(nativeHandle: Long, generation: Long, errorCode: Int)
 
 /// A remote central enabled notifications on one of our server
 /// characteristics. This — not the physical connection — is when the

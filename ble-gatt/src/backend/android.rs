@@ -371,6 +371,10 @@ impl Backend for AndroidBackend {
         // `ScanCallback` through a handler rather than calling it inline on
         // this thread, so it cannot deadlock us.
         let mut scan = self.inner.scan.lock().unwrap();
+        // Chosen before `startScan` so the platform callbacks can echo it
+        // back: a callback that fires during the call must be attributable
+        // to this scan, not to whatever was installed before.
+        let generation = scan.generation + 1;
         {
             let mut env = self.inner.env()?;
             let uuid = env
@@ -381,8 +385,8 @@ impl Backend for AndroidBackend {
                 .call_method(
                     bridge.as_obj(),
                     "startScan",
-                    "(Ljava/lang/String;)Z",
-                    &[JValue::Object(&uuid)],
+                    "(Ljava/lang/String;J)Z",
+                    &[JValue::Object(&uuid), JValue::Long(generation as i64)],
                 )
                 .and_then(|v| v.z());
             match started {
@@ -407,8 +411,7 @@ impl Backend for AndroidBackend {
         // this lock — finds our sender and records against our scan.
         scan.tx = Some(tx);
         scan.error = None;
-        scan.generation += 1;
-        let generation = scan.generation;
+        scan.generation = generation;
         drop(scan);
 
         Ok(Box::pin(ScanStream {
@@ -460,13 +463,28 @@ impl Backend for AndroidBackend {
             return Err(err);
         }
 
+        // Cancellation guard. `connect()` is an async fn, so its caller can
+        // drop the future mid-await — a timeout, a `select!` losing a race —
+        // and nothing below would then run. Without this, the pending slot
+        // stays populated and every retry is refused as "already in
+        // progress"; and if the callback later lands anyway, it marks a GATT
+        // live that no Rust handle owns, after which retries are refused as
+        // "already open" instead. Disarmed on success.
+        let guard = ConnectGuard {
+            inner: self.inner.clone(),
+            address: peer.0.clone(),
+            armed: true,
+        };
+
         if connected_rx.await.is_err() {
-            self.inner.clear_pending_connect(&peer.0);
+            // The guard handles cleanup on the way out.
             return Err(BleError::ConnectFailed {
                 peer: peer.0.clone(),
                 reason: "disconnected before connection completed".to_string(),
             });
         }
+        let mut guard = guard;
+        guard.armed = false;
 
         Ok(Box::new(AndroidGattConnection {
             inner: self.inner.clone(),
@@ -937,7 +955,7 @@ fn read_byte_array_array(env: &mut JNIEnv, array: &JObjectArray, len: i32) -> Ve
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onPeerDiscovered<'local>(
-    mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, address: JString<'local>,
+    mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, generation: jlong, address: JString<'local>,
     name: JString<'local>, rssi: jint, manufacturer_ids: JIntArray<'local>,
     manufacturer_values: JObjectArray<'local>, service_data_uuids: JObjectArray<'local>,
     service_data_values: JObjectArray<'local>,
@@ -972,6 +990,13 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onPeerDiscovered<'local>(
     }
 
     let scan = inner.scan.lock().unwrap();
+    // Discard results belonging to a scan that has already been replaced.
+    // A callback can already be executing when its scan is stopped, and
+    // without this it would be delivered as a *later* scan's discovery —
+    // reporting a peer that never matched the new scan's service filter.
+    if scan.generation != generation as u64 {
+        return;
+    }
     if let Some(tx) = scan.tx.as_ref() {
         // try_send on a bounded queue: this runs on a JVM callback thread
         // that must not block, and in a dense advertising environment the
@@ -1007,7 +1032,8 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onAdvertiseResult<'local>(
 
 #[no_mangle]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onScanFailed<'local>(
-    _env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, error_code: jint,
+    _env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, generation: jlong,
+    error_code: jint,
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
     // Deliver the failure *as a stream item* before closing, then drop the
@@ -1019,6 +1045,10 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onScanFailed<'local>(
     // a saturated queue would swallow the error, and the consumer would then
     // drain the buffered successes and see an ordinary end-of-stream.
     let mut scan = inner.scan.lock().unwrap();
+    // A stale failure must not terminate the scan that replaced it.
+    if scan.generation != generation as u64 {
+        return;
+    }
     scan.error = Some(BleError::Gatt(format!(
         "Android scan failed (ScanCallback error code {error_code})"
     )));
@@ -1251,6 +1281,35 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onServerSubscribed<'local>(
         peer: PeerAddress(address),
         local_role: Role::Peripheral,
     });
+}
+
+/// Undoes a `connect()` that never completed, including one abandoned by a
+/// dropped future. Closing the platform attempt matters as much as clearing
+/// the slot: an abandoned `BluetoothGatt` left open would keep the address
+/// occupied on the Kotlin side.
+struct ConnectGuard {
+    inner: Arc<Inner>,
+    address: String,
+    armed: bool,
+}
+
+impl Drop for ConnectGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.inner.clear_pending_connect(&self.address);
+        if let Ok(mut env) = self.inner.env() {
+            if let Ok(address) = env.new_string(&self.address) {
+                let _ = self.inner.call_void(
+                    &mut env,
+                    "closeConnection",
+                    "(Ljava/lang/String;)V",
+                    &[JValue::Object(&address)],
+                );
+            }
+        }
+    }
 }
 
 /// Completion of a queued server notification.
