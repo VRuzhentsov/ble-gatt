@@ -169,7 +169,15 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     }
 
     fun connect(address: String) {
-        val device = adapter?.getRemoteDevice(address) ?: return
+        val device = adapter?.getRemoteDevice(address)
+        if (device == null) {
+            // No adapter at all. Rust has already stored connected_tx, so
+            // returning silently strands it forever — the same failure the
+            // advertiser path had. Report the link as never established.
+            Log.w(TAG, "connect: no Bluetooth adapter available for $address")
+            onDisconnected(nativeHandle, address, false)
+            return
+        }
         val callback = object : BluetoothGattCallback() {
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
                 when (newState) {
@@ -327,7 +335,15 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             onSubscribed(nativeHandle, address, characteristicUuid, false)
             return
         }
-        gatt.setCharacteristicNotification(characteristic, true)
+        if (!gatt.setCharacteristicNotification(characteristic, true)) {
+            // Local delivery was never enabled, so onCharacteristicChanged
+            // can never fire. Writing the remote CCCD anyway would let the
+            // descriptor callback report success and hand Rust a live-looking
+            // stream that stays silent forever.
+            Log.w(TAG, "setCharacteristicNotification failed: $address/$characteristicUuid")
+            onSubscribed(nativeHandle, address, characteristicUuid, false)
+            return
+        }
         @Suppress("DEPRECATION")
         cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
         @Suppress("DEPRECATION")
@@ -439,7 +455,14 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 permissions = permissions or BluetoothGattCharacteristic.PERMISSION_READ
             }
             if (writable[i]) {
-                properties = properties or BluetoothGattCharacteristic.PROPERTY_WRITE
+                // Both modes, matching linux.rs (`write` and
+                // `write_without_response`). Advertising only PROPERTY_WRITE
+                // let a peer using WriteType::WithoutResponse discover no
+                // such capability and reject the write command locally,
+                // before it ever reached onCharacteristicWriteRequest.
+                properties = properties or
+                    BluetoothGattCharacteristic.PROPERTY_WRITE or
+                    BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE
                 permissions = permissions or BluetoothGattCharacteristic.PERMISSION_WRITE
             }
             if (notifiable[i]) {
