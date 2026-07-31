@@ -4,6 +4,7 @@
 //! `backend::mock::MockBackend` for a CI-safe, radio-free stand-in.
 
 pub mod backend;
+pub mod datagram;
 pub mod error;
 pub mod models;
 
