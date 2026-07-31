@@ -83,8 +83,17 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     // Central role
     // ---------------------------------------------------------------
 
-    fun startScan(serviceUuid: String) {
-        val scanner = adapter?.bluetoothLeScanner ?: return
+    /// Returns false if a scan is already running. There is one
+    /// `scanCallback` and one discovery sender, so a second concurrent scan
+    /// would silently replace the first — and dropping either stream would
+    /// then cancel the wrong one. Refusing is honest; per-scan ownership can
+    /// come later if a caller genuinely needs concurrent scans.
+    fun startScan(serviceUuid: String): Boolean {
+        if (scanCallback != null) {
+            Log.w(TAG, "startScan refused: a scan is already active")
+            return false
+        }
+        val scanner = adapter?.bluetoothLeScanner ?: return false
         val target = UUID.fromString(serviceUuid)
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
@@ -150,6 +159,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         // with matching done here works identically on real adapters and
         // sidesteps whatever that native-filter gap is. See docs/adr/0002.
         scanner.startScan(emptyList(), settings, callback)
+        return true
     }
 
     fun stopScan() {
@@ -174,7 +184,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                             // false, so the pending connect would hang
                             // forever. Report the link as gone instead.
                             Log.w(TAG, "discoverServices did not start for $address")
-                            onDisconnected(nativeHandle, address)
+                            onDisconnected(nativeHandle, address, false)
                             gatt.close()
                         }
                     }
@@ -185,7 +195,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                         // peer powered off), which is the whole point of
                         // surfacing this to Rust rather than only reporting
                         // disconnects we initiated.
-                        onDisconnected(nativeHandle, address)
+                        onDisconnected(nativeHandle, address, false)
                         gatt.close()
                     }
                 }
@@ -206,7 +216,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                     Log.w(TAG, "onServicesDiscovered failed for $address status=$status")
                     connectedGatts.remove(address)
                     pendingCharacteristics.remove(address)
-                    onDisconnected(nativeHandle, address)
+                    onDisconnected(nativeHandle, address, false)
                     gatt.close()
                     return
                 }
@@ -217,7 +227,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                     }
                 }
                 pendingCharacteristics[address] = byUuid
-                onConnected(nativeHandle, address)
+                onConnected(nativeHandle, address, false)
             }
 
             @Suppress("DEPRECATION")
@@ -335,9 +345,32 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         serviceUuid: String, characteristicUuids: Array<String>, readable: BooleanArray, writable: BooleanArray,
         notifiable: BooleanArray, initialValues: Array<ByteArray>,
     ) {
-        val advertiser = adapter?.bluetoothLeAdvertiser ?: return
+        val advertiser = adapter?.bluetoothLeAdvertiser
+        if (advertiser == null) {
+            // Central-only device, or Bluetooth switched off. Returning
+            // silently left Rust's oneshot pending forever, which is worse
+            // than the unsupported error the backend contract asks for.
+            Log.w(TAG, "startAdvertising: no BLE advertiser available")
+            onAdvertiseResult(nativeHandle, false, ADVERTISE_ERROR_UNAVAILABLE)
+            return
+        }
 
         val serverCallback = object : BluetoothGattServerCallback() {
+            /// `addService` completes asynchronously. Advertising used to
+            /// start immediately after the call, so a delayed or rejected
+            /// registration still resolved Rust's `advertise()` as success
+            /// while centrals could see the advertisement but not the
+            /// service it promised.
+            override fun onServiceAdded(status: Int, service: BluetoothGattService) {
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    Log.e(TAG, "onServiceAdded failed: status=$status")
+                    onAdvertiseResult(nativeHandle, false, status)
+                    return
+                }
+                Log.d(TAG, "onServiceAdded ok, starting advertisement")
+                beginAdvertising(advertiser, serviceUuid)
+            }
+
             /// Real server-side lifecycle. Without this the peripheral role
             /// had no genuine connect/disconnect signal at all — it was
             /// synthesized from write traffic, so a central that connected
@@ -346,14 +379,14 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 when (newState) {
                     BluetoothProfile.STATE_CONNECTED -> {
                         Log.d(TAG, "server: central connected ${device.address}")
-                        onConnected(nativeHandle, device.address)
+                        onConnected(nativeHandle, device.address, true)
                     }
                     BluetoothProfile.STATE_DISCONNECTED -> {
                         Log.d(TAG, "server: central disconnected ${device.address}")
                         for (subscribers in subscribedDevices.values) {
                             subscribers.remove(device)
                         }
-                        onDisconnected(nativeHandle, device.address)
+                        onDisconnected(nativeHandle, device.address, true)
                     }
                 }
             }
@@ -427,8 +460,16 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             service.addCharacteristic(characteristic)
             serverCharacteristics[characteristicUuids[i]] = characteristic
         }
-        server.addService(service)
+        if (!server.addService(service)) {
+            Log.e(TAG, "addService was rejected outright for $serviceUuid")
+            onAdvertiseResult(nativeHandle, false, ADVERTISE_ERROR_SERVICE_REJECTED)
+            return
+        }
+        // Advertising now starts from onServiceAdded, once registration has
+        // actually succeeded.
+    }
 
+    private fun beginAdvertising(advertiser: android.bluetooth.le.BluetoothLeAdvertiser, serviceUuid: String) {
         val settings = AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
             .setConnectable(true)
@@ -455,6 +496,25 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         advertiseCallback = callback
         Log.d(TAG, "startAdvertising: serviceUuid=$serviceUuid advertiser=${advertiser != null}")
         advertiser.startAdvertising(settings, data, callback)
+    }
+
+    /// Close every open GATT and the server, so no Kotlin object is left
+    /// holding a callback that captures `nativeHandle`. Rust calls this
+    /// before the last `Arc<Inner>` can be freed; without it a later
+    /// link-state callback would reconstruct an `Arc` from freed memory.
+    fun closeAll() {
+        for (gatt in connectedGatts.values) {
+            try {
+                gatt.disconnect()
+                gatt.close()
+            } catch (e: Exception) {
+                Log.w(TAG, "closeAll: error closing gatt", e)
+            }
+        }
+        connectedGatts.clear()
+        pendingCharacteristics.clear()
+        stopScan()
+        stopAdvertising()
     }
 
     fun stopAdvertising() {
@@ -498,5 +558,11 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         /// Largest ATT MTU the Bluetooth spec permits. Requested on every
         /// connection; the peer negotiates it down to whatever it supports.
         private const val MAX_ATT_MTU: Int = 517
+
+        /// Locally-assigned advertise error codes, chosen above the range
+        /// Android's AdvertiseCallback uses (1..5) so they cannot be
+        /// confused with a real controller error.
+        private const val ADVERTISE_ERROR_UNAVAILABLE: Int = 100
+        private const val ADVERTISE_ERROR_SERVICE_REJECTED: Int = 101
     }
 }

@@ -19,7 +19,7 @@ use crate::backend::{Backend, BoxStream, GattConnection};
 use crate::error::{BleError, Result};
 use crate::models::{
     CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress,
-    ServiceUuid, WriteType,
+    Role, ServiceUuid, WriteType,
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
@@ -114,10 +114,18 @@ impl MockBackend {
     pub fn simulate_peer_loss(&self, peer: &PeerAddress) {
         self.network.emit(
             &self.address,
-            GattEvent::Disconnected { peer: peer.clone() },
+            GattEvent::Disconnected {
+                peer: peer.clone(),
+                local_role: Role::Peripheral,
+            },
         );
-        self.network
-            .emit(peer, GattEvent::Disconnected { peer: self.address.clone() });
+        self.network.emit(
+            peer,
+            GattEvent::Disconnected {
+                peer: self.address.clone(),
+                local_role: Role::Central,
+            },
+        );
     }
 }
 
@@ -158,14 +166,22 @@ impl Backend for MockBackend {
         }
         // The peripheral observes the central arriving; the central observes
         // its own connection coming up. Each side sees its own view.
+        // The peripheral sees a central arrive; the central sees its own
+        // outbound link come up. Each side reports the role it played.
         self.network.emit(
             peer,
             GattEvent::Connected {
                 peer: self.address.clone(),
+                local_role: Role::Peripheral,
             },
         );
-        self.network
-            .emit(&self.address, GattEvent::Connected { peer: peer.clone() });
+        self.network.emit(
+            &self.address,
+            GattEvent::Connected {
+                peer: peer.clone(),
+                local_role: Role::Central,
+            },
+        );
         Ok(Box::new(MockGattConnection {
             central: self.address.clone(),
             peripheral: peer.clone(),
@@ -285,6 +301,7 @@ impl GattConnection for MockGattConnection {
             &self.peripheral,
             GattEvent::Connected {
                 peer: self.central.clone(),
+                local_role: Role::Peripheral,
             },
         );
         self.network.emit(
@@ -316,12 +333,14 @@ impl GattConnection for MockGattConnection {
             &self.peripheral,
             GattEvent::Disconnected {
                 peer: self.central.clone(),
+                local_role: Role::Peripheral,
             },
         );
         self.network.emit(
             &self.central,
             GattEvent::Disconnected {
                 peer: self.peripheral.clone(),
+                local_role: Role::Central,
             },
         );
         Ok(())

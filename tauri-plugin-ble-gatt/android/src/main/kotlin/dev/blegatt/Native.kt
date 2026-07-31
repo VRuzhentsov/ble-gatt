@@ -26,9 +26,12 @@ external fun onPeerDiscovered(
     serviceDataUuids: Array<String>, serviceDataValues: Array<ByteArray>,
 )
 
-external fun onConnected(nativeHandle: Long, address: String)
+/// `fromServer` distinguishes an inbound central (our GATT server) from our
+/// own outbound connection. Without it Rust cannot tell the two apart, and a
+/// backend used in both roles treats its own dial-out as an arriving peer.
+external fun onConnected(nativeHandle: Long, address: String, fromServer: Boolean)
 
-external fun onDisconnected(nativeHandle: Long, address: String)
+external fun onDisconnected(nativeHandle: Long, address: String, fromServer: Boolean)
 
 /// Reports the ATT MTU actually negotiated for a connection. Fires from
 /// `BluetoothGattCallback.onMtuChanged` after the explicit `requestMtu`

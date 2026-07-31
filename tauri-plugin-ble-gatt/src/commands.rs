@@ -102,9 +102,9 @@ pub struct CharacteristicSpecDto {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum GattEventDto {
     #[serde(rename_all = "camelCase")]
-    Connected { address: String },
+    Connected { address: String, local_role: String },
     #[serde(rename_all = "camelCase")]
-    Disconnected { address: String },
+    Disconnected { address: String, local_role: String },
     #[serde(rename_all = "camelCase")]
     CharacteristicWritten {
         address: String,
@@ -113,11 +113,27 @@ pub enum GattEventDto {
     },
 }
 
+/// Which role *this* device played. JS needs it for the same reason Rust
+/// does: an outbound connection and an inbound central are otherwise
+/// indistinguishable.
+fn role_name(role: ble_gatt::Role) -> String {
+    match role {
+        ble_gatt::Role::Central => "central".to_string(),
+        ble_gatt::Role::Peripheral => "peripheral".to_string(),
+    }
+}
+
 impl From<GattEvent> for GattEventDto {
     fn from(event: GattEvent) -> Self {
         match event {
-            GattEvent::Connected { peer } => Self::Connected { address: peer.0 },
-            GattEvent::Disconnected { peer } => Self::Disconnected { address: peer.0 },
+            GattEvent::Connected { peer, local_role } => Self::Connected {
+                address: peer.0,
+                local_role: role_name(local_role),
+            },
+            GattEvent::Disconnected { peer, local_role } => Self::Disconnected {
+                address: peer.0,
+                local_role: role_name(local_role),
+            },
             GattEvent::CharacteristicWritten {
                 peer,
                 characteristic,

@@ -59,7 +59,7 @@ use crate::datagram::reassembly::{Accept, Reassembler, ReassemblyLimits};
 use crate::error::{BleError, Result};
 use crate::models::{
     CharacteristicUuid, GattCharacteristicSpec, GattEvent, GattServiceSpec, PeerAddress,
-    ServiceUuid, WriteType,
+    Role, ServiceUuid, WriteType,
 };
 
 pub const DEFAULT_MAX_MESSAGE_LEN: usize = 1024 * 1024;
@@ -404,7 +404,10 @@ fn spawn_link_loss_watch(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(event) = events.next().await {
-            if matches!(&event, GattEvent::Disconnected { peer: lost } if *lost == peer) {
+            if matches!(
+                &event,
+                GattEvent::Disconnected { peer: lost, local_role: Role::Central } if *lost == peer
+            ) {
                 reassembly.abort();
                 return;
             }
@@ -461,7 +464,16 @@ pub async fn serve(
 
         while let Some(event) = events.next().await {
             match event {
-                GattEvent::Connected { peer } => {
+                // Only inbound connections belong to the peripheral role.
+                // Without the role check, this backend's own *outbound*
+                // `connect` calls also surface here — yielding a phantom
+                // channel for a remote peripheral and, worse, occupying the
+                // single-central slot so the genuine inbound central is
+                // refused.
+                GattEvent::Connected {
+                    peer,
+                    local_role: Role::Peripheral,
+                } => {
                     // `Connected` is NOT once-per-connection. Both real
                     // backends re-emit it ahead of every characteristic
                     // write, because neither has a true server-side
@@ -534,11 +546,16 @@ pub async fn serve(
                         }
                     }
                 }
-                GattEvent::Disconnected { peer } => {
+                GattEvent::Disconnected {
+                    peer,
+                    local_role: Role::Peripheral,
+                } => {
                     // Dropping the fragment sender ends that peer's
                     // reassembly task, which closes its channel's `recv()`.
                     inbound.remove(&peer);
                 }
+                // Central-role lifecycle belongs to `connect`, not here.
+                GattEvent::Connected { .. } | GattEvent::Disconnected { .. } => {}
             }
         }
     });

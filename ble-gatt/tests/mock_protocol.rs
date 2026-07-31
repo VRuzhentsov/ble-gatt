@@ -312,7 +312,7 @@ async fn central_learns_about_unsolicited_peer_loss_through_the_event_stream() {
 
     let lost = events.next().await.expect("disconnect event should reach the central");
     match lost {
-        GattEvent::Disconnected { peer } => assert_eq!(peer, peripheral_addr),
+        GattEvent::Disconnected { peer, .. } => assert_eq!(peer, peripheral_addr),
         other => panic!("expected Disconnected, got {other:?}"),
     }
 }

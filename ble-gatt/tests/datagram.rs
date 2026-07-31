@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use ble_gatt::backend::mock::{MockBackend, MockNetwork};
 use ble_gatt::datagram::{self, DatagramChannel, DatagramConfig};
-use ble_gatt::{CapabilityReport, CharacteristicUuid, PeerAddress, ServiceUuid};
+use ble_gatt::{Backend, CapabilityReport, CharacteristicUuid, PeerAddress, ServiceUuid};
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
@@ -281,4 +281,50 @@ async fn a_zero_queue_depth_is_rejected_rather_than_panicking() {
     let mut zero_fragments = config();
     zero_fragments.fragment_queue_depth = 0;
     assert!(datagram::serve(backend, &zero_fragments).await.is_err());
+}
+
+#[tokio::test]
+async fn serving_and_dialling_on_one_backend_do_not_cross_over() {
+    // A backend used in both roles emits Connected for its own outbound
+    // dial too. Without role information on the event, serve() treated that
+    // as an arriving central: it yielded a phantom channel for the remote
+    // peripheral *and* consumed the single-central slot, so the genuine
+    // inbound central was then refused.
+    let network = MockNetwork::new();
+    let config = config();
+
+    let both_roles: Arc<MockBackend> = Arc::new(MockBackend::new(
+        PeerAddress("both-roles".to_string()),
+        network.clone(),
+        full_capabilities(),
+    ));
+    let remote: Arc<MockBackend> = Arc::new(MockBackend::new(
+        PeerAddress("remote-peripheral".to_string()),
+        network.clone(),
+        full_capabilities(),
+    ));
+
+    remote
+        .advertise(config.service_spec())
+        .await
+        .expect("remote advertises");
+    let mut incoming = datagram::serve(both_roles.clone(), &config)
+        .await
+        .expect("serve");
+
+    // Dial out from the same backend that is serving.
+    let _outbound = datagram::connect(
+        both_roles.clone(),
+        &PeerAddress("remote-peripheral".to_string()),
+        &config,
+    )
+    .await
+    .expect("outbound connect");
+
+    // serve() must not have produced a channel from our own dial-out.
+    let phantom = tokio::time::timeout(Duration::from_millis(300), incoming.next()).await;
+    assert!(
+        phantom.is_err(),
+        "serve() yielded a channel for our own outbound connection"
+    );
 }

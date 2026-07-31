@@ -42,9 +42,12 @@ export interface ConnectionMtu {
 }
 
 /** Connection lifecycle, as delivered by {@link watchEvents}. */
+/** Which role this device played: `central` = we dialled out, `peripheral` = a central connected to us. */
+export type LocalRole = "central" | "peripheral";
+
 export type GattEvent =
-  | { type: "connected"; address: string }
-  | { type: "disconnected"; address: string }
+  | { type: "connected"; address: string; localRole: LocalRole }
+  | { type: "disconnected"; address: string; localRole: LocalRole }
   | {
       type: "characteristicWritten";
       address: string;

@@ -18,12 +18,17 @@
 //! as the Kotlin object might still call back. `AndroidGattConnection`
 //! holds its own `Arc<Inner>` clone, keeping the allocation alive even if
 //! `AndroidBackend` itself is dropped first while connections are still
-//! live. The residual risk: if *every* `Arc<Inner>` handle is dropped while
-//! a JNI callback is genuinely in flight on another thread, that callback
-//! observes a dangling pointer. `Drop for AndroidBackend` mitigates this by
-//! best-effort quiescing the bridge (stop scan/advertising) before the
-//! count can reach zero, but does not eliminate the race — documented
-//! honestly rather than silently assumed away, matching Fini's own
+//! live. `Drop for AndroidBackend` calls the bridge's `closeAll()`, which
+//! disconnects and closes every open `BluetoothGatt` and the GATT server
+//! before the allocation can go away. That matters: each open GATT holds a
+//! Kotlin callback capturing `native_handle`, so leaving them open meant a
+//! later link-state callback could rebuild an `Arc` from freed memory.
+//!
+//! The residual risk is now narrower but not zero: a callback already
+//! *executing* on a Binder thread at the moment the last `Arc<Inner>` is
+//! released still observes a dangling pointer. Closing the GATTs first
+//! removes the sources of new callbacks; it cannot retract one already in
+//! flight. Documented rather than silently assumed away, matching the
 //! don't-hide-hard-cases convention this project inherited.
 
 use std::collections::{BTreeMap, HashMap};
@@ -42,7 +47,7 @@ use crate::backend::{Backend, BoxStream, GattConnection};
 use crate::error::{BleError, Result};
 use crate::models::{
     CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress,
-    ServiceUuid, WriteType,
+    Role, ServiceUuid, WriteType,
 };
 
 const BRIDGE_CLASS_BINARY_NAME: &str = "dev.blegatt.BleGattBridge";
@@ -193,8 +198,11 @@ impl Drop for AndroidBackend {
         // Best-effort quiesce — see the module doc comment's native-handle
         // contract for what this does and does not guarantee.
         if let Ok(mut env) = self.inner.env() {
-            let _ = self.inner.call_void(&mut env, "stopScan", "()V", &[]);
-            let _ = self.inner.call_void(&mut env, "stopAdvertising", "()V", &[]);
+            // Close every open GATT, not just scan/advertising. Each one
+            // holds a Kotlin callback capturing `native_handle`; leaving
+            // them open meant a later link-state callback could rebuild an
+            // `Arc` from freed memory once the last handle went away.
+            let _ = self.inner.call_void(&mut env, "closeAll", "()V", &[]);
         }
     }
 }
@@ -247,8 +255,21 @@ impl Backend for AndroidBackend {
             let uuid = env
                 .new_string(service.0.to_string())
                 .map_err(|err| BleError::Gatt(err.to_string()))?;
-            self.inner
-                .call_void(&mut env, "startScan", "(Ljava/lang/String;)V", &[JValue::Object(&uuid)])?;
+            let bridge = self.inner.bridge()?;
+            let started = env
+                .call_method(
+                    bridge.as_obj(),
+                    "startScan",
+                    "(Ljava/lang/String;)Z",
+                    &[JValue::Object(&uuid)],
+                )
+                .and_then(|v| v.z())
+                .map_err(|err| BleError::Gatt(format!("startScan failed: {err}")))?;
+            if !started {
+                return Err(BleError::Gatt(
+                    "a scan is already active; concurrent scans are not supported".to_string(),
+                ));
+            }
         }
         Ok(Box::pin(ScanStream {
             inner: self.inner.clone(),
@@ -733,6 +754,7 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onMtuChanged<'local>(
 #[no_mangle]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onConnected<'local>(
     mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, address: JString<'local>,
+    from_server: jboolean,
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
     let address = read_jstring(&mut env, &address);
@@ -745,17 +767,21 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onConnected<'local>(
         }
     }
     // Publish regardless of whether a client connect was pending: Linux
-    // already does this, and `Backend::events` documents both roles. Without
-    // it, central-role connections were invisible to `events()` on Android
-    // only, and `datagram::serve` never saw a central arrive.
+    // already does this, and `Backend::events` documents both roles.
     let _ = inner.server_events_tx.send(GattEvent::Connected {
         peer: PeerAddress(address),
+        local_role: if from_server != 0 {
+            Role::Peripheral
+        } else {
+            Role::Central
+        },
     });
 }
 
 #[no_mangle]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onDisconnected<'local>(
     mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, address: JString<'local>,
+    from_server: jboolean,
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
     let address = read_jstring(&mut env, &address);
@@ -778,6 +804,11 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onDisconnected<'local>(
     // caller learns about the former.
     let _ = inner.server_events_tx.send(GattEvent::Disconnected {
         peer: PeerAddress(address),
+        local_role: if from_server != 0 {
+            Role::Peripheral
+        } else {
+            Role::Central
+        },
     });
 }
 
@@ -854,8 +885,13 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onServerCharacteristicWritten<'
     let Ok(uuid) = Uuid::parse_str(&characteristic_uuid) else {
         return;
     };
+    // Kept as a safety net for stacks where `onConnectionStateChange` on the
+    // server callback does not fire; `serve` treats `Connected` as
+    // idempotent, so a duplicate here is harmless. Always the peripheral
+    // role — this is a write arriving at *our* GATT server.
     let _ = inner.server_events_tx.send(GattEvent::Connected {
         peer: PeerAddress(address.clone()),
+        local_role: Role::Peripheral,
     });
     let _ = inner.server_events_tx.send(GattEvent::CharacteristicWritten {
         peer: PeerAddress(address),

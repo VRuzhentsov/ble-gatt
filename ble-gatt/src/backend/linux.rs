@@ -33,7 +33,7 @@ use crate::backend::{Backend, BoxStream, GattConnection};
 use crate::error::{BleError, Result};
 use crate::models::{
     CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress,
-    ServiceUuid, WriteType,
+    Role, ServiceUuid, WriteType,
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
@@ -163,7 +163,10 @@ impl Backend for LinuxBackend {
             peer: peer.0.clone(),
             reason: err.to_string(),
         })?;
-        let _ = self.events_tx.send(GattEvent::Connected { peer: peer.clone() });
+        let _ = self.events_tx.send(GattEvent::Connected {
+            peer: peer.clone(),
+            local_role: Role::Central,
+        });
 
         // Watch BlueZ's own Connected property so an *unsolicited* drop (peer
         // out of range, powered off) reaches `events()`. Without this a
@@ -183,7 +186,10 @@ impl Backend for LinuxBackend {
                 else {
                     continue;
                 };
-                let _ = events_tx.send(GattEvent::Disconnected { peer: watch_peer });
+                let _ = events_tx.send(GattEvent::Disconnected {
+                    peer: watch_peer,
+                    local_role: Role::Central,
+                });
                 return;
             }
         });
@@ -232,7 +238,10 @@ impl Backend for LinuxBackend {
                         let peer = PeerAddress(req.device_address.to_string());
                         Box::pin(async move {
                             values.lock().unwrap().insert(uuid, value.clone());
-                            let _ = events_tx.send(GattEvent::Connected { peer: peer.clone() });
+                            let _ = events_tx.send(GattEvent::Connected {
+                                peer: peer.clone(),
+                                local_role: Role::Peripheral,
+                            });
                             let _ = events_tx.send(GattEvent::CharacteristicWritten {
                                 peer,
                                 characteristic: uuid,

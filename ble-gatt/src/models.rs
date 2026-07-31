@@ -74,9 +74,16 @@ pub enum WriteType {
 pub enum GattEvent {
     Connected {
         peer: PeerAddress,
+        /// The role *this* device played. `Central` means we dialled out;
+        /// `Peripheral` means a central connected to our GATT server.
+        /// Without it the two are indistinguishable, so a backend used in
+        /// both roles at once cannot tell an outbound connection from an
+        /// inbound one.
+        local_role: Role,
     },
     Disconnected {
         peer: PeerAddress,
+        local_role: Role,
     },
     CharacteristicWritten {
         peer: PeerAddress,
