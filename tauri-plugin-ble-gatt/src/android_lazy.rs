@@ -144,6 +144,11 @@ impl Backend for LazyAndroidBackend {
         // Always a live subscription, whether or not the backend exists yet.
         // Once it is built, `inner()` starts forwarding into this channel.
         let rx = self.events_tx.subscribe();
-        Box::pin(BroadcastStream::new(rx).filter_map(|item| item.ok()))
+        Box::pin(BroadcastStream::new(rx).map(|item| match item {
+            Ok(event) => event,
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                GattEvent::Lagged { dropped: n }
+            }
+        }))
     }
 }

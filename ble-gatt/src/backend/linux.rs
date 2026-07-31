@@ -651,7 +651,13 @@ impl Backend for LinuxBackend {
     fn events(&self) -> BoxStream<GattEvent> {
         let rx = self.events_tx.subscribe();
         Box::pin(
-            tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|item| async move { item.ok() }),
+            tokio_stream::wrappers::BroadcastStream::new(rx)
+                .map(|item| match item {
+                    Ok(event) => event,
+                    Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                        GattEvent::Lagged { dropped: n }
+                    }
+                }),
         )
     }
 }

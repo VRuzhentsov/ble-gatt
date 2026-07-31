@@ -111,6 +111,11 @@ pub enum GattEventDto {
         characteristic_uuid: String,
         value: Vec<u8>,
     },
+    /// This subscriber fell behind and events were discarded. Forwarded
+    /// rather than hidden: a JS consumer tracking connection state from this
+    /// stream cannot know its view is still accurate otherwise.
+    #[serde(rename_all = "camelCase")]
+    Lagged { dropped: u64 },
 }
 
 /// Which role *this* device played. JS needs it for the same reason Rust
@@ -143,6 +148,7 @@ impl From<GattEvent> for GattEventDto {
                 characteristic_uuid: characteristic.0.to_string(),
                 value,
             },
+            GattEvent::Lagged { dropped } => Self::Lagged { dropped },
         }
     }
 }

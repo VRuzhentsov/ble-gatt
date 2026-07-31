@@ -82,7 +82,13 @@ struct ConnectionState {
     /// exists.
     live: bool,
     connected_tx: Option<oneshot::Sender<()>>,
-    read_tx: Option<oneshot::Sender<Result<Vec<u8>>>>,
+    /// Pending read, tagged with the characteristic it was issued for.
+    ///
+    /// Routing on address alone let a delayed callback from a *cancelled*
+    /// read resolve whichever read replaced it — returning the earlier
+    /// characteristic's bytes as the later one's result, which is silent
+    /// data corruption rather than an error.
+    read_tx: Option<(CharacteristicUuid, oneshot::Sender<Result<Vec<u8>>>)>,
     write_tx: Option<oneshot::Sender<Result<()>>>,
     subscribe_tx: HashMap<CharacteristicUuid, oneshot::Sender<bool>>,
     notify_tx: HashMap<CharacteristicUuid, (mpsc::Sender<Vec<u8>>, Arc<AtomicBool>)>,
@@ -681,7 +687,12 @@ impl Backend for AndroidBackend {
 
     fn events(&self) -> BoxStream<GattEvent> {
         let rx = self.inner.server_events_tx.subscribe();
-        Box::pin(tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|item| item.ok()))
+        Box::pin(tokio_stream::wrappers::BroadcastStream::new(rx).map(|item| match item {
+            Ok(event) => event,
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                GattEvent::Lagged { dropped: n }
+            }
+        }))
     }
 }
 
@@ -784,7 +795,16 @@ impl GattConnection for AndroidGattConnection {
         {
             let mut connections = self.inner.connections.lock().unwrap();
             let state = connections.entry(self.address.clone()).or_default();
-            state.read_tx = Some(tx);
+            // Refuse rather than replace: a second read while one is in
+            // flight would strand the first caller, and the platform has one
+            // outstanding read per connection anyway.
+            if state.read_tx.is_some() {
+                return Err(BleError::Gatt(format!(
+                    "a read from {} is already in progress",
+                    self.address
+                )));
+            }
+            state.read_tx = Some((characteristic, tx));
         }
         {
             let mut env = self.inner.env()?;
@@ -799,7 +819,15 @@ impl GattConnection for AndroidGattConnection {
                 &[JValue::Object(&address), JValue::Object(&uuid)],
             )?;
         }
-        rx.await.map_err(|_| BleError::NotConnected(self.address.clone()))?
+        // Clear ownership on every exit, including a dropped future, so a
+        // cancelled read cannot block later ones for the life of the link.
+        let guard = ReadGuard {
+            inner: self.inner.clone(),
+            address: self.address.clone(),
+        };
+        let result = rx.await.map_err(|_| BleError::NotConnected(self.address.clone()));
+        drop(guard);
+        result?
     }
 
     async fn write_with_type(
@@ -831,7 +859,15 @@ impl GattConnection for AndroidGattConnection {
                 ],
             )?;
         }
-        rx.await.map_err(|_| BleError::NotConnected(self.address.clone()))?
+        // Clear ownership on every exit, including a dropped future, so a
+        // cancelled read cannot block later ones for the life of the link.
+        let guard = ReadGuard {
+            inner: self.inner.clone(),
+            address: self.address.clone(),
+        };
+        let result = rx.await.map_err(|_| BleError::NotConnected(self.address.clone()));
+        drop(guard);
+        result?
     }
 
     async fn subscribe(
@@ -1202,20 +1238,34 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onDisconnected<'local>(
 #[no_mangle]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onCharacteristicRead<'local>(
     mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, address: JString<'local>,
-    _characteristic_uuid: JString<'local>, value: JByteArray<'local>, success: jboolean,
+    characteristic_uuid: JString<'local>, value: JByteArray<'local>, success: jboolean,
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
     let address = read_jstring(&mut env, &address);
+    let uuid = read_jstring(&mut env, &characteristic_uuid);
     let bytes = env.convert_byte_array(&value).unwrap_or_default();
     let mut connections = inner.connections.lock().unwrap();
     if let Some(state) = connections.get_mut(&address) {
-        if let Some(tx) = state.read_tx.take() {
-            let result = if success != 0 {
-                Ok(bytes)
-            } else {
-                Err(BleError::Gatt("characteristic read failed".to_string()))
-            };
-            let _ = tx.send(result);
+        // Only resolve the pending read if this callback is *for* it. A
+        // delayed callback from a cancelled read would otherwise hand the
+        // waiting caller the wrong characteristic's bytes — a wrong answer
+        // rather than a failure, which is the harder kind to notice.
+        let matches = match (&state.read_tx, Uuid::parse_str(&uuid)) {
+            (Some((pending, _)), Ok(parsed)) => pending.0 == parsed,
+            // No UUID to compare against: fall back to address routing
+            // rather than stranding the caller forever.
+            (Some(_), Err(_)) => true,
+            (None, _) => false,
+        };
+        if matches {
+            if let Some((_, tx)) = state.read_tx.take() {
+                let result = if success != 0 {
+                    Ok(bytes)
+                } else {
+                    Err(BleError::Gatt("characteristic read failed".to_string()))
+                };
+                let _ = tx.send(result);
+            }
         }
     }
 }
@@ -1343,6 +1393,23 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onServerSubscribed<'local>(
         peer: PeerAddress(address),
         local_role: Role::Peripheral,
     });
+}
+
+/// Releases a pending read slot on every exit path, including a dropped
+/// future — otherwise a cancelled read would refuse every later read on that
+/// connection for the life of the link.
+struct ReadGuard {
+    inner: Arc<Inner>,
+    address: String,
+}
+
+impl Drop for ReadGuard {
+    fn drop(&mut self) {
+        let mut connections = self.inner.connections.lock().unwrap();
+        if let Some(state) = connections.get_mut(&self.address) {
+            state.read_tx = None;
+        }
+    }
 }
 
 /// Undoes a `connect()` that never completed, including one abandoned by a

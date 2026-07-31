@@ -409,7 +409,12 @@ impl Backend for MockBackend {
         // not conditional on advertising, since a central-only consumer
         // needs it to learn about unsolicited peer loss.
         let rx = self.events_tx.subscribe();
-        Box::pin(BroadcastStream::new(rx).filter_map(|item| item.ok()))
+        Box::pin(BroadcastStream::new(rx).map(|item| match item {
+            Ok(event) => event,
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                GattEvent::Lagged { dropped: n }
+            }
+        }))
     }
 }
 

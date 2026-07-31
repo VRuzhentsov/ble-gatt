@@ -681,3 +681,62 @@ async fn a_receiver_already_waiting_is_woken_when_inbound_data_is_lost() {
         .expect("receiver task should not panic");
     assert!(woken, "the wakeup must deliver the loss as an error, not close the channel");
 }
+
+#[tokio::test]
+async fn dropping_a_served_channel_frees_the_slot_for_the_next_central() {
+    let config = config();
+    let network = MockNetwork::new();
+    let peripheral_addr = PeerAddress("peripheral-drop-slot".to_string());
+
+    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+        peripheral_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    ));
+    let first: Arc<MockBackend> = Arc::new(MockBackend::new(
+        PeerAddress("central-drop-slot-1".to_string()),
+        network.clone(),
+        full_capabilities(),
+    ));
+
+    let mut incoming = datagram::serve(peripheral.clone(), &config)
+        .await
+        .expect("serve should start");
+    let _first_client = datagram::connect(first.clone(), &peripheral_addr, &config)
+        .await
+        .expect("connect should succeed");
+    let served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
+        .await
+        .expect("serve should yield a channel")
+        .expect("channel stream should not be closed");
+
+    // The caller is done with this peer and drops its channel while the
+    // central is still connected. `close()` is a no-op in the peripheral
+    // role, so the drop is the only signal `serve` can act on — without it
+    // the peer keeps the single-central slot forever.
+    drop(served);
+
+    let second: Arc<MockBackend> = Arc::new(MockBackend::new(
+        PeerAddress("central-drop-slot-2".to_string()),
+        network.clone(),
+        full_capabilities(),
+    ));
+    let mut second_client = datagram::connect(second.clone(), &peripheral_addr, &config)
+        .await
+        .expect("connect should succeed");
+    let mut second_served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
+        .await
+        .expect("the freed slot must admit the next central")
+        .expect("channel stream should not be closed");
+
+    second_served
+        .send(b"to-the-second".to_vec())
+        .await
+        .expect("the newly served central must be reachable");
+    let received = tokio::time::timeout(Duration::from_secs(2), second_client.recv())
+        .await
+        .expect("second central should receive it")
+        .expect("channel should be open")
+        .expect("no error");
+    assert_eq!(received, b"to-the-second");
+}

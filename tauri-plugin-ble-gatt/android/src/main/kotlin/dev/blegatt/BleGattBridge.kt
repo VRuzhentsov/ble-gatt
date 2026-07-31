@@ -107,6 +107,16 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     private val notifyQueue = ArrayDeque<PendingNotify>()
     private var notifyInFlight: PendingNotify? = null
 
+    /// Incremented every time a GATT server is opened. A notification
+    /// callback from a previous server can still be executing when a new one
+    /// is advertising; without this it would consume the *new* server's
+    /// in-flight entry, report that request's outcome using the old
+    /// request's status, and restart the pump while the new send is still
+    /// active — defeating the one-in-flight rule that keeps fragmented
+    /// datagrams intact.
+    @Volatile
+    private var serverGeneration: Long = 0
+
     fun hasCentralSupport(): Boolean = adapter?.bluetoothLeScanner != null
 
     fun hasPeripheralSupport(): Boolean =
@@ -279,6 +289,16 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                     gatt.close()
                     return
                 }
+                // The connect may have been cancelled while this callback
+                // was already running: `ConnectGuard` closes the GATT and
+                // clears the Rust slot, and publishing here afterwards would
+                // recreate the address entry and mark it live with no Rust
+                // handle owning a GATT — after which every later connect is
+                // refused as "already open".
+                if (connectedGatts[address] !== gatt) {
+                    Log.d(TAG, "onServicesDiscovered: $address superseded or cancelled, ignoring")
+                    return
+                }
                 val byUuid = ConcurrentHashMap<String, BluetoothGattCharacteristic>()
                 for (service in gatt.services) {
                     for (characteristic in service.characteristics) {
@@ -422,6 +442,10 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             return
         }
 
+        // Captured by every callback below, so a callback outliving its
+        // server can tell that it has been superseded.
+        val generation = synchronized(this) { ++serverGeneration }
+
         val serverCallback = object : BluetoothGattServerCallback() {
             /// `addService` completes asynchronously. Advertising used to
             /// start immediately after the call, so a delayed or rejected
@@ -479,6 +503,10 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
 
             override fun onNotificationSent(device: BluetoothDevice, status: Int) {
                 val completed = synchronized(this@BleGattBridge) {
+                    if (serverGeneration != generation) {
+                        Log.d(TAG, "onNotificationSent: stale server generation, ignoring")
+                        return
+                    }
                     val done = notifyInFlight
                     notifyInFlight = null
                     done

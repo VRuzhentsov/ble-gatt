@@ -274,6 +274,15 @@ pub struct DatagramChannel {
     characteristic: CharacteristicUuid,
     sink: Mutex<Sink>,
     inbound: ReceiverStream<Result<Vec<u8>>>,
+    /// Tells `serve` this channel is gone, so it can free the single-central
+    /// slot and drop the peer.
+    ///
+    /// Needed because `close()` is a no-op in the peripheral role and
+    /// dropping the channel only aborted reassembly: `serve` kept the peer
+    /// in `inbound`, so subsequent writes went to a closed receiver, the
+    /// entry was never removed, and every other central was refused
+    /// indefinitely.
+    release: Option<mpsc::Sender<PeerAddress>>,
     /// Raised when inbound data was dropped for this channel.
     ///
     /// Out-of-band rather than an error pushed onto the message queue:
@@ -297,6 +306,12 @@ impl Drop for DatagramChannel {
     fn drop(&mut self) {
         for task in &self.tasks {
             task.abort();
+        }
+        // Tell `serve` the slot is free. try_send because Drop cannot await;
+        // the queue is sized for the peers `serve` can hold, so it cannot
+        // legitimately be full.
+        if let Some(release) = &self.release {
+            let _ = release.try_send(self.peer.clone());
         }
     }
 }
@@ -402,6 +417,27 @@ impl DatagramChannel {
             // is what ends it. Stopping advertising here would tear down
             // every other peer's channel too.
             Sink::Notify { .. } => Ok(()),
+        }
+    }
+}
+
+/// A served peer's fragment sender, channel-liveness flag, and overflow
+/// signal, as held by `serve` while that peer occupies the single slot.
+type ServedPeer = (mpsc::Sender<Vec<u8>>, Arc<AtomicBool>, Arc<OverflowSignal>);
+
+/// Free the single-central slot for a peer whose channel the caller dropped,
+/// and drop the peer so it is not left subscribed to a server that is no
+/// longer reading from it.
+async fn release_peer(
+    inbound: &mut HashMap<PeerAddress, ServedPeer>, peer: &PeerAddress, backend: &dyn Backend,
+) {
+    if let Some((_, active, _)) = inbound.remove(peer) {
+        active.store(false, Ordering::SeqCst);
+        if let Err(err) = backend.disconnect_peer(peer).await {
+            eprintln!(
+                "[ble-gatt][datagram] could not disconnect released central {}: {err}",
+                peer.0
+            );
         }
     }
 }
@@ -544,6 +580,9 @@ pub async fn connect(
             write_type: config.write_type,
         }),
         inbound: ReceiverStream::new(rx),
+        // Central channels are not held in anyone's slot, so nothing needs
+        // telling when this one goes away.
+        release: None,
         // Set when the backend reports it dropped notifications — the
         // central-side equivalent of `serve`'s fragment-queue overflow.
         overflow,
@@ -619,6 +658,7 @@ pub async fn serve(
     backend.advertise(config.service_spec()).await?;
 
     let (channels_tx, channels_rx) = mpsc::channel(config.accept_queue_depth);
+    let (release_tx, mut release_rx) = mpsc::channel::<PeerAddress>(config.accept_queue_depth);
     let config = config.clone();
     // The peripheral has no `GattConnection` to ask for a negotiated MTU, so
     // it budgets against the spec-minimum. Conservative on purpose:
@@ -633,11 +673,7 @@ pub async fn serve(
         // are refused rather than served.
         // The fragment sender plus the liveness flag handed to that peer's
     // channel, so a disconnect can invalidate the channel the caller holds.
-    #[allow(clippy::type_complexity)]
-    let mut inbound: HashMap<
-        PeerAddress,
-        (mpsc::Sender<Vec<u8>>, Arc<AtomicBool>, Arc<OverflowSignal>),
-    > = HashMap::new();
+    let mut inbound: HashMap<PeerAddress, ServedPeer> = HashMap::new();
 
         // Dropping the accept stream means "no more *new* peers" — it does
         // not abandon the ones already handed over, which still need this
@@ -651,9 +687,19 @@ pub async fn serve(
 
         loop {
             let event = if accept_closed {
-                match events.next().await {
-                    Some(event) => event,
-                    None => return,
+                tokio::select! {
+                    released = release_rx.recv() => {
+                        let Some(peer) = released else { return };
+                        release_peer(&mut inbound, &peer, backend.as_ref()).await;
+                        if inbound.is_empty() {
+                            return;
+                        }
+                        continue;
+                    }
+                    event = events.next() => match event {
+                        Some(event) => event,
+                        None => return,
+                    },
                 }
             } else {
                 tokio::select! {
@@ -661,6 +707,15 @@ pub async fn serve(
                         accept_closed = true;
                         if inbound.is_empty() {
                             return;
+                        }
+                        continue;
+                    }
+                    // The caller dropped a channel it had accepted. Without
+                    // this the peer stayed in `inbound` forever, holding the
+                    // single-central slot against everyone else.
+                    released = release_rx.recv() => {
+                        if let Some(peer) = released {
+                            release_peer(&mut inbound, &peer, backend.as_ref()).await;
                         }
                         continue;
                     }
@@ -681,6 +736,16 @@ pub async fn serve(
                     peer,
                     local_role: Role::Peripheral,
                 } => {
+                    // Drain releases first. A caller that drops a channel and
+                    // immediately accepts the next peer would otherwise race:
+                    // if this event is processed before the queued release,
+                    // the arriving central is refused *and disconnected* on
+                    // behalf of a peer that is already gone, and the caller
+                    // never learns why.
+                    while let Ok(released) = release_rx.try_recv() {
+                        release_peer(&mut inbound, &released, backend.as_ref()).await;
+                    }
+
                     // `Connected` is NOT once-per-connection. Both real
                     // backends re-emit it ahead of every characteristic
                     // write, because neither has a true server-side
@@ -735,6 +800,7 @@ pub async fn serve(
                             active: active.clone(),
                         }),
                         inbound: ReceiverStream::new(msg_rx),
+                        release: Some(release_tx.clone()),
                         overflow: overflow.clone(),
                         next_msg_id: 0,
                         max_message_len: effective_max_message_len(
@@ -841,6 +907,20 @@ pub async fn serve(
                     }
                     if accept_closed && inbound.is_empty() {
                         return;
+                    }
+                }
+                // Events were dropped before this task could read them. Any
+                // of them could have been an acknowledged write, so every
+                // served peer's inbound stream may now have a hole — and
+                // which ones is unknowable, since the events are gone.
+                // Reporting to all of them is the only sound response.
+                GattEvent::Lagged { dropped } => {
+                    eprintln!(
+                        "[ble-gatt][datagram] lifecycle stream lagged by {dropped} events; \
+                         reporting possible inbound loss to every served peer"
+                    );
+                    for (_, _, overflow) in inbound.values() {
+                        overflow.raise();
                     }
                 }
                 // Central-role lifecycle belongs to `connect`, not here.

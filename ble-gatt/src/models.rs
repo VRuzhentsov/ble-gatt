@@ -90,6 +90,17 @@ pub enum GattEvent {
         characteristic: CharacteristicUuid,
         value: Vec<u8>,
     },
+    /// This subscriber fell behind and `dropped` events were discarded
+    /// before it could read them.
+    ///
+    /// Reported rather than swallowed because the lost events are not all
+    /// harmless: an acknowledged `CharacteristicWritten` disappearing here
+    /// removes a fragment the sender was told had arrived, so a consumer
+    /// treating the remaining events as a complete record would wait
+    /// forever for a message that can no longer be assembled. Which peers
+    /// were affected is unknowable — the events are simply gone — so a
+    /// consumer must treat every session it is tracking as suspect.
+    Lagged { dropped: u64 },
 }
 
 #[derive(Debug, Clone)]
