@@ -15,7 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
@@ -58,7 +58,7 @@ pub struct LinuxBackend {
     /// Centrals currently being watched for a peripheral-role disconnect.
     /// Doubles as a spawn guard: writes are frequent, and a watcher per
     /// write would spawn an unbounded number of tasks per peer.
-    served_peers: Arc<StdMutex<HashSet<PeerAddress>>>,
+    served_peers: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
     /// Live notify sessions, keyed by characteristic *and subscriber*.
     ///
     /// `CharacteristicNotifyMethod::Io` is used rather than `Fun` precisely
@@ -69,8 +69,13 @@ pub struct LinuxBackend {
     events_tx: broadcast::Sender<GattEvent>,
     app_handle: AsyncMutex<Option<ApplicationHandle>>,
     adv_handle: AsyncMutex<Option<bluer::adv::AdvertisementHandle>>,
-    /// Aborts the notify-session watchers started by `advertise`.
-    server_watch: AsyncMutex<Vec<tokio::task::AbortHandle>>,
+    /// Aborts the notify-session watchers started by `advertise`, *and* the
+    /// per-peer disconnect watchers they spawn — those were previously
+    /// detached, so `stop_advertising` could not cancel them.
+    server_watch: Arc<AsyncMutex<Vec<tokio::task::AbortHandle>>>,
+    /// Session ids for served peers, so a watcher that finishes late cannot
+    /// act on the session that replaced it.
+    next_session: Arc<AtomicU64>,
     /// Addresses this backend dialled itself, in the central role. BlueZ
     /// reports one `Connected` property per device regardless of who
     /// initiated, so without this an outbound connection would be
@@ -102,12 +107,13 @@ impl LinuxBackend {
             _session: session,
             adapter,
             values: Arc::new(StdMutex::new(HashMap::new())),
-            served_peers: Arc::new(StdMutex::new(HashSet::new())),
+            served_peers: Arc::new(StdMutex::new(HashMap::new())),
+            next_session: Arc::new(AtomicU64::new(1)),
             notify_writers: Arc::new(AsyncMutex::new(HashMap::new())),
             events_tx,
             app_handle: AsyncMutex::new(None),
             adv_handle: AsyncMutex::new(None),
-            server_watch: AsyncMutex::new(Vec::new()),
+            server_watch: Arc::new(AsyncMutex::new(Vec::new())),
             dialed: Arc::new(StdMutex::new(HashSet::new())),
         })
     }
@@ -121,11 +127,13 @@ impl LinuxBackend {
 /// service-attributed (an unrelated device connected to the same adapter
 /// never appears here), notification-ready by construction, and identified
 /// without inference.
+#[allow(clippy::too_many_arguments)]
 async fn watch_notify_sessions(
     mut control: CharacteristicControl, uuid: CharacteristicUuid,
     writers: Arc<AsyncMutex<HashMap<CharacteristicUuid, Vec<CharacteristicWriter>>>>,
     events_tx: broadcast::Sender<GattEvent>,
-    served_peers: Arc<StdMutex<HashSet<PeerAddress>>>, adapter: Adapter,
+    served_peers: Arc<StdMutex<HashMap<PeerAddress, u64>>>, adapter: Adapter,
+    next_session: Arc<AtomicU64>, watchers: Arc<AsyncMutex<Vec<tokio::task::AbortHandle>>>,
 ) {
     while let Some(event) = control.next().await {
         let CharacteristicControlEvent::Notify(writer) = event else {
@@ -141,21 +149,31 @@ async fn watch_notify_sessions(
             sessions.push(writer);
         }
 
-        if !served_peers.lock().unwrap().insert(peer.clone()) {
-            continue;
-        }
+        let session = {
+            let mut served = served_peers.lock().unwrap();
+            if served.contains_key(&peer) {
+                continue;
+            }
+            let session = next_session.fetch_add(1, Ordering::Relaxed);
+            served.insert(peer.clone(), session);
+            session
+        };
         let _ = events_tx.send(GattEvent::Connected {
             peer: peer.clone(),
             local_role: Role::Peripheral,
         });
-        spawn_peripheral_disconnect_watch(
+        let handle = spawn_peripheral_disconnect_watch(
             adapter.clone(),
             address,
             peer,
             events_tx.clone(),
             served_peers.clone(),
             writers.clone(),
+            session,
         );
+        // Registered so `stop_advertising` cancels it; previously these were
+        // detached and outlived the server that created them.
+        watchers.lock().await.push(handle.abort_handle());
     }
 }
 
@@ -166,11 +184,14 @@ async fn watch_notify_sessions(
 /// different roles and different cleanup: `datagram::serve` filters strictly
 /// on `local_role`, so emitting the central variant here would be silently
 /// ignored.
+#[allow(clippy::too_many_arguments)]
 fn spawn_peripheral_disconnect_watch(
     adapter: Adapter, address: bluer::Address, peer: PeerAddress,
-    events_tx: broadcast::Sender<GattEvent>, served_peers: Arc<StdMutex<HashSet<PeerAddress>>>,
+    events_tx: broadcast::Sender<GattEvent>,
+    served_peers: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
     writers: Arc<AsyncMutex<HashMap<CharacteristicUuid, Vec<CharacteristicWriter>>>>,
-) {
+    session: u64,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Any exit path must clear the guard, or a peer that failed to be
         // watched once could never be watched again.
@@ -217,12 +238,22 @@ fn spawn_peripheral_disconnect_watch(
             Some(())
         }
         .await;
+        // Only if this watcher still owns the session. The same address can
+        // have reconnected and been served afresh while this task was
+        // finishing; emitting then would tear down the replacement channel
+        // and erase its spawn guard, and the entry it removed would be the
+        // new session's.
+        let mut served = served_peers.lock().unwrap();
+        if served.get(&peer) != Some(&session) {
+            return;
+        }
+        served.remove(&peer);
+        drop(served);
         let _ = events_tx.send(GattEvent::Disconnected {
             peer: peer.clone(),
             local_role: Role::Peripheral,
         });
-        served_peers.lock().unwrap().remove(&peer);
-    });
+    })
 }
 
 /// Whether `peer` still holds any open notify session.
@@ -430,6 +461,8 @@ impl Backend for LinuxBackend {
 
     async fn advertise(&self, service: GattServiceSpec) -> Result<()> {
         let values = self.values.clone();
+        let next_session = self.next_session.clone();
+        let server_watch = self.server_watch.clone();
         let notify_writers = self.notify_writers.clone();
         let mut notify_sessions = Vec::new();
         let served_peers = self.served_peers.clone();
@@ -462,6 +495,8 @@ impl Backend for LinuxBackend {
                 let served_peers = served_peers.clone();
                 let adapter = adapter.clone();
                 let notify_writers = notify_writers.clone();
+                let next_session = next_session.clone();
+                let server_watch = server_watch.clone();
                 CharacteristicWrite {
                     write: true,
                     write_without_response: true,
@@ -471,6 +506,8 @@ impl Backend for LinuxBackend {
                         let served_peers = served_peers.clone();
                         let adapter = adapter.clone();
                         let notify_writers = notify_writers.clone();
+                        let next_session = next_session.clone();
+                        let server_watch = server_watch.clone();
                         let address = req.device_address;
                         let peer = PeerAddress(address.to_string());
                         Box::pin(async move {
@@ -490,19 +527,28 @@ impl Backend for LinuxBackend {
                             // entry in `datagram::serve`'s single-central map
                             // is never cleared — permanently refusing every
                             // reconnect after the first central leaves.
-                            let newly_served = served_peers
-                                .lock()
-                                .unwrap()
-                                .insert(peer.clone());
-                            if newly_served {
-                                spawn_peripheral_disconnect_watch(
+                            let session = {
+                                let mut served = served_peers.lock().unwrap();
+                                if served.contains_key(&peer) {
+                                    None
+                                } else {
+                                    let session =
+                                        next_session.fetch_add(1, Ordering::Relaxed);
+                                    served.insert(peer.clone(), session);
+                                    Some(session)
+                                }
+                            };
+                            if let Some(session) = session {
+                                let handle = spawn_peripheral_disconnect_watch(
                                     adapter,
                                     address,
                                     peer.clone(),
                                     events_tx.clone(),
                                     served_peers,
                                     notify_writers,
+                                    session,
                                 );
+                                server_watch.lock().await.push(handle.abort_handle());
                             }
                             let _ = events_tx.send(GattEvent::CharacteristicWritten {
                                 peer,
@@ -538,6 +584,8 @@ impl Backend for LinuxBackend {
                     events_tx.clone(),
                     served_peers.clone(),
                     adapter.clone(),
+                    next_session.clone(),
+                    server_watch.clone(),
                 )));
             }
 
@@ -603,7 +651,8 @@ impl Backend for LinuxBackend {
         // still live, so a later `advertise` had the old task disconnecting
         // the new server's central as an interloper — locking the new
         // `serve` out until the stale peer happened to drop physically.
-        let served: Vec<PeerAddress> = self.served_peers.lock().unwrap().drain().collect();
+        let served: Vec<PeerAddress> =
+            self.served_peers.lock().unwrap().drain().map(|(peer, _)| peer).collect();
         for peer in served {
             let _ = self.events_tx.send(GattEvent::Disconnected {
                 peer,

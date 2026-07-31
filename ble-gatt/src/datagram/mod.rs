@@ -644,7 +644,8 @@ pub async fn connect(
     // the JoinHandle meant aborting the watcher merely dropped it — and
     // dropping a Tokio JoinHandle detaches its task rather than cancelling
     // it, so reassembly outlived the channel that owned it.
-    let watcher = spawn_link_loss_watch(events, peer.clone(), reassembly.abort_handle());
+    let watcher =
+        spawn_link_loss_watch(events, peer.clone(), reassembly.abort_handle(), overflow.clone());
 
     Ok(DatagramChannel {
         peer: peer.clone(),
@@ -676,17 +677,36 @@ pub async fn connect(
 /// backend a subscription outlives the link, so waiting for it to close
 /// would be waiting forever.
 fn spawn_link_loss_watch(
-    mut events: BoxStream<GattEvent>, peer: PeerAddress,
-    reassembly: tokio::task::AbortHandle,
+    mut events: BoxStream<GattEvent>, peer: PeerAddress, reassembly: tokio::task::AbortHandle,
+    overflow: Arc<OverflowSignal>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(event) = events.next().await {
-            if matches!(
-                &event,
-                GattEvent::Disconnected { peer: lost, local_role: Role::Central } if *lost == peer
-            ) {
-                reassembly.abort();
-                return;
+            match &event {
+                GattEvent::Disconnected { peer: lost, local_role: Role::Central }
+                    if *lost == peer =>
+                {
+                    reassembly.abort();
+                    return;
+                }
+                // Lag is terminal here for the same reason it is in `serve`:
+                // the discarded events may include this peer's
+                // `Disconnected`, and the notification stream is explicitly
+                // not guaranteed to close with the link — so a caller parked
+                // in `recv()` would wait forever on a peer that is gone.
+                // Report the gap first so that wait ends with an error
+                // rather than a silent close.
+                GattEvent::Lagged { dropped } => {
+                    eprintln!(
+                        "[ble-gatt][datagram] lifecycle stream lagged by {dropped} events; \
+                         ending the channel to {}, since its disconnect may have been lost",
+                        peer.0
+                    );
+                    overflow.raise();
+                    reassembly.abort();
+                    return;
+                }
+                _ => {}
             }
         }
         // Event stream ended: nothing more can arrive, so the reassembly

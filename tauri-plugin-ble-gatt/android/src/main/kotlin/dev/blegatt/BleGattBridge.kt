@@ -284,6 +284,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                         if (current) {
                             connectedGatts.remove(address)
                             pendingCharacteristics.remove(address)
+                            clearPendingOperations(address)
                             // Fires for unsolicited drops too (out of range,
                             // peer powered off), which is the whole point of
                             // surfacing this to Rust rather than only
@@ -301,6 +302,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             }
 
             override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+                if (connectedGatts[address] !== gatt) return
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     Log.d(TAG, "onMtuChanged: $address negotiated mtu=$mtu")
                     onMtuChanged(nativeHandle, address, mtu)
@@ -330,6 +332,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                     Log.w(TAG, "onServicesDiscovered failed for $address status=$status")
                     connectedGatts.remove(address)
                     pendingCharacteristics.remove(address)
+                    clearPendingOperations(address)
                     onDisconnected(nativeHandle, address, false)
                     gatt.close()
                     return
@@ -348,6 +351,10 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             override fun onCharacteristicRead(
                 gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int
             ) {
+                // Ownership first: a superseded GATT's callback must not
+                // even consume a queue entry, or it would pop the live
+                // operation's id and strand it.
+                if (connectedGatts[address] !== gatt) return
                 val queue = pendingReadIds[address] ?: return
                 val requestId = synchronized(queue) { queue.removeFirstOrNull() } ?: return
                 onCharacteristicRead(
@@ -359,6 +366,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             override fun onCharacteristicWrite(
                 gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int
             ) {
+                if (connectedGatts[address] !== gatt) return
                 val queue = pendingWriteIds[address] ?: return
                 val requestId = synchronized(queue) { queue.removeFirstOrNull() } ?: return
                 onCharacteristicWriteResult(
@@ -387,6 +395,11 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             override fun onDescriptorWrite(
                 gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int
             ) {
+                // A superseded GATT's CCCD completion would otherwise resolve
+                // the *replacement's* pending subscribe with the old
+                // operation's status — handing back a stream before
+                // notifications are enabled, or failing a valid new setup.
+                if (connectedGatts[address] !== gatt) return
                 onSubscribed(
                     nativeHandle,
                     address,
@@ -567,6 +580,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             override fun onCharacteristicReadRequest(
                 device: BluetoothDevice, requestId: Int, offset: Int, characteristic: BluetoothGattCharacteristic
             ) {
+                if (serverGeneration != generation) return
                 val value = characteristic.value ?: ByteArray(0)
                 gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
             }
@@ -576,6 +590,11 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 device: BluetoothDevice, requestId: Int, characteristic: BluetoothGattCharacteristic,
                 preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray,
             ) {
+                // A write queued against a stopped server would otherwise be
+                // published as current. If it is a datagram fragment, the
+                // replacement session reassembles stale bytes into its own
+                // message — corruption, not just a late delivery.
+                if (serverGeneration != generation) return
                 characteristic.value = value
                 if (responseNeeded) {
                     gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
@@ -752,12 +771,26 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     fun closeConnection(address: String) {
         val gatt = connectedGatts.remove(address) ?: return
         pendingCharacteristics.remove(address)
+        clearPendingOperations(address)
         try {
             gatt.disconnect()
             gatt.close()
         } catch (e: Exception) {
             Log.w(TAG, "closeConnection: error closing gatt for $address", e)
         }
+    }
+
+    /// Forget outstanding operation ids for an address whose GATT is going
+    /// away.
+    ///
+    /// The queues are keyed by address but the ids belong to a specific
+    /// `BluetoothGatt`. An operation cancelled before its callback arrived
+    /// leaves its id behind; after a reconnect the replacement's first
+    /// callback would pop that stale id, Rust would reject it as belonging
+    /// to a finished operation, and the live one would hang forever.
+    private fun clearPendingOperations(address: String) {
+        pendingReadIds.remove(address)
+        pendingWriteIds.remove(address)
     }
 
     fun closeAll() {
@@ -771,6 +804,8 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         }
         connectedGatts.clear()
         pendingCharacteristics.clear()
+        pendingReadIds.clear()
+        pendingWriteIds.clear()
         stopScan()
         stopAdvertising()
     }

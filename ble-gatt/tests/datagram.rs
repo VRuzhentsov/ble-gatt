@@ -1000,3 +1000,51 @@ async fn abandoning_connect_mid_setup_still_releases_the_connection() {
          drop the handle"
     );
 }
+
+#[tokio::test]
+async fn a_central_parked_in_recv_is_released_when_lifecycle_events_lag() {
+    let config = config();
+    let network = MockNetwork::new();
+    let peripheral_addr = PeerAddress("peripheral-clag".to_string());
+    let central_addr = PeerAddress("central-clag".to_string());
+
+    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+        peripheral_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    ));
+    let central: Arc<MockBackend> = Arc::new(MockBackend::new(
+        central_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    ));
+
+    let mut incoming = datagram::serve(peripheral.clone(), &config)
+        .await
+        .expect("serve should start");
+    let mut client = datagram::connect(central.clone(), &peripheral_addr, &config)
+        .await
+        .expect("connect should succeed");
+    let _served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
+        .await
+        .expect("serve should yield a channel")
+        .expect("stream open");
+
+    // Park in recv() before the lag. The peer's `Disconnected` may be among
+    // the discarded events, and the notification stream is explicitly not
+    // guaranteed to close with the link — so without terminal handling this
+    // caller waits forever on a peer that may already be gone.
+    let receiver = tokio::spawn(async move { client.recv().await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    network.simulate_event_lag(&central_addr, 9);
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), receiver)
+        .await
+        .expect("a parked central must be released when lifecycle events lag")
+        .expect("receiver task should not panic");
+    assert!(
+        outcome.is_none() || outcome.map(|item| item.is_err()).unwrap_or(false),
+        "the channel must end or report an error, not deliver lag as normal data"
+    );
+}
