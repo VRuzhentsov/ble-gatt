@@ -402,6 +402,13 @@ impl GattConnection for LinuxGattConnection {
 
     async fn subscribe(&mut self, characteristic: CharacteristicUuid) -> Result<BoxStream<Vec<u8>>> {
         let target = self.find_characteristic(characteristic).await?;
+        // Refresh here too. `datagram::connect` only subscribes before it
+        // fixes its fragment budget, so without this a Linux datagram
+        // channel stayed at the 23-byte spec minimum — 14 payload bytes per
+        // fragment — for its whole life, however large the negotiated MTU.
+        if let Ok(mtu) = target.mtu().await {
+            self.att_mtu.store(mtu as u16, Ordering::Relaxed);
+        }
         let notify_stream = target.notify().await.map_err(|err| BleError::Gatt(err.to_string()))?;
         Ok(Box::pin(notify_stream))
     }

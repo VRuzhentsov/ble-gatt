@@ -29,6 +29,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             commands::ble_disconnect,
             commands::ble_connection_mtu,
             commands::ble_watch_events,
+            commands::ble_unwatch_events,
         ])
         .setup(|app, _api| {
             let backend: Arc<dyn Backend> = build_backend()?;

@@ -69,6 +69,9 @@ pub const DEFAULT_MAX_CONCURRENT_REASSEMBLIES: usize = 4;
 /// Bounded deliberately: an unbounded queue lets a peer sending valid
 /// messages faster than the consumer reads them grow memory without limit.
 pub const DEFAULT_INBOUND_QUEUE_DEPTH: usize = 32;
+/// Raw fragments buffered per peer. Sized to comfortably hold one
+/// maximum-fragment-count message in flight without being a memory lever.
+pub const DEFAULT_FRAGMENT_QUEUE_DEPTH: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct DatagramConfig {
@@ -87,6 +90,11 @@ pub struct DatagramConfig {
     /// messages, so without this a slow or stalled consumer is a memory
     /// exhaustion vector.
     pub inbound_queue_depth: usize,
+    /// Raw fragments buffered per peer before the oldest are dropped.
+    /// Bounding the *completed* queue alone is not enough: once reassembly
+    /// blocks on a full completed queue it stops draining fragments, and an
+    /// unbounded fragment queue then grows without limit instead.
+    pub fragment_queue_depth: usize,
 }
 
 impl DatagramConfig {
@@ -99,7 +107,26 @@ impl DatagramConfig {
             max_concurrent_reassemblies: DEFAULT_MAX_CONCURRENT_REASSEMBLIES,
             write_type: WriteType::WithResponse,
             inbound_queue_depth: DEFAULT_INBOUND_QUEUE_DEPTH,
+            fragment_queue_depth: DEFAULT_FRAGMENT_QUEUE_DEPTH,
         }
+    }
+
+    /// `mpsc::channel(0)` panics, and `inbound_queue_depth` is a public
+    /// field with no non-zero invariant — validate rather than letting a
+    /// caller's zero crash `connect`, or worse, panic `serve`'s detached
+    /// background task where nothing observes it.
+    fn validate(&self) -> Result<()> {
+        if self.inbound_queue_depth == 0 {
+            return Err(BleError::Gatt(
+                "inbound_queue_depth must be at least 1".to_string(),
+            ));
+        }
+        if self.fragment_queue_depth == 0 {
+            return Err(BleError::Gatt(
+                "fragment_queue_depth must be at least 1".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn limits(&self) -> ReassemblyLimits {
@@ -319,6 +346,7 @@ where
 pub async fn connect(
     backend: Arc<dyn Backend>, peer: &PeerAddress, config: &DatagramConfig,
 ) -> Result<DatagramChannel> {
+    config.validate()?;
     let mut connection = backend.connect(peer).await?;
     let notifications = connection.subscribe(config.characteristic).await?;
 
@@ -341,10 +369,11 @@ pub async fn connect(
 
     let (tx, rx) = mpsc::channel(config.inbound_queue_depth);
     let reassembly = spawn_reassembly(notifications, config.limits(), tx);
-    // The watcher owns the reassembly handle so it can abort it on link
-    // loss; the channel keeps the watcher's handle so dropping the channel
-    // tears both down.
-    let watcher = spawn_link_loss_watch(events, peer.clone(), reassembly);
+    // The watcher gets an *AbortHandle*, not the JoinHandle. Handing over
+    // the JoinHandle meant aborting the watcher merely dropped it — and
+    // dropping a Tokio JoinHandle detaches its task rather than cancelling
+    // it, so reassembly outlived the channel that owned it.
+    let watcher = spawn_link_loss_watch(events, peer.clone(), reassembly.abort_handle());
 
     Ok(DatagramChannel {
         peer: peer.clone(),
@@ -357,7 +386,7 @@ pub async fn connect(
         next_msg_id: 0,
         max_message_len: effective_max_message_len(config.max_message_len, budget),
         fragment_budget: budget,
-        tasks: vec![watcher],
+        tasks: vec![reassembly, watcher],
     })
 }
 
@@ -370,7 +399,8 @@ pub async fn connect(
 /// backend a subscription outlives the link, so waiting for it to close
 /// would be waiting forever.
 fn spawn_link_loss_watch(
-    mut events: BoxStream<GattEvent>, peer: PeerAddress, reassembly: tokio::task::JoinHandle<()>,
+    mut events: BoxStream<GattEvent>, peer: PeerAddress,
+    reassembly: tokio::task::AbortHandle,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(event) = events.next().await {
@@ -410,6 +440,7 @@ fn spawn_link_loss_watch(
 pub async fn serve(
     backend: Arc<dyn Backend>, config: &DatagramConfig,
 ) -> Result<BoxStream<DatagramChannel>> {
+    config.validate()?;
     backend.advertise(config.service_spec()).await?;
 
     let (channels_tx, channels_rx) = mpsc::unbounded_channel();
@@ -426,7 +457,7 @@ pub async fn serve(
     tokio::spawn(async move {
         // At most one entry: see the doc comment on why concurrent centrals
         // are refused rather than served.
-        let mut inbound: HashMap<PeerAddress, mpsc::UnboundedSender<Vec<u8>>> = HashMap::new();
+        let mut inbound: HashMap<PeerAddress, mpsc::Sender<Vec<u8>>> = HashMap::new();
 
         while let Some(event) = events.next().await {
             match event {
@@ -451,10 +482,10 @@ pub async fn serve(
                         );
                         continue;
                     }
-                    let (frag_tx, frag_rx) = mpsc::unbounded_channel();
+                    let (frag_tx, frag_rx) = mpsc::channel(config.fragment_queue_depth);
                     let (msg_tx, msg_rx) = mpsc::channel(config.inbound_queue_depth);
                     let reassembly = spawn_reassembly(
-                        UnboundedReceiverStream::new(frag_rx),
+                        ReceiverStream::new(frag_rx),
                         config.limits(),
                         msg_tx,
                     );
@@ -488,7 +519,19 @@ pub async fn serve(
                         continue;
                     }
                     if let Some(tx) = inbound.get(&peer) {
-                        let _ = tx.send(value);
+                        // try_send, not send: this loop also carries
+                        // disconnects, so blocking it on a backed-up peer
+                        // would stall cleanup for everyone. A dropped
+                        // fragment costs one message, which the reassembly
+                        // timeout then reaps — unbounded growth would cost
+                        // the process.
+                        if tx.try_send(value).is_err() {
+                            eprintln!(
+                                "[ble-gatt][datagram] fragment queue full for {}, dropping \
+                                 fragment; the affected message will time out",
+                                peer.0
+                            );
+                        }
                     }
                 }
                 GattEvent::Disconnected { peer } => {

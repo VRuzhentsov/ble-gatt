@@ -129,14 +129,21 @@ export async function connectionMtu(handle: number): Promise<ConnectionMtu> {
  *
  * Returns a disposer; call it to stop receiving events.
  */
-export async function watchEvents(handler: (event: GattEvent) => void): Promise<() => void> {
+export async function watchEvents(
+  handler: (event: GattEvent) => void,
+): Promise<() => Promise<void>> {
   const channel = new Channel<GattEvent>();
   channel.onmessage = handler;
-  await invoke("plugin:ble-gatt|ble_watch_events", { onEvent: channel });
-  return () => {
-    // Detaching the handler stops delivery on the JS side; the Rust task
-    // then observes the closed channel on its next send and exits.
+  const subscription: number = await invoke("plugin:ble-gatt|ble_watch_events", {
+    onEvent: channel,
+  });
+  return async () => {
+    // Detaching the handler is not enough on its own: the Channel stays
+    // valid, so Rust keeps sending and its forwarding task never exits.
+    // Repeated subscribe/dispose cycles would accumulate tasks and IPC
+    // traffic for the life of the app.
     channel.onmessage = () => {};
+    await invoke("plugin:ble-gatt|ble_unwatch_events", { subscription });
   };
 }
 

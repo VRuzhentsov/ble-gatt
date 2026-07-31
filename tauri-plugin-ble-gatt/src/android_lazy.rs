@@ -83,9 +83,13 @@ impl LazyAndroidBackend {
                 let sink = self.events_tx.clone();
                 tokio::spawn(async move {
                     while let Some(event) = source.next().await {
-                        if sink.send(event).is_err() {
-                            return; // no subscribers left
-                        }
+                        // `broadcast::Sender::send` errors when there are
+                        // currently no receivers — which is normal, not
+                        // terminal. Exiting on it meant one event arriving
+                        // before anyone subscribed killed the forwarder
+                        // permanently, and every later subscriber got a
+                        // live-looking stream that never yielded anything.
+                        let _ = sink.send(event);
                     }
                 });
                 Ok(backend)

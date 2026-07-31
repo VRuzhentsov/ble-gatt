@@ -262,3 +262,23 @@ async fn the_reported_message_limit_is_one_the_channel_can_actually_send() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_zero_queue_depth_is_rejected_rather_than_panicking() {
+    // `mpsc::channel(0)` panics. `inbound_queue_depth` is a public field
+    // with no non-zero invariant, so a caller's zero used to crash
+    // `connect` — and panic `serve`'s detached background task, where
+    // nothing observes it at all.
+    let network = MockNetwork::new();
+    let addr = PeerAddress("peripheral-zero".to_string());
+    let backend: Arc<MockBackend> =
+        Arc::new(MockBackend::new(addr.clone(), network, full_capabilities()));
+
+    let mut zero_inbound = config();
+    zero_inbound.inbound_queue_depth = 0;
+    assert!(datagram::serve(backend.clone(), &zero_inbound).await.is_err());
+
+    let mut zero_fragments = config();
+    zero_fragments.fragment_queue_depth = 0;
+    assert!(datagram::serve(backend, &zero_fragments).await.is_err());
+}

@@ -10,6 +10,7 @@ const COMMANDS: &[&str] = &[
     "ble_disconnect",
     "ble_connection_mtu",
     "ble_watch_events",
+    "ble_unwatch_events",
 ];
 
 fn main() {

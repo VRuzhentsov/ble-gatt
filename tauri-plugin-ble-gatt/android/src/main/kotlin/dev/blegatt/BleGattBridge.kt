@@ -132,7 +132,11 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             }
 
             override fun onScanFailed(errorCode: Int) {
+                // Reported asynchronously, after Rust already has a
+                // discovery stream. Without forwarding it, a scan that never
+                // started is indistinguishable from one that found nothing.
                 Log.e(TAG, "onScanFailed: errorCode=$errorCode")
+                onScanFailed(nativeHandle, errorCode)
             }
         }
         Log.d(TAG, "startScan: serviceUuid=$serviceUuid scanner=${scanner != null}")
@@ -165,7 +169,14 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                         // value and reports it via onMtuChanged; until then
                         // Rust keeps the conservative 23-byte default.
                         gatt.requestMtu(MAX_ATT_MTU)
-                        gatt.discoverServices()
+                        if (!gatt.discoverServices()) {
+                            // No callback is guaranteed when this returns
+                            // false, so the pending connect would hang
+                            // forever. Report the link as gone instead.
+                            Log.w(TAG, "discoverServices did not start for $address")
+                            onDisconnected(nativeHandle, address)
+                            gatt.close()
+                        }
                     }
                     BluetoothProfile.STATE_DISCONNECTED -> {
                         connectedGatts.remove(address)
@@ -188,6 +199,17 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             }
 
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    // Previously ignored, so a failed discovery still
+                    // resolved connect() successfully and handed back a
+                    // connection with no usable characteristics.
+                    Log.w(TAG, "onServicesDiscovered failed for $address status=$status")
+                    connectedGatts.remove(address)
+                    pendingCharacteristics.remove(address)
+                    onDisconnected(nativeHandle, address)
+                    gatt.close()
+                    return
+                }
                 val byUuid = HashMap<String, BluetoothGattCharacteristic>()
                 for (service in gatt.services) {
                     for (characteristic in service.characteristics) {
@@ -316,6 +338,26 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         val advertiser = adapter?.bluetoothLeAdvertiser ?: return
 
         val serverCallback = object : BluetoothGattServerCallback() {
+            /// Real server-side lifecycle. Without this the peripheral role
+            /// had no genuine connect/disconnect signal at all — it was
+            /// synthesized from write traffic, so a central that connected
+            /// and then left was never reported as gone.
+            override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
+                when (newState) {
+                    BluetoothProfile.STATE_CONNECTED -> {
+                        Log.d(TAG, "server: central connected ${device.address}")
+                        onConnected(nativeHandle, device.address)
+                    }
+                    BluetoothProfile.STATE_DISCONNECTED -> {
+                        Log.d(TAG, "server: central disconnected ${device.address}")
+                        for (subscribers in subscribedDevices.values) {
+                            subscribers.remove(device)
+                        }
+                        onDisconnected(nativeHandle, device.address)
+                    }
+                }
+            }
+
             override fun onCharacteristicReadRequest(
                 device: BluetoothDevice, requestId: Int, offset: Int, characteristic: BluetoothGattCharacteristic
             ) {
@@ -398,10 +440,16 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         val callback = object : AdvertiseCallback() {
             override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
                 Log.d(TAG, "advertise onStartSuccess: serviceUuid=$serviceUuid")
+                onAdvertiseResult(nativeHandle, true, 0)
             }
 
             override fun onStartFailure(errorCode: Int) {
+                // Android reports this asynchronously — advertising already
+                // in progress, controller out of resources. Reporting it
+                // back is what stops Rust claiming the service is reachable
+                // when no advertisement exists.
                 Log.e(TAG, "advertise onStartFailure: errorCode=$errorCode serviceUuid=$serviceUuid")
+                onAdvertiseResult(nativeHandle, false, errorCode)
             }
         }
         advertiseCallback = callback
@@ -419,15 +467,28 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         subscribedDevices.clear()
     }
 
-    fun notifyCharacteristic(characteristicUuid: String, value: ByteArray) {
-        val characteristic = serverCharacteristics[characteristicUuid] ?: return
+    /// Returns false when the payload could not be delivered to anyone —
+    /// not advertising, unknown characteristic, or nobody subscribed. Rust
+    /// turns that into an error; silently returning normally made
+    /// `Backend::notify` and `DatagramChannel::send` report success while
+    /// dropping the data.
+    fun notifyCharacteristic(characteristicUuid: String, value: ByteArray): Boolean {
+        val server = gattServer ?: return false
+        val characteristic = serverCharacteristics[characteristicUuid] ?: return false
         @Suppress("DEPRECATION")
         characteristic.value = value
-        val subscribers = subscribedDevices[characteristicUuid] ?: return
+        val subscribers = subscribedDevices[characteristicUuid]
+        if (subscribers.isNullOrEmpty()) {
+            return false
+        }
+        var delivered = false
         for (device in subscribers) {
             @Suppress("DEPRECATION")
-            gattServer?.notifyCharacteristicChanged(device, characteristic, false)
+            if (server.notifyCharacteristicChanged(device, characteristic, false)) {
+                delivered = true
+            }
         }
+        return delivered
     }
 
     companion object {

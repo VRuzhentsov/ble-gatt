@@ -75,6 +75,13 @@ struct Inner {
     /// because the JNI callback arrives on a Binder thread with only the
     /// address to key on.
     att_mtus: StdMutex<HashMap<String, u16>>,
+    /// Resolved by `onAdvertiseResult`. Android decides asynchronously
+    /// whether an advertisement actually started, so `advertise()` must wait
+    /// for it rather than reporting success the moment the JNI call returns.
+    advertise_tx: StdMutex<Option<oneshot::Sender<std::result::Result<(), i32>>>>,
+    /// Set by `onScanFailed` so a scan that never started is distinguishable
+    /// from one that simply found nothing.
+    scan_failed_tx: StdMutex<Option<oneshot::Sender<i32>>>,
 }
 
 impl Inner {
@@ -143,6 +150,8 @@ impl AndroidBackend {
             discovery_tx: StdMutex::new(None),
             server_events_tx,
             att_mtus: StdMutex::new(HashMap::new()),
+            advertise_tx: StdMutex::new(None),
+            scan_failed_tx: StdMutex::new(None),
         });
 
         // See the module doc comment: this pointer must stay valid for as
@@ -272,6 +281,10 @@ impl Backend for AndroidBackend {
     }
 
     async fn advertise(&self, service: GattServiceSpec) -> Result<()> {
+        // Scoped: `JNIEnv` is `!Send`, so it must be entirely out of scope
+        // before the `.await` below, or the whole future stops being `Send`
+        // and no longer satisfies the trait.
+        let rx = {
         let mut env = self.inner.env()?;
         let n = service.characteristics.len() as i32;
 
@@ -308,6 +321,8 @@ impl Backend for AndroidBackend {
                 .map_err(|err| BleError::Gatt(err.to_string()))?;
         }
 
+        let (tx, rx) = oneshot::channel();
+        *self.inner.advertise_tx.lock().unwrap() = Some(tx);
         self.inner.call_void(
             &mut env,
             "startAdvertising",
@@ -320,7 +335,19 @@ impl Backend for AndroidBackend {
                 JValue::Object(&notifiable),
                 JValue::Object(&values),
             ],
-        )
+        )?;
+        rx
+        };
+
+        match rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(code)) => Err(BleError::Gatt(format!(
+                "Android refused to start advertising (AdvertiseCallback error {code})"
+            ))),
+            Err(_) => Err(BleError::Gatt(
+                "advertise outcome was never reported".to_string(),
+            )),
+        }
     }
 
     async fn stop_advertising(&self) -> Result<()> {
@@ -334,12 +361,24 @@ impl Backend for AndroidBackend {
             .new_string(characteristic.0.to_string())
             .map_err(|err| BleError::Gatt(err.to_string()))?;
         let bytes = env.byte_array_from_slice(&value).map_err(|err| BleError::Gatt(err.to_string()))?;
-        self.inner.call_void(
-            &mut env,
-            "notifyCharacteristic",
-            "(Ljava/lang/String;[B)V",
-            &[JValue::Object(&uuid), JValue::Object(&bytes)],
-        )
+        let bridge = self.inner.bridge()?;
+        let delivered = env
+            .call_method(
+                bridge.as_obj(),
+                "notifyCharacteristic",
+                "(Ljava/lang/String;[B)Z",
+                &[JValue::Object(&uuid), JValue::Object(&bytes)],
+            )
+            .and_then(|v| v.z())
+            .map_err(|err| BleError::Gatt(format!("notifyCharacteristic failed: {err}")))?;
+        if !delivered {
+            return Err(BleError::Gatt(
+                "notify delivered to nobody — not advertising, unknown characteristic, \
+                 or no subscriber"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn events(&self) -> BoxStream<GattEvent> {
@@ -655,6 +694,33 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onPeerDiscovered<'local>(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_dev_blegatt_NativeKt_onAdvertiseResult<'local>(
+    _env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, success: jboolean,
+    error_code: jint,
+) {
+    let inner = unsafe { inner_from_handle(native_handle) };
+    let pending = inner.advertise_tx.lock().unwrap().take();
+    if let Some(tx) = pending {
+        let _ = tx.send(if success != 0 { Ok(()) } else { Err(error_code) });
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_blegatt_NativeKt_onScanFailed<'local>(
+    _env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, error_code: jint,
+) {
+    let inner = unsafe { inner_from_handle(native_handle) };
+    let pending = inner.scan_failed_tx.lock().unwrap().take();
+    if let Some(tx) = pending {
+        let _ = tx.send(error_code);
+    }
+    // Close the discovery stream: a scan that never started must not look
+    // like a scan that found nothing.
+    let mut discovery = inner.discovery_tx.lock().unwrap();
+    *discovery = None;
+}
+
+#[no_mangle]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onMtuChanged<'local>(
     mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, address: JString<'local>,
     mtu: jint,
@@ -670,12 +736,21 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onConnected<'local>(
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
     let address = read_jstring(&mut env, &address);
-    let mut connections = inner.connections.lock().unwrap();
-    if let Some(state) = connections.get_mut(&address) {
-        if let Some(tx) = state.connected_tx.take() {
-            let _ = tx.send(());
+    {
+        let mut connections = inner.connections.lock().unwrap();
+        if let Some(state) = connections.get_mut(&address) {
+            if let Some(tx) = state.connected_tx.take() {
+                let _ = tx.send(());
+            }
         }
     }
+    // Publish regardless of whether a client connect was pending: Linux
+    // already does this, and `Backend::events` documents both roles. Without
+    // it, central-role connections were invisible to `events()` on Android
+    // only, and `datagram::serve` never saw a central arrive.
+    let _ = inner.server_events_tx.send(GattEvent::Connected {
+        peer: PeerAddress(address),
+    });
 }
 
 #[no_mangle]

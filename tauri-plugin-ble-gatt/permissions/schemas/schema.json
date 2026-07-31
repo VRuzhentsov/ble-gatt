@@ -403,6 +403,18 @@
           "markdownDescription": "Denies the ble_stop_advertising command without any pre-configured scope."
         },
         {
+          "description": "Enables the ble_unwatch_events command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-ble-unwatch-events",
+          "markdownDescription": "Enables the ble_unwatch_events command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the ble_unwatch_events command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-ble-unwatch-events",
+          "markdownDescription": "Denies the ble_unwatch_events command without any pre-configured scope."
+        },
+        {
           "description": "Enables the ble_watch_events command without any pre-configured scope.",
           "type": "string",
           "const": "allow-ble-watch-events",
@@ -427,10 +439,10 @@
           "markdownDescription": "Denies the ble_write command without any pre-configured scope."
         },
         {
-          "description": "Default permissions for the ble-gatt plugin: capability query, advertise/scan, and GATT client/server operations.\n#### This default permission set includes:\n\n- `allow-ble-capabilities`\n- `allow-ble-advertise`\n- `allow-ble-stop-advertising`\n- `allow-ble-notify`\n- `allow-ble-scan-once`\n- `allow-ble-connect`\n- `allow-ble-read`\n- `allow-ble-write`\n- `allow-ble-disconnect`\n- `allow-ble-connection-mtu`\n- `allow-ble-watch-events`",
+          "description": "Default permissions for the ble-gatt plugin: capability query, advertise/scan, and GATT client/server operations.\n#### This default permission set includes:\n\n- `allow-ble-capabilities`\n- `allow-ble-advertise`\n- `allow-ble-stop-advertising`\n- `allow-ble-notify`\n- `allow-ble-scan-once`\n- `allow-ble-connect`\n- `allow-ble-read`\n- `allow-ble-write`\n- `allow-ble-disconnect`\n- `allow-ble-connection-mtu`\n- `allow-ble-watch-events`\n- `allow-ble-unwatch-events`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Default permissions for the ble-gatt plugin: capability query, advertise/scan, and GATT client/server operations.\n#### This default permission set includes:\n\n- `allow-ble-capabilities`\n- `allow-ble-advertise`\n- `allow-ble-stop-advertising`\n- `allow-ble-notify`\n- `allow-ble-scan-once`\n- `allow-ble-connect`\n- `allow-ble-read`\n- `allow-ble-write`\n- `allow-ble-disconnect`\n- `allow-ble-connection-mtu`\n- `allow-ble-watch-events`"
+          "markdownDescription": "Default permissions for the ble-gatt plugin: capability query, advertise/scan, and GATT client/server operations.\n#### This default permission set includes:\n\n- `allow-ble-capabilities`\n- `allow-ble-advertise`\n- `allow-ble-stop-advertising`\n- `allow-ble-notify`\n- `allow-ble-scan-once`\n- `allow-ble-connect`\n- `allow-ble-read`\n- `allow-ble-write`\n- `allow-ble-disconnect`\n- `allow-ble-connection-mtu`\n- `allow-ble-watch-events`\n- `allow-ble-unwatch-events`"
         }
       ]
     }

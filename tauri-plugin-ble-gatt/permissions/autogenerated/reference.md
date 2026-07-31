@@ -15,6 +15,7 @@ Default permissions for the ble-gatt plugin: capability query, advertise/scan, a
 - `allow-ble-disconnect`
 - `allow-ble-connection-mtu`
 - `allow-ble-watch-events`
+- `allow-ble-unwatch-events`
 
 ## Permission Table
 
@@ -255,6 +256,32 @@ Enables the ble_stop_advertising command without any pre-configured scope.
 <td>
 
 Denies the ble_stop_advertising command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`ble-gatt:allow-ble-unwatch-events`
+
+</td>
+<td>
+
+Enables the ble_unwatch_events command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`ble-gatt:deny-ble-unwatch-events`
+
+</td>
+<td>
+
+Denies the ble_unwatch_events command without any pre-configured scope.
 
 </td>
 </tr>

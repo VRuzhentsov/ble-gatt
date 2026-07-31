@@ -52,6 +52,14 @@ external fun onServerCharacteristicWritten(
     nativeHandle: Long, address: String, characteristicUuid: String, value: ByteArray
 )
 
+/// Asynchronous advertise outcome. `startAdvertising` returns before Android
+/// has decided, so this is the only signal that the advertisement is really
+/// live.
+external fun onAdvertiseResult(nativeHandle: Long, success: Boolean, errorCode: Int)
+
+/// Asynchronous scan-start failure, for the same reason.
+external fun onScanFailed(nativeHandle: Long, errorCode: Int)
+
 external fun onSubscribed(
     nativeHandle: Long, address: String, characteristicUuid: String, success: Boolean,
 )

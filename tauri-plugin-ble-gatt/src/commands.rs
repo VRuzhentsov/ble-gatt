@@ -23,6 +23,11 @@ use uuid::Uuid;
 type SharedConnection = Arc<Mutex<Box<dyn GattConnection>>>;
 
 pub struct PluginState {
+    /// Live event-forwarding tasks, so a JS caller can actually stop one.
+    /// Dropping the JS handler alone does not: the `Channel` stays valid and
+    /// Rust keeps sending, so repeated subscribe/dispose cycles accumulated
+    /// tasks and IPC traffic forever.
+    watchers: Mutex<HashMap<u64, tokio::task::JoinHandle<()>>>,
     backend: Arc<dyn Backend>,
     /// Each connection gets its own lock. A single map-wide mutex was held
     /// across `.await`, so one slow or hung GATT operation blocked every
@@ -36,6 +41,7 @@ impl PluginState {
         Self {
             backend,
             connections: Mutex::new(HashMap::new()),
+            watchers: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
         }
     }
@@ -299,12 +305,14 @@ pub async fn ble_connection_mtu(
 /// This is the only way the frontend learns about a peer disappearing
 /// without warning — every other command reports failures of operations you
 /// initiated, so a UI mid-transfer would otherwise just appear to stall.
+/// Returns a subscription id; pass it to `ble_unwatch_events` to stop.
 #[tauri::command]
 pub async fn ble_watch_events(
     state: tauri::State<'_, PluginState>, on_event: Channel<GattEventDto>,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let mut events = state.backend.events();
-    tokio::spawn(async move {
+    let id = state.next_handle.fetch_add(1, Ordering::SeqCst);
+    let task = tokio::spawn(async move {
         while let Some(event) = events.next().await {
             // Send failure means the JS side dropped the channel; stop
             // rather than spin forwarding into nothing.
@@ -313,6 +321,17 @@ pub async fn ble_watch_events(
             }
         }
     });
+    state.watchers.lock().await.insert(id, task);
+    Ok(id)
+}
+
+#[tauri::command]
+pub async fn ble_unwatch_events(
+    state: tauri::State<'_, PluginState>, subscription: u64,
+) -> Result<(), String> {
+    if let Some(task) = state.watchers.lock().await.remove(&subscription) {
+        task.abort();
+    }
     Ok(())
 }
 
