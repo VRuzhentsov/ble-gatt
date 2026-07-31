@@ -574,6 +574,23 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         return delivered
     }
 
+    /// Drop a central's connection to our GATT server, and forget its
+    /// subscriptions so `notifyCharacteristic` stops broadcasting to it even
+    /// before `onConnectionStateChange` lands.
+    fun disconnectServerPeer(address: String) {
+        val server = gattServer ?: return
+        val device = subscribedDevices.values
+            .asSequence()
+            .flatten()
+            .firstOrNull { it.address == address }
+            ?: adapter?.getRemoteDevice(address)
+            ?: return
+        for (peers in subscribedDevices.values) {
+            peers.removeAll { it.address == address }
+        }
+        server.cancelConnection(device)
+    }
+
     companion object {
         private val CLIENT_CHARACTERISTIC_CONFIG_UUID: UUID =
             UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")

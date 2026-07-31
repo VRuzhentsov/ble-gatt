@@ -113,7 +113,27 @@ pub trait Backend: Send + Sync {
     /// on the local GATT server (the server-initiated half of GATT notify —
     /// the client-initiated half is `GattConnection::subscribe`). Errors if
     /// not currently advertising.
+    ///
+    /// **This is a broadcast, and on Linux it cannot be anything else.**
+    /// BlueZ's `StartNotify` does not identify the subscribing device —
+    /// `bluer`'s `CharacteristicNotifier` carries no address — so a
+    /// peripheral genuinely cannot address a notification to one peer there.
+    /// (Android can: `notifyCharacteristicChanged` takes a device.) A server
+    /// that must not mix two peers' traffic therefore has to keep a second
+    /// central from being subscribed at all — see [`Backend::disconnect_peer`].
     async fn notify(&self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()>;
+
+    /// Drop a remote central's connection to the local GATT server.
+    ///
+    /// The enforcement half of a single-peer server. Refusing a second
+    /// central at the protocol layer is not enough: subscribing is a purely
+    /// client-side act needing no server consent, so a refused peer stays
+    /// subscribed and — because [`Backend::notify`] is a broadcast — keeps
+    /// receiving the accepted peer's traffic. Disconnecting is the only
+    /// portable way to actually exclude it.
+    ///
+    /// Best-effort and idempotent: a peer that is already gone is `Ok`.
+    async fn disconnect_peer(&self, peer: &PeerAddress) -> Result<()>;
 
     // --- Lifecycle ---
 

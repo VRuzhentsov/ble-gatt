@@ -130,6 +130,10 @@ impl Backend for LazyAndroidBackend {
         self.inner().await?.notify(characteristic, value).await
     }
 
+    async fn disconnect_peer(&self, peer: &PeerAddress) -> Result<()> {
+        self.inner().await?.disconnect_peer(peer).await
+    }
+
     fn events(&self) -> BoxStream<GattEvent> {
         // Always a live subscription, whether or not the backend exists yet.
         // Once it is built, `inner()` starts forwarding into this channel.

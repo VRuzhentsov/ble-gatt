@@ -350,3 +350,79 @@ async fn an_asynchronous_scan_failure_is_reported_instead_of_looking_like_no_pee
     );
     assert!(discovered.next().await.is_none(), "an error item ends the scan");
 }
+
+#[tokio::test]
+async fn a_central_refused_by_a_single_peer_server_stops_receiving_notifications() {
+    let network = MockNetwork::new();
+    let service_uuid = ServiceUuid(Uuid::new_v4());
+    let characteristic_uuid = CharacteristicUuid(Uuid::new_v4());
+    let peripheral_addr = PeerAddress("peripheral-exclusive".to_string());
+
+    let peripheral = MockBackend::new(peripheral_addr.clone(), network.clone(), full_capabilities());
+    peripheral
+        .advertise(GattServiceSpec {
+            uuid: service_uuid,
+            characteristics: vec![GattCharacteristicSpec {
+                uuid: characteristic_uuid,
+                readable: false,
+                writable: true,
+                notifiable: true,
+                initial_value: Vec::new(),
+            }],
+        })
+        .await
+        .expect("advertise should succeed");
+
+    // Two centrals subscribe. Subscribing needs no server consent, so at
+    // this point the server has no say in who receives its broadcasts.
+    let first = MockBackend::new(PeerAddress("central-first".to_string()), network.clone(), full_capabilities());
+    let mut first_conn = first.connect(&peripheral_addr).await.expect("connect should succeed");
+    let mut first_rx = first_conn.subscribe(characteristic_uuid).await.expect("subscribe should succeed");
+
+    let refused_addr = PeerAddress("central-refused".to_string());
+    let refused = MockBackend::new(refused_addr.clone(), network.clone(), full_capabilities());
+    let mut refused_conn = refused.connect(&peripheral_addr).await.expect("connect should succeed");
+    let mut refused_rx = refused_conn.subscribe(characteristic_uuid).await.expect("subscribe should succeed");
+
+    // Proof the hazard is real rather than hypothetical: before exclusion, a
+    // broadcast reaches the peer the server intends to refuse.
+    peripheral
+        .notify(characteristic_uuid, b"for-the-served-peer".to_vec())
+        .await
+        .expect("notify should succeed");
+    assert_eq!(
+        refused_rx.next().await.as_deref(),
+        Some(b"for-the-served-peer".as_slice()),
+        "precondition: notify is a broadcast, so an un-excluded peer does receive it"
+    );
+    // The served peer received it too — drain so the assertion below reads
+    // the notification sent *after* exclusion, not this one.
+    assert_eq!(
+        first_rx.next().await.as_deref(),
+        Some(b"for-the-served-peer".as_slice())
+    );
+
+    // What a single-peer server must actually do about it.
+    peripheral
+        .disconnect_peer(&refused_addr)
+        .await
+        .expect("disconnect_peer should succeed");
+
+    peripheral
+        .notify(characteristic_uuid, b"private-payload".to_vec())
+        .await
+        .expect("notify should succeed");
+
+    assert_eq!(
+        first_rx.next().await.as_deref(),
+        Some(b"private-payload".as_slice()),
+        "the served central must still receive its own traffic"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), refused_rx.next())
+            .await
+            .map(|item| item.is_none())
+            .unwrap_or(true),
+        "a disconnected central must not receive the served peer's fragments"
+    );
+}

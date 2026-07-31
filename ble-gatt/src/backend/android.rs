@@ -84,6 +84,13 @@ struct Inner {
     bridge: OnceLock<GlobalRef>,
     connections: StdMutex<HashMap<String, ConnectionState>>,
     discovery_tx: StdMutex<Option<mpsc::Sender<Result<DiscoveredPeer>>>>,
+    /// Terminal scan failure, delivered out-of-band from the result queue.
+    /// It cannot ride the queue: if the queue is saturated when
+    /// `onScanFailed` arrives the error would be dropped, and a slow
+    /// consumer would then drain the buffered successes and see a normal
+    /// end-of-stream — reporting a truncated peer list as success when the
+    /// controller had actually failed.
+    scan_error: StdMutex<Option<BleError>>,
     /// Named `server_events_tx` historically, but now carries both roles'
     /// lifecycle events — including central-side link loss. See
     /// `Backend::events`.
@@ -183,6 +190,7 @@ impl AndroidBackend {
             bridge: OnceLock::new(),
             connections: StdMutex::new(HashMap::new()),
             discovery_tx: StdMutex::new(None),
+            scan_error: StdMutex::new(None),
             server_events_tx,
             att_mtus: StdMutex::new(HashMap::new()),
             advertise_tx: StdMutex::new(None),
@@ -278,13 +286,38 @@ impl Backend for AndroidBackend {
 
     async fn scan(&self, service: ServiceUuid) -> Result<BoxStream<Result<DiscoveredPeer>>> {
         let (tx, rx) = mpsc::channel(DISCOVERY_QUEUE_DEPTH);
-        *self.inner.discovery_tx.lock().unwrap() = Some(tx);
+        // Install the new sender only *after* the platform confirms the scan
+        // started. Installing first would drop the in-flight scan's sole
+        // sender and close its stream, so merely attempting a concurrent
+        // scan would cancel the original one — the opposite of the
+        // exclusivity this check exists to enforce. On any failure the
+        // previous sender is put back untouched.
+        let previous = self.inner.discovery_tx.lock().unwrap().take();
+        let restore = |inner: &Arc<Inner>, previous| {
+            *inner.discovery_tx.lock().unwrap() = previous;
+        };
         {
-            let mut env = self.inner.env()?;
-            let uuid = env
-                .new_string(service.0.to_string())
-                .map_err(|err| BleError::Gatt(err.to_string()))?;
-            let bridge = self.inner.bridge()?;
+            let mut env = match self.inner.env() {
+                Ok(env) => env,
+                Err(err) => {
+                    restore(&self.inner, previous);
+                    return Err(err);
+                }
+            };
+            let uuid = match env.new_string(service.0.to_string()) {
+                Ok(uuid) => uuid,
+                Err(err) => {
+                    restore(&self.inner, previous);
+                    return Err(BleError::Gatt(err.to_string()));
+                }
+            };
+            let bridge = match self.inner.bridge() {
+                Ok(bridge) => bridge,
+                Err(err) => {
+                    restore(&self.inner, previous);
+                    return Err(err);
+                }
+            };
             let started = env
                 .call_method(
                     bridge.as_obj(),
@@ -292,14 +325,29 @@ impl Backend for AndroidBackend {
                     "(Ljava/lang/String;)Z",
                     &[JValue::Object(&uuid)],
                 )
-                .and_then(|v| v.z())
-                .map_err(|err| BleError::Gatt(format!("startScan failed: {err}")))?;
-            if !started {
-                return Err(BleError::Gatt(
-                    "a scan is already active; concurrent scans are not supported".to_string(),
-                ));
+                .and_then(|v| v.z());
+            match started {
+                // Same exception-clearing contract as `call_void`/`call_bool`:
+                // a `startScan` that throws (a missing runtime Bluetooth
+                // permission is the common case) would otherwise leave the
+                // exception pending on the daemon-attached Tokio worker and
+                // poison every later JNI call scheduled there.
+                Err(err) => {
+                    let mapped = jni_error(&mut env, "startScan", err);
+                    restore(&self.inner, previous);
+                    return Err(mapped);
+                }
+                Ok(false) => {
+                    restore(&self.inner, previous);
+                    return Err(BleError::Gatt(
+                        "a scan is already active; concurrent scans are not supported".to_string(),
+                    ));
+                }
+                Ok(true) => {}
             }
         }
+        *self.inner.scan_error.lock().unwrap() = None;
+        *self.inner.discovery_tx.lock().unwrap() = Some(tx);
         Ok(Box::pin(ScanStream {
             inner: self.inner.clone(),
             rx: ReceiverStream::new(rx),
@@ -419,8 +467,11 @@ impl Backend for AndroidBackend {
                 "(Ljava/lang/String;[B)Z",
                 &[JValue::Object(&uuid), JValue::Object(&bytes)],
             )
-            .and_then(|v| v.z())
-            .map_err(|err| BleError::Gatt(format!("notifyCharacteristic failed: {err}")))?;
+            .and_then(|v| v.z());
+        let delivered = match delivered {
+            Ok(value) => value,
+            Err(err) => return Err(jni_error(&mut env, "notifyCharacteristic", err)),
+        };
         if !delivered {
             return Err(BleError::Gatt(
                 "notify delivered to nobody — not advertising, unknown characteristic, \
@@ -429,6 +480,19 @@ impl Backend for AndroidBackend {
             ));
         }
         Ok(())
+    }
+
+    async fn disconnect_peer(&self, peer: &PeerAddress) -> Result<()> {
+        let mut env = self.inner.env()?;
+        let address = env
+            .new_string(&peer.0)
+            .map_err(|err| BleError::Gatt(err.to_string()))?;
+        self.inner.call_void(
+            &mut env,
+            "disconnectServerPeer",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(&address)],
+        )
     }
 
     fn events(&self) -> BoxStream<GattEvent> {
@@ -450,7 +514,16 @@ impl tokio_stream::Stream for ScanStream {
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        std::pin::Pin::new(&mut self.rx).poll_next(cx)
+        match std::pin::Pin::new(&mut self.rx).poll_next(cx) {
+            // Queue drained. Every buffered result has been delivered, so
+            // now surface any terminal failure — taking it so the stream
+            // ends on the poll after.
+            std::task::Poll::Ready(None) => {
+                let error = self.inner.scan_error.lock().unwrap().take();
+                std::task::Poll::Ready(error.map(Err))
+            }
+            other => other,
+        }
     }
 }
 
@@ -774,12 +847,15 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onScanFailed<'local>(
     // started indistinguishable from a scan that found nothing — the caller
     // would report "no peers" when the real answer is a permission denial or
     // a powered-off adapter.
-    let pending = inner.discovery_tx.lock().unwrap().take();
-    if let Some(tx) = pending {
-        let _ = tx.try_send(Err(BleError::Gatt(format!(
-            "Android scan failed (ScanCallback error code {error_code})"
-        ))));
-    }
+    // Recorded in a dedicated slot rather than pushed onto the result queue:
+    // a saturated queue would swallow the error, and the consumer would then
+    // drain the buffered successes and see an ordinary end-of-stream.
+    *inner.scan_error.lock().unwrap() = Some(BleError::Gatt(format!(
+        "Android scan failed (ScanCallback error code {error_code})"
+    )));
+    // Dropping the sender ends the queue; `ScanStream` yields the recorded
+    // error as its final item.
+    inner.discovery_tx.lock().unwrap().take();
 }
 
 #[no_mangle]

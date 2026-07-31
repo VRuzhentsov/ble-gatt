@@ -53,6 +53,13 @@ pub struct LinuxBackend {
     events_tx: broadcast::Sender<GattEvent>,
     app_handle: AsyncMutex<Option<ApplicationHandle>>,
     adv_handle: AsyncMutex<Option<bluer::adv::AdvertisementHandle>>,
+    /// Aborts the inbound-connection watcher started by `advertise`.
+    server_watch: AsyncMutex<Option<tokio::task::AbortHandle>>,
+    /// Addresses this backend dialled itself, in the central role. BlueZ
+    /// reports one `Connected` property per device regardless of who
+    /// initiated, so without this an outbound connection would be
+    /// misreported as a central arriving at our server.
+    dialed: Arc<StdMutex<HashSet<PeerAddress>>>,
 }
 
 impl LinuxBackend {
@@ -84,7 +91,60 @@ impl LinuxBackend {
             events_tx,
             app_handle: AsyncMutex::new(None),
             adv_handle: AsyncMutex::new(None),
+            server_watch: AsyncMutex::new(None),
+            dialed: Arc::new(StdMutex::new(HashSet::new())),
         })
+    }
+}
+
+/// Watch for centrals connecting to our GATT server and surface each as
+/// `Connected { local_role: Peripheral }`.
+///
+/// BlueZ gives a GATT server no connection callback, so this infers presence
+/// from the adapter's per-device `Connected` property. Two things it must
+/// get right:
+///
+/// - **Exclude our own outbound dials.** BlueZ reports one `Connected`
+///   property per device whoever initiated it, so without the `dialed` set
+///   a central-role connection would be announced as an inbound one.
+/// - **Deduplicate.** `served_peers` is shared with the write path, so a
+///   peer that connects and then writes is announced once, not twice.
+async fn watch_inbound_connections(
+    adapter: Adapter, events_tx: broadcast::Sender<GattEvent>,
+    served_peers: Arc<StdMutex<HashSet<PeerAddress>>>, dialed: Arc<StdMutex<HashSet<PeerAddress>>>,
+) {
+    let Ok(mut events) = adapter.events().await else {
+        return;
+    };
+    while let Some(event) = events.next().await {
+        let AdapterEvent::DeviceAdded(address) = event else {
+            continue;
+        };
+        let peer = PeerAddress(address.to_string());
+        if dialed.lock().unwrap().contains(&peer) {
+            continue;
+        }
+        let Ok(device) = adapter.device(address) else {
+            continue;
+        };
+        if !device.is_connected().await.unwrap_or(false) {
+            continue;
+        }
+        let newly_served = served_peers.lock().unwrap().insert(peer.clone());
+        if !newly_served {
+            continue;
+        }
+        let _ = events_tx.send(GattEvent::Connected {
+            peer: peer.clone(),
+            local_role: Role::Peripheral,
+        });
+        spawn_peripheral_disconnect_watch(
+            adapter.clone(),
+            address,
+            peer,
+            events_tx.clone(),
+            served_peers.clone(),
+        );
     }
 }
 
@@ -200,10 +260,18 @@ impl Backend for LinuxBackend {
             peer: peer.0.clone(),
             reason: err.to_string(),
         })?;
-        device.connect().await.map_err(|err| BleError::ConnectFailed {
-            peer: peer.0.clone(),
-            reason: err.to_string(),
-        })?;
+        // Recorded *before* dialling: BlueZ can publish the Connected
+        // property before `connect()` returns, and the inbound watcher would
+        // otherwise race us and announce our own outbound link as a central
+        // arriving at our server.
+        self.dialed.lock().unwrap().insert(peer.clone());
+        if let Err(err) = device.connect().await {
+            self.dialed.lock().unwrap().remove(peer);
+            return Err(BleError::ConnectFailed {
+                peer: peer.0.clone(),
+                reason: err.to_string(),
+            });
+        }
         let _ = self.events_tx.send(GattEvent::Connected {
             peer: peer.clone(),
             local_role: Role::Central,
@@ -217,6 +285,7 @@ impl Backend for LinuxBackend {
         let watch_device = device.clone();
         let watch_peer = peer.clone();
         let events_tx = self.events_tx.clone();
+        let dialed = self.dialed.clone();
         tokio::spawn(async move {
             let Ok(mut changes) = watch_device.events().await else {
                 return;
@@ -228,9 +297,12 @@ impl Backend for LinuxBackend {
                     continue;
                 };
                 let _ = events_tx.send(GattEvent::Disconnected {
-                    peer: watch_peer,
+                    peer: watch_peer.clone(),
                     local_role: Role::Central,
                 });
+                // Stop suppressing inbound reports for this address: a later
+                // connection from it may genuinely be an inbound one.
+                dialed.lock().unwrap().remove(&watch_peer);
                 return;
             }
         });
@@ -333,6 +405,16 @@ impl Backend for LinuxBackend {
                     method: CharacteristicNotifyMethod::Fun(Box::new(move |notifier| {
                         let notifiers = notifiers.clone();
                         Box::pin(async move {
+                            // NOTE: BlueZ's StartNotify does not identify the
+                            // subscribing device — `CharacteristicNotifier`
+                            // carries no address — so this cannot emit a
+                            // `Connected` for the subscriber the way the
+                            // write path does, and cannot be addressed to one
+                            // peer later. That single platform gap is why
+                            // `Backend::notify` is documented as an
+                            // unavoidable broadcast on Linux and why
+                            // single-peer servers must exclude extra centrals
+                            // via `disconnect_peer`.
                             notifiers.lock().await.entry(uuid).or_default().push(notifier);
                         })
                     })),
@@ -378,10 +460,30 @@ impl Backend for LinuxBackend {
 
         *self.app_handle.lock().await = Some(app_handle);
         *self.adv_handle.lock().await = Some(adv_handle);
+
+        // A central that connects and waits for the server to speak first
+        // would otherwise never be seen: before this, the only peripheral-
+        // role presence signal on Linux was an inbound *write*, so
+        // `serve()` yielded no channel and both sides waited forever.
+        // Android and the mock both surface the peer at connection time;
+        // this closes that divergence.
+        let watch = tokio::spawn(watch_inbound_connections(
+            self.adapter.clone(),
+            self.events_tx.clone(),
+            self.served_peers.clone(),
+            self.dialed.clone(),
+        ));
+        if let Some(previous) = self.server_watch.lock().await.replace(watch.abort_handle()) {
+            previous.abort();
+        }
         Ok(())
     }
 
     async fn stop_advertising(&self) -> Result<()> {
+        if let Some(watch) = self.server_watch.lock().await.take() {
+            watch.abort();
+        }
+        self.served_peers.lock().unwrap().clear();
         *self.app_handle.lock().await = None;
         *self.adv_handle.lock().await = None;
         self.notifiers.lock().await.clear();
@@ -398,6 +500,21 @@ impl Backend for LinuxBackend {
             let _ = notifier.notify(value.clone()).await;
         }
         Ok(())
+    }
+
+    async fn disconnect_peer(&self, peer: &PeerAddress) -> Result<()> {
+        let Ok(address) = peer.0.parse() else {
+            return Err(BleError::Gatt(format!("malformed peer address {}", peer.0)));
+        };
+        // Already gone is success: this is called to guarantee absence, not
+        // to assert presence.
+        let Ok(device) = self.adapter.device(address) else {
+            return Ok(());
+        };
+        device
+            .disconnect()
+            .await
+            .map_err(|err| BleError::Gatt(format!("disconnecting {} failed: {err}", peer.0)))
     }
 
     fn events(&self) -> BoxStream<GattEvent> {

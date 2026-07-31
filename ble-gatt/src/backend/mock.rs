@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use tokio::sync::broadcast;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio::sync::{broadcast, mpsc};
+use tokio_stream::wrappers::{BroadcastStream, UnboundedReceiverStream};
 use tokio_stream::StreamExt;
 
 use crate::backend::{Backend, BoxStream, GattConnection};
@@ -23,7 +23,6 @@ use crate::models::{
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
-const NOTIFY_CHANNEL_CAPACITY: usize = 64;
 
 /// ATT MTU the mock reports for every connection. Deliberately *not*
 /// `DEFAULT_ATT_MTU`: a realistic negotiated value, so tests that chunk
@@ -34,7 +33,10 @@ const MOCK_ATT_MTU: u16 = 247;
 struct PeripheralState {
     service: GattServiceSpec,
     values: HashMap<CharacteristicUuid, Vec<u8>>,
-    notify_tx: HashMap<CharacteristicUuid, broadcast::Sender<Vec<u8>>>,
+    /// One sender per *subscriber*, not one per characteristic. Modelling
+    /// notify as a single broadcast made the cross-peer leak that
+    /// `disconnect_peer` prevents impossible to express, let alone test.
+    subscribers: HashMap<CharacteristicUuid, HashMap<PeerAddress, mpsc::UnboundedSender<Vec<u8>>>>,
     manufacturer_data: BTreeMap<u16, Vec<u8>>,
     service_data: BTreeMap<ServiceUuid, Vec<u8>>,
     rssi: Option<i16>,
@@ -72,6 +74,18 @@ impl MockNetwork {
 
     fn take_armed_scan_failure(&self) -> Option<String> {
         self.armed_scan_failure.lock().unwrap().take()
+    }
+
+    /// Forget every notify subscription `central` holds on `peripheral`.
+    /// Without this the mock would keep delivering notifications to a peer
+    /// the server has disconnected — the very leak `disconnect_peer` exists
+    /// to close, papered over in the one place it can be tested.
+    fn drop_subscriptions(&self, peripheral: &PeerAddress, central: &PeerAddress) {
+        if let Some(state) = self.peripherals.lock().unwrap().get_mut(peripheral) {
+            for peers in state.subscribers.values_mut() {
+                peers.remove(central);
+            }
+        }
     }
 
     fn emit(&self, to: &PeerAddress, event: GattEvent) {
@@ -219,10 +233,10 @@ impl Backend for MockBackend {
             return Err(BleError::PeripheralUnsupported);
         }
         let mut values = HashMap::new();
-        let mut notify_tx = HashMap::new();
+        let mut subscribers = HashMap::new();
         for characteristic in &service.characteristics {
             values.insert(characteristic.uuid, characteristic.initial_value.clone());
-            notify_tx.insert(characteristic.uuid, broadcast::channel(NOTIFY_CHANNEL_CAPACITY).0);
+            subscribers.insert(characteristic.uuid, HashMap::new());
         }
         let mut peripherals = self.network.peripherals.lock().unwrap();
         let previous = peripherals.remove(&self.address);
@@ -231,7 +245,7 @@ impl Backend for MockBackend {
             PeripheralState {
                 service,
                 values,
-                notify_tx,
+                subscribers,
                 // Advertisement payload survives a re-advertise: it's set
                 // out-of-band by the test, not part of GattServiceSpec.
                 manufacturer_data: previous
@@ -258,11 +272,38 @@ impl Backend for MockBackend {
         let state = peripherals
             .get(&self.address)
             .ok_or_else(|| BleError::Gatt("not advertising".to_string()))?;
-        let tx = state
-            .notify_tx
+        let peers = state
+            .subscribers
             .get(&characteristic)
             .ok_or_else(|| BleError::Gatt("unknown characteristic".to_string()))?;
-        let _ = tx.send(value);
+        // Faithful to both real backends: notify is a broadcast, so every
+        // subscriber gets it — including a central the protocol layer
+        // believes it refused. That is the whole hazard.
+        for tx in peers.values() {
+            let _ = tx.send(value.clone());
+        }
+        Ok(())
+    }
+
+    async fn disconnect_peer(&self, peer: &PeerAddress) -> Result<()> {
+        // Mirrors the real backends: the refused central learns it was
+        // dropped, and the server sees the peripheral-role disconnect that
+        // clears its single-central slot.
+        self.network.emit(
+            peer,
+            GattEvent::Disconnected {
+                peer: self.address.clone(),
+                local_role: Role::Central,
+            },
+        );
+        self.network.emit(
+            &self.address,
+            GattEvent::Disconnected {
+                peer: peer.clone(),
+                local_role: Role::Peripheral,
+            },
+        );
+        self.network.drop_subscriptions(&self.address, peer);
         Ok(())
     }
 
@@ -341,16 +382,20 @@ impl GattConnection for MockGattConnection {
     }
 
     async fn subscribe(&mut self, characteristic: CharacteristicUuid) -> Result<BoxStream<Vec<u8>>> {
-        let peripherals = self.network.peripherals.lock().unwrap();
+        let mut peripherals = self.network.peripherals.lock().unwrap();
         let state = peripherals
-            .get(&self.peripheral)
+            .get_mut(&self.peripheral)
             .ok_or_else(|| BleError::NotConnected(self.peripheral.0.clone()))?;
-        let tx = state
-            .notify_tx
-            .get(&characteristic)
+        let peers = state
+            .subscribers
+            .get_mut(&characteristic)
             .ok_or_else(|| BleError::Gatt("unknown characteristic".to_string()))?;
-        let rx = tx.subscribe();
-        Ok(Box::pin(BroadcastStream::new(rx).filter_map(|item| item.ok())))
+        // Subscribing is purely client-side — the server gets no say, which
+        // is exactly why refusing a central at the protocol layer does not
+        // stop it receiving broadcasts.
+        let (tx, rx) = mpsc::unbounded_channel();
+        peers.insert(self.central.clone(), tx);
+        Ok(Box::pin(UnboundedReceiverStream::new(rx)))
     }
 
     async fn disconnect(&mut self) -> Result<()> {

@@ -510,6 +510,20 @@ pub async fn serve(
                              each other's messages",
                             peer.0, active.0
                         );
+                        // Refusing to allocate state is NOT refusing service.
+                        // The peer subscribed without needing our consent, so
+                        // until it is disconnected every `Sink::Notify`
+                        // broadcast still reaches it — handing it the served
+                        // peer's fragments, interleaved into its own stream.
+                        // Disconnecting is the only portable exclusion: BlueZ
+                        // cannot address a notification to one peer at all.
+                        if let Err(err) = backend.disconnect_peer(&peer).await {
+                            eprintln!(
+                                "[ble-gatt][datagram] could not disconnect refused central \
+                                 {}: {err} — it may still receive broadcast notifications",
+                                peer.0
+                            );
+                        }
                         continue;
                     }
                     let (frag_tx, frag_rx) = mpsc::channel(config.fragment_queue_depth);
