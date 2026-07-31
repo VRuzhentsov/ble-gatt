@@ -282,7 +282,7 @@ pub struct DatagramChannel {
     /// in `inbound`, so subsequent writes went to a closed receiver, the
     /// entry was never removed, and every other central was refused
     /// indefinitely.
-    release: Option<(mpsc::Sender<(PeerAddress, u64)>, u64)>,
+    release: Option<(mpsc::UnboundedSender<(PeerAddress, u64)>, u64)>,
     /// Raised when inbound data was dropped for this channel.
     ///
     /// Out-of-band rather than an error pushed onto the message queue:
@@ -307,16 +307,18 @@ impl Drop for DatagramChannel {
         for task in &self.tasks {
             task.abort();
         }
-        // Tell `serve` the slot is free. try_send because Drop cannot await;
-        // the queue is sized for the peers `serve` can hold, so it cannot
-        // legitimately be full.
+        // Tell `serve` the slot is free. Unbounded because `Drop` cannot
+        // await and a *dropped* release is unrecoverable: the slot stays
+        // occupied by a channel that no longer exists, and no later event
+        // can free it. Outstanding releases are bounded by the number of
+        // live channels, so this cannot grow without limit.
         //
         // The generation is what makes this safe against address reuse: a
         // stale channel held past its peer's disconnect would otherwise
         // release whatever entry the *same address* currently occupies,
         // disconnecting a central that had just reconnected.
         if let Some((release, generation)) = &self.release {
-            let _ = release.try_send((self.peer.clone(), *generation));
+            let _ = release.send((self.peer.clone(), *generation));
         }
     }
 }
@@ -677,8 +679,7 @@ pub async fn serve(
     backend.advertise(config.service_spec()).await?;
 
     let (channels_tx, channels_rx) = mpsc::channel(config.accept_queue_depth);
-    let (release_tx, mut release_rx) =
-        mpsc::channel::<(PeerAddress, u64)>(config.accept_queue_depth);
+    let (release_tx, mut release_rx) = mpsc::unbounded_channel::<(PeerAddress, u64)>();
     let config = config.clone();
     // The peripheral has no `GattConnection` to ask for a negotiated MTU, so
     // it budgets against the spec-minimum. Conservative on purpose:

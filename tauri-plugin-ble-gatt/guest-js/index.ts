@@ -53,7 +53,16 @@ export type GattEvent =
       address: string;
       characteristicUuid: string;
       value: number[];
-    };
+    }
+  /**
+   * This subscriber fell behind and `dropped` events were discarded before
+   * it could read them.
+   *
+   * Not cosmetic: the lost events may include acknowledged writes, so any
+   * connection state derived from this stream should be treated as stale
+   * and re-read rather than trusted.
+   */
+  | { type: "lagged"; dropped: number };
 
 export async function capabilities(): Promise<Capabilities> {
   return invoke("plugin:ble-gatt|ble_capabilities");

@@ -806,3 +806,79 @@ async fn a_stale_channel_drop_does_not_evict_the_reconnected_peer() {
         .expect("no error");
     assert_eq!(received, b"still-serving");
 }
+
+#[tokio::test]
+async fn a_release_survives_a_saturated_accept_queue() {
+    // Depth 1 is what made the old bounded release queue discardable.
+    let mut config = config();
+    config.accept_queue_depth = 1;
+
+    let network = MockNetwork::new();
+    let peripheral_addr = PeerAddress("peripheral-relqueue".to_string());
+    let central_addr = PeerAddress("central-relqueue".to_string());
+
+    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+        peripheral_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    ));
+
+    let mut incoming = datagram::serve(peripheral.clone(), &config)
+        .await
+        .expect("serve should start");
+
+    // First generation, then a reconnect of the same address, then drop the
+    // stale channel followed immediately by the live one. The stale release
+    // is discarded by design (superseded), but the *live* one must not be —
+    // if it is, the slot stays occupied by a channel that no longer exists
+    // and nothing later can free it.
+    let first: Arc<MockBackend> = Arc::new(MockBackend::new(
+        central_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    ));
+    let first_client = datagram::connect(first.clone(), &peripheral_addr, &config)
+        .await
+        .expect("connect should succeed");
+    let stale = tokio::time::timeout(Duration::from_secs(2), incoming.next())
+        .await
+        .expect("serve should yield a channel")
+        .expect("stream open");
+
+    drop(first_client);
+    peripheral.simulate_peer_loss(&central_addr);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let second: Arc<MockBackend> = Arc::new(MockBackend::new(
+        central_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    ));
+    let second_client = datagram::connect(second.clone(), &peripheral_addr, &config)
+        .await
+        .expect("reconnect should succeed");
+    let live = tokio::time::timeout(Duration::from_secs(2), incoming.next())
+        .await
+        .expect("serve should yield a channel for the reconnected peer")
+        .expect("stream open");
+
+    drop(stale);
+    drop(live);
+    drop(second_client);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The slot must be free: a third central has to be accepted.
+    let third_addr = PeerAddress("central-relqueue-3".to_string());
+    let third: Arc<MockBackend> = Arc::new(MockBackend::new(
+        third_addr,
+        network.clone(),
+        full_capabilities(),
+    ));
+    let _third_client = datagram::connect(third.clone(), &peripheral_addr, &config)
+        .await
+        .expect("connect should succeed");
+    tokio::time::timeout(Duration::from_secs(2), incoming.next())
+        .await
+        .expect("the slot must be free after the live channel's release")
+        .expect("stream open");
+}

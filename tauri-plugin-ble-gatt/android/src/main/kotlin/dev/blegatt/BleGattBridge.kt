@@ -292,6 +292,21 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             }
 
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+                // Ownership is checked *first*, before the failure branch as
+                // well as the success one. The connect may have been
+                // cancelled while this callback was already running:
+                // `ConnectGuard` closes the GATT and clears the Rust slot,
+                // and either branch acting afterwards damages whatever
+                // replaced it — the success path by publishing state no Rust
+                // handle owns, the failure path by deleting the replacement's
+                // bookkeeping and reporting it disconnected.
+                if (connectedGatts[address] !== gatt) {
+                    Log.d(TAG, "onServicesDiscovered: $address superseded or cancelled, ignoring")
+                    // Still release this handle; just do not touch state that
+                    // now belongs to another GATT.
+                    gatt.close()
+                    return
+                }
                 if (status != BluetoothGatt.GATT_SUCCESS) {
                     // Previously ignored, so a failed discovery still
                     // resolved connect() successfully and handed back a
@@ -301,16 +316,6 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                     pendingCharacteristics.remove(address)
                     onDisconnected(nativeHandle, address, false)
                     gatt.close()
-                    return
-                }
-                // The connect may have been cancelled while this callback
-                // was already running: `ConnectGuard` closes the GATT and
-                // clears the Rust slot, and publishing here afterwards would
-                // recreate the address entry and mark it live with no Rust
-                // handle owning a GATT — after which every later connect is
-                // refused as "already open".
-                if (connectedGatts[address] !== gatt) {
-                    Log.d(TAG, "onServicesDiscovered: $address superseded or cancelled, ignoring")
                     return
                 }
                 val byUuid = ConcurrentHashMap<String, BluetoothGattCharacteristic>()
@@ -483,7 +488,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                     return
                 }
                 Log.d(TAG, "onServiceAdded ok, starting advertisement")
-                beginAdvertising(advertiser, serviceUuid)
+                beginAdvertising(advertiser, serviceUuid, generation)
             }
 
             /// Real server-side lifecycle. Without this the peripheral role
@@ -629,7 +634,10 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         // actually succeeded.
     }
 
-    private fun beginAdvertising(advertiser: android.bluetooth.le.BluetoothLeAdvertiser, serviceUuid: String) {
+    private fun beginAdvertising(
+        advertiser: android.bluetooth.le.BluetoothLeAdvertiser, serviceUuid: String,
+        generation: Long,
+    ) {
         val settings = AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
             .setConnectable(true)
@@ -640,11 +648,26 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             .build()
         val callback = object : AdvertiseCallback() {
             override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
+                // A stop/restart can leave this callback running against a
+                // replacement generation. Resolving the new server's advertise
+                // waiter with this attempt's outcome would report a success
+                // that belongs to an advertisement already torn down.
+                if (serverGeneration != generation) {
+                    Log.d(TAG, "advertise onStartSuccess: stale generation, ignoring")
+                    return
+                }
                 Log.d(TAG, "advertise onStartSuccess: serviceUuid=$serviceUuid")
                 onAdvertiseResult(nativeHandle, true, 0)
             }
 
             override fun onStartFailure(errorCode: Int) {
+                // Worse than a misreported success: `failAdvertise` tears the
+                // server down, so a stale failure would destroy the
+                // advertisement that replaced this one.
+                if (serverGeneration != generation) {
+                    Log.d(TAG, "advertise onStartFailure: stale generation, ignoring")
+                    return
+                }
                 // Android reports this asynchronously — advertising already
                 // in progress, controller out of resources. Reporting it
                 // back is what stops Rust claiming the service is reachable
