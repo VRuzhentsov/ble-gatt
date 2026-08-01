@@ -975,21 +975,30 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
 
     fun stopAdvertising() {
         val advertiser = adapter?.bluetoothLeAdvertiser
-        advertiseCallback?.let { advertiser?.stopAdvertising(it) }
-        advertiseCallback = null
 
-        // Invalidation and teardown are one critical section, and the
-        // increment comes *first*. Clearing subscribers before invalidating
-        // let a CCCD-enable callback acquire the monitor in the gap, pass
-        // the old-generation check, and add a peer back after the snapshot —
-        // whose eventual disconnect this increment then causes to be
-        // ignored, leaving Rust's channel holding the single-central slot
-        // forever.
+        // The generation increment comes before the callback is even read.
+        // Capturing and clearing `advertiseCallback` outside the monitor let
+        // an old `onServiceAdded` run in the gap, install its callback after
+        // the clear and start an advertisement this stop was meant to end —
+        // or a queued start callback resolve the *replacement's*
+        // `advertise_tx`, which Rust installs before calling in here.
+        val stopping = synchronized(this) {
+            ++serverGeneration
+            val previous = advertiseCallback
+            advertiseCallback = null
+            previous
+        }
+        stopping?.let { advertiser?.stopAdvertising(it) }
+
+        // Teardown shares the same monitor as the invalidation above, so a
+        // CCCD-enable callback cannot acquire it in between, pass the
+        // old-generation check, and add a peer back after the snapshot —
+        // whose eventual disconnect would then be discarded as stale,
+        // leaving Rust's channel holding the single-central slot forever.
         //
         // `failPendingNotifications` re-enters this monitor; Java monitors
         // are reentrant, so that is safe.
         synchronized(this) {
-            ++serverGeneration
             failPendingNotifications()
 
             // Report every served central as gone before dropping the

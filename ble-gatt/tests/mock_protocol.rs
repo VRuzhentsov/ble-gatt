@@ -598,3 +598,51 @@ async fn a_disconnected_handle_is_actually_closed() {
         "a closed connection must refuse a second disconnect"
     );
 }
+
+#[tokio::test]
+async fn simulated_peer_loss_closes_the_link_as_well_as_announcing_it() {
+    let network = MockNetwork::new();
+    let service_uuid = ServiceUuid(Uuid::new_v4());
+    let characteristic_uuid = CharacteristicUuid(Uuid::new_v4());
+    let peripheral_addr = PeerAddress("peripheral-loss-state".to_string());
+    let central_addr = PeerAddress("central-loss-state".to_string());
+
+    let peripheral = MockBackend::new(peripheral_addr.clone(), network.clone(), full_capabilities());
+    peripheral
+        .advertise(GattServiceSpec {
+            uuid: service_uuid,
+            characteristics: vec![GattCharacteristicSpec {
+                uuid: characteristic_uuid,
+                readable: true,
+                writable: true,
+                notifiable: true,
+                initial_value: b"v".to_vec(),
+            }],
+        })
+        .await
+        .expect("advertise should succeed");
+
+    let central = MockBackend::new(central_addr.clone(), network.clone(), full_capabilities());
+    let mut connection = central.connect(&peripheral_addr).await.expect("connect");
+    connection.read(characteristic_uuid).await.expect("read while connected");
+
+    // The documented link-loss simulation must leave the same state a real
+    // drop would: not merely an event, but a connection that no longer works.
+    peripheral.simulate_peer_loss(&central_addr);
+
+    assert!(
+        connection.read(characteristic_uuid).await.is_err(),
+        "a lost link must refuse reads"
+    );
+    assert!(
+        connection.write(characteristic_uuid, b"x".to_vec()).await.is_err(),
+        "a lost link must refuse writes"
+    );
+    assert!(
+        peripheral
+            .notify_peer(&central_addr, characteristic_uuid, b"n".to_vec())
+            .await
+            .is_err(),
+        "a lost peer must no longer be reachable by notify"
+    );
+}

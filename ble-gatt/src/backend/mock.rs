@@ -230,6 +230,19 @@ impl MockBackend {
     /// involved, which is exactly the case `Backend::events()` exists to
     /// surface; tests use this to prove a consumer learns about it.
     pub fn simulate_peer_loss(&self, peer: &PeerAddress) {
+        // Clear the state as well as announcing it. Emitting events alone
+        // left the central's handle passing `ensure_current` afterwards, so
+        // reads, writes and subscribes still succeeded across a link this
+        // method exists to say is gone — and the peripheral kept a notify
+        // route to it. That is the mock accepting what both real backends
+        // reject, which is how a divergence hides a bug rather than
+        // surfacing it.
+        self.network
+            .live_sessions
+            .lock()
+            .unwrap()
+            .remove(&(peer.clone(), self.address.clone()));
+        self.network.drop_subscriptions(&self.address, peer);
         self.network.emit(
             &self.address,
             GattEvent::Disconnected {

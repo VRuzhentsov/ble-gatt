@@ -76,7 +76,7 @@ pub struct LinuxBackend {
     /// Session ids for served peers, so a watcher that finishes late cannot
     /// act on the session that replaced it.
     next_session: Arc<AtomicU64>,
-    /// Serialises dialling against disconnecting.
+    /// Serialises every GATT operation against dial and teardown.
     ///
     /// `bluer`'s `Device` is address-backed, so checking ownership and then
     /// awaiting `disconnect()` leaves a window in which a reconnect installs
@@ -89,7 +89,13 @@ pub struct LinuxBackend {
     /// are not registered in `server_watch` and cannot be aborted, so
     /// dropping the application handle does not stop a handler that is
     /// already running — it has to check for itself.
-    advertise_generation: Arc<AtomicU64>,
+    ///
+    /// A mutex rather than an atomic: a handler must compare the generation
+    /// **and** publish without being preempted in between, and
+    /// `stop_advertising` must not be able to change it mid-publication.
+    /// `broadcast::Sender::send` does not block, so holding this across the
+    /// send is safe.
+    advertise_generation: Arc<StdMutex<u64>>,
     /// Addresses this backend dialled itself, in the central role. BlueZ
     /// reports one `Connected` property per device regardless of who
     /// initiated, so without this an outbound connection would be
@@ -124,7 +130,7 @@ impl LinuxBackend {
             served_peers: Arc::new(StdMutex::new(HashMap::new())),
             next_session: Arc::new(AtomicU64::new(1)),
             dial_lock: Arc::new(AsyncMutex::new(())),
-            advertise_generation: Arc::new(AtomicU64::new(1)),
+            advertise_generation: Arc::new(StdMutex::new(1)),
             notify_writers: Arc::new(AsyncMutex::new(HashMap::new())),
             events_tx,
             app_handle: AsyncMutex::new(None),
@@ -522,7 +528,11 @@ impl Backend for LinuxBackend {
         // Claimed before anything is registered, so every handler built
         // below is stamped with the generation it belongs to.
         let advertise_generation = self.advertise_generation.clone();
-        let this_generation = advertise_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let this_generation = {
+            let mut current = advertise_generation.lock().unwrap();
+            *current += 1;
+            *current
+        };
         let server_watch = self.server_watch.clone();
         let notify_writers = self.notify_writers.clone();
         let mut notify_sessions = Vec::new();
@@ -582,7 +592,7 @@ impl Backend for LinuxBackend {
                             // as current data. Dropping the application
                             // handle does not prevent it — an already-running
                             // handler is not cancelled — so it checks here.
-                            if advertise_generation.load(Ordering::SeqCst) != this_generation {
+                            if *advertise_generation.lock().unwrap() != this_generation {
                                 return ReqResult::Ok(());
                             }
                             values.lock().unwrap().insert(uuid, value.clone());
@@ -633,21 +643,26 @@ impl Backend for LinuxBackend {
                                 );
                                 server_watch.lock().await.push(handle.abort_handle());
                             }
-                            // Re-checked after the awaits above. The gate at
-                            // the top of this handler is not enough: the
-                            // handler can block on `server_watch` while a
-                            // stop/restart runs, and publishing on resume
-                            // would inject these bytes into the replacement
-                            // `serve` session. Ownership has to hold through
-                            // the effect, not just before it.
-                            if advertise_generation.load(Ordering::SeqCst) != this_generation {
-                                return ReqResult::Ok(());
+                            // Check *and* publish under one lock. Re-checking
+                            // immediately before the send was still a sample:
+                            // this handler can be preempted between the two,
+                            // and `stop_advertising` running in that instant
+                            // means these bytes land in the replacement
+                            // `serve` session as current data. Holding the
+                            // lock across the send makes the pair one effect;
+                            // `broadcast::send` does not block, so nothing is
+                            // held for long.
+                            {
+                                let current = advertise_generation.lock().unwrap();
+                                if *current != this_generation {
+                                    return ReqResult::Ok(());
+                                }
+                                let _ = events_tx.send(GattEvent::CharacteristicWritten {
+                                    peer,
+                                    characteristic: uuid,
+                                    value,
+                                });
                             }
-                            let _ = events_tx.send(GattEvent::CharacteristicWritten {
-                                peer,
-                                characteristic: uuid,
-                                value,
-                            });
                             ReqResult::Ok(())
                         })
                     })),
@@ -742,7 +757,10 @@ impl Backend for LinuxBackend {
 
     async fn stop_advertising(&self) -> Result<()> {
         // Invalidate first, so a handler already running publishes nothing.
-        self.advertise_generation.fetch_add(1, Ordering::SeqCst);
+        // Taking the same lock the handlers publish under means an
+        // in-progress publication completes before this, or is rejected —
+        // never interleaved.
+        *self.advertise_generation.lock().unwrap() += 1;
         for watch in self.server_watch.lock().await.drain(..) {
             watch.abort();
         }
@@ -880,6 +898,12 @@ impl GattConnection for LinuxGattConnection {
     }
 
     async fn read(&mut self, characteristic: CharacteristicUuid) -> Result<Vec<u8>> {
+        // Held across the platform call for the same reason `disconnect`
+        // holds it: `Device` is address-backed, so a reconnect landing
+        // mid-operation would have this handle acting on the replacement
+        // link. Checking and then awaiting is a check-then-act however
+        // narrow the gap.
+        let _dial = self.dial_lock.lock().await;
         self.ensure_current()?;
         let target = self.find_characteristic(characteristic).await?;
         if let Ok(mtu) = target.mtu().await {
@@ -891,6 +915,7 @@ impl GattConnection for LinuxGattConnection {
     async fn write_with_type(
         &mut self, characteristic: CharacteristicUuid, value: Vec<u8>, write_type: WriteType,
     ) -> Result<()> {
+        let _dial = self.dial_lock.lock().await;
         self.ensure_current()?;
         let target = self.find_characteristic(characteristic).await?;
         // Cache the negotiated MTU opportunistically: BlueZ only publishes a
@@ -915,6 +940,7 @@ impl GattConnection for LinuxGattConnection {
     async fn subscribe(
         &mut self, characteristic: CharacteristicUuid,
     ) -> Result<BoxStream<Result<Vec<u8>>>> {
+        let _dial = self.dial_lock.lock().await;
         self.ensure_current()?;
         let target = self.find_characteristic(characteristic).await?;
         // Refresh here too. `datagram::connect` only subscribes before it
