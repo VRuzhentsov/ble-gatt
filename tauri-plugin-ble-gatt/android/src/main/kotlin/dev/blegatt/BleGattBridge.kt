@@ -705,6 +705,12 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                                 return
                             }
                             Log.d(TAG, "server: central disconnected ${device.address}")
+                            // Discard anything this peer had prepared but not
+                            // executed. Left behind, a later connection from
+                            // the same address could prepare the remaining
+                            // offsets and execute — publishing a value spliced
+                            // from two different sessions.
+                            discardPreparedWrites(device.address)
                             for (subscribers in subscribedDevices.values) {
                                 subscribers.remove(device)
                             }
@@ -806,13 +812,29 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                         if (!execute) continue
                         val uuid = key.removePrefix(prefix)
                         val characteristic = serverCharacteristics[uuid] ?: continue
-                        // TreeMap iterates in offset order, so the chunks
-                        // rejoin in the order the central wrote them.
-                        val assembled = java.io.ByteArrayOutputStream()
-                        for (chunk in staged.values) {
-                            assembled.write(chunk)
+                        // Assemble by *placement*, not concatenation. The
+                        // offsets are what the central asked for: chunks may
+                        // overlap (a rewrite) or leave a gap (a malformed
+                        // sequence), and concatenating in key order produces
+                        // a different value than was requested in the first
+                        // case and silently accepts the second.
+                        var end = 0
+                        for ((chunkOffset, chunk) in staged) {
+                            if (chunkOffset > end) {
+                                // A hole: nothing ever wrote those bytes.
+                                Log.w(TAG, "onExecuteWrite: gap at $chunkOffset for $uuid")
+                                gattServer?.sendResponse(
+                                    device, requestId, BluetoothGatt.GATT_INVALID_OFFSET, 0, null
+                                )
+                                return
+                            }
+                            end = maxOf(end, chunkOffset + chunk.size)
                         }
-                        val value = assembled.toByteArray()
+                        val assembled = ByteArray(end)
+                        for ((chunkOffset, chunk) in staged) {
+                            chunk.copyInto(assembled, chunkOffset)
+                        }
+                        val value = assembled
                         @Suppress("DEPRECATION")
                         characteristic.value = value
                         onServerCharacteristicWritten(nativeHandle, device.address, uuid, value)
@@ -1070,6 +1092,8 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         // are reentrant, so that is safe.
         synchronized(this) {
             failPendingNotifications()
+            // Nothing staged survives the server that was collecting it.
+            preparedWrites.clear()
 
             // Report every served central as gone before dropping the
             // server. Closing a GATT server delivers no
@@ -1173,6 +1197,12 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     /// Fail every queued and in-flight notification. Called when the server
     /// goes away, so Rust callers are not left waiting on sends that can no
     /// longer complete.
+    /// Drop every prepared-write chunk staged for one peer.
+    private fun discardPreparedWrites(address: String) {
+        val prefix = "$address/"
+        preparedWrites.keys.removeAll { it.startsWith(prefix) }
+    }
+
     private fun failPendingNotifications() {
         val abandoned = synchronized(this) {
             val all = notifyQueue.toList() + listOfNotNull(notifyInFlight)

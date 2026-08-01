@@ -621,6 +621,24 @@ impl GattConnection for MockGattConnection {
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
+        // Re-checked *after* the await and held across the insert below.
+        // Checking only before meant a stalled subscribe could be superseded
+        // by a reconnect and then install its sender into the replacement's
+        // state and announce a peer — accepting an operation both real
+        // backends reject as stale, in the one place tests use to exercise
+        // exactly that timing.
+        //
+        // Lock order is `live_sessions` then `peripherals`, matching
+        // `disconnect`; taking them the other way round here would have been
+        // a deadlock rather than a fix.
+        let live = self.network.live_sessions.lock().unwrap();
+        if live
+            .get(&(self.central.clone(), self.peripheral.clone()))
+            .copied()
+            != Some(self.session)
+        {
+            return Err(BleError::NotConnected(self.peripheral.0.clone()));
+        }
         let mut peripherals = self.network.peripherals.lock().unwrap();
         let state = peripherals
             .get_mut(&self.peripheral)
@@ -635,6 +653,7 @@ impl GattConnection for MockGattConnection {
         let (tx, rx) = mpsc::unbounded_channel();
         peers.insert(self.central.clone(), tx);
         drop(peripherals);
+        drop(live);
 
         // The peripheral-role arrival signal, emitted only now that the
         // notify path back to this central exists. Both real backends do the

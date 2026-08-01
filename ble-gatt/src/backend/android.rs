@@ -685,6 +685,14 @@ impl Backend for AndroidBackend {
     }
 
     async fn stop_advertising(&self) -> Result<()> {
+        // Same lock `advertise` holds across its platform call. Without it a
+        // stop could land between an attempt installing its sender and
+        // issuing `startAdvertising`: the stop resolves that sender and
+        // stops whatever is visible, then the advertise resumes and starts a
+        // server *after* stop has already returned — and because the attempt
+        // observed an outcome, its guard is disarmed and nothing cleans it
+        // up.
+        let _serialise = self.inner.advertise_lock.lock().await;
         // Resolve any advertise still waiting on Android's asynchronous
         // start result. Kotlin invalidates the server generation, so that
         // callback is deliberately ignored when it arrives — which means

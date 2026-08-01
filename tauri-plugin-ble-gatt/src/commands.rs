@@ -372,7 +372,18 @@ pub async fn ble_watch_events(
     let mut events = state.backend.events();
     let id = state.next_handle.fetch_add(1, Ordering::SeqCst);
     let watchers = state.watchers.clone();
+    // The task must not be able to finish — and try to remove itself —
+    // before its handle is registered. An already-closed event stream, or a
+    // first send that fails immediately, would otherwise have the removal
+    // find nothing and the insertion below store a completed handle
+    // permanently: the exact leak the self-removal was added to fix.
+    let (registered_tx, registered) = tokio::sync::oneshot::channel::<()>();
     let task = tokio::spawn(async move {
+        // Cancelled only if registration itself failed, in which case there
+        // is nothing to remove.
+        if registered.await.is_err() {
+            return;
+        }
         while let Some(event) = events.next().await {
             // Send failure means the JS side dropped the channel — a webview
             // reload, a closed window — and no disposer will ever call
@@ -386,6 +397,7 @@ pub async fn ble_watch_events(
         watchers.lock().await.remove(&id);
     });
     state.watchers.lock().await.insert(id, task);
+    let _ = registered_tx.send(());
     Ok(id)
 }
 

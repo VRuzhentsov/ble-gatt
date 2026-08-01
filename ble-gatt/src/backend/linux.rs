@@ -79,6 +79,14 @@ pub struct LinuxBackend {
     /// Session ids for served peers, so a watcher that finishes late cannot
     /// act on the session that replaced it.
     next_session: Arc<AtomicU64>,
+    /// Serialises advertisement setup against teardown.
+    ///
+    /// `advertise` awaits two BlueZ registrations; without this a
+    /// `stop_advertising` could complete in that window — invalidating the
+    /// generation and clearing the installed handles — and the suspended
+    /// setup would then install its own handles regardless, leaving the
+    /// service advertising after stop had returned.
+    advertise_lock: Arc<AsyncMutex<()>>,
     /// Serialises every GATT operation against dial and teardown.
     ///
     /// `bluer`'s `Device` is address-backed, so checking ownership and then
@@ -133,6 +141,7 @@ impl LinuxBackend {
             served_peers: Arc::new(StdMutex::new(HashMap::new())),
             next_session: Arc::new(AtomicU64::new(1)),
             dial_lock: Arc::new(AsyncMutex::new(())),
+            advertise_lock: Arc::new(AsyncMutex::new(())),
             advertise_generation: Arc::new(StdMutex::new(1)),
             notify_writers: Arc::new(AsyncMutex::new(HashMap::new())),
             events_tx,
@@ -536,6 +545,9 @@ impl Backend for LinuxBackend {
     }
 
     async fn advertise(&self, service: GattServiceSpec) -> Result<()> {
+        // Held for the whole setup, including both BlueZ registrations, so a
+        // concurrent stop cannot interleave with installing the handles.
+        let _serialise = self.advertise_lock.lock().await;
         // Abort the previous generation's watchers *before* spawning any of
         // this one's, so no task registered below can be mistaken for a
         // leftover and cancelled at the end of this call.
@@ -777,6 +789,7 @@ impl Backend for LinuxBackend {
     }
 
     async fn stop_advertising(&self) -> Result<()> {
+        let _serialise = self.advertise_lock.lock().await;
         // Invalidate first, so a handler already running publishes nothing.
         // Taking the same lock the handlers publish under means an
         // in-progress publication completes before this, or is rejected —
