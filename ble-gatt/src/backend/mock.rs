@@ -501,10 +501,10 @@ impl MockGattConnection {
             .get(&(self.central.clone(), self.peripheral.clone()))
             .copied();
         match current {
-            Some(now) if now != self.session => {
-                Err(BleError::NotConnected(self.peripheral.0.clone()))
-            }
-            _ => Ok(()),
+            Some(now) if now == self.session => Ok(()),
+            // Superseded by a newer dial, or closed outright — either way
+            // this handle no longer owns the link.
+            _ => Err(BleError::NotConnected(self.peripheral.0.clone())),
         }
     }
 }
@@ -618,6 +618,18 @@ impl GattConnection for MockGattConnection {
         // Mirrors both real backends: a handle kept across a reconnect must
         // not tear down the session that replaced it.
         self.ensure_current()?;
+        // Then actually close it. Emitting events without clearing state
+        // left this handle passing `ensure_current` afterwards, so reads,
+        // writes, subscribes and repeated disconnects all still succeeded
+        // through a closed connection — the mock accepting what both real
+        // backends reject, which is exactly the divergence that hides bugs
+        // rather than surfacing them.
+        self.network
+            .live_sessions
+            .lock()
+            .unwrap()
+            .remove(&(self.central.clone(), self.peripheral.clone()));
+        self.network.drop_subscriptions(&self.peripheral, &self.central);
         self.network
             .disconnect_log
             .lock()

@@ -76,6 +76,15 @@ pub struct LinuxBackend {
     /// Session ids for served peers, so a watcher that finishes late cannot
     /// act on the session that replaced it.
     next_session: Arc<AtomicU64>,
+    /// Serialises dialling against disconnecting.
+    ///
+    /// `bluer`'s `Device` is address-backed, so checking ownership and then
+    /// awaiting `disconnect()` leaves a window in which a reconnect installs
+    /// a new dial — and the in-flight call then drops *that* link. A plain
+    /// mutex around the check cannot help, because the platform call is
+    /// asynchronous; the two operations have to exclude each other for their
+    /// whole duration.
+    dial_lock: Arc<AsyncMutex<()>>,
     /// Which advertisement is current. The GATT application's own handlers
     /// are not registered in `server_watch` and cannot be aborted, so
     /// dropping the application handle does not stop a handler that is
@@ -114,6 +123,7 @@ impl LinuxBackend {
             values: Arc::new(StdMutex::new(HashMap::new())),
             served_peers: Arc::new(StdMutex::new(HashMap::new())),
             next_session: Arc::new(AtomicU64::new(1)),
+            dial_lock: Arc::new(AsyncMutex::new(())),
             advertise_generation: Arc::new(AtomicU64::new(1)),
             notify_writers: Arc::new(AsyncMutex::new(HashMap::new())),
             events_tx,
@@ -431,6 +441,9 @@ impl Backend for LinuxBackend {
         // otherwise race us and announce our own outbound link as a central
         // arriving at our server.
         //
+        // Held across the platform call, so a concurrent `disconnect` on an
+        // older handle cannot land midway and drop this link.
+        let _dial = self.dial_lock.lock().await;
         // The generation distinguishes successive dials to the same address,
         // so a watcher from a previous connection cannot report a disconnect
         // for the one that replaced it.
@@ -490,6 +503,7 @@ impl Backend for LinuxBackend {
         Ok(Box::new(LinuxGattConnection {
             session: dial_generation,
             dialed: self.dialed.clone(),
+            dial_lock: self.dial_lock.clone(),
             peer: peer.clone(),
             device,
             att_mtu: AtomicU16::new(crate::backend::DEFAULT_ATT_MTU),
@@ -618,6 +632,16 @@ impl Backend for LinuxBackend {
                                     session,
                                 );
                                 server_watch.lock().await.push(handle.abort_handle());
+                            }
+                            // Re-checked after the awaits above. The gate at
+                            // the top of this handler is not enough: the
+                            // handler can block on `server_watch` while a
+                            // stop/restart runs, and publishing on resume
+                            // would inject these bytes into the replacement
+                            // `serve` session. Ownership has to hold through
+                            // the effect, not just before it.
+                            if advertise_generation.load(Ordering::SeqCst) != this_generation {
+                                return ReqResult::Ok(());
                             }
                             let _ = events_tx.send(GattEvent::CharacteristicWritten {
                                 peer,
@@ -797,6 +821,8 @@ struct LinuxGattConnection {
     /// BlueZ through the address-backed `Device` proxy and disconnects the
     /// connection that replaced it.
     dialed: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
+    /// See `LinuxBackend::dial_lock`.
+    dial_lock: Arc<AsyncMutex<()>>,
     peer: PeerAddress,
     device: bluer::Device,
     /// Negotiated ATT MTU, refreshed from BlueZ whenever a characteristic
@@ -909,6 +935,12 @@ impl GattConnection for LinuxGattConnection {
         // The most damaging operation for a stale handle: `Device` is backed
         // by the address, so this would drop whichever link currently owns
         // it — including one established after this handle's own.
+        //
+        // The lock is taken *before* the check and held across the platform
+        // call, so a reconnect cannot slip in between them. Checking and
+        // then awaiting was still a check-then-act, just with a smaller
+        // window.
+        let _dial = self.dial_lock.lock().await;
         self.ensure_current()?;
         self.device.disconnect().await.map_err(|err| BleError::Gatt(err.to_string()))
     }

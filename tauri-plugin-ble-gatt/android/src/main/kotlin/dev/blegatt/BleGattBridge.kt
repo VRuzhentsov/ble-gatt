@@ -604,6 +604,18 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         serviceUuid: String, characteristicUuids: Array<String>, readable: BooleanArray, writable: BooleanArray,
         notifiable: BooleanArray, initialValues: Array<ByteArray>,
     ) {
+        // Tear down any predecessor first. This bridge holds a single
+        // `gattServer`/`advertiseCallback` pair, so starting without
+        // stopping silently overwrote them — leaving an abandoned attempt's
+        // server open and its advertisement discoverable, with nothing left
+        // able to close it.
+        //
+        // Doing it here rather than in the abandoned attempt's own cleanup
+        // is deliberate: that cleanup must no-op once superseded, or it
+        // would stop the very advertisement that replaced it. Making the
+        // retry responsible serialises the two without either racing.
+        stopAdvertising()
+
         val advertiser = adapter?.bluetoothLeAdvertiser
         if (advertiser == null) {
             // Central-only device, or Bluetooth switched off. Returning

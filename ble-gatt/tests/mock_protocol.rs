@@ -547,3 +547,54 @@ async fn a_stale_connection_handle_cannot_disturb_the_session_that_replaced_it()
         .expect("the current connection must still be usable");
     assert_eq!(value, b"v");
 }
+
+#[tokio::test]
+async fn a_disconnected_handle_is_actually_closed() {
+    let network = MockNetwork::new();
+    let service_uuid = ServiceUuid(Uuid::new_v4());
+    let characteristic_uuid = CharacteristicUuid(Uuid::new_v4());
+    let peripheral_addr = PeerAddress("peripheral-closed".to_string());
+
+    let peripheral = MockBackend::new(peripheral_addr.clone(), network.clone(), full_capabilities());
+    peripheral
+        .advertise(GattServiceSpec {
+            uuid: service_uuid,
+            characteristics: vec![GattCharacteristicSpec {
+                uuid: characteristic_uuid,
+                readable: true,
+                writable: true,
+                notifiable: true,
+                initial_value: b"v".to_vec(),
+            }],
+        })
+        .await
+        .expect("advertise should succeed");
+
+    let central = MockBackend::new(
+        PeerAddress("central-closed".to_string()),
+        network.clone(),
+        full_capabilities(),
+    );
+    let mut connection = central.connect(&peripheral_addr).await.expect("connect");
+    connection.read(characteristic_uuid).await.expect("read while open");
+    connection.disconnect().await.expect("disconnect");
+
+    // Everything must now be refused. A mock that kept accepting these would
+    // let post-disconnect use pass tests that the real backends reject.
+    assert!(
+        connection.read(characteristic_uuid).await.is_err(),
+        "a closed connection must refuse reads"
+    );
+    assert!(
+        connection.write(characteristic_uuid, b"x".to_vec()).await.is_err(),
+        "a closed connection must refuse writes"
+    );
+    assert!(
+        connection.subscribe(characteristic_uuid).await.is_err(),
+        "a closed connection must refuse subscribes"
+    );
+    assert!(
+        connection.disconnect().await.is_err(),
+        "a closed connection must refuse a second disconnect"
+    );
+}

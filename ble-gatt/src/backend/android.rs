@@ -1639,6 +1639,11 @@ impl Drop for AdvertiseGuard {
             // Only if no retry has superseded this attempt. `stopAdvertising`
             // is addressless, so acting unconditionally would stop whatever
             // is advertising now.
+            //
+            // Skipping cleanup here does not leak the abandoned attempt:
+            // `startAdvertising` tears down any predecessor before opening
+            // its own server, so the retry that superseded this one has
+            // already closed it.
             if inner.advertise_generation.load(Ordering::SeqCst) != generation {
                 return;
             }
