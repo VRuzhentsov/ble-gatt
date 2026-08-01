@@ -26,3 +26,7 @@ log = "0.4"
 tauri = { version = "2.11.0", features = [] }
 tauri-plugin-log = "2"
 tauri-plugin-ble-gatt = { path = "../../../tauri-plugin-ble-gatt" }
+ble-gatt = { path = "../../../ble-gatt" }
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+tokio-stream = "0.1"
+uuid = "1"

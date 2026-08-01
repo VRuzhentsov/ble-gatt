@@ -51,6 +51,17 @@ impl PluginState {
 }
 
 impl PluginState {
+    /// The backend this plugin drives.
+    ///
+    /// Exposed so a Rust-side consumer of the plugin — the hardware
+    /// verification harness in `examples/tauri-app`, for instance — can use
+    /// the `ble-gatt` API directly instead of going out through the JS
+    /// command surface and back. On Android this is the only way to reach a
+    /// working backend, since the JNI bridge is set up by the plugin.
+    pub fn backend(&self) -> Arc<dyn Backend> {
+        self.backend.clone()
+    }
+
     /// Look up a connection and release the map lock immediately, so a slow
     /// operation on one connection cannot block commands on another.
     async fn connection(&self, handle: u64) -> Result<SharedConnection, String> {
