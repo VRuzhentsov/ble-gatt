@@ -9,6 +9,19 @@ of the library's behaviour is confirmed until two radios exchange bytes.
 
 This document is how that is done.
 
+## Status
+
+**No two-device round trip has passed yet.** What is confirmed so far:
+
+| Claim | Evidence |
+| --- | --- |
+| Linux peripheral genuinely on the air | `LEAdvertisingManager1.ActiveInstances = 1` |
+| Android peripheral role end to end | `HWVERIFY: READY peripheral` + `onAdvertisingSetStarted … status=0` |
+| Android↔Android discovery | **Blocked** — platform gap, see below |
+
+The remaining route to a round trip is Linux ↔ Android or Linux ↔ Linux,
+both of which need real radios.
+
 ## The harness
 
 Two halves that speak the same protocol, use the same UUIDs and the same
@@ -41,8 +54,12 @@ Markers:
 
 ### Two Android emulators (RootCanal)
 
+> **This topology cannot complete a round trip.** LE discovery does not work
+> between two emulators — see "Why discovery fails" below. It still proves
+> the peripheral role, so it is documented rather than deleted.
+
 No physical hardware. Exercises the Android backend, the Kotlin bridge and
-the JNI boundary on both ends — where the majority of review findings landed.
+the JNI boundary — where the majority of review findings landed.
 
 The emulator log line to look for at startup is:
 
@@ -54,28 +71,87 @@ That is RootCanal, the virtual Bluetooth controller. Without it the emulator
 has no Bluetooth at all and every run will fail at `capabilities`.
 
 ```bash
-# two instances, different ports; -no-snapshot so state is clean each run
-emulator -avd ble-test-2 -no-window -no-audio -no-boot-anim -no-snapshot -port 5554 &
-emulator -avd fini-e2e   -no-window -no-audio -no-boot-anim -no-snapshot -port 5556 &
+# two instances, different ports; -no-snapshot so state is clean each run.
+# -gpu host is required: see "Emulator crashes on start" below.
+emulator -avd ble-test-2 -gpu host -no-window -no-audio -no-boot-anim -no-snapshot -port 5554 &
+emulator -avd fini-e2e   -gpu host -no-window -no-audio -no-boot-anim -no-snapshot -port 5556 &
 
-# install on both
-adb -s emulator-5554 install -r <apk>
-adb -s emulator-5556 install -r <apk>
+# install on both. Debug builds get a `.debug` package suffix; the activity
+# keeps the base name. Using the unsuffixed id makes `pm grant` silently
+# grant nothing and `am start` fail with "Activity class does not exist".
+for s in emulator-5554 emulator-5556; do
+  adb -s $s install -r <apk>
+  adb -s $s shell cmd bluetooth_manager enable
+  for p in BLUETOOTH_SCAN BLUETOOTH_CONNECT BLUETOOTH_ADVERTISE; do
+    adb -s $s shell pm grant dev.blegatt.example.debug android.permission.$p
+  done
+done
 
 # assign roles, then launch
 adb -s emulator-5554 shell setprop debug.blegatt.role peripheral
 adb -s emulator-5556 shell setprop debug.blegatt.role central
+adb -s emulator-5554 shell am start -n dev.blegatt.example.debug/dev.blegatt.example.MainActivity
 ```
 
 Start the **peripheral first** and wait for its `READY` marker before
 launching the central, or the central's scan window can open and close
 before anything is advertising.
 
-Known limitation, recorded in `docs/adr/0002-android-jni-bridge.md`: a
-*filtered* scan against RootCanal returned zero results even with the target
+#### Emulator crashes on start
+
+The emulator segfaults (exit 139) during boot under the default GPU mode.
+The coredump backtrace puts frames 1–5 in `gles_swiftshader/libGLESv2.so`
+with frame 0 at an unmapped JIT address — SwiftShader's LLVM JIT. `-gpu off`
+does **not** avoid it, because SwiftShader is loaded regardless. `-gpu host`
+uses the real DRM node (`/dev/dri/renderD128`) and avoids the JIT entirely.
+
+#### Why discovery fails
+
+The central's scan starts cleanly, reports no error, and returns nothing.
+The cause is below this library, and the stack's own counters show it:
+
+```bash
+adb -s emulator-5556 shell dumpsys bluetooth_manager | grep -A 30 "GATT Scanner Map"
+```
+
+```
+dev.blegatt.example.debug
+  Scan time in ms (active/suspend/total) : 90036 / 0 / 90036
+  Total number of results                : 0
+com.google.uid.shared:10126 (Registered)
+  Scan time in ms (active/suspend/total) : 1612286 / 0 / 1612286
+  Total number of results                : 0
+```
+
+**Every** scanner on the device gets zero results, including Google Play
+services' — not just ours. Meanwhile RootCanal is bridging correctly at the
+controller level; its log shows the exchange in both directions:
+
+```
+le_controller.cc:2836  1  Sending LE Scan request to advertising address 4d:…
+le_controller.cc:4303  0  Accepting LE Scan request to extended advertiser 0
+le_controller.cc:4392  1  Accepting LE Scan response from advertising address 4d:…
+```
+
+So the advertisement reaches the scanner's controller and is answered, but
+no advertising report is ever delivered up to the host. A plausible reading
+is that RootCanal drives its advertiser through the extended state machine
+while the emulated controller advertises `extended_scan_support: 0` (visible
+in the same `dumpsys` output) — but that is a hypothesis about netsim, not a
+finding about this library, and nothing here can work around it.
+
+Related and recorded earlier in `docs/adr/0002-android-jni-bridge.md`: a
+*filtered* scan against RootCanal also returned zero results with the target
 confirmed advertising and the filter accepted (`status=0`). The Android
-backend therefore scans unfiltered and matches in code. A filtered-scan
-regression will not be caught by this topology.
+backend therefore scans unfiltered and matches in code. Both observations
+now look like the same underlying gap.
+
+#### What this topology does prove
+
+The peripheral half runs end to end: `ndk_context` bridging, the classloader
+lookup, the Kotlin bridge, the GATT server, and the async advertise
+handshake, confirmed by `HWVERIFY: READY peripheral` and the stack's own
+`onAdvertisingSetStarted … status=0`. Only discovery is blocked.
 
 ### Linux ↔ Android
 
