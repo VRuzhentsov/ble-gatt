@@ -77,5 +77,6 @@ external fun onNotifySent(nativeHandle: Long, requestId: Long, success: Boolean)
 external fun onServerSubscribed(nativeHandle: Long, address: String)
 
 external fun onSubscribed(
-    nativeHandle: Long, address: String, characteristicUuid: String, success: Boolean,
+    nativeHandle: Long,
+    requestId: Long, address: String, characteristicUuid: String, success: Boolean,
 )

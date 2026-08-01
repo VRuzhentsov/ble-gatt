@@ -109,7 +109,9 @@ struct ConnectionState {
     read_tx: Option<(u64, oneshot::Sender<Result<Vec<u8>>>)>,
     /// Pending write, tagged like `read_tx` and for the same reason.
     write_tx: Option<(u64, oneshot::Sender<Result<()>>)>,
-    subscribe_tx: HashMap<CharacteristicUuid, oneshot::Sender<bool>>,
+    /// Pending subscribes, tagged with the request id that issued them
+    /// so a cancelled attempt's callback cannot resolve its retry.
+    subscribe_tx: HashMap<CharacteristicUuid, (u64, oneshot::Sender<bool>)>,
     notify_tx: HashMap<CharacteristicUuid, (mpsc::Sender<Vec<u8>>, Arc<AtomicBool>)>,
     disconnected_tx: Option<oneshot::Sender<()>>,
 }
@@ -949,13 +951,14 @@ impl GattConnection for AndroidGattConnection {
     async fn subscribe(
         &mut self, characteristic: CharacteristicUuid,
     ) -> Result<BoxStream<Result<Vec<u8>>>> {
+        let request_id = self.inner.next_op_id.fetch_add(1, Ordering::Relaxed);
         let (confirm_tx, confirm_rx) = oneshot::channel();
         let (notify_tx, notify_rx) = mpsc::channel(NOTIFY_QUEUE_DEPTH);
         let overflow = Arc::new(AtomicBool::new(false));
         {
             let mut connections = self.inner.connections.lock().unwrap();
             let state = connections.entry(self.address.clone()).or_default();
-            state.subscribe_tx.insert(characteristic, confirm_tx);
+            state.subscribe_tx.insert(characteristic, (request_id, confirm_tx));
             state.notify_tx.insert(characteristic, (notify_tx, overflow.clone()));
         }
         {
@@ -967,8 +970,12 @@ impl GattConnection for AndroidGattConnection {
             self.inner.call_void(
                 &mut env,
                 "subscribeCharacteristic",
-                "(Ljava/lang/String;Ljava/lang/String;)V",
-                &[JValue::Object(&address), JValue::Object(&uuid)],
+                "(Ljava/lang/String;Ljava/lang/String;J)V",
+                &[
+                    JValue::Object(&address),
+                    JValue::Object(&uuid),
+                    JValue::Long(request_id as i64),
+                ],
             )?;
         }
         let subscribed = confirm_rx
@@ -1445,7 +1452,8 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onServerCharacteristicWritten<'
 
 #[no_mangle]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onSubscribed<'local>(
-    mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, address: JString<'local>,
+    mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, request_id: jlong,
+    address: JString<'local>,
     characteristic_uuid: JString<'local>, success: jboolean,
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
@@ -1456,7 +1464,16 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onSubscribed<'local>(
     };
     let mut connections = inner.connections.lock().unwrap();
     if let Some(state) = connections.get_mut(&address) {
-        if let Some(tx) = state.subscribe_tx.remove(&CharacteristicUuid(uuid)) {
+        // Resolve only the attempt this callback belongs to.
+        if state
+            .subscribe_tx
+            .get(&CharacteristicUuid(uuid))
+            .map(|(id, _)| *id)
+            != Some(request_id as u64)
+        {
+            return;
+        }
+        if let Some((_, tx)) = state.subscribe_tx.remove(&CharacteristicUuid(uuid)) {
             let _ = tx.send(success != 0);
         }
     }

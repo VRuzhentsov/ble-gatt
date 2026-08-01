@@ -97,6 +97,10 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     /// Rust A's bytes as B's result, which is the corruption the ids were
     /// added to prevent. Android completes these in issue order, so popping
     /// the oldest outstanding id matches each callback to its own operation.
+    /// Keyed by address+characteristic, since a connection may have several
+    /// subscriptions outstanding — unlike reads and writes, where Android
+    /// permits one at a time.
+    private val pendingSubscribeIds = ConcurrentHashMap<String, Long>()
     private val pendingReadIds = ConcurrentHashMap<String, ArrayDeque<Long>>()
     private val pendingWriteIds = ConcurrentHashMap<String, ArrayDeque<Long>>()
     private val pendingCharacteristics =
@@ -430,10 +434,18 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 // operation's status — handing back a stream before
                 // notifications are enabled, or failing a valid new setup.
                 if (connectedGatts[address] !== gatt) return
+                val characteristicUuid = descriptor.characteristic.uuid.toString()
+                // Tagged like reads and writes: a cancelled subscribe's
+                // delayed callback would otherwise resolve the retry that
+                // replaced it, handing back a stream before the CCCD write
+                // completed or failing a valid attempt.
+                val requestId =
+                    pendingSubscribeIds.remove("$address/$characteristicUuid") ?: return
                 onSubscribed(
                     nativeHandle,
+                    requestId,
                     address,
-                    descriptor.characteristic.uuid.toString(),
+                    characteristicUuid,
                     status == BluetoothGatt.GATT_SUCCESS,
                 )
             }
@@ -498,13 +510,15 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         }
     }
 
-    fun subscribeCharacteristic(address: String, characteristicUuid: String) {
+    fun subscribeCharacteristic(address: String, characteristicUuid: String, requestId: Long) {
+        pendingSubscribeIds["$address/$characteristicUuid"] = requestId
         val gatt = connectedGatts[address]
         val characteristic = findCharacteristic(address, characteristicUuid)
         val cccd = characteristic?.getDescriptor(CLIENT_CHARACTERISTIC_CONFIG_UUID)
         if (gatt == null || characteristic == null || cccd == null) {
             Log.w(TAG, "subscribeCharacteristic could not start: $address/$characteristicUuid")
-            onSubscribed(nativeHandle, address, characteristicUuid, false)
+            pendingSubscribeIds.remove("$address/$characteristicUuid")
+            onSubscribed(nativeHandle, requestId, address, characteristicUuid, false)
             return
         }
         if (!gatt.setCharacteristicNotification(characteristic, true)) {
@@ -513,7 +527,8 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             // descriptor callback report success and hand Rust a live-looking
             // stream that stays silent forever.
             Log.w(TAG, "setCharacteristicNotification failed: $address/$characteristicUuid")
-            onSubscribed(nativeHandle, address, characteristicUuid, false)
+            pendingSubscribeIds.remove("$address/$characteristicUuid")
+            onSubscribed(nativeHandle, requestId, address, characteristicUuid, false)
             return
         }
         @Suppress("DEPRECATION")
@@ -521,7 +536,8 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         @Suppress("DEPRECATION")
         if (!gatt.writeDescriptor(cccd)) {
             Log.w(TAG, "subscribe descriptor write rejected: $address/$characteristicUuid")
-            onSubscribed(nativeHandle, address, characteristicUuid, false)
+            pendingSubscribeIds.remove("$address/$characteristicUuid")
+            onSubscribed(nativeHandle, requestId, address, characteristicUuid, false)
         }
     }
 
@@ -560,17 +576,24 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 // completed, and during a rapid stop/start it would start
                 // the *old* service and resolve the new generation's
                 // advertise waiter with the old attempt's outcome.
-                if (serverGeneration != generation) {
-                    Log.d(TAG, "onServiceAdded: stale server generation, ignoring")
-                    return
+                // Validation *and* effects under the monitor. Sampling the
+                // generation and then acting let this callback resume after
+                // a restart and either tear the replacement down via
+                // `failAdvertise` or overwrite `advertiseCallback` and start
+                // the old advertisement.
+                synchronized(this@BleGattBridge) {
+                    if (serverGeneration != generation) {
+                        Log.d(TAG, "onServiceAdded: stale server generation, ignoring")
+                        return
+                    }
+                    if (status != BluetoothGatt.GATT_SUCCESS) {
+                        Log.e(TAG, "onServiceAdded failed: status=$status")
+                        failAdvertise(status)
+                        return
+                    }
+                    Log.d(TAG, "onServiceAdded ok, starting advertisement")
+                    beginAdvertising(advertiser, serviceUuid, generation)
                 }
-                if (status != BluetoothGatt.GATT_SUCCESS) {
-                    Log.e(TAG, "onServiceAdded failed: status=$status")
-                    failAdvertise(status)
-                    return
-                }
-                Log.d(TAG, "onServiceAdded ok, starting advertisement")
-                beginAdvertising(advertiser, serviceUuid, generation)
             }
 
             /// Real server-side lifecycle. Without this the peripheral role
@@ -579,7 +602,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             /// and then left was never reported as gone.
             override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
                 when (newState) {
-                    BluetoothProfile.STATE_CONNECTED -> {
+                    BluetoothProfile.STATE_CONNECTED -> synchronized(this@BleGattBridge) {
                         if (serverGeneration != generation) {
                             Log.d(TAG, "server: stale generation connect, ignoring")
                             return
@@ -594,15 +617,22 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                         // central from the *new* generation's subscriber set
                         // and report it disconnected, tearing down a served
                         // channel that had only just been established.
-                        if (serverGeneration != generation) {
-                            Log.d(TAG, "server: stale generation disconnect, ignoring")
-                            return
+                        // Check and effects together: otherwise this can
+                        // resume after the same device has subscribed to the
+                        // replacement server, strip it from that generation's
+                        // subscriber sets and report it gone — terminating a
+                        // channel that was just established.
+                        synchronized(this@BleGattBridge) {
+                            if (serverGeneration != generation) {
+                                Log.d(TAG, "server: stale generation disconnect, ignoring")
+                                return
+                            }
+                            Log.d(TAG, "server: central disconnected ${device.address}")
+                            for (subscribers in subscribedDevices.values) {
+                                subscribers.remove(device)
+                            }
+                            onDisconnected(nativeHandle, device.address, true)
                         }
-                        Log.d(TAG, "server: central disconnected ${device.address}")
-                        for (subscribers in subscribedDevices.values) {
-                            subscribers.remove(device)
-                        }
-                        onDisconnected(nativeHandle, device.address, true)
                     }
                 }
             }
@@ -610,9 +640,13 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             override fun onCharacteristicReadRequest(
                 device: BluetoothDevice, requestId: Int, offset: Int, characteristic: BluetoothGattCharacteristic
             ) {
-                if (serverGeneration != generation) return
-                val value = characteristic.value ?: ByteArray(0)
-                gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
+                synchronized(this@BleGattBridge) {
+                    if (serverGeneration != generation) return
+                    val value = characteristic.value ?: ByteArray(0)
+                    gattServer?.sendResponse(
+                        device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value
+                    )
+                }
             }
 
             @Suppress("DEPRECATION")
@@ -679,6 +713,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 // CCCD callback queued against a stopped server could strip
                 // a subscription the *replacement* server had just accepted
                 // and report that central disconnected.
+                synchronized(this@BleGattBridge) {
                 if (serverGeneration != generation) {
                     Log.d(TAG, "onDescriptorWriteRequest: stale server generation, ignoring")
                     return
@@ -709,6 +744,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 }
                 if (responseNeeded) {
                     gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
+                }
                 }
             }
         }
@@ -781,18 +817,21 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 // replacement generation. Resolving the new server's advertise
                 // waiter with this attempt's outcome would report a success
                 // that belongs to an advertisement already torn down.
-                if (serverGeneration != generation) {
-                    Log.d(TAG, "advertise onStartSuccess: stale generation, ignoring")
-                    return
+                synchronized(this@BleGattBridge) {
+                    if (serverGeneration != generation) {
+                        Log.d(TAG, "advertise onStartSuccess: stale generation, ignoring")
+                        return
+                    }
+                    Log.d(TAG, "advertise onStartSuccess: serviceUuid=$serviceUuid")
+                    onAdvertiseResult(nativeHandle, true, 0)
                 }
-                Log.d(TAG, "advertise onStartSuccess: serviceUuid=$serviceUuid")
-                onAdvertiseResult(nativeHandle, true, 0)
             }
 
             override fun onStartFailure(errorCode: Int) {
                 // Worse than a misreported success: `failAdvertise` tears the
                 // server down, so a stale failure would destroy the
                 // advertisement that replaced this one.
+                synchronized(this@BleGattBridge) {
                 if (serverGeneration != generation) {
                     Log.d(TAG, "advertise onStartFailure: stale generation, ignoring")
                     return
@@ -803,6 +842,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 // when no advertisement exists.
                 Log.e(TAG, "advertise onStartFailure: errorCode=$errorCode serviceUuid=$serviceUuid")
                 failAdvertise(errorCode)
+                }
             }
         }
         advertiseCallback = callback
@@ -843,6 +883,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     private fun clearPendingOperations(address: String) {
         pendingReadIds.remove(address)
         pendingWriteIds.remove(address)
+        pendingSubscribeIds.keys.removeAll { it.startsWith("$address/") }
     }
 
     fun closeAll() {
@@ -858,6 +899,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         pendingCharacteristics.clear()
         pendingReadIds.clear()
         pendingWriteIds.clear()
+        pendingSubscribeIds.clear()
         stopScan()
         stopAdvertising()
     }

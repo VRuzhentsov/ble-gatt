@@ -542,34 +542,42 @@ impl Backend for LinuxBackend {
                         let peer = PeerAddress(address.to_string());
                         Box::pin(async move {
                             values.lock().unwrap().insert(uuid, value.clone());
-                            let _ = events_tx.send(GattEvent::Connected {
-                                peer: peer.clone(),
-                                local_role: Role::Peripheral,
-                                session: served_peers.lock().unwrap().get(&peer).copied(),
-                            });
+
                             // BlueZ gives a GATT *server* no connection
                             // callback at all — the write itself is the only
                             // signal that a central is present. So the first
                             // write from a peer arms the same Connected-
                             // property watcher the central role uses.
                             //
-                            // Without this there is no peripheral-role
-                            // disconnect producer on Linux, and the stale
-                            // entry in `datagram::serve`'s single-central map
-                            // is never cleared — permanently refusing every
-                            // reconnect after the first central leaves.
+                            // The session is allocated *before* `Connected`
+                            // is published, not after. Publishing first meant
+                            // the very first write for a peer carried
+                            // `session: None` — so `serve` recorded the
+                            // channel with no session identity and could not
+                            // then reject a queued `Disconnected` from the
+                            // previous connection to that address, which is
+                            // exactly the teardown session ids exist to stop.
                             let session = {
                                 let mut served = served_peers.lock().unwrap();
-                                if served.contains_key(&peer) {
-                                    None
-                                } else {
-                                    let session =
-                                        next_session.fetch_add(1, Ordering::Relaxed);
-                                    served.insert(peer.clone(), session);
-                                    Some(session)
+                                match served.get(&peer) {
+                                    Some(existing) => (*existing, false),
+                                    None => {
+                                        let session =
+                                            next_session.fetch_add(1, Ordering::Relaxed);
+                                        served.insert(peer.clone(), session);
+                                        (session, true)
+                                    }
                                 }
                             };
-                            if let Some(session) = session {
+                            let (session, newly_served) = session;
+
+                            let _ = events_tx.send(GattEvent::Connected {
+                                peer: peer.clone(),
+                                local_role: Role::Peripheral,
+                                session: Some(session),
+                            });
+
+                            if newly_served {
                                 let handle = spawn_peripheral_disconnect_watch(
                                     adapter,
                                     address,
