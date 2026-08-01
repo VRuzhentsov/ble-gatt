@@ -824,8 +824,14 @@ impl Backend for LinuxBackend {
     }
 
     async fn notify_peer(
-        &self, peer: &PeerAddress, characteristic: CharacteristicUuid, value: Vec<u8>,
+        &self, peer: &PeerAddress, session: Option<u64>, characteristic: CharacteristicUuid,
+        value: Vec<u8>,
     ) -> Result<()> {
+        if let Some(session) = session {
+            if self.served_peers.lock().unwrap().get(peer) != Some(&session) {
+                return Err(BleError::NotConnected(peer.0.clone()));
+            }
+        }
         let wanted = peer.0.clone();
         self.notify_matching(
             characteristic,
@@ -837,10 +843,11 @@ impl Backend for LinuxBackend {
     }
 
     async fn disconnect_peer(&self, peer: &PeerAddress, session: Option<u64>) -> Result<()> {
-        // A caller naming a session must be told to drop *that* one. Since
-        // `Device` is address-backed, acting on a mismatch would disconnect
-        // whichever link now holds the address — typically the replacement
-        // the caller's stale state knows nothing about.
+        // Serialised against dial and every other address-backed platform
+        // operation, and held across the check *and* the disconnect: `Device`
+        // resolves by address, so validating and then awaiting would let a
+        // reconnect land in between and have this call drop the replacement.
+        let _dial = self.dial_lock.lock().await;
         if let Some(session) = session {
             if self.served_peers.lock().unwrap().get(peer) != Some(&session) {
                 return Ok(());

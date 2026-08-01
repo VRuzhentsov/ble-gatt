@@ -74,7 +74,7 @@ external fun onScanFailed(nativeHandle: Long, generation: Long, errorCode: Int)
 /// send status here, not from `notifyCharacteristicChanged`.
 external fun onNotifySent(nativeHandle: Long, requestId: Long, success: Boolean)
 
-external fun onServerSubscribed(nativeHandle: Long, address: String)
+external fun onServerSubscribed(nativeHandle: Long, address: String, session: Long)
 
 external fun onSubscribed(
     nativeHandle: Long,

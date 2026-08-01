@@ -392,7 +392,13 @@ impl DatagramChannel {
                     // disconnects it — and a broadcast in that window would
                     // hand it this peer's fragments. Addressing closes the
                     // window entirely rather than narrowing it.
-                    backend.notify_peer(&self.peer, characteristic, fragment).await?;
+                    // Named by the session this channel serves: a stale
+                    // channel must not route its fragments through the
+                    // subscription that replaced its peer, where they would
+                    // be reassembled as current data.
+                    backend
+                        .notify_peer(&self.peer, self.session, characteristic, fragment)
+                        .await?;
                 }
             }
         }

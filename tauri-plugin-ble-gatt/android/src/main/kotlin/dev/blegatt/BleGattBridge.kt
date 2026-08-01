@@ -92,6 +92,16 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     /// is verified on *this* side instead, under the same lock that resolves
     /// the GATT, which makes validation and initiation one transition.
     private val gattSessions = ConcurrentHashMap<String, Long>()
+
+    /// Session id per central attached to our GATT server.
+    ///
+    /// Minted here rather than in Rust so that validating a session and
+    /// acting on it can be one transition under this monitor. Rust cannot
+    /// hold its own map across the JNI call — a Binder thread inside
+    /// `onDescriptorWriteRequest` already holds this monitor and calls into
+    /// Rust for that map, so holding it here would close the cycle.
+    private val serverSessions = ConcurrentHashMap<String, Long>()
+    private var nextServerSession: Long = 1
     /// Request ids for the one outstanding read and write Android allows per
     /// connection, echoed back on completion.
     ///
@@ -711,6 +721,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                             // offsets and execute — publishing a value spliced
                             // from two different sessions.
                             discardPreparedWrites(device.address)
+                            serverSessions.remove(device.address)
                             for (subscribers in subscribedDevices.values) {
                                 subscribers.remove(device)
                             }
@@ -898,7 +909,10 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                     // time was too early, since a greeting sent before the
                     // CCCD write has nowhere to go.
                     if (added) {
-                        onServerSubscribed(nativeHandle, device.address)
+                        val session = serverSessions.getOrPut(device.address) {
+                            nextServerSession++
+                        }
+                        onServerSubscribed(nativeHandle, device.address, session)
                     }
                 } else {
                     val removed = subscribedDevices[characteristicUuid]?.remove(device) ?: false
@@ -1106,6 +1120,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             failPendingNotifications()
             // Nothing staged survives the server that was collecting it.
             preparedWrites.clear()
+            serverSessions.clear()
 
             // Report every served central as gone before dropping the
             // server. Closing a GATT server delivers no
@@ -1237,7 +1252,16 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     /// Drop a central's connection to our GATT server, and forget its
     /// subscriptions so `notifyCharacteristic` stops broadcasting to it even
     /// before `onConnectionStateChange` lands.
-    fun disconnectServerPeer(address: String) {
+    fun disconnectServerPeer(address: String, session: Long) = synchronized(this) {
+        // Validated and acted on under one monitor: a Binder callback could
+        // otherwise remove this session and install a replacement
+        // subscription between Rust's check and this call, after which the
+        // cancellation would drop the replacement.
+        if (session != 0L && serverSessions[address] != session) {
+            Log.d(TAG, "disconnectServerPeer: $address session superseded, ignoring")
+            return
+        }
+        serverSessions.remove(address)
         val server = gattServer ?: return
         val device = subscribedDevices.values
             .asSequence()

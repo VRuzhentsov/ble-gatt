@@ -468,7 +468,7 @@ async fn an_addressed_notify_reaches_only_its_peer() {
     let mut other_rx = other_conn.subscribe(characteristic_uuid).await.expect("subscribe");
 
     peripheral
-        .notify_peer(&served_addr, characteristic_uuid, b"for-the-served-peer".to_vec())
+        .notify_peer(&served_addr, None, characteristic_uuid, b"for-the-served-peer".to_vec())
         .await
         .expect("addressed notify should succeed");
 
@@ -488,6 +488,7 @@ async fn an_addressed_notify_reaches_only_its_peer() {
         peripheral
             .notify_peer(
                 &PeerAddress("nobody".to_string()),
+                None,
                 characteristic_uuid,
                 b"x".to_vec()
             )
@@ -640,7 +641,7 @@ async fn simulated_peer_loss_closes_the_link_as_well_as_announcing_it() {
     );
     assert!(
         peripheral
-            .notify_peer(&central_addr, characteristic_uuid, b"n".to_vec())
+            .notify_peer(&central_addr, None, characteristic_uuid, b"n".to_vec())
             .await
             .is_err(),
         "a lost peer must no longer be reachable by notify"

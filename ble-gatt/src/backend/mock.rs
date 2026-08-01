@@ -489,8 +489,21 @@ impl Backend for MockBackend {
     }
 
     async fn notify_peer(
-        &self, peer: &PeerAddress, characteristic: CharacteristicUuid, value: Vec<u8>,
+        &self, peer: &PeerAddress, session: Option<u64>, characteristic: CharacteristicUuid,
+        value: Vec<u8>,
     ) -> Result<()> {
+        if let Some(session) = session {
+            let live = self
+                .network
+                .live_sessions
+                .lock()
+                .unwrap()
+                .get(&(peer.clone(), self.address.clone()))
+                .copied();
+            if live != Some(session) {
+                return Err(BleError::NotConnected(peer.0.clone()));
+            }
+        }
         let peripherals = self.network.peripherals.lock().unwrap();
         let state = peripherals
             .get(&self.address)
@@ -655,7 +668,11 @@ impl GattConnection for MockGattConnection {
             GattEvent::Connected {
                 peer: self.central.clone(),
                 local_role: Role::Peripheral,
-                session: None,
+                // Carry the real session, so `serve` records one and the
+                // session-aware disconnect and notify paths are actually
+                // exercised here rather than always taking the `None`
+                // fallback.
+                session: Some(self.session),
             },
         );
         self.network.emit(

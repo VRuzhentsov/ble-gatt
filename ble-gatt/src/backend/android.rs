@@ -735,7 +735,7 @@ impl Backend for AndroidBackend {
         let mut delivered = false;
         let mut last_error = None;
         for peer in subscribers {
-            match self.notify_peer(&peer, characteristic, value.clone()).await {
+            match self.notify_peer(&peer, None, characteristic, value.clone()).await {
                 Ok(()) => delivered = true,
                 Err(err) => last_error = Some(err),
             }
@@ -748,8 +748,14 @@ impl Backend for AndroidBackend {
     }
 
     async fn notify_peer(
-        &self, peer: &PeerAddress, characteristic: CharacteristicUuid, value: Vec<u8>,
+        &self, peer: &PeerAddress, session: Option<u64>, characteristic: CharacteristicUuid,
+        value: Vec<u8>,
     ) -> Result<()> {
+        if let Some(session) = session {
+            if self.inner.server_sessions.lock().unwrap().get(&peer.0) != Some(&session) {
+                return Err(BleError::NotConnected(peer.0.clone()));
+            }
+        }
         let request_id = self.inner.next_notify_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.inner.notify_waiters.lock().unwrap().insert(request_id, tx);
@@ -810,13 +816,11 @@ impl Backend for AndroidBackend {
     }
 
     async fn disconnect_peer(&self, peer: &PeerAddress, session: Option<u64>) -> Result<()> {
-        // Server-side peers are tracked by the session assigned when they
-        // subscribed, so a stale release cannot drop their replacement.
-        if let Some(session) = session {
-            if self.inner.server_sessions.lock().unwrap().get(&peer.0) != Some(&session) {
-                return Ok(());
-            }
-        }
+        // The session is validated inside Kotlin, atomically with selecting
+        // and cancelling the device. Checking it here and then calling would
+        // be two transitions, and a Binder callback can replace the
+        // subscription in between. 0 means "whichever session holds this
+        // address", matching `None` at the port.
         let mut env = self.inner.env()?;
         let address = env
             .new_string(&peer.0)
@@ -824,8 +828,11 @@ impl Backend for AndroidBackend {
         self.inner.call_void(
             &mut env,
             "disconnectServerPeer",
-            "(Ljava/lang/String;)V",
-            &[JValue::Object(&address)],
+            "(Ljava/lang/String;J)V",
+            &[
+                JValue::Object(&address),
+                JValue::Long(session.unwrap_or(0) as i64),
+            ],
         )
     }
 
@@ -1652,18 +1659,20 @@ fn _callback_class_name() -> &'static str {
 #[no_mangle]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onServerSubscribed<'local>(
     mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, address: JString<'local>,
+    session: jlong,
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
     let address = read_jstring(&mut env, &address);
-    // The subscription is the session boundary for a server-side peer, so
-    // this is where its id is minted. Reusing an existing one keeps a peer
-    // that subscribes to several characteristics as one session.
-    let session = {
-        let mut sessions = inner.server_sessions.lock().unwrap();
-        *sessions
-            .entry(address.clone())
-            .or_insert_with(|| inner.next_op_id.fetch_add(1, Ordering::Relaxed))
-    };
+    // Kotlin mints these, so validating a session and acting on it can be
+    // one transition under its monitor — Rust cannot hold its own map across
+    // a JNI call without risking a cycle. Recorded here so `serve` and the
+    // event stream can see it.
+    let session = session as u64;
+    inner
+        .server_sessions
+        .lock()
+        .unwrap()
+        .insert(address.clone(), session);
     let _ = inner.server_events_tx.send(GattEvent::Connected {
         peer: PeerAddress(address),
         local_role: Role::Peripheral,

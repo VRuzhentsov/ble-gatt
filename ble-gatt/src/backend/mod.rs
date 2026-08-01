@@ -150,8 +150,15 @@ pub trait Backend: Send + Sync {
     /// disconnecting is asynchronous, and a broadcast during that window
     /// would hand the refused peer the served peer's traffic. Errors if
     /// `peer` has no live notify session.
+    /// `session` names which of that address's notify sessions to target,
+    /// for the same reason [`Backend::disconnect_peer`] takes one: both
+    /// platforms select subscriptions by address, so a caller holding a
+    /// stale channel would otherwise route its payloads into the
+    /// subscription that replaced it — where they are reassembled as
+    /// current data. `None` targets whatever currently holds the address.
     async fn notify_peer(
-        &self, peer: &PeerAddress, characteristic: CharacteristicUuid, value: Vec<u8>,
+        &self, peer: &PeerAddress, session: Option<u64>, characteristic: CharacteristicUuid,
+        value: Vec<u8>,
     ) -> Result<()>;
 
     /// Drop a remote central's connection to the local GATT server.
