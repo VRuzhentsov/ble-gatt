@@ -100,7 +100,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     /// Keyed by address+characteristic, since a connection may have several
     /// subscriptions outstanding — unlike reads and writes, where Android
     /// permits one at a time.
-    private val pendingSubscribeIds = ConcurrentHashMap<String, Long>()
+    private val pendingSubscribeIds = ConcurrentHashMap<String, ArrayDeque<Long>>()
     private val pendingReadIds = ConcurrentHashMap<String, ArrayDeque<Long>>()
     private val pendingWriteIds = ConcurrentHashMap<String, ArrayDeque<Long>>()
     private val pendingCharacteristics =
@@ -322,7 +322,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 }
             }
 
-            override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) = synchronized(gattLock) {
                 if (connectedGatts[address] !== gatt) return
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     Log.d(TAG, "onMtuChanged: $address negotiated mtu=$mtu")
@@ -385,9 +385,11 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             override fun onCharacteristicRead(
                 gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int
             ) {
-                // Ownership first: a superseded GATT's callback must not
-                // even consume a queue entry, or it would pop the live
-                // operation's id and strand it.
+                // Ownership first, and held: a superseded GATT's callback
+                // must not even consume a queue entry, or it would pop the
+                // live operation's id and strand it. Checking and then
+                // popping as two steps left that window open.
+                synchronized(gattLock) {
                 if (connectedGatts[address] !== gatt) return
                 val queue = pendingReadIds[address] ?: return
                 val requestId = synchronized(queue) { queue.removeFirstOrNull() } ?: return
@@ -395,11 +397,13 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                     nativeHandle, requestId, address, characteristic.uuid.toString(),
                     characteristic.value ?: ByteArray(0), status == BluetoothGatt.GATT_SUCCESS
                 )
+                }
             }
 
             override fun onCharacteristicWrite(
                 gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int
             ) {
+                synchronized(gattLock) {
                 if (connectedGatts[address] !== gatt) return
                 val queue = pendingWriteIds[address] ?: return
                 val requestId = synchronized(queue) { queue.removeFirstOrNull() } ?: return
@@ -407,23 +411,30 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                     nativeHandle, requestId, address, characteristic.uuid.toString(),
                     status == BluetoothGatt.GATT_SUCCESS
                 )
+                }
             }
 
             @Suppress("DEPRECATION")
             override fun onCharacteristicChanged(
                 gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic
             ) {
-                // A notification from a superseded GATT would otherwise be
-                // injected into the replacement session's stream and
-                // reassembled as current data — an old datagram fragment
-                // corrupting a new message rather than merely being stale.
-                if (connectedGatts[address] !== gatt) {
-                    Log.d(TAG, "onCharacteristicChanged: $address superseded, dropping payload")
-                    return
+                // Ownership *and* the forwarding under one lock. Checking
+                // and then publishing let a cancellation remove this GATT in
+                // between, after which the payload lands in the replacement
+                // connection's address-keyed stream and an old datagram
+                // fragment is reassembled as current data.
+                synchronized(gattLock) {
+                    if (connectedGatts[address] !== gatt) {
+                        Log.d(TAG, "onCharacteristicChanged: $address superseded, dropping payload")
+                        return
+                    }
+                    onCharacteristicChanged(
+                        nativeHandle,
+                        address,
+                        characteristic.uuid.toString(),
+                        characteristic.value ?: ByteArray(0),
+                    )
                 }
-                onCharacteristicChanged(
-                    nativeHandle, address, characteristic.uuid.toString(), characteristic.value ?: ByteArray(0)
-                )
             }
 
             override fun onDescriptorWrite(
@@ -433,14 +444,15 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 // the *replacement's* pending subscribe with the old
                 // operation's status — handing back a stream before
                 // notifications are enabled, or failing a valid new setup.
+                synchronized(gattLock) {
                 if (connectedGatts[address] !== gatt) return
                 val characteristicUuid = descriptor.characteristic.uuid.toString()
                 // Tagged like reads and writes: a cancelled subscribe's
                 // delayed callback would otherwise resolve the retry that
                 // replaced it, handing back a stream before the CCCD write
                 // completed or failing a valid attempt.
-                val requestId =
-                    pendingSubscribeIds.remove("$address/$characteristicUuid") ?: return
+                val queue = pendingSubscribeIds["$address/$characteristicUuid"] ?: return
+                val requestId = synchronized(queue) { queue.removeFirstOrNull() } ?: return
                 onSubscribed(
                     nativeHandle,
                     requestId,
@@ -448,6 +460,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                     characteristicUuid,
                     status == BluetoothGatt.GATT_SUCCESS,
                 )
+                }
             }
         }
         val gatt = device.connectGatt(context, false, callback)
@@ -511,13 +524,19 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     }
 
     fun subscribeCharacteristic(address: String, characteristicUuid: String, requestId: Long) {
-        pendingSubscribeIds["$address/$characteristicUuid"] = requestId
+        // A queue, not a slot: a cancelled attempt whose callback has not
+        // arrived must not have its identity overwritten by the retry, or
+        // that callback reports the retry's id and Rust accepts the old
+        // status as the new attempt's completion.
+        val subscribeQueue =
+            pendingSubscribeIds.getOrPut("$address/$characteristicUuid") { ArrayDeque() }
+        synchronized(subscribeQueue) { subscribeQueue.addLast(requestId) }
         val gatt = connectedGatts[address]
         val characteristic = findCharacteristic(address, characteristicUuid)
         val cccd = characteristic?.getDescriptor(CLIENT_CHARACTERISTIC_CONFIG_UUID)
         if (gatt == null || characteristic == null || cccd == null) {
             Log.w(TAG, "subscribeCharacteristic could not start: $address/$characteristicUuid")
-            pendingSubscribeIds.remove("$address/$characteristicUuid")
+            synchronized(subscribeQueue) { subscribeQueue.remove(requestId) }
             onSubscribed(nativeHandle, requestId, address, characteristicUuid, false)
             return
         }
@@ -527,7 +546,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             // descriptor callback report success and hand Rust a live-looking
             // stream that stays silent forever.
             Log.w(TAG, "setCharacteristicNotification failed: $address/$characteristicUuid")
-            pendingSubscribeIds.remove("$address/$characteristicUuid")
+            synchronized(subscribeQueue) { subscribeQueue.remove(requestId) }
             onSubscribed(nativeHandle, requestId, address, characteristicUuid, false)
             return
         }
@@ -536,7 +555,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         @Suppress("DEPRECATION")
         if (!gatt.writeDescriptor(cccd)) {
             Log.w(TAG, "subscribe descriptor write rejected: $address/$characteristicUuid")
-            pendingSubscribeIds.remove("$address/$characteristicUuid")
+            synchronized(subscribeQueue) { subscribeQueue.remove(requestId) }
             onSubscribed(nativeHandle, requestId, address, characteristicUuid, false)
         }
     }

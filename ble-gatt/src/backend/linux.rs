@@ -490,6 +490,12 @@ impl Backend for LinuxBackend {
     }
 
     async fn advertise(&self, service: GattServiceSpec) -> Result<()> {
+        // Abort the previous generation's watchers *before* spawning any of
+        // this one's, so no task registered below can be mistaken for a
+        // leftover and cancelled at the end of this call.
+        for previous in self.server_watch.lock().await.drain(..) {
+            previous.abort();
+        }
         let values = self.values.clone();
         let next_session = self.next_session.clone();
         let server_watch = self.server_watch.clone();
@@ -668,12 +674,18 @@ impl Backend for LinuxBackend {
         *self.app_handle.lock().await = Some(app_handle);
         *self.adv_handle.lock().await = Some(adv_handle);
 
-        // Replace the previous generation's notify-session watchers.
-        let mut server_watch = self.server_watch.lock().await;
-        for previous in server_watch.drain(..) {
-            previous.abort();
-        }
-        server_watch.extend(notify_sessions.iter().map(|h| h.abort_handle()));
+        // The previous generation's watchers were already aborted before any
+        // of this generation's tasks were spawned — see the drain near the
+        // top of this function. Draining *here* would have been wrong: a
+        // central can acquire a notify session between the application being
+        // served and this point, and `watch_notify_sessions` pushes that
+        // peer's disconnect watcher into the same vector — so a drain here
+        // would abort a watcher belonging to the new advertisement, leaving
+        // that peer stuck in `served_peers` with nothing to report its loss.
+        self.server_watch
+            .lock()
+            .await
+            .extend(notify_sessions.iter().map(|h| h.abort_handle()));
         // The JoinHandles themselves are dropped here, which detaches rather
         // than cancels — the AbortHandles above are what stop them.
         drop(notify_sessions);
