@@ -169,6 +169,9 @@ struct Inner {
     /// the operation that issued it rather than to whatever now occupies the
     /// slot.
     next_op_id: AtomicU64,
+    /// Which advertise attempt is current. A guard for an abandoned attempt
+    /// must not tear down the advertisement that replaced it.
+    advertise_generation: AtomicU64,
 }
 
 impl Inner {
@@ -309,6 +312,7 @@ impl AndroidBackend {
             notify_waiters: StdMutex::new(HashMap::new()),
             next_notify_id: AtomicU64::new(1),
             next_op_id: AtomicU64::new(1),
+            advertise_generation: AtomicU64::new(1),
         });
 
         // See the module doc comment: this pointer must stay valid for as
@@ -479,6 +483,7 @@ impl Backend for AndroidBackend {
 
     async fn connect(&self, peer: &PeerAddress) -> Result<Box<dyn GattConnection>> {
         let (connected_tx, connected_rx) = oneshot::channel();
+        let session;
         {
             let mut connections = self.inner.connections.lock().unwrap();
             let state = connections.entry(peer.0.clone()).or_default();
@@ -502,6 +507,7 @@ impl Backend for AndroidBackend {
             }
             state.session = self.inner.next_op_id.fetch_add(1, Ordering::Relaxed);
             state.connected_tx = Some(connected_tx);
+            session = state.session;
         }
 
         // Every failure below must clear `connected_tx`. Leaving it set once
@@ -511,9 +517,15 @@ impl Backend for AndroidBackend {
         // even after it was fixed.
         let dial = (|| -> Result<()> {
             let mut env = self.inner.env()?;
+            let session = session as i64;
             let address = env.new_string(&peer.0).map_err(|err| BleError::Gatt(err.to_string()))?;
             self.inner
-                .call_void(&mut env, "connect", "(Ljava/lang/String;)V", &[JValue::Object(&address)])
+                .call_void(
+                    &mut env,
+                    "connect",
+                    "(Ljava/lang/String;J)V",
+                    &[JValue::Object(&address), JValue::Long(session)],
+                )
         })();
         if let Err(err) = dial {
             self.inner.clear_pending_connect(&peer.0);
@@ -558,6 +570,13 @@ impl Backend for AndroidBackend {
     }
 
     async fn advertise(&self, service: GattServiceSpec) -> Result<()> {
+        // Claimed before the platform call, so an abandoned attempt's guard
+        // can tell whether a retry has since superseded it.
+        let advertise_generation = self
+            .inner
+            .advertise_generation
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
         // Scoped: `JNIEnv` is `!Send`, so it must be entirely out of scope
         // before the `.await` below, or the whole future stops being `Send`
         // and no longer satisfies the trait.
@@ -625,6 +644,7 @@ impl Backend for AndroidBackend {
         // server reference or fails as already advertising.
         let guard = AdvertiseGuard {
             inner: self.inner.clone(),
+            generation: advertise_generation,
             armed: true,
         };
 
@@ -931,11 +951,12 @@ impl GattConnection for AndroidGattConnection {
             self.inner.call_void(
                 &mut env,
                 "readCharacteristic",
-                "(Ljava/lang/String;Ljava/lang/String;J)V",
+                "(Ljava/lang/String;Ljava/lang/String;JJ)V",
                 &[
                     JValue::Object(&address),
                     JValue::Object(&uuid),
                     JValue::Long(request_id as i64),
+                    JValue::Long(self.session.unwrap_or_default() as i64),
                 ],
             )?;
         }
@@ -976,13 +997,14 @@ impl GattConnection for AndroidGattConnection {
             self.inner.call_void(
                 &mut env,
                 "writeCharacteristic",
-                "(Ljava/lang/String;Ljava/lang/String;[BZJ)V",
+                "(Ljava/lang/String;Ljava/lang/String;[BZJJ)V",
                 &[
                     JValue::Object(&address),
                     JValue::Object(&uuid),
                     JValue::Object(&bytes),
                     JValue::Bool(without_response as jboolean),
                     JValue::Long(request_id as i64),
+                    JValue::Long(self.session.unwrap_or_default() as i64),
                 ],
             )?;
         }
@@ -1014,11 +1036,12 @@ impl GattConnection for AndroidGattConnection {
             self.inner.call_void(
                 &mut env,
                 "subscribeCharacteristic",
-                "(Ljava/lang/String;Ljava/lang/String;J)V",
+                "(Ljava/lang/String;Ljava/lang/String;JJ)V",
                 &[
                     JValue::Object(&address),
                     JValue::Object(&uuid),
                     JValue::Long(request_id as i64),
+                    JValue::Long(self.session.unwrap_or_default() as i64),
                 ],
             )?;
         }
@@ -1052,8 +1075,11 @@ impl GattConnection for AndroidGattConnection {
             self.inner.call_void(
                 &mut env,
                 "disconnect",
-                "(Ljava/lang/String;)V",
-                &[JValue::Object(&address)],
+                "(Ljava/lang/String;J)V",
+                &[
+                    JValue::Object(&address),
+                    JValue::Long(self.session.unwrap_or_default() as i64),
+                ],
             )?;
         }
         // Report a disconnect that never completed. Swallowing the timeout
@@ -1595,6 +1621,10 @@ impl Drop for PendingOpGuard {
 /// advertise on the same bridge.
 struct AdvertiseGuard {
     inner: Arc<Inner>,
+    /// The attempt this guard belongs to. Without it the detached cleanup
+    /// task acts on whichever advertisement is current when it happens to be
+    /// scheduled — tearing down the retry that replaced the abandoned one.
+    generation: u64,
     armed: bool,
 }
 
@@ -1604,7 +1634,14 @@ impl Drop for AdvertiseGuard {
             return;
         }
         let inner = self.inner.clone();
+        let generation = self.generation;
         tokio::spawn(async move {
+            // Only if no retry has superseded this attempt. `stopAdvertising`
+            // is addressless, so acting unconditionally would stop whatever
+            // is advertising now.
+            if inner.advertise_generation.load(Ordering::SeqCst) != generation {
+                return;
+            }
             if let Some(pending) = inner.advertise_tx.lock().unwrap().take() {
                 let _ = pending.send(Err(ADVERTISE_ERROR_STOPPED));
             }

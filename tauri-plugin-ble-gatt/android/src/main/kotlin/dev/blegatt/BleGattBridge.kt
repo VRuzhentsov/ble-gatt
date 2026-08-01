@@ -83,6 +83,15 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     /// that pair is exactly where a cancellation and retry can interleave.
     private val gattLock = Any()
     private val connectedGatts = ConcurrentHashMap<String, BluetoothGatt>()
+    /// Rust's session id for the GATT currently owning each address.
+    ///
+    /// Rust cannot make its own check-and-act atomic: it must not hold the
+    /// `connections` mutex across a JNI call, since the Kotlin callbacks
+    /// take `gattLock` and then call back into Rust for that same mutex —
+    /// holding it here would close that cycle into a deadlock. So ownership
+    /// is verified on *this* side instead, under the same lock that resolves
+    /// the GATT, which makes validation and initiation one transition.
+    private val gattSessions = ConcurrentHashMap<String, Long>()
     /// Request ids for the one outstanding read and write Android allows per
     /// connection, echoed back on completion.
     ///
@@ -255,7 +264,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         }
     }
 
-    fun connect(address: String) {
+    fun connect(address: String, session: Long) {
         val device = adapter?.getRemoteDevice(address)
         if (device == null) {
             // No adapter at all. Rust has already stored connected_tx, so
@@ -302,6 +311,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                         synchronized(gattLock) {
                             if (connectedGatts[address] === gatt) {
                                 connectedGatts.remove(address)
+                                gattSessions.remove(address)
                                 pendingCharacteristics.remove(address)
                                 clearPendingOperations(address)
                                 // Fires for unsolicited drops too (out of
@@ -322,7 +332,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 }
             }
 
-            override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) = synchronized(gattLock) {
+            override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int): Unit = synchronized(gattLock) {
                 if (connectedGatts[address] !== gatt) return
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     Log.d(TAG, "onMtuChanged: $address negotiated mtu=$mtu")
@@ -353,6 +363,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                             // a connection with no usable characteristics.
                             Log.w(TAG, "onServicesDiscovered failed for $address status=$status")
                             connectedGatts.remove(address)
+                            gattSessions.remove(address)
                             pendingCharacteristics.remove(address)
                             clearPendingOperations(address)
                             onDisconnected(nativeHandle, address, false)
@@ -464,10 +475,19 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             }
         }
         val gatt = device.connectGatt(context, false, callback)
-        connectedGatts[address] = gatt
+        synchronized(gattLock) {
+            connectedGatts[address] = gatt
+            gattSessions[address] = session
+        }
     }
 
-    fun disconnect(address: String) {
+    fun disconnect(address: String, session: Long): Unit = synchronized(gattLock) {
+        // The operation that most needs this: a stale handle's disconnect
+        // would otherwise drop the link that replaced it.
+        if (gattSessions[address] != session) {
+            Log.d(TAG, "disconnect: $address session superseded, ignoring")
+            return
+        }
         connectedGatts[address]?.disconnect()
     }
 
@@ -478,7 +498,13 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     /// the Rust side's oneshot unresolved and its caller awaiting forever —
     /// and unknown UUIDs or incomplete service discovery are ordinary
     /// errors, not exotic ones.
-    fun readCharacteristic(address: String, characteristicUuid: String, requestId: Long) {
+    fun readCharacteristic(
+        address: String, characteristicUuid: String, requestId: Long, session: Long,
+    ): Unit = synchronized(gattLock) {
+        if (gattSessions[address] != session) {
+            onCharacteristicRead(nativeHandle, requestId, address, characteristicUuid, ByteArray(0), false)
+            return
+        }
         val gatt = connectedGatts[address]
         val characteristic = findCharacteristic(address, characteristicUuid)
         val queue = pendingReadIds.getOrPut(address) { ArrayDeque() }
@@ -498,8 +524,12 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     @Suppress("DEPRECATION")
     fun writeCharacteristic(
         address: String, characteristicUuid: String, value: ByteArray, withoutResponse: Boolean,
-        requestId: Long,
-    ) {
+        requestId: Long, session: Long,
+    ): Unit = synchronized(gattLock) {
+        if (gattSessions[address] != session) {
+            onCharacteristicWriteResult(nativeHandle, requestId, address, characteristicUuid, false)
+            return
+        }
         val gatt = connectedGatts[address]
         val characteristic = findCharacteristic(address, characteristicUuid)
         val queue = pendingWriteIds.getOrPut(address) { ArrayDeque() }
@@ -523,7 +553,13 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         }
     }
 
-    fun subscribeCharacteristic(address: String, characteristicUuid: String, requestId: Long) {
+    fun subscribeCharacteristic(
+        address: String, characteristicUuid: String, requestId: Long, session: Long,
+    ): Unit = synchronized(gattLock) {
+        if (gattSessions[address] != session) {
+            onSubscribed(nativeHandle, requestId, address, characteristicUuid, false)
+            return
+        }
         // A queue, not a slot: a cancelled attempt whose callback has not
         // arrived must not have its identity overwritten by the retry, or
         // that callback reports the retry's id and Rust accepts the old
@@ -879,6 +915,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     fun closeConnection(address: String) {
         val gatt = synchronized(gattLock) {
             val existing = connectedGatts.remove(address) ?: return
+            gattSessions.remove(address)
             pendingCharacteristics.remove(address)
             existing
         } ?: return
@@ -915,6 +952,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             }
         }
         connectedGatts.clear()
+        gattSessions.clear()
         pendingCharacteristics.clear()
         pendingReadIds.clear()
         pendingWriteIds.clear()
@@ -928,26 +966,31 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         advertiseCallback?.let { advertiser?.stopAdvertising(it) }
         advertiseCallback = null
 
-        // Report every served central as gone *before* dropping the server.
-        // Closing a GATT server delivers no onConnectionStateChange for the
-        // centrals attached to it, so without this Rust keeps them in its
-        // single-central map with their channels live — and a later
-        // advertise has the stale generation disconnecting the new server's
-        // central as an interloper.
-        val served = subscribedDevices.values.flatten().map { it.address }.distinct()
-        subscribedDevices.clear()
-        for (address in served) {
-            onDisconnected(nativeHandle, address, true)
-        }
+        // Invalidation and teardown are one critical section, and the
+        // increment comes *first*. Clearing subscribers before invalidating
+        // let a CCCD-enable callback acquire the monitor in the gap, pass
+        // the old-generation check, and add a peer back after the snapshot —
+        // whose eventual disconnect this increment then causes to be
+        // ignored, leaving Rust's channel holding the single-central slot
+        // forever.
+        //
+        // `failPendingNotifications` re-enters this monitor; Java monitors
+        // are reentrant, so that is safe.
+        synchronized(this) {
+            ++serverGeneration
+            failPendingNotifications()
 
-        // Invalidate this generation *before* closing, so any callback
-        // already queued against it is ignored rather than acting on a
-        // server that is going away.
-        // Same monitor the server callbacks validate under, so a callback
-        // either completes its effects entirely before this increment or
-        // observes the new generation and declines.
-        synchronized(this) { ++serverGeneration }
-        failPendingNotifications()
+            // Report every served central as gone before dropping the
+            // server. Closing a GATT server delivers no
+            // onConnectionStateChange for the centrals attached to it, so
+            // without this Rust keeps them in its single-central map with
+            // their channels live.
+            val served = subscribedDevices.values.flatten().map { it.address }.distinct()
+            subscribedDevices.clear()
+            for (address in served) {
+                onDisconnected(nativeHandle, address, true)
+            }
+        }
 
         gattServer?.close()
         gattServer = null

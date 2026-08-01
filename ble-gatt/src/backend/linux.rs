@@ -76,6 +76,11 @@ pub struct LinuxBackend {
     /// Session ids for served peers, so a watcher that finishes late cannot
     /// act on the session that replaced it.
     next_session: Arc<AtomicU64>,
+    /// Which advertisement is current. The GATT application's own handlers
+    /// are not registered in `server_watch` and cannot be aborted, so
+    /// dropping the application handle does not stop a handler that is
+    /// already running — it has to check for itself.
+    advertise_generation: Arc<AtomicU64>,
     /// Addresses this backend dialled itself, in the central role. BlueZ
     /// reports one `Connected` property per device regardless of who
     /// initiated, so without this an outbound connection would be
@@ -109,6 +114,7 @@ impl LinuxBackend {
             values: Arc::new(StdMutex::new(HashMap::new())),
             served_peers: Arc::new(StdMutex::new(HashMap::new())),
             next_session: Arc::new(AtomicU64::new(1)),
+            advertise_generation: Arc::new(AtomicU64::new(1)),
             notify_writers: Arc::new(AsyncMutex::new(HashMap::new())),
             events_tx,
             app_handle: AsyncMutex::new(None),
@@ -483,6 +489,7 @@ impl Backend for LinuxBackend {
 
         Ok(Box::new(LinuxGattConnection {
             session: dial_generation,
+            dialed: self.dialed.clone(),
             peer: peer.clone(),
             device,
             att_mtu: AtomicU16::new(crate::backend::DEFAULT_ATT_MTU),
@@ -498,6 +505,10 @@ impl Backend for LinuxBackend {
         }
         let values = self.values.clone();
         let next_session = self.next_session.clone();
+        // Claimed before anything is registered, so every handler built
+        // below is stamped with the generation it belongs to.
+        let advertise_generation = self.advertise_generation.clone();
+        let this_generation = advertise_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let server_watch = self.server_watch.clone();
         let notify_writers = self.notify_writers.clone();
         let mut notify_sessions = Vec::new();
@@ -533,6 +544,7 @@ impl Backend for LinuxBackend {
                 let notify_writers = notify_writers.clone();
                 let next_session = next_session.clone();
                 let server_watch = server_watch.clone();
+                let advertise_generation = advertise_generation.clone();
                 CharacteristicWrite {
                     write: true,
                     write_without_response: true,
@@ -544,9 +556,21 @@ impl Backend for LinuxBackend {
                         let notify_writers = notify_writers.clone();
                         let next_session = next_session.clone();
                         let server_watch = server_watch.clone();
+                        let advertise_generation = advertise_generation.clone();
                         let address = req.device_address;
                         let peer = PeerAddress(address.to_string());
                         Box::pin(async move {
+                            // A handler descheduled around the awaits below
+                            // can resume after advertising has been stopped
+                            // and restarted. Publishing then would inject
+                            // this payload into the *replacement* `serve`
+                            // session, where a datagram fragment is accepted
+                            // as current data. Dropping the application
+                            // handle does not prevent it — an already-running
+                            // handler is not cancelled — so it checks here.
+                            if advertise_generation.load(Ordering::SeqCst) != this_generation {
+                                return ReqResult::Ok(());
+                            }
                             values.lock().unwrap().insert(uuid, value.clone());
 
                             // BlueZ gives a GATT *server* no connection
@@ -693,6 +717,8 @@ impl Backend for LinuxBackend {
     }
 
     async fn stop_advertising(&self) -> Result<()> {
+        // Invalidate first, so a handler already running publishes nothing.
+        self.advertise_generation.fetch_add(1, Ordering::SeqCst);
         for watch in self.server_watch.lock().await.drain(..) {
             watch.abort();
         }
@@ -766,6 +792,11 @@ impl Backend for LinuxBackend {
 struct LinuxGattConnection {
     /// The dial this connection belongs to; see `GattEvent::Connected`.
     session: u64,
+    /// Current dial per address, so this handle can tell whether it still
+    /// owns the link. Without it, a handle kept across a reconnect drives
+    /// BlueZ through the address-backed `Device` proxy and disconnects the
+    /// connection that replaced it.
+    dialed: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
     peer: PeerAddress,
     device: bluer::Device,
     /// Negotiated ATT MTU, refreshed from BlueZ whenever a characteristic
@@ -797,6 +828,17 @@ impl LinuxGattConnection {
     }
 }
 
+impl LinuxGattConnection {
+    /// Refuse to act when a newer dial to this peer has superseded us,
+    /// matching the Android and mock backends.
+    fn ensure_current(&self) -> Result<()> {
+        match self.dialed.lock().unwrap().get(&self.peer) {
+            Some(now) if *now != self.session => Err(BleError::NotConnected(self.peer.0.clone())),
+            _ => Ok(()),
+        }
+    }
+}
+
 #[async_trait]
 impl GattConnection for LinuxGattConnection {
     fn peer(&self) -> PeerAddress {
@@ -812,6 +854,7 @@ impl GattConnection for LinuxGattConnection {
     }
 
     async fn read(&mut self, characteristic: CharacteristicUuid) -> Result<Vec<u8>> {
+        self.ensure_current()?;
         let target = self.find_characteristic(characteristic).await?;
         if let Ok(mtu) = target.mtu().await {
             self.att_mtu.store(mtu as u16, Ordering::Relaxed);
@@ -822,6 +865,7 @@ impl GattConnection for LinuxGattConnection {
     async fn write_with_type(
         &mut self, characteristic: CharacteristicUuid, value: Vec<u8>, write_type: WriteType,
     ) -> Result<()> {
+        self.ensure_current()?;
         let target = self.find_characteristic(characteristic).await?;
         // Cache the negotiated MTU opportunistically: BlueZ only publishes a
         // characteristic's MTU once the link is up, so this is the first
@@ -845,6 +889,7 @@ impl GattConnection for LinuxGattConnection {
     async fn subscribe(
         &mut self, characteristic: CharacteristicUuid,
     ) -> Result<BoxStream<Result<Vec<u8>>>> {
+        self.ensure_current()?;
         let target = self.find_characteristic(characteristic).await?;
         // Refresh here too. `datagram::connect` only subscribes before it
         // fixes its fragment budget, so without this a Linux datagram
@@ -861,6 +906,10 @@ impl GattConnection for LinuxGattConnection {
     }
 
     async fn disconnect(&mut self) -> Result<()> {
+        // The most damaging operation for a stale handle: `Device` is backed
+        // by the address, so this would drop whichever link currently owns
+        // it — including one established after this handle's own.
+        self.ensure_current()?;
         self.device.disconnect().await.map_err(|err| BleError::Gatt(err.to_string()))
     }
 }
