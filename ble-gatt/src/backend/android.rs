@@ -10,7 +10,11 @@
 //! ## The native-handle contract (read before touching this file)
 //!
 //! `Inner` is heap-allocated behind an `Arc`. `AndroidBackend::new()` passes
-//! `Arc::as_ptr(&inner) as jlong` to the `BleGattBridge` Kotlin constructor,
+//! `Arc::into_raw(inner.clone()) as jlong` to the `BleGattBridge` Kotlin
+//! constructor — a strong reference the bridge owns and that is never
+//! reclaimed, so the allocation outlives any callback the JVM may still have
+//! queued. See the comment at the call site for why releasing it would be
+//! unsound,
 //! which stores it and echoes it back on every callback
 //! (`Native.kt`/`Java_dev_blegatt_NativeKt_on*`). Every callback
 //! reconstructs a borrowed `&Inner` via `&*(native_handle as *const Inner)`
@@ -24,12 +28,11 @@
 //! Kotlin callback capturing `native_handle`, so leaving them open meant a
 //! later link-state callback could rebuild an `Arc` from freed memory.
 //!
-//! The residual risk is now narrower but not zero: a callback already
-//! *executing* on a Binder thread at the moment the last `Arc<Inner>` is
-//! released still observes a dangling pointer. Closing the GATTs first
-//! removes the sources of new callbacks; it cannot retract one already in
-//! flight. Documented rather than silently assumed away, matching the
-//! don't-hide-hard-cases convention this project inherited.
+//! That retained reference is what makes the contract sound. An earlier
+//! revision used `Arc::as_ptr` and documented the resulting use-after-free
+//! as an accepted residual risk; it was not acceptable — a callback already
+//! queued when the last `Arc` dropped would increment a strong count through
+//! a freed allocation. Ownership, not timing, is what closes that window.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -59,6 +62,12 @@ const NOTIFY_QUEUE_DEPTH: usize = 256;
 /// as failed. Generous: a real disconnect is fast, and a caller that gets an
 /// error here is expected to retry rather than assume the link is gone.
 const DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Locally-assigned code for "an advertise was cancelled by
+/// `stop_advertising` before Android reported its result". Above the range
+/// Android's `AdvertiseCallback` uses, so it cannot be mistaken for a
+/// controller error.
+const ADVERTISE_ERROR_STOPPED: i32 = 102;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
@@ -300,7 +309,21 @@ impl AndroidBackend {
         // See the module doc comment: this pointer must stay valid for as
         // long as any `Arc<Inner>` handle (this `AndroidBackend`, or any
         // `AndroidGattConnection` cloned from it) is alive.
-        let native_handle = Arc::as_ptr(&inner) as jlong;
+        // `into_raw`, not `as_ptr`: the Kotlin bridge holds a *strong*
+        // reference for as long as it might call back. With `as_ptr` the
+        // handle was non-owning, so once the last `Arc<Inner>` dropped, a
+        // Binder callback already queued would run `increment_strong_count`
+        // on a freed allocation — undefined behaviour, not merely a stale
+        // read. `closeAll()` narrows the window by stopping the sources of
+        // new callbacks; it cannot retract one already in flight, which is
+        // why the window has to be closed by ownership instead.
+        //
+        // This reference is deliberately never reclaimed. Releasing it would
+        // reintroduce exactly the race it exists to remove, since nothing
+        // can prove the JVM has no queued callback left. The cost is one
+        // `Inner` per backend — in practice one per process — which is a
+        // bounded leak traded for the elimination of a use-after-free.
+        let native_handle = Arc::into_raw(inner.clone()) as jlong;
         let mut env = inner
             .env()
             .map_err(|err| BleError::AdapterUnavailable(format!("JNI re-attach failed: {err}")))?;
@@ -591,6 +614,14 @@ impl Backend for AndroidBackend {
     }
 
     async fn stop_advertising(&self) -> Result<()> {
+        // Resolve any advertise still waiting on Android's asynchronous
+        // start result. Kotlin invalidates the server generation, so that
+        // callback is deliberately ignored when it arrives — which means
+        // nothing else would ever complete this waiter and `advertise()`
+        // would hang for the life of the process.
+        if let Some(pending) = self.inner.advertise_tx.lock().unwrap().take() {
+            let _ = pending.send(Err(ADVERTISE_ERROR_STOPPED));
+        }
         let mut env = self.inner.env()?;
         self.inner.call_void(&mut env, "stopAdvertising", "()V", &[])
     }

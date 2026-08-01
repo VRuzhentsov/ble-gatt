@@ -13,7 +13,7 @@
 //! handshake over the link, not by this event), revisit if a consumer needs
 //! precise link-level connect/disconnect timing.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -80,7 +80,7 @@ pub struct LinuxBackend {
     /// reports one `Connected` property per device regardless of who
     /// initiated, so without this an outbound connection would be
     /// misreported as a central arriving at our server.
-    dialed: Arc<StdMutex<HashSet<PeerAddress>>>,
+    dialed: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
 }
 
 impl LinuxBackend {
@@ -114,7 +114,7 @@ impl LinuxBackend {
             app_handle: AsyncMutex::new(None),
             adv_handle: AsyncMutex::new(None),
             server_watch: Arc::new(AsyncMutex::new(Vec::new())),
-            dialed: Arc::new(StdMutex::new(HashSet::new())),
+            dialed: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
 }
@@ -127,6 +127,32 @@ impl LinuxBackend {
 /// service-attributed (an unrelated device connected to the same adapter
 /// never appears here), notification-ready by construction, and identified
 /// without inference.
+/// Report the loss of an outbound connection, but only while this watcher
+/// still owns the dial it was armed for.
+///
+/// A peer that drops and reconnects quickly leaves the old watcher holding a
+/// queued `Connected(false)`. Emitting that unconditionally would announce a
+/// disconnect for the *replacement* link — whose datagram watcher would then
+/// tear down a channel that is working — and would clear a `dialed` entry
+/// that now belongs to the new connection.
+fn report_central_loss(
+    events_tx: &broadcast::Sender<GattEvent>, dialed: &Arc<StdMutex<HashMap<PeerAddress, u64>>>,
+    peer: &PeerAddress, generation: u64,
+) {
+    let mut dialed = dialed.lock().unwrap();
+    if dialed.get(peer) != Some(&generation) {
+        return;
+    }
+    // Stop suppressing inbound reports for this address: a later connection
+    // from it may genuinely be an inbound one.
+    dialed.remove(peer);
+    drop(dialed);
+    let _ = events_tx.send(GattEvent::Disconnected {
+        peer: peer.clone(),
+        local_role: Role::Central,
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn watch_notify_sessions(
     mut control: CharacteristicControl, uuid: CharacteristicUuid,
@@ -395,9 +421,17 @@ impl Backend for LinuxBackend {
         // property before `connect()` returns, and the inbound watcher would
         // otherwise race us and announce our own outbound link as a central
         // arriving at our server.
-        self.dialed.lock().unwrap().insert(peer.clone());
+        //
+        // The generation distinguishes successive dials to the same address,
+        // so a watcher from a previous connection cannot report a disconnect
+        // for the one that replaced it.
+        let dial_generation = self.next_session.fetch_add(1, Ordering::Relaxed);
+        self.dialed.lock().unwrap().insert(peer.clone(), dial_generation);
         if let Err(err) = device.connect().await {
-            self.dialed.lock().unwrap().remove(peer);
+            let mut dialed = self.dialed.lock().unwrap();
+            if dialed.get(peer) == Some(&dial_generation) {
+                dialed.remove(peer);
+            }
             return Err(BleError::ConnectFailed {
                 peer: peer.0.clone(),
                 reason: err.to_string(),
@@ -417,6 +451,7 @@ impl Backend for LinuxBackend {
         let watch_peer = peer.clone();
         let events_tx = self.events_tx.clone();
         let dialed = self.dialed.clone();
+        let generation = dial_generation;
         tokio::spawn(async move {
             let Ok(mut changes) = watch_device.events().await else {
                 return;
@@ -428,11 +463,7 @@ impl Backend for LinuxBackend {
             // `Disconnected` is ever emitted — leaving `dialed` stale and a
             // datagram receiver blocked forever.
             if !watch_device.is_connected().await.unwrap_or(false) {
-                let _ = events_tx.send(GattEvent::Disconnected {
-                    peer: watch_peer.clone(),
-                    local_role: Role::Central,
-                });
-                dialed.lock().unwrap().remove(&watch_peer);
+                report_central_loss(&events_tx, &dialed, &watch_peer, generation);
                 return;
             }
             while let Some(event) = changes.next().await {
@@ -441,13 +472,7 @@ impl Backend for LinuxBackend {
                 else {
                     continue;
                 };
-                let _ = events_tx.send(GattEvent::Disconnected {
-                    peer: watch_peer.clone(),
-                    local_role: Role::Central,
-                });
-                // Stop suppressing inbound reports for this address: a later
-                // connection from it may genuinely be an inbound one.
-                dialed.lock().unwrap().remove(&watch_peer);
+                report_central_loss(&events_tx, &dialed, &watch_peer, generation);
                 return;
             }
         });
