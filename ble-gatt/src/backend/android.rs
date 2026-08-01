@@ -751,11 +751,11 @@ impl Backend for AndroidBackend {
         &self, peer: &PeerAddress, session: Option<u64>, characteristic: CharacteristicUuid,
         value: Vec<u8>,
     ) -> Result<()> {
-        if let Some(session) = session {
-            if self.inner.server_sessions.lock().unwrap().get(&peer.0) != Some(&session) {
-                return Err(BleError::NotConnected(peer.0.clone()));
-            }
-        }
+        // The session is validated inside Kotlin, atomically with selecting
+        // the subscriber and enqueuing. Checking it here would be a separate
+        // transition, and Rust cannot hold `server_sessions` across the JNI
+        // call without completing a deadlock cycle through the bridge
+        // monitor. 0 means "whichever session holds this address".
         let request_id = self.inner.next_notify_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.inner.notify_waiters.lock().unwrap().insert(request_id, tx);
@@ -773,12 +773,13 @@ impl Backend for AndroidBackend {
                 .call_method(
                     bridge.as_obj(),
                     "notifyCharacteristicTo",
-                    "(Ljava/lang/String;Ljava/lang/String;[BJ)Z",
+                    "(Ljava/lang/String;Ljava/lang/String;[BJJ)Z",
                     &[
                         JValue::Object(&address),
                         JValue::Object(&uuid),
                         JValue::Object(&bytes),
                         JValue::Long(request_id as i64),
+                        JValue::Long(session.unwrap_or(0) as i64),
                     ],
                 )
                 .and_then(|v| v.z());

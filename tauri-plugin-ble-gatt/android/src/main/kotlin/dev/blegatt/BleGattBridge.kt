@@ -1207,6 +1207,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     /// peer is not subscribed); anything queued is answered by the callback.
     fun notifyCharacteristicTo(
         address: String, characteristicUuid: String, value: ByteArray, requestId: Long,
+        session: Long,
     ): Boolean {
         // Validation and admission under the same monitor `stopAdvertising`
         // uses. Checking outside it let a request be enqueued *after* the
@@ -1215,6 +1216,16 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         // discarded as stale — and Rust's `notify_peer` waits forever for an
         // `onNotifySent` that will never be delivered.
         synchronized(this) {
+            // Session validated here, inside the same monitor that selects
+            // the subscriber and enqueues — checking it in Rust and then
+            // calling would let the old subscription drop and the same
+            // address resubscribe in between, after which a retained
+            // channel's fragment is queued to the replacement device and
+            // accepted there as current application data.
+            if (session != 0L && serverSessions[address] != session) {
+                Log.d(TAG, "notifyCharacteristicTo: $address session superseded, dropping")
+                return false
+            }
             if (gattServer == null || serverCharacteristics[characteristicUuid] == null) {
                 return false
             }

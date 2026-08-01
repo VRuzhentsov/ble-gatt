@@ -321,6 +321,11 @@ fn spawn_peripheral_disconnect_watch(
         // finishing; emitting then would tear down the replacement channel
         // and erase its spawn guard, and the entry it removed would be the
         // new session's.
+        //
+        // The writers lock is taken first, matching `notify_matching` and
+        // `watch_notify_sessions`: one order everywhere, so a notify in
+        // flight cannot observe a session this removal is about to retire.
+        let _writers = writers.lock().await;
         let mut served = served_peers.lock().unwrap();
         if served.get(&peer) != Some(&session) {
             return;
@@ -363,9 +368,24 @@ impl LinuxBackend {
     /// be told a dropped payload was delivered.
     async fn notify_matching(
         &self, characteristic: CharacteristicUuid, value: Vec<u8>,
-        want: impl Fn(&CharacteristicWriter) -> bool, nobody: &str,
+        owner: Option<(&PeerAddress, u64)>, want: impl Fn(&CharacteristicWriter) -> bool,
+        nobody: &str,
     ) -> Result<()> {
+        // The writers lock is taken *first*, and the session is validated
+        // while holding it. Checking before acquiring it left a gap in which
+        // the named session could drop and the same address acquire a
+        // replacement writer — after which the address predicate selects the
+        // replacement and the stale channel's fragment is reassembled there
+        // as current data.
+        //
+        // Every mutation of `served_peers` takes this lock first as well, so
+        // the check and the selection below cannot be separated.
         let mut writers = self.notify_writers.lock().await;
+        if let Some((peer, session)) = owner {
+            if self.served_peers.lock().unwrap().get(peer) != Some(&session) {
+                return Err(BleError::NotConnected(peer.0.clone()));
+            }
+        }
         let Some(sessions) = writers.get_mut(&characteristic) else {
             return Err(BleError::Gatt("no active notify session for characteristic".to_string()));
         };
@@ -820,22 +840,19 @@ impl Backend for LinuxBackend {
     }
 
     async fn notify(&self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
-        self.notify_matching(characteristic, value, |_| true, "no subscriber").await
+        self.notify_matching(characteristic, value, None, |_| true, "no subscriber")
+            .await
     }
 
     async fn notify_peer(
         &self, peer: &PeerAddress, session: Option<u64>, characteristic: CharacteristicUuid,
         value: Vec<u8>,
     ) -> Result<()> {
-        if let Some(session) = session {
-            if self.served_peers.lock().unwrap().get(peer) != Some(&session) {
-                return Err(BleError::NotConnected(peer.0.clone()));
-            }
-        }
         let wanted = peer.0.clone();
         self.notify_matching(
             characteristic,
             value,
+            session.map(|session| (peer, session)),
             move |writer: &CharacteristicWriter| writer.device_address().to_string() == wanted,
             &format!("{} has no live notify session", peer.0),
         )
