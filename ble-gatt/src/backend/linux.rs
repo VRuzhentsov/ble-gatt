@@ -72,7 +72,10 @@ pub struct LinuxBackend {
     /// Aborts the notify-session watchers started by `advertise`, *and* the
     /// per-peer disconnect watchers they spawn — those were previously
     /// detached, so `stop_advertising` could not cancel them.
-    server_watch: Arc<AsyncMutex<Vec<tokio::task::AbortHandle>>>,
+    /// Synchronous on purpose: it is only ever pushed to and drained, and
+    /// an async mutex forced an `.await` into the middle of effects that
+    /// must be indivisible with their generation check.
+    server_watch: Arc<StdMutex<Vec<tokio::task::AbortHandle>>>,
     /// Session ids for served peers, so a watcher that finishes late cannot
     /// act on the session that replaced it.
     next_session: Arc<AtomicU64>,
@@ -135,7 +138,7 @@ impl LinuxBackend {
             events_tx,
             app_handle: AsyncMutex::new(None),
             adv_handle: AsyncMutex::new(None),
-            server_watch: Arc::new(AsyncMutex::new(Vec::new())),
+            server_watch: Arc::new(StdMutex::new(Vec::new())),
             dialed: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
@@ -182,7 +185,8 @@ async fn watch_notify_sessions(
     writers: Arc<AsyncMutex<HashMap<CharacteristicUuid, Vec<CharacteristicWriter>>>>,
     events_tx: broadcast::Sender<GattEvent>,
     served_peers: Arc<StdMutex<HashMap<PeerAddress, u64>>>, adapter: Adapter,
-    next_session: Arc<AtomicU64>, watchers: Arc<AsyncMutex<Vec<tokio::task::AbortHandle>>>,
+    next_session: Arc<AtomicU64>, watchers: Arc<StdMutex<Vec<tokio::task::AbortHandle>>>,
+    advertise_generation: Arc<StdMutex<u64>>, this_generation: u64,
 ) {
     while let Some(event) = control.next().await {
         let CharacteristicControlEvent::Notify(writer) = event else {
@@ -191,27 +195,42 @@ async fn watch_notify_sessions(
         let address = writer.device_address();
         let peer = PeerAddress(address.to_string());
 
-        {
-            let mut writers = writers.lock().await;
-            let sessions = writers.entry(uuid).or_default();
+        // Aborting this task's handle does not interrupt a poll already in
+        // progress, so a watcher can resume after a stop/restart and push a
+        // dead writer into the replacement's map, claim a `served_peers`
+        // slot and announce a peer the new server never accepted — which
+        // then refuses the legitimate central.
+        //
+        // The async lock on `writers` is taken *first*, so that from the
+        // generation check onward there is no await and every effect below
+        // is indivisible with it.
+        let mut writers_guard = writers.lock().await;
+        let session = {
+            let current = advertise_generation.lock().unwrap();
+            if *current != this_generation {
+                return;
+            }
+
+            let sessions = writers_guard.entry(uuid).or_default();
             sessions.retain(|w| !w.is_closed().unwrap_or(true));
             sessions.push(writer);
-        }
 
-        let session = {
             let mut served = served_peers.lock().unwrap();
             if served.contains_key(&peer) {
                 continue;
             }
             let session = next_session.fetch_add(1, Ordering::Relaxed);
             served.insert(peer.clone(), session);
+
+            let _ = events_tx.send(GattEvent::Connected {
+                peer: peer.clone(),
+                local_role: Role::Peripheral,
+                session: Some(session),
+            });
             session
         };
-        let _ = events_tx.send(GattEvent::Connected {
-            peer: peer.clone(),
-            local_role: Role::Peripheral,
-            session: Some(session),
-        });
+        drop(writers_guard);
+
         let handle = spawn_peripheral_disconnect_watch(
             adapter.clone(),
             address,
@@ -223,7 +242,7 @@ async fn watch_notify_sessions(
         );
         // Registered so `stop_advertising` cancels it; previously these were
         // detached and outlived the server that created them.
-        watchers.lock().await.push(handle.abort_handle());
+        watchers.lock().unwrap().push(handle.abort_handle());
     }
 }
 
@@ -520,7 +539,7 @@ impl Backend for LinuxBackend {
         // Abort the previous generation's watchers *before* spawning any of
         // this one's, so no task registered below can be mistaken for a
         // leftover and cancelled at the end of this call.
-        for previous in self.server_watch.lock().await.drain(..) {
+        for previous in self.server_watch.lock().unwrap().drain(..) {
             previous.abort();
         }
         let values = self.values.clone();
@@ -592,9 +611,24 @@ impl Backend for LinuxBackend {
                             // as current data. Dropping the application
                             // handle does not prevent it — an already-running
                             // handler is not cancelled — so it checks here.
-                            if *advertise_generation.lock().unwrap() != this_generation {
+                            // Every effect below is generation-scoped, not
+                            // just the final publish. A handler resuming
+                            // after a stop/restart would otherwise overwrite
+                            // the replacement server's characteristic value,
+                            // claim its single-central slot with a phantom
+                            // peer, announce that peer and spawn a watcher
+                            // for it — after which the new `serve` refuses
+                            // the real central. Guarding only the last send
+                            // left all of that reachable.
+                            //
+                            // `server_watch` is a sync mutex precisely so
+                            // there is no await anywhere in here: from the
+                            // check onward this is indivisible.
+                            let current = advertise_generation.lock().unwrap();
+                            if *current != this_generation {
                                 return ReqResult::Ok(());
                             }
+
                             values.lock().unwrap().insert(uuid, value.clone());
 
                             // BlueZ gives a GATT *server* no connection
@@ -603,15 +637,13 @@ impl Backend for LinuxBackend {
                             // write from a peer arms the same Connected-
                             // property watcher the central role uses.
                             //
-                            // The session is allocated *before* `Connected`
-                            // is published, not after. Publishing first meant
-                            // the very first write for a peer carried
-                            // `session: None` — so `serve` recorded the
-                            // channel with no session identity and could not
-                            // then reject a queued `Disconnected` from the
-                            // previous connection to that address, which is
-                            // exactly the teardown session ids exist to stop.
-                            let session = {
+                            // The session is allocated before `Connected` is
+                            // published: publishing first meant the very
+                            // first write for a peer carried `session: None`,
+                            // so `serve` recorded the channel with no
+                            // identity and could not reject a queued
+                            // `Disconnected` from the previous connection.
+                            let (session, newly_served) = {
                                 let mut served = served_peers.lock().unwrap();
                                 match served.get(&peer) {
                                     Some(existing) => (*existing, false),
@@ -623,7 +655,6 @@ impl Backend for LinuxBackend {
                                     }
                                 }
                             };
-                            let (session, newly_served) = session;
 
                             let _ = events_tx.send(GattEvent::Connected {
                                 peer: peer.clone(),
@@ -641,28 +672,16 @@ impl Backend for LinuxBackend {
                                     notify_writers,
                                     session,
                                 );
-                                server_watch.lock().await.push(handle.abort_handle());
+                                server_watch.lock().unwrap().push(handle.abort_handle());
                             }
-                            // Check *and* publish under one lock. Re-checking
-                            // immediately before the send was still a sample:
-                            // this handler can be preempted between the two,
-                            // and `stop_advertising` running in that instant
-                            // means these bytes land in the replacement
-                            // `serve` session as current data. Holding the
-                            // lock across the send makes the pair one effect;
-                            // `broadcast::send` does not block, so nothing is
-                            // held for long.
-                            {
-                                let current = advertise_generation.lock().unwrap();
-                                if *current != this_generation {
-                                    return ReqResult::Ok(());
-                                }
-                                let _ = events_tx.send(GattEvent::CharacteristicWritten {
-                                    peer,
-                                    characteristic: uuid,
-                                    value,
-                                });
-                            }
+
+                            let _ = events_tx.send(GattEvent::CharacteristicWritten {
+                                peer,
+                                characteristic: uuid,
+                                value,
+                            });
+                            drop(current);
+
                             ReqResult::Ok(())
                         })
                     })),
@@ -694,6 +713,8 @@ impl Backend for LinuxBackend {
                     adapter.clone(),
                     next_session.clone(),
                     server_watch.clone(),
+                    advertise_generation.clone(),
+                    this_generation,
                 )));
             }
 
@@ -747,7 +768,7 @@ impl Backend for LinuxBackend {
         // that peer stuck in `served_peers` with nothing to report its loss.
         self.server_watch
             .lock()
-            .await
+            .unwrap()
             .extend(notify_sessions.iter().map(|h| h.abort_handle()));
         // The JoinHandles themselves are dropped here, which detaches rather
         // than cancels — the AbortHandles above are what stop them.
@@ -761,7 +782,7 @@ impl Backend for LinuxBackend {
         // in-progress publication completes before this, or is rejected —
         // never interleaved.
         *self.advertise_generation.lock().unwrap() += 1;
-        for watch in self.server_watch.lock().await.drain(..) {
+        for watch in self.server_watch.lock().unwrap().drain(..) {
             watch.abort();
         }
         // Announce the departure of every central we were serving *before*
