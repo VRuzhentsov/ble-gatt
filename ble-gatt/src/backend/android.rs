@@ -83,6 +83,10 @@ const CALLBACK_CLASS: &str = "dev/blegatt/NativeKt";
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 
+/// A live notification route: the subscribe request that created it, where
+/// payloads go, and the flag raised when the queue drops one.
+type NotifyRoute = (u64, mpsc::Sender<Vec<u8>>, Arc<AtomicBool>);
+
 #[derive(Default)]
 struct ConnectionState {
     /// Distinguishes successive connections to this address, so a lifecycle
@@ -112,7 +116,12 @@ struct ConnectionState {
     /// Pending subscribes, tagged with the request id that issued them
     /// so a cancelled attempt's callback cannot resolve its retry.
     subscribe_tx: HashMap<CharacteristicUuid, (u64, oneshot::Sender<bool>)>,
-    notify_tx: HashMap<CharacteristicUuid, (mpsc::Sender<Vec<u8>>, Arc<AtomicBool>)>,
+    /// Notification routes, tagged with the subscribe request that created
+    /// them. The tag is what lets cleanup identify its *own* route: keying
+    /// on `subscribe_tx` did not work, because `onSubscribed` removes that
+    /// entry before the future returns — so on a rejected subscription the
+    /// predicate was already false and the dead route stayed.
+    notify_tx: HashMap<CharacteristicUuid, NotifyRoute>,
     disconnected_tx: Option<oneshot::Sender<()>>,
 }
 
@@ -1051,7 +1060,7 @@ impl GattConnection for AndroidGattConnection {
         let overflow = Arc::new(AtomicBool::new(false));
         self.with_session(|state| {
             state.subscribe_tx.insert(characteristic, (request_id, confirm_tx));
-            state.notify_tx.insert(characteristic, (notify_tx, overflow.clone()));
+            state.notify_tx.insert(characteristic, (request_id, notify_tx, overflow.clone()));
         })?;
         // Every unsuccessful exit — a peer rejecting the subscription, an
         // unknown UUID, a JNI failure, or this future being dropped — must
@@ -1532,7 +1541,7 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onCharacteristicChanged<'local>
     };
     let connections = inner.connections.lock().unwrap();
     if let Some(state) = connections.get(&address) {
-        if let Some((tx, overflow)) = state.notify_tx.get(&CharacteristicUuid(uuid)) {
+        if let Some((_, tx, overflow)) = state.notify_tx.get(&CharacteristicUuid(uuid)) {
             // JVM callback thread: cannot block, so a saturated consumer
             // costs the payload rather than unbounded heap growth. But the
             // peer has already had this notification confirmed as sent, so
@@ -1692,14 +1701,24 @@ impl Drop for SubscribeGuard {
         let Some(state) = connections.get_mut(&self.address) else {
             return;
         };
-        // Conditional on request id: a retry may already own these entries,
-        // and removing them would strand it.
+        // Keyed on the *notification route's* own id, not on `subscribe_tx`:
+        // a rejected subscription has already had its `subscribe_tx` removed
+        // by `onSubscribed`, so predicating on that entry meant the dead
+        // route was never cleaned up — the exact leak this guard exists to
+        // prevent. Both entries are still conditional on ownership so a
+        // retry that has claimed them is not stranded.
         if state
             .subscribe_tx
             .get(&self.characteristic)
             .is_some_and(|(id, _)| *id == self.request_id)
         {
             state.subscribe_tx.remove(&self.characteristic);
+        }
+        if state
+            .notify_tx
+            .get(&self.characteristic)
+            .is_some_and(|(id, _, _)| *id == self.request_id)
+        {
             state.notify_tx.remove(&self.characteristic);
         }
     }

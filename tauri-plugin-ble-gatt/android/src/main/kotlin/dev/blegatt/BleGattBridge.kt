@@ -807,34 +807,46 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                     if (serverGeneration != generation) return
                     val prefix = "${device.address}/"
                     val keys = preparedWrites.keys.filter { it.startsWith(prefix) }
-                    for (key in keys) {
-                        val staged = preparedWrites.remove(key) ?: continue
-                        if (!execute) continue
-                        val uuid = key.removePrefix(prefix)
-                        val characteristic = serverCharacteristics[uuid] ?: continue
-                        // Assemble by *placement*, not concatenation. The
-                        // offsets are what the central asked for: chunks may
-                        // overlap (a rewrite) or leave a gap (a malformed
-                        // sequence), and concatenating in key order produces
-                        // a different value than was requested in the first
-                        // case and silently accepts the second.
-                        var end = 0
-                        for ((chunkOffset, chunk) in staged) {
-                            if (chunkOffset > end) {
-                                // A hole: nothing ever wrote those bytes.
-                                Log.w(TAG, "onExecuteWrite: gap at $chunkOffset for $uuid")
-                                gattServer?.sendResponse(
-                                    device, requestId, BluetoothGatt.GATT_INVALID_OFFSET, 0, null
-                                )
-                                return
+
+                    // ATT execute is transactional: validate and assemble
+                    // *everything* first, and only then mutate and publish.
+                    // Publishing as we went meant a gap in a later
+                    // characteristic returned failure to the central after
+                    // earlier characteristics had already taken effect.
+                    val assembled = ArrayList<Pair<String, ByteArray>>()
+                    if (execute) {
+                        for (key in keys) {
+                            val staged = preparedWrites[key] ?: continue
+                            val uuid = key.removePrefix(prefix)
+                            if (serverCharacteristics[uuid] == null) continue
+                            var end = 0
+                            for ((chunkOffset, chunk) in staged) {
+                                if (chunkOffset > end) {
+                                    Log.w(TAG, "onExecuteWrite: gap at $chunkOffset for $uuid")
+                                    // Nothing has been applied yet, so the
+                                    // central's failure is total, as ATT
+                                    // requires. The staged data stays put so
+                                    // it can be cancelled explicitly.
+                                    gattServer?.sendResponse(
+                                        device, requestId, BluetoothGatt.GATT_INVALID_OFFSET, 0, null
+                                    )
+                                    return
+                                }
+                                end = maxOf(end, chunkOffset + chunk.size)
                             }
-                            end = maxOf(end, chunkOffset + chunk.size)
+                            val value = ByteArray(end)
+                            for ((chunkOffset, chunk) in staged) {
+                                chunk.copyInto(value, chunkOffset)
+                            }
+                            assembled.add(uuid to value)
                         }
-                        val assembled = ByteArray(end)
-                        for ((chunkOffset, chunk) in staged) {
-                            chunk.copyInto(assembled, chunkOffset)
-                        }
-                        val value = assembled
+                    }
+
+                    for (key in keys) {
+                        preparedWrites.remove(key)
+                    }
+                    for ((uuid, value) in assembled) {
+                        val characteristic = serverCharacteristics[uuid] ?: continue
                         @Suppress("DEPRECATION")
                         characteristic.value = value
                         onServerCharacteristicWritten(nativeHandle, device.address, uuid, value)
@@ -1181,13 +1193,19 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     fun notifyCharacteristicTo(
         address: String, characteristicUuid: String, value: ByteArray, requestId: Long,
     ): Boolean {
-        if (gattServer == null || serverCharacteristics[characteristicUuid] == null) {
-            return false
-        }
-        val device = subscribedDevices[characteristicUuid]
-            ?.firstOrNull { it.address == address }
-            ?: return false
+        // Validation and admission under the same monitor `stopAdvertising`
+        // uses. Checking outside it let a request be enqueued *after* the
+        // teardown drained pending notifications, so the pump would start it
+        // on an invalidated server whose completion callback is then
+        // discarded as stale — and Rust's `notify_peer` waits forever for an
+        // `onNotifySent` that will never be delivered.
         synchronized(this) {
+            if (gattServer == null || serverCharacteristics[characteristicUuid] == null) {
+                return false
+            }
+            val device = subscribedDevices[characteristicUuid]
+                ?.firstOrNull { it.address == address }
+                ?: return false
             notifyQueue.addLast(PendingNotify(device, characteristicUuid, value, requestId))
         }
         pumpNotifications()
