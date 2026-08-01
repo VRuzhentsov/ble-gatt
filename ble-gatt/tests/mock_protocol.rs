@@ -496,3 +496,54 @@ async fn an_addressed_notify_reaches_only_its_peer() {
         "notifying an unsubscribed peer must report failure"
     );
 }
+
+#[tokio::test]
+async fn a_stale_connection_handle_cannot_disturb_the_session_that_replaced_it() {
+    let network = MockNetwork::new();
+    let service_uuid = ServiceUuid(Uuid::new_v4());
+    let characteristic_uuid = CharacteristicUuid(Uuid::new_v4());
+    let peripheral_addr = PeerAddress("peripheral-stale-handle".to_string());
+
+    let peripheral = MockBackend::new(peripheral_addr.clone(), network.clone(), full_capabilities());
+    peripheral
+        .advertise(GattServiceSpec {
+            uuid: service_uuid,
+            characteristics: vec![GattCharacteristicSpec {
+                uuid: characteristic_uuid,
+                readable: true,
+                writable: true,
+                notifiable: true,
+                initial_value: b"v".to_vec(),
+            }],
+        })
+        .await
+        .expect("advertise should succeed");
+
+    let central = MockBackend::new(
+        PeerAddress("central-stale-handle".to_string()),
+        network.clone(),
+        full_capabilities(),
+    );
+
+    // A handle held across an unsolicited drop and reconnect. Both are keyed
+    // by address, so without a session check the old handle operates on the
+    // new session — and its `disconnect` tears down a live connection.
+    let mut stale = central.connect(&peripheral_addr).await.expect("connect");
+    let mut current = central.connect(&peripheral_addr).await.expect("reconnect");
+
+    assert!(
+        stale.disconnect().await.is_err(),
+        "a superseded handle must refuse to disconnect the session that replaced it"
+    );
+    assert!(
+        stale.read(characteristic_uuid).await.is_err(),
+        "a superseded handle must refuse to read through the replacement"
+    );
+
+    // The replacement is untouched.
+    let value = current
+        .read(characteristic_uuid)
+        .await
+        .expect("the current connection must still be usable");
+    assert_eq!(value, b"v");
+}

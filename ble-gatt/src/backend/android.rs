@@ -616,7 +616,19 @@ impl Backend for AndroidBackend {
         rx
         };
 
-        match rx.await {
+        // Armed once the platform call has been issued. A caller that times
+        // out or drops this future runs none of the code below, and dropping
+        // `rx` performs no platform cleanup — so Kotlin would go on to
+        // finish service registration and start advertising for an attempt
+        // nobody is waiting on. That leaves a live server the caller never
+        // received, and a retry then either overwrites the bridge's sole
+        // server reference or fails as already advertising.
+        let guard = AdvertiseGuard {
+            inner: self.inner.clone(),
+            armed: true,
+        };
+
+        let outcome = match rx.await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(code)) => Err(BleError::Gatt(format!(
                 "Android refused to start advertising (AdvertiseCallback error {code})"
@@ -624,7 +636,15 @@ impl Backend for AndroidBackend {
             Err(_) => Err(BleError::Gatt(
                 "advertise outcome was never reported".to_string(),
             )),
-        }
+        };
+        // Disarmed whenever an outcome was actually observed, success or
+        // failure: success hands the caller a server it now owns, and a
+        // failure has already been torn down by `failAdvertise` on the
+        // Kotlin side. The guard exists solely for the path where this
+        // future is dropped before `rx` resolves, where neither is true.
+        let mut guard = guard;
+        guard.armed = false;
+        outcome
     }
 
     async fn stop_advertising(&self) -> Result<()> {
@@ -832,6 +852,27 @@ struct AndroidGattConnection {
     session: Option<u64>,
 }
 
+impl AndroidGattConnection {
+    /// Refuse to act if this handle no longer owns the address.
+    ///
+    /// State here is keyed by address, so a handle kept across an
+    /// unsolicited disconnect and reconnect would otherwise operate on the
+    /// *replacement* session — installing its waiters into that session's
+    /// slots, or telling Kotlin to disconnect a GATT that belongs to
+    /// someone else. Every operation checks this first.
+    fn ensure_current(&self) -> Result<()> {
+        let connections = self.inner.connections.lock().unwrap();
+        let current = connections.get(&self.address).map(|state| state.session);
+        match (self.session, current) {
+            (Some(mine), Some(now)) if mine == now => Ok(()),
+            // No session recorded on either side: nothing to distinguish, so
+            // fall back to address behaviour rather than refusing outright.
+            (None, _) | (_, None) => Ok(()),
+            _ => Err(BleError::NotConnected(self.address.clone())),
+        }
+    }
+}
+
 #[async_trait]
 impl GattConnection for AndroidGattConnection {
     fn peer(&self) -> PeerAddress {
@@ -853,6 +894,7 @@ impl GattConnection for AndroidGattConnection {
     }
 
     async fn read(&mut self, characteristic: CharacteristicUuid) -> Result<Vec<u8>> {
+        self.ensure_current()?;
         let request_id = self.inner.next_op_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         {
@@ -908,6 +950,7 @@ impl GattConnection for AndroidGattConnection {
     async fn write_with_type(
         &mut self, characteristic: CharacteristicUuid, value: Vec<u8>, write_type: WriteType,
     ) -> Result<()> {
+        self.ensure_current()?;
         let request_id = self.inner.next_op_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         {
@@ -951,6 +994,7 @@ impl GattConnection for AndroidGattConnection {
     async fn subscribe(
         &mut self, characteristic: CharacteristicUuid,
     ) -> Result<BoxStream<Result<Vec<u8>>>> {
+        self.ensure_current()?;
         let request_id = self.inner.next_op_id.fetch_add(1, Ordering::Relaxed);
         let (confirm_tx, confirm_rx) = oneshot::channel();
         let (notify_tx, notify_rx) = mpsc::channel(NOTIFY_QUEUE_DEPTH);
@@ -994,6 +1038,9 @@ impl GattConnection for AndroidGattConnection {
     }
 
     async fn disconnect(&mut self) -> Result<()> {
+        // Most important here: a stale handle's `disconnect` would otherwise
+        // tear down the connection that replaced it.
+        self.ensure_current()?;
         let (tx, rx) = oneshot::channel();
         {
             let mut connections = self.inner.connections.lock().unwrap();
@@ -1536,6 +1583,35 @@ impl Drop for PendingOpGuard {
                 PendingOp::Write => state.write_tx = None,
             }
         }
+    }
+}
+
+/// Tears down an `advertise()` that was abandoned before its result was
+/// observed.
+///
+/// `Drop` cannot await, so the teardown is handed to a short detached task.
+/// Leaving the attempt running would strand a GATT server that no caller
+/// holds — and unlike a stranded connection, that also blocks every later
+/// advertise on the same bridge.
+struct AdvertiseGuard {
+    inner: Arc<Inner>,
+    armed: bool,
+}
+
+impl Drop for AdvertiseGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            if let Some(pending) = inner.advertise_tx.lock().unwrap().take() {
+                let _ = pending.send(Err(ADVERTISE_ERROR_STOPPED));
+            }
+            if let Ok(mut env) = inner.env() {
+                let _ = inner.call_void(&mut env, "stopAdvertising", "()V", &[]);
+            }
+        });
     }
 }
 

@@ -70,6 +70,9 @@ pub struct MockNetwork {
     /// Session ids handed to connections, so the mock reproduces the real
     /// backends' ability to distinguish successive links to one address.
     next_session: std::sync::atomic::AtomicU64,
+    /// Newest session per (central, peripheral) pair, so the mock can
+    /// reproduce a stale handle being superseded.
+    live_sessions: Mutex<HashMap<(PeerAddress, PeerAddress), u64>>,
 }
 
 impl MockNetwork {
@@ -304,11 +307,17 @@ impl Backend for MockBackend {
                 session: None,
             },
         );
+        let session = self
+            .network
+            .next_session
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.network
+            .live_sessions
+            .lock()
+            .unwrap()
+            .insert((self.address.clone(), peer.clone()), session);
         Ok(Box::new(MockGattConnection {
-            session: self
-                .network
-                .next_session
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            session,
             central: self.address.clone(),
             peripheral: peer.clone(),
             network: self.network.clone(),
@@ -481,6 +490,25 @@ struct MockGattConnection {
     network: Arc<MockNetwork>,
 }
 
+impl MockGattConnection {
+    /// Refuse to act when a newer connection to this peer has superseded us.
+    fn ensure_current(&self) -> Result<()> {
+        let current = self
+            .network
+            .live_sessions
+            .lock()
+            .unwrap()
+            .get(&(self.central.clone(), self.peripheral.clone()))
+            .copied();
+        match current {
+            Some(now) if now != self.session => {
+                Err(BleError::NotConnected(self.peripheral.0.clone()))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 #[async_trait]
 impl GattConnection for MockGattConnection {
     fn peer(&self) -> PeerAddress {
@@ -496,6 +524,7 @@ impl GattConnection for MockGattConnection {
     }
 
     async fn read(&mut self, characteristic: CharacteristicUuid) -> Result<Vec<u8>> {
+        self.ensure_current()?;
         let peripherals = self.network.peripherals.lock().unwrap();
         let state = peripherals
             .get(&self.peripheral)
@@ -510,6 +539,7 @@ impl GattConnection for MockGattConnection {
     async fn write_with_type(
         &mut self, characteristic: CharacteristicUuid, value: Vec<u8>, _write_type: WriteType,
     ) -> Result<()> {
+        self.ensure_current()?;
         // The mock delivers both write types identically: it has no real
         // link to drop packets on, so modelling WithoutResponse as lossy
         // would invent a failure mode rather than reproduce one.
@@ -548,6 +578,7 @@ impl GattConnection for MockGattConnection {
     async fn subscribe(
         &mut self, characteristic: CharacteristicUuid,
     ) -> Result<BoxStream<Result<Vec<u8>>>> {
+        self.ensure_current()?;
         let delay = *self.network.subscribe_delay.lock().unwrap();
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
@@ -584,6 +615,9 @@ impl GattConnection for MockGattConnection {
     }
 
     async fn disconnect(&mut self) -> Result<()> {
+        // Mirrors both real backends: a handle kept across a reconnect must
+        // not tear down the session that replaced it.
+        self.ensure_current()?;
         self.network
             .disconnect_log
             .lock()
