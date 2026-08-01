@@ -139,6 +139,13 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         val requestId: Long,
     )
 
+    /// Chunks of an ATT Prepare Write, keyed by device+characteristic and
+    /// ordered by offset. A central uses this for values larger than one MTU
+    /// and for reliable writes; applying each chunk on arrival published a
+    /// series of partial values as if each were a complete write.
+    private val preparedWrites =
+        ConcurrentHashMap<String, java.util.TreeMap<Int, ByteArray>>()
+
     private val notifyQueue = ArrayDeque<PendingNotify>()
     private var notifyInFlight: PendingNotify? = null
 
@@ -213,6 +220,9 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 onPeerDiscovered(
                     nativeHandle,
                     generation,
+                    // Already parsed to match the scan filter; passing it on
+                    // costs nothing and is what Linux and the mock report.
+                    (uuids ?: emptyList()).map { it.uuid.toString() }.toTypedArray(),
                     result.device.address,
                     result.device.name,
                     result.rssi,
@@ -710,8 +720,22 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 synchronized(this@BleGattBridge) {
                     if (serverGeneration != generation) return
                     val value = characteristic.value ?: ByteArray(0)
+                    // A central continuing a long read sends Read Blob with a
+                    // nonzero offset. Returning the whole value again while
+                    // echoing that offset duplicates data or fails outright;
+                    // the response must carry the suffix from `offset`.
+                    if (offset > value.size) {
+                        gattServer?.sendResponse(
+                            device, requestId, BluetoothGatt.GATT_INVALID_OFFSET, offset, null
+                        )
+                        return
+                    }
                     gattServer?.sendResponse(
-                        device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value
+                        device,
+                        requestId,
+                        BluetoothGatt.GATT_SUCCESS,
+                        offset,
+                        value.copyOfRange(offset, value.size),
                     )
                 }
             }
@@ -740,6 +764,21 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 // is reassembled as current data.
                 synchronized(this@BleGattBridge) {
                     if (serverGeneration != generation) return
+
+                    // Prepared chunks are staged, not applied: the value is
+                    // only complete once the central sends Execute Write.
+                    if (preparedWrite) {
+                        val key = "${device.address}/${characteristic.uuid}"
+                        preparedWrites
+                            .getOrPut(key) { java.util.TreeMap() }[offset] = value
+                        if (responseNeeded) {
+                            gattServer?.sendResponse(
+                                device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value
+                            )
+                        }
+                        return
+                    }
+
                     characteristic.value = value
                     if (responseNeeded) {
                         gattServer?.sendResponse(
@@ -749,6 +788,36 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                     onServerCharacteristicWritten(
                         nativeHandle, device.address, characteristic.uuid.toString(), value
                     )
+                }
+            }
+
+            /// Apply or discard everything staged by Prepare Write.
+            ///
+            /// Without this the central's execute went unacknowledged, so a
+            /// reliable or long write never completed from its point of view
+            /// even though the chunks had already been published.
+            override fun onExecuteWrite(device: BluetoothDevice, requestId: Int, execute: Boolean) {
+                synchronized(this@BleGattBridge) {
+                    if (serverGeneration != generation) return
+                    val prefix = "${device.address}/"
+                    val keys = preparedWrites.keys.filter { it.startsWith(prefix) }
+                    for (key in keys) {
+                        val staged = preparedWrites.remove(key) ?: continue
+                        if (!execute) continue
+                        val uuid = key.removePrefix(prefix)
+                        val characteristic = serverCharacteristics[uuid] ?: continue
+                        // TreeMap iterates in offset order, so the chunks
+                        // rejoin in the order the central wrote them.
+                        val assembled = java.io.ByteArrayOutputStream()
+                        for (chunk in staged.values) {
+                            assembled.write(chunk)
+                        }
+                        val value = assembled.toByteArray()
+                        @Suppress("DEPRECATION")
+                        characteristic.value = value
+                        onServerCharacteristicWritten(nativeHandle, device.address, uuid, value)
+                    }
+                    gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
                 }
             }
 
@@ -969,6 +1038,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         pendingReadIds.clear()
         pendingWriteIds.clear()
         pendingSubscribeIds.clear()
+        preparedWrites.clear()
         stopScan()
         stopAdvertising()
     }

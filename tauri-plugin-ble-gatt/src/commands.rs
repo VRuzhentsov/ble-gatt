@@ -27,7 +27,10 @@ pub struct PluginState {
     /// Dropping the JS handler alone does not: the `Channel` stays valid and
     /// Rust keeps sending, so repeated subscribe/dispose cycles accumulated
     /// tasks and IPC traffic forever.
-    watchers: Mutex<HashMap<u64, tokio::task::JoinHandle<()>>>,
+    /// Shared so a watcher task can remove its own entry when it exits
+    /// on its own — otherwise a channel dropped by a webview reload leaves
+    /// a completed handle here for the life of the plugin.
+    watchers: Arc<Mutex<HashMap<u64, tokio::task::JoinHandle<()>>>>,
     backend: Arc<dyn Backend>,
     /// Each connection gets its own lock. A single map-wide mutex was held
     /// across `.await`, so one slow or hung GATT operation blocked every
@@ -41,7 +44,7 @@ impl PluginState {
         Self {
             backend,
             connections: Mutex::new(HashMap::new()),
-            watchers: Mutex::new(HashMap::new()),
+            watchers: Arc::new(Mutex::new(HashMap::new())),
             next_handle: AtomicU64::new(1),
         }
     }
@@ -368,14 +371,19 @@ pub async fn ble_watch_events(
 ) -> Result<u64, String> {
     let mut events = state.backend.events();
     let id = state.next_handle.fetch_add(1, Ordering::SeqCst);
+    let watchers = state.watchers.clone();
     let task = tokio::spawn(async move {
         while let Some(event) = events.next().await {
-            // Send failure means the JS side dropped the channel; stop
-            // rather than spin forwarding into nothing.
+            // Send failure means the JS side dropped the channel — a webview
+            // reload, a closed window — and no disposer will ever call
+            // `ble_unwatch_events`. Stop forwarding, and take this entry out
+            // of the registry on the way: leaving it behind accumulated a
+            // finished handle per page lifecycle for the life of the plugin.
             if on_event.send(GattEventDto::from(event)).is_err() {
-                return;
+                break;
             }
         }
+        watchers.lock().await.remove(&id);
     });
     state.watchers.lock().await.insert(id, task);
     Ok(id)

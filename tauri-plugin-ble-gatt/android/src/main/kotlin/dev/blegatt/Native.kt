@@ -22,7 +22,7 @@ package dev.blegatt
 /// index-for-index with their key arrays.
 external fun onPeerDiscovered(
     nativeHandle: Long,
-    generation: Long, address: String, name: String?, rssi: Int,
+    generation: Long, advertisedServiceUuids: Array<String>, address: String, name: String?, rssi: Int,
     manufacturerIds: IntArray, manufacturerValues: Array<ByteArray>,
     serviceDataUuids: Array<String>, serviceDataValues: Array<ByteArray>,
 )

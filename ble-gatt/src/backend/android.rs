@@ -1235,7 +1235,8 @@ fn read_byte_array_array(env: &mut JNIEnv, array: &JObjectArray, len: i32) -> Ve
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onPeerDiscovered<'local>(
-    mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, generation: jlong, address: JString<'local>,
+    mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, generation: jlong,
+    advertised_service_uuids: JObjectArray<'local>, address: JString<'local>,
     name: JString<'local>, rssi: jint, manufacturer_ids: JIntArray<'local>,
     manufacturer_values: JObjectArray<'local>, service_data_uuids: JObjectArray<'local>,
     service_data_values: JObjectArray<'local>,
@@ -1269,6 +1270,22 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onPeerDiscovered<'local>(
         }
     }
 
+    // Android already parsed these to match the scan filter, so reporting
+    // them costs nothing — and an empty list made a `DiscoveredPeer` from
+    // this backend claim no advertised services at all, unlike Linux and the
+    // mock, breaking consumers that inspect the field.
+    let mut services = Vec::new();
+    if let Ok(len) = env.get_array_length(&advertised_service_uuids) {
+        for i in 0..len {
+            let Ok(item) = env.get_object_array_element(&advertised_service_uuids, i) else {
+                continue;
+            };
+            if let Ok(uuid) = Uuid::parse_str(&read_jstring(&mut env, &JString::from(item))) {
+                services.push(ServiceUuid(uuid));
+            }
+        }
+    }
+
     let scan = inner.scan.lock().unwrap();
     // Discard results belonging to a scan that has already been replaced.
     // A callback can already be executing when its scan is stopped, and
@@ -1284,7 +1301,7 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onPeerDiscovered<'local>(
         let peer = DiscoveredPeer {
             address: PeerAddress(address),
             name,
-            services: Vec::new(),
+            services,
             manufacturer_data,
             service_data,
             rssi: Some(rssi as i16),
