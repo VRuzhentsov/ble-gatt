@@ -553,6 +553,31 @@ impl GattConnection for MockGattConnection {
         &mut self, characteristic: CharacteristicUuid, value: Vec<u8>, _write_type: WriteType,
     ) -> Result<()> {
         self.ensure_current()?;
+        // Validate against the advertised spec before mutating anything.
+        // Accepting any UUID meant a protocol test could pass with a
+        // mistyped characteristic, or with one the peripheral never declared
+        // writable, and only fail on a real device — where neither backend
+        // exposes a writable characteristic for that input at all.
+        {
+            let peripherals = self.network.peripherals.lock().unwrap();
+            let state = peripherals
+                .get(&self.peripheral)
+                .ok_or_else(|| BleError::NotConnected(self.peripheral.0.clone()))?;
+            let spec = state
+                .service
+                .characteristics
+                .iter()
+                .find(|spec| spec.uuid == characteristic)
+                .ok_or_else(|| {
+                    BleError::Gatt(format!("unknown characteristic {}", characteristic.0))
+                })?;
+            if !spec.writable {
+                return Err(BleError::Gatt(format!(
+                    "characteristic {} is not writable",
+                    characteristic.0
+                )));
+            }
+        }
         // The mock delivers both write types identically: it has no real
         // link to drop packets on, so modelling WithoutResponse as lossy
         // would invent a failure mode rather than reproduce one.

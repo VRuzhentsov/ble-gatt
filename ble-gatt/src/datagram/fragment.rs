@@ -1,23 +1,34 @@
 //! Fragment header encoding and payload splitting.
 //!
 //! Every fragment — including a message small enough to fit in one — carries
-//! the same 6-byte header. A single uniform path is worth the 6 bytes: a
+//! the same 8-byte header. A single uniform path is worth the 8 bytes: a
 //! "small messages skip the header" optimisation would mean the receiver has
 //! to guess which format it is looking at, and that guess is exactly where
 //! framing bugs live.
 //!
 //! ```text
-//! offset 0..2   msg_id   u16 little-endian   rolling per-channel counter, wraps
-//! offset 2..4   index    u16 little-endian   0-based fragment index
-//! offset 4..6   total    u16 little-endian   fragment count for this message
-//! offset 6..    payload
+//! offset 0..4   msg_id   u32 little-endian   rolling per-channel counter
+//! offset 4..6   index    u16 little-endian   0-based fragment index
+//! offset 6..8   total    u16 little-endian   fragment count for this message
+//! offset 8..    payload
 //! ```
+//!
+//! `msg_id` is 32 bits rather than 16 deliberately, and the extra two bytes
+//! buy correctness rather than headroom. With a 16-bit counter a sender
+//! using unacknowledged writes can wrap through 65,536 messages well inside
+//! the 30-second reassembly timeout and reuse an id whose message is still
+//! incomplete — after which the receiver splices fragments from two
+//! different messages into one that completes and passes every check.
+//! Content-based detection cannot close that: if the fragment the first
+//! message lost is exactly the one the second supplies, the arriving index
+//! is not a duplicate and nothing looks wrong. Only making reuse
+//! unreachable does, and at 2^32 ids it is.
 
 use crate::error::{BleError, Result};
 
 /// Size of the fragment header in bytes. Subtract from a connection's
 /// `max_write_len()` to get the per-fragment payload budget.
-pub const FRAGMENT_HEADER_LEN: usize = 6;
+pub const FRAGMENT_HEADER_LEN: usize = 8;
 
 /// Largest number of fragments one message can be split into, bounded by the
 /// `u16` `total` field.
@@ -25,7 +36,7 @@ pub const MAX_FRAGMENTS: usize = u16::MAX as usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FragmentHeader {
-    pub msg_id: u16,
+    pub msg_id: u32,
     pub index: u16,
     pub total: u16,
 }
@@ -45,9 +56,9 @@ impl FragmentHeader {
             return None;
         }
         let header = Self {
-            msg_id: u16::from_le_bytes([bytes[0], bytes[1]]),
-            index: u16::from_le_bytes([bytes[2], bytes[3]]),
-            total: u16::from_le_bytes([bytes[4], bytes[5]]),
+            msg_id: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            index: u16::from_le_bytes([bytes[4], bytes[5]]),
+            total: u16::from_le_bytes([bytes[6], bytes[7]]),
         };
         Some((header, &bytes[FRAGMENT_HEADER_LEN..]))
     }
@@ -59,7 +70,7 @@ impl FragmentHeader {
 /// An empty payload still produces exactly one fragment (`total = 1`, empty
 /// body) so that "send nothing" round-trips as "receive nothing" rather than
 /// silently vanishing.
-pub fn split(msg_id: u16, payload: &[u8], max_fragment_payload: usize) -> Result<Vec<Vec<u8>>> {
+pub fn split(msg_id: u32, payload: &[u8], max_fragment_payload: usize) -> Result<Vec<Vec<u8>>> {
     if max_fragment_payload == 0 {
         return Err(BleError::Gatt(
             "fragment payload budget is zero — negotiated MTU is too small to carry data"

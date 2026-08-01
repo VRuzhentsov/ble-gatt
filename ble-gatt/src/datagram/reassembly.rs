@@ -58,7 +58,7 @@ struct PartialMessage {
 /// only unique within a single sender's channel.
 pub struct Reassembler {
     limits: ReassemblyLimits,
-    partial: BTreeMap<u16, PartialMessage>,
+    partial: BTreeMap<u32, PartialMessage>,
 }
 
 impl Reassembler {
@@ -222,7 +222,7 @@ mod tests {
         }
     }
 
-    fn header(msg_id: u16, index: u16, total: u16) -> FragmentHeader {
+    fn header(msg_id: u32, index: u16, total: u16) -> FragmentHeader {
         FragmentHeader {
             msg_id,
             index,

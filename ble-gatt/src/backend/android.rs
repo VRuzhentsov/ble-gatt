@@ -581,10 +581,17 @@ impl Backend for AndroidBackend {
         // so an abandoned attempt's cleanup cannot interleave with a retry.
         // Released before awaiting the result, so a cancelled attempt's
         // cleanup is able to acquire it.
-        let advertise_generation = {
-            let _serialise = self.inner.advertise_lock.lock().await;
-            self.inner.advertise_generation.fetch_add(1, Ordering::SeqCst) + 1
-        };
+        // Held across claiming the generation *and* issuing the platform
+        // call. Releasing after the increment left two windows: a
+        // `stop_advertising` could complete while no attempt was installed
+        // and this future would then start a server after the stop returned,
+        // and two attempts could claim generations in one order and call
+        // Kotlin in the other, so the older one replaced the newer. Released
+        // before awaiting the result, so a cancelled attempt's cleanup can
+        // still acquire it.
+        let serialise = self.inner.advertise_lock.lock().await;
+        let advertise_generation =
+            self.inner.advertise_generation.fetch_add(1, Ordering::SeqCst) + 1;
         // Scoped: `JNIEnv` is `!Send`, so it must be entirely out of scope
         // before the `.await` below, or the whole future stops being `Send`
         // and no longer satisfies the trait.
@@ -642,6 +649,8 @@ impl Backend for AndroidBackend {
         )?;
         rx
         };
+
+        drop(serialise);
 
         // Armed once the platform call has been issued. A caller that times
         // out or drops this future runs none of the code below, and dropping
@@ -888,15 +897,26 @@ impl AndroidGattConnection {
     /// *replacement* session — installing its waiters into that session's
     /// slots, or telling Kotlin to disconnect a GATT that belongs to
     /// someone else. Every operation checks this first.
-    fn ensure_current(&self) -> Result<()> {
-        let connections = self.inner.connections.lock().unwrap();
-        let current = connections.get(&self.address).map(|state| state.session);
-        match (self.session, current) {
-            (Some(mine), Some(now)) if mine == now => Ok(()),
-            // No session recorded on either side: nothing to distinguish, so
-            // fall back to address behaviour rather than refusing outright.
-            (None, _) | (_, None) => Ok(()),
-            _ => Err(BleError::NotConnected(self.address.clone())),
+    /// Check ownership *and* install this operation's waiter in one
+    /// critical section.
+    ///
+    /// Checking first and assigning afterwards let a reconnect land in
+    /// between, so a stale handle overwrote the replacement session's
+    /// waiter — Kotlin then rejected the stale operation, that rejection
+    /// removed the sender, and the replacement's own callback found no
+    /// waiter, leaving its future pending forever.
+    fn with_session<T>(&self, install: impl FnOnce(&mut ConnectionState) -> T) -> Result<T> {
+        let mut connections = self.inner.connections.lock().unwrap();
+        let state = connections
+            .get_mut(&self.address)
+            .ok_or_else(|| BleError::NotConnected(self.address.clone()))?;
+        match self.session {
+            // A handle with no session predates session tracking; fall back
+            // to address behaviour rather than refusing outright.
+            Some(mine) if mine != state.session => {
+                Err(BleError::NotConnected(self.address.clone()))
+            }
+            _ => Ok(install(state)),
         }
     }
 }
@@ -922,12 +942,9 @@ impl GattConnection for AndroidGattConnection {
     }
 
     async fn read(&mut self, characteristic: CharacteristicUuid) -> Result<Vec<u8>> {
-        self.ensure_current()?;
         let request_id = self.inner.next_op_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        {
-            let mut connections = self.inner.connections.lock().unwrap();
-            let state = connections.entry(self.address.clone()).or_default();
+        self.with_session(|state| {
             // Refuse rather than replace: a second read while one is in
             // flight would strand the first caller, and the platform has one
             // outstanding read per connection anyway.
@@ -938,7 +955,8 @@ impl GattConnection for AndroidGattConnection {
                 )));
             }
             state.read_tx = Some((request_id, tx));
-        }
+            Ok(())
+        })??;
         // Armed *before* the fallible JNI setup below, not after. Installing
         // the sender and then returning early on a transient failure — a JNI
         // attach, a string allocation, a missing runtime permission — left
@@ -979,14 +997,9 @@ impl GattConnection for AndroidGattConnection {
     async fn write_with_type(
         &mut self, characteristic: CharacteristicUuid, value: Vec<u8>, write_type: WriteType,
     ) -> Result<()> {
-        self.ensure_current()?;
         let request_id = self.inner.next_op_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        {
-            let mut connections = self.inner.connections.lock().unwrap();
-            let state = connections.entry(self.address.clone()).or_default();
-            state.write_tx = Some((request_id, tx));
-        }
+        self.with_session(|state| state.write_tx = Some((request_id, tx)))?;
         // Same reasoning as `read`: armed before the fallible setup, so a
         // transient JNI failure cannot strand the slot.
         let guard = PendingOpGuard {
@@ -1024,17 +1037,26 @@ impl GattConnection for AndroidGattConnection {
     async fn subscribe(
         &mut self, characteristic: CharacteristicUuid,
     ) -> Result<BoxStream<Result<Vec<u8>>>> {
-        self.ensure_current()?;
         let request_id = self.inner.next_op_id.fetch_add(1, Ordering::Relaxed);
         let (confirm_tx, confirm_rx) = oneshot::channel();
         let (notify_tx, notify_rx) = mpsc::channel(NOTIFY_QUEUE_DEPTH);
         let overflow = Arc::new(AtomicBool::new(false));
-        {
-            let mut connections = self.inner.connections.lock().unwrap();
-            let state = connections.entry(self.address.clone()).or_default();
+        self.with_session(|state| {
             state.subscribe_tx.insert(characteristic, (request_id, confirm_tx));
             state.notify_tx.insert(characteristic, (notify_tx, overflow.clone()));
-        }
+        })?;
+        // Every unsuccessful exit — a peer rejecting the subscription, an
+        // unknown UUID, a JNI failure, or this future being dropped — must
+        // remove both entries. Leaving them behind grows the connection's
+        // maps with dead senders, and a failed retry for a UUID that already
+        // had a live route would replace it with one whose receiver is gone.
+        let subscribe_guard = SubscribeGuard {
+            inner: self.inner.clone(),
+            address: self.address.clone(),
+            characteristic,
+            request_id,
+            armed: true,
+        };
         {
             let mut env = self.inner.env()?;
             let address = env.new_string(&self.address).map_err(|err| BleError::Gatt(err.to_string()))?;
@@ -1062,6 +1084,10 @@ impl GattConnection for AndroidGattConnection {
                 characteristic.0
             )));
         }
+        // Subscribed: the entries are live, so the guard must not remove
+        // them.
+        let mut subscribe_guard = subscribe_guard;
+        subscribe_guard.armed = false;
         Ok(Box::pin(NotifyStream {
             rx: ReceiverStream::new(notify_rx),
             overflow,
@@ -1071,12 +1097,8 @@ impl GattConnection for AndroidGattConnection {
     async fn disconnect(&mut self) -> Result<()> {
         // Most important here: a stale handle's `disconnect` would otherwise
         // tear down the connection that replaced it.
-        self.ensure_current()?;
         let (tx, rx) = oneshot::channel();
-        {
-            let mut connections = self.inner.connections.lock().unwrap();
-            connections.entry(self.address.clone()).or_default().disconnected_tx = Some(tx);
-        }
+        self.with_session(|state| state.disconnected_tx = Some(tx))?;
         {
             let mut env = self.inner.env()?;
             let address = env.new_string(&self.address).map_err(|err| BleError::Gatt(err.to_string()))?;
@@ -1616,6 +1638,44 @@ impl Drop for PendingOpGuard {
                 PendingOp::Read => state.read_tx = None,
                 PendingOp::Write => state.write_tx = None,
             }
+        }
+    }
+}
+
+/// Removes a subscription's waiter and notification route unless the
+/// subscribe succeeded.
+///
+/// `onSubscribed` only removes `subscribe_tx`, so without this a rejected,
+/// failed or abandoned attempt left `notify_tx` holding a sender whose
+/// receiver had been dropped — accumulating per distinct UUID until the
+/// connection closed, and clobbering a live route when a retry for an
+/// existing UUID failed.
+struct SubscribeGuard {
+    inner: Arc<Inner>,
+    address: String,
+    characteristic: CharacteristicUuid,
+    request_id: u64,
+    armed: bool,
+}
+
+impl Drop for SubscribeGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut connections = self.inner.connections.lock().unwrap();
+        let Some(state) = connections.get_mut(&self.address) else {
+            return;
+        };
+        // Conditional on request id: a retry may already own these entries,
+        // and removing them would strand it.
+        if state
+            .subscribe_tx
+            .get(&self.characteristic)
+            .is_some_and(|(id, _)| *id == self.request_id)
+        {
+            state.subscribe_tx.remove(&self.characteristic);
+            state.notify_tx.remove(&self.characteristic);
         }
     }
 }

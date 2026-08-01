@@ -293,7 +293,10 @@ pub struct DatagramChannel {
     /// would be the first thing discarded — the failure would silence its
     /// own alarm.
     overflow: Arc<OverflowSignal>,
-    next_msg_id: u16,
+    /// Rolling message id. 32-bit so it cannot wrap back onto an id whose
+    /// message is still being reassembled — see `fragment`'s header docs for
+    /// why 16 bits was not merely tight but unsound.
+    next_msg_id: u32,
     max_message_len: usize,
     /// Fixed at construction from the negotiated MTU. BLE does not
     /// renegotiate mid-session in practice, so this is not refreshed.

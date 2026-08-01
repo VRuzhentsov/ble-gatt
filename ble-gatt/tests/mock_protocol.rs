@@ -646,3 +646,68 @@ async fn simulated_peer_loss_closes_the_link_as_well_as_announcing_it() {
         "a lost peer must no longer be reachable by notify"
     );
 }
+
+#[tokio::test]
+async fn writes_to_unknown_or_read_only_characteristics_are_refused() {
+    let network = MockNetwork::new();
+    let service_uuid = ServiceUuid(Uuid::new_v4());
+    let writable_uuid = CharacteristicUuid(Uuid::new_v4());
+    let read_only_uuid = CharacteristicUuid(Uuid::new_v4());
+    let peripheral_addr = PeerAddress("peripheral-perms".to_string());
+
+    let peripheral = MockBackend::new(peripheral_addr.clone(), network.clone(), full_capabilities());
+    peripheral
+        .advertise(GattServiceSpec {
+            uuid: service_uuid,
+            characteristics: vec![
+                GattCharacteristicSpec {
+                    uuid: writable_uuid,
+                    readable: true,
+                    writable: true,
+                    notifiable: false,
+                    initial_value: Vec::new(),
+                },
+                GattCharacteristicSpec {
+                    uuid: read_only_uuid,
+                    readable: true,
+                    writable: false,
+                    notifiable: false,
+                    initial_value: b"ro".to_vec(),
+                },
+            ],
+        })
+        .await
+        .expect("advertise should succeed");
+
+    let central = MockBackend::new(
+        PeerAddress("central-perms".to_string()),
+        network.clone(),
+        full_capabilities(),
+    );
+    let mut connection = central.connect(&peripheral_addr).await.expect("connect");
+
+    connection
+        .write(writable_uuid, b"ok".to_vec())
+        .await
+        .expect("a declared writable characteristic must accept writes");
+
+    // Neither real backend exposes a writable characteristic for these, so a
+    // mock that accepted them would let a mistyped UUID or a permissions
+    // mistake pass here and fail only on a device.
+    assert!(
+        connection
+            .write(CharacteristicUuid(Uuid::new_v4()), b"x".to_vec())
+            .await
+            .is_err(),
+        "an unknown characteristic must be refused"
+    );
+    assert!(
+        connection.write(read_only_uuid, b"x".to_vec()).await.is_err(),
+        "a characteristic advertised as not writable must be refused"
+    );
+    assert_eq!(
+        connection.read(read_only_uuid).await.expect("read"),
+        b"ro",
+        "the refused write must not have mutated the value"
+    );
+}
