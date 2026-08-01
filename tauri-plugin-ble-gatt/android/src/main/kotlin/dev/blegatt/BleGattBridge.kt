@@ -802,8 +802,13 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                             device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value
                         )
                     }
+                    // Minted here if this write is the first sign of the
+                    // peer, so Kotlin stays the single source of server
+                    // session ids — Rust minting its own would give the same
+                    // map two independent id spaces.
+                    val session = serverSessions.getOrPut(device.address) { nextServerSession++ }
                     onServerCharacteristicWritten(
-                        nativeHandle, device.address, characteristic.uuid.toString(), value
+                        nativeHandle, device.address, characteristic.uuid.toString(), value, session
                     )
                 }
             }
@@ -856,11 +861,17 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                     for (key in keys) {
                         preparedWrites.remove(key)
                     }
+                    // Same session as a plain write: an executed prepared
+                    // write is this peer's traffic and must carry the same
+                    // identity, or `serve` records a sessionless channel.
+                    val session = serverSessions.getOrPut(device.address) { nextServerSession++ }
                     for ((uuid, value) in assembled) {
                         val characteristic = serverCharacteristics[uuid] ?: continue
                         @Suppress("DEPRECATION")
                         characteristic.value = value
-                        onServerCharacteristicWritten(nativeHandle, device.address, uuid, value)
+                        onServerCharacteristicWritten(
+                            nativeHandle, device.address, uuid, value, session
+                        )
                     }
                     gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
                 }

@@ -943,9 +943,15 @@ impl LinuxGattConnection {
     /// Refuse to act when a newer dial to this peer has superseded us,
     /// matching the Android and mock backends.
     fn ensure_current(&self) -> Result<()> {
+        // A *missing* entry is not ownership. `report_central_loss` removes
+        // the address once the link drops, so treating absence as "still
+        // ours" let a retained handle keep driving the address-backed
+        // `Device` — and if that peer had since connected to us in the
+        // peripheral role, its `disconnect()` would tear down that inbound
+        // link instead.
         match self.dialed.lock().unwrap().get(&self.peer) {
-            Some(now) if *now != self.session => Err(BleError::NotConnected(self.peer.0.clone())),
-            _ => Ok(()),
+            Some(now) if *now == self.session => Ok(()),
+            _ => Err(BleError::NotConnected(self.peer.0.clone())),
         }
     }
 }

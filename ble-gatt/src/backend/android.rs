@@ -1588,7 +1588,7 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onCharacteristicChanged<'local>
 #[no_mangle]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onServerCharacteristicWritten<'local>(
     mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, address: JString<'local>,
-    characteristic_uuid: JString<'local>, value: JByteArray<'local>,
+    characteristic_uuid: JString<'local>, value: JByteArray<'local>, session: jlong,
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
     let address = read_jstring(&mut env, &address);
@@ -1601,10 +1601,22 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onServerCharacteristicWritten<'
     // server callback does not fire; `serve` treats `Connected` as
     // idempotent, so a duplicate here is harmless. Always the peripheral
     // role — this is a write arriving at *our* GATT server.
+    // Kotlin supplies the session, minting one if this write is the first
+    // sign of the peer. A central that writes before enabling its CCCD
+    // arrives here first, and `serve` records *this* event — the later
+    // `onServerSubscribed` is discarded as a duplicate. Emitting `None` here
+    // therefore left the channel sessionless for its whole life, so its
+    // sends fell back to targeting whichever session owned the address.
+    let session = session as u64;
+    inner
+        .server_sessions
+        .lock()
+        .unwrap()
+        .insert(address.clone(), session);
     let _ = inner.server_events_tx.send(GattEvent::Connected {
         peer: PeerAddress(address.clone()),
         local_role: Role::Peripheral,
-        session: None,
+        session: Some(session),
     });
     let _ = inner.server_events_tx.send(GattEvent::CharacteristicWritten {
         peer: PeerAddress(address),

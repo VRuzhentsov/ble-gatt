@@ -55,7 +55,9 @@ external fun onCharacteristicChanged(
 )
 
 external fun onServerCharacteristicWritten(
-    nativeHandle: Long, address: String, characteristicUuid: String, value: ByteArray
+    // `session` identifies the server-side peer; see `onServerSubscribed`.
+    nativeHandle: Long, address: String, characteristicUuid: String, value: ByteArray,
+    session: Long,
 )
 
 /// Asynchronous advertise outcome. `startAdvertising` returns before Android

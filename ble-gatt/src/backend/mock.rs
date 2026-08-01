@@ -139,13 +139,19 @@ impl MockNetwork {
     /// concerned, even with the link still up — so the mock must too, or the
     /// lockout it causes is untestable here.
     pub fn simulate_unsubscribe(&self, peripheral: &PeerAddress, central: &PeerAddress) {
+        let session = self
+            .live_sessions
+            .lock()
+            .unwrap()
+            .get(&(central.clone(), peripheral.clone()))
+            .copied();
         self.drop_subscriptions(peripheral, central);
         self.emit(
             peripheral,
             GattEvent::Disconnected {
                 peer: central.clone(),
                 local_role: Role::Peripheral,
-                session: None,
+                session,
             },
         );
     }
@@ -734,12 +740,19 @@ impl GattConnection for MockGattConnection {
         // same — Android from the CCCD write, Linux from AcquireNotify — and
         // the mock announcing at connect made a server-first greeting look
         // safe in tests while it could still race in production.
+        //
+        // This is the event `serve` actually records, because
+        // `datagram::connect` subscribes before it writes; the write-derived
+        // one that follows is ignored as a duplicate. So the session has to
+        // be here — carrying it only on the later event left every channel
+        // sessionless and every disconnect and notify taking the unchecked
+        // `None` path.
         self.network.emit(
             &self.peripheral,
             GattEvent::Connected {
                 peer: self.central.clone(),
                 local_role: Role::Peripheral,
-                session: None,
+                session: Some(self.session),
             },
         );
         Ok(Box::pin(UnboundedReceiverStream::new(rx)))
