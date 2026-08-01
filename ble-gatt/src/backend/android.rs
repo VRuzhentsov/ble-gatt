@@ -172,6 +172,12 @@ struct Inner {
     /// Which advertise attempt is current. A guard for an abandoned attempt
     /// must not tear down the advertisement that replaced it.
     advertise_generation: AtomicU64,
+    /// Serialises starting an advertisement against cleaning up an abandoned
+    /// one. Reading the generation and then acting on it are two steps, so
+    /// without this a retry could increment, install its sender and start
+    /// its server in between — and the abandoned attempt's cleanup would
+    /// then take the retry's sender and stop the retry's advertisement.
+    advertise_lock: tokio::sync::Mutex<()>,
 }
 
 impl Inner {
@@ -313,6 +319,7 @@ impl AndroidBackend {
             next_notify_id: AtomicU64::new(1),
             next_op_id: AtomicU64::new(1),
             advertise_generation: AtomicU64::new(1),
+            advertise_lock: tokio::sync::Mutex::new(()),
         });
 
         // See the module doc comment: this pointer must stay valid for as
@@ -570,13 +577,14 @@ impl Backend for AndroidBackend {
     }
 
     async fn advertise(&self, service: GattServiceSpec) -> Result<()> {
-        // Claimed before the platform call, so an abandoned attempt's guard
-        // can tell whether a retry has since superseded it.
-        let advertise_generation = self
-            .inner
-            .advertise_generation
-            .fetch_add(1, Ordering::SeqCst)
-            + 1;
+        // Held across claiming the generation and issuing the platform call,
+        // so an abandoned attempt's cleanup cannot interleave with a retry.
+        // Released before awaiting the result, so a cancelled attempt's
+        // cleanup is able to acquire it.
+        let advertise_generation = {
+            let _serialise = self.inner.advertise_lock.lock().await;
+            self.inner.advertise_generation.fetch_add(1, Ordering::SeqCst) + 1
+        };
         // Scoped: `JNIEnv` is `!Send`, so it must be entirely out of scope
         // before the `.await` below, or the whole future stops being `Send`
         // and no longer satisfies the trait.
@@ -1636,6 +1644,11 @@ impl Drop for AdvertiseGuard {
         let inner = self.inner.clone();
         let generation = self.generation;
         tokio::spawn(async move {
+            // Serialised against `advertise`, so the check and the teardown
+            // are one transition: a retry cannot slip between reading the
+            // generation and acting on it, which would otherwise have this
+            // task take the retry's sender and stop the retry's server.
+            let _serialise = inner.advertise_lock.lock().await;
             // Only if no retry has superseded this attempt. `stopAdvertising`
             // is addressless, so acting unconditionally would stop whatever
             // is advertising now.

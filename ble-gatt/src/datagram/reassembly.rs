@@ -140,9 +140,32 @@ impl Reassembler {
             .get_mut(&header.msg_id)
             .expect("inserted above when absent");
 
-        // Duplicate index: keep the first copy. Re-accepting would let a peer
-        // grow cumulative_len without bound using one index.
-        if message.fragments.contains_key(&header.index) {
+        // Duplicate index. Keeping the first copy is what stops a peer
+        // growing `cumulative_len` without bound using one index — but only
+        // when the two copies are genuinely the same fragment.
+        //
+        // A *differing* payload at an index we already hold means this
+        // `msg_id` has been reused while the previous message was still
+        // incomplete: `next_msg_id` is a `u16`, so a sender using
+        // `WithoutResponse` can wrap through 65,536 messages well inside the
+        // reassembly timeout. Merging then blends two messages into one that
+        // completes and passes every check — corrupt data delivered as
+        // valid, which is the worst outcome this layer can produce. The
+        // differing total case above already catches reuse when the sizes
+        // disagree; this catches it when they happen to match.
+        if let Some(existing) = message.fragments.get(&header.index) {
+            if existing.as_slice() == payload {
+                return Accept::Pending;
+            }
+            // Start over from this fragment: the buffered set belongs to a
+            // message that will never arrive.
+            let restarted = PartialMessage {
+                total: header.total,
+                fragments: BTreeMap::from([(header.index, payload.to_vec())]),
+                cumulative_len: payload.len(),
+                started_at: now,
+            };
+            self.partial.insert(header.msg_id, restarted);
             return Accept::Pending;
         }
         if message.cumulative_len + payload.len() > limit {
@@ -243,14 +266,34 @@ mod tests {
     }
 
     #[test]
-    fn a_duplicate_index_is_ignored_and_the_first_copy_wins() {
+    fn an_identical_duplicate_index_is_ignored() {
         let mut r = Reassembler::new(limits());
         let now = Instant::now();
+        // A genuine retransmission. Ignoring it is what stops a peer growing
+        // `cumulative_len` without bound by resending one index.
         assert_eq!(r.accept(header(1, 0, 2), b"first", now), Accept::Pending);
-        assert_eq!(r.accept(header(1, 0, 2), b"second", now), Accept::Pending);
+        assert_eq!(r.accept(header(1, 0, 2), b"first", now), Accept::Pending);
         assert_eq!(
             r.accept(header(1, 1, 2), b"!", now),
             Accept::Complete(b"first!".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_differing_duplicate_index_restarts_rather_than_keeping_the_first_copy() {
+        let mut r = Reassembler::new(limits());
+        let now = Instant::now();
+        assert_eq!(r.accept(header(1, 0, 2), b"first", now), Accept::Pending);
+        // Different bytes at an index already held means this `msg_id` has
+        // been reused while the previous message was still incomplete.
+        // Keeping the first copy — which this reassembler used to do — is
+        // what lets the two messages blend into one that completes and looks
+        // valid.
+        assert_eq!(r.accept(header(1, 0, 2), b"second", now), Accept::Pending);
+        assert_eq!(
+            r.accept(header(1, 1, 2), b"!", now),
+            Accept::Complete(b"second!".to_vec()),
+            "the completed message must be the new one, not a splice of both"
         );
     }
 
@@ -364,4 +407,45 @@ mod tests {
             Accept::Complete(b"one-first".to_vec())
         );
     }
+    #[test]
+    fn a_reused_message_id_starts_a_new_message_rather_than_blending_two() {
+        let mut reassembler = Reassembler::new(limits());
+        let now = Instant::now();
+
+        // Message A: three fragments, but the middle one is lost.
+        assert!(matches!(
+            reassembler.accept(header(7, 0, 3), b"AAAA", now),
+            Accept::Pending
+        ));
+        assert!(matches!(
+            reassembler.accept(header(7, 2, 3), b"CCCC", now),
+            Accept::Pending
+        ));
+
+        // `next_msg_id` is a u16, so a sender using unacknowledged writes can
+        // wrap all the way round well inside the reassembly timeout and
+        // reuse id 7 while A is still incomplete. This message happens to
+        // have the same fragment count, so the inconsistent-total check does
+        // not catch it.
+        assert!(matches!(
+            reassembler.accept(header(7, 0, 3), b"xxxx", now),
+            Accept::Pending
+        ));
+        assert!(matches!(
+            reassembler.accept(header(7, 1, 3), b"yyyy", now),
+            Accept::Pending
+        ));
+
+        // The fragment that completes the set must complete the *new*
+        // message. Merging would deliver A's surviving fragment inside B —
+        // a byte-for-byte blend of two messages, passing every check.
+        match reassembler.accept(header(7, 2, 3), b"zzzz", now) {
+            Accept::Complete(message) => assert_eq!(
+                message, b"xxxxyyyyzzzz",
+                "a reused id must not splice the previous message's fragments into this one"
+            ),
+            other => panic!("expected the new message to complete, got {other:?}"),
+        }
+    }
+
 }
