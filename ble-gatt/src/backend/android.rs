@@ -178,6 +178,11 @@ struct Inner {
     /// the operation that issued it rather than to whatever now occupies the
     /// slot.
     next_op_id: AtomicU64,
+    /// Session id per central attached to our GATT server, assigned when it
+    /// subscribes. Gives server-side peers the same identity outbound
+    /// connections have, so a stale caller cannot disconnect the session
+    /// that replaced the one it meant.
+    server_sessions: StdMutex<HashMap<String, u64>>,
     /// Which advertise attempt is current. A guard for an abandoned attempt
     /// must not tear down the advertisement that replaced it.
     advertise_generation: AtomicU64,
@@ -327,6 +332,7 @@ impl AndroidBackend {
             notify_waiters: StdMutex::new(HashMap::new()),
             next_notify_id: AtomicU64::new(1),
             next_op_id: AtomicU64::new(1),
+            server_sessions: StdMutex::new(HashMap::new()),
             advertise_generation: AtomicU64::new(1),
             advertise_lock: tokio::sync::Mutex::new(()),
         });
@@ -803,7 +809,14 @@ impl Backend for AndroidBackend {
         }
     }
 
-    async fn disconnect_peer(&self, peer: &PeerAddress) -> Result<()> {
+    async fn disconnect_peer(&self, peer: &PeerAddress, session: Option<u64>) -> Result<()> {
+        // Server-side peers are tracked by the session assigned when they
+        // subscribed, so a stale release cannot drop their replacement.
+        if let Some(session) = session {
+            if self.inner.server_sessions.lock().unwrap().get(&peer.0) != Some(&session) {
+                return Ok(());
+            }
+        }
         let mut env = self.inner.env()?;
         let address = env
             .new_string(&peer.0)
@@ -1430,12 +1443,17 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onDisconnected<'local>(
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
     let address = read_jstring(&mut env, &address);
-    let disconnected_session = inner
-        .connections
-        .lock()
-        .unwrap()
-        .get(&address)
-        .map(|state| state.session);
+    let disconnected_session = if from_server != 0 {
+        // Server-side peers carry the session minted when they subscribed.
+        inner.server_sessions.lock().unwrap().remove(&address)
+    } else {
+        inner
+            .connections
+            .lock()
+            .unwrap()
+            .get(&address)
+            .map(|state| state.session)
+    };
     // Likewise: a central leaving our GATT server says nothing about an
     // outbound connection we hold to that same address. Tearing down the
     // client state here would kill reads, writes and subscriptions on a
@@ -1637,12 +1655,19 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onServerSubscribed<'local>(
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
     let address = read_jstring(&mut env, &address);
+    // The subscription is the session boundary for a server-side peer, so
+    // this is where its id is minted. Reusing an existing one keeps a peer
+    // that subscribes to several characteristics as one session.
+    let session = {
+        let mut sessions = inner.server_sessions.lock().unwrap();
+        *sessions
+            .entry(address.clone())
+            .or_insert_with(|| inner.next_op_id.fetch_add(1, Ordering::Relaxed))
+    };
     let _ = inner.server_events_tx.send(GattEvent::Connected {
         peer: PeerAddress(address),
         local_role: Role::Peripheral,
-        // Android's server callbacks carry no session of their own; the
-        // subscription itself is the session boundary here.
-        session: None,
+        session: Some(session),
     });
 }
 

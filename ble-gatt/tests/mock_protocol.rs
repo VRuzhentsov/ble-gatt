@@ -408,7 +408,7 @@ async fn a_central_refused_by_a_single_peer_server_stops_receiving_notifications
 
     // What a single-peer server must actually do about it.
     peripheral
-        .disconnect_peer(&refused_addr)
+        .disconnect_peer(&refused_addr, None)
         .await
         .expect("disconnect_peer should succeed");
 

@@ -136,8 +136,8 @@ impl Backend for LazyAndroidBackend {
         self.inner().await?.notify_peer(peer, characteristic, value).await
     }
 
-    async fn disconnect_peer(&self, peer: &PeerAddress) -> Result<()> {
-        self.inner().await?.disconnect_peer(peer).await
+    async fn disconnect_peer(&self, peer: &PeerAddress, session: Option<u64>) -> Result<()> {
+        self.inner().await?.disconnect_peer(peer, session).await
     }
 
     fn events(&self) -> BoxStream<GattEvent> {

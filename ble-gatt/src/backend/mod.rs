@@ -159,7 +159,13 @@ pub trait Backend: Send + Sync {
     /// The enforcement half of a single-peer server: a refused central stays
     /// subscribed until it is dropped, so this is what actually excludes it.
     /// Best-effort and idempotent: a peer that is already gone is `Ok`.
-    async fn disconnect_peer(&self, peer: &PeerAddress) -> Result<()>;
+    ///
+    /// `session` names *which* connection to drop — every backend addresses
+    /// peers by address, so without it a caller holding stale state can
+    /// disconnect a peer's replacement session instead of the one it meant.
+    /// `None` disconnects whatever currently holds the address, which is
+    /// only correct when the caller has no session to be stale about.
+    async fn disconnect_peer(&self, peer: &PeerAddress, session: Option<u64>) -> Result<()>;
 
     // --- Lifecycle ---
 

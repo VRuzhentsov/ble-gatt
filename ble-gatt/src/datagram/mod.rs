@@ -469,7 +469,11 @@ async fn release_peer(
     }
     if let Some(served) = inbound.remove(peer) {
         served.active.store(false, Ordering::SeqCst);
-        if let Err(err) = backend.disconnect_peer(peer).await {
+        // Named by the backend session this channel was serving. Releasing a
+        // channel from a superseded `serve` generation would otherwise
+        // disconnect whatever now holds the address — the peer's own
+        // replacement session, established by the server that replaced us.
+        if let Err(err) = backend.disconnect_peer(peer, served.backend_session).await {
             eprintln!(
                 "[ble-gatt][datagram] could not disconnect released central {}: {err}",
                 peer.0
@@ -484,8 +488,8 @@ async fn release_peer(
 /// not stop the peer receiving traffic: it is still subscribed, and
 /// `Backend::notify` is a broadcast that cannot be addressed to one peer on
 /// BlueZ. Disconnecting is the only portable exclusion.
-async fn disconnect_refused(backend: &dyn Backend, peer: &PeerAddress) {
-    if let Err(err) = backend.disconnect_peer(peer).await {
+async fn disconnect_refused(backend: &dyn Backend, peer: &PeerAddress, session: Option<u64>) {
+    if let Err(err) = backend.disconnect_peer(peer, session).await {
         eprintln!(
             "[ble-gatt][datagram] could not disconnect refused central {}: {err} \
              — it may still receive broadcast notifications",
@@ -911,7 +915,7 @@ pub async fn serve(
                         // peer's fragments, interleaved into its own stream.
                         // Disconnecting is the only portable exclusion: BlueZ
                         // cannot address a notification to one peer at all.
-                        disconnect_refused(backend.as_ref(), &peer).await;
+                        disconnect_refused(backend.as_ref(), &peer, backend_session).await;
                         continue;
                     }
                     let generation = next_generation;
@@ -977,7 +981,7 @@ pub async fn serve(
                             // queue drains and another central is accepted,
                             // every broadcast notification reaches this one
                             // too.
-                            disconnect_refused(backend.as_ref(), &peer).await;
+                            disconnect_refused(backend.as_ref(), &peer, backend_session).await;
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             // Do NOT disconnect here. A generation that is
@@ -1091,14 +1095,17 @@ pub async fn serve(
                     );
                     let served: Vec<PeerAddress> = inbound.keys().cloned().collect();
                     for peer in served {
-                        if let Some(state) = inbound.remove(&peer) {
+                        let session = if let Some(state) = inbound.remove(&peer) {
                             // Report the gap first, so a receiver parked in
                             // `recv()` gets an error rather than a silent
                             // close, then invalidate the channel.
                             state.overflow.raise();
                             state.active.store(false, Ordering::SeqCst);
-                        }
-                        disconnect_refused(backend.as_ref(), &peer).await;
+                            state.backend_session
+                        } else {
+                            None
+                        };
+                        disconnect_refused(backend.as_ref(), &peer, session).await;
                     }
                     if accept_closed && inbound.is_empty() {
                         return;

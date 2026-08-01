@@ -17,6 +17,7 @@ use tokio_stream::StreamExt;
 
 use crate::backend::{Backend, BoxStream, GattConnection};
 use crate::error::{BleError, Result};
+use crate::models::GattCharacteristicSpec;
 use crate::models::{
     CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress,
     Role, ServiceUuid, WriteType,
@@ -440,7 +441,21 @@ impl Backend for MockBackend {
         Ok(())
     }
 
-    async fn disconnect_peer(&self, peer: &PeerAddress) -> Result<()> {
+    async fn disconnect_peer(&self, peer: &PeerAddress, session: Option<u64>) -> Result<()> {
+        // Mirrors the real backends: a stale caller must not drop the
+        // session that replaced the one it meant.
+        if let Some(session) = session {
+            let live = self
+                .network
+                .live_sessions
+                .lock()
+                .unwrap()
+                .get(&(peer.clone(), self.address.clone()))
+                .copied();
+            if live != Some(session) {
+                return Ok(());
+            }
+        }
         // Mirrors the real backends: the refused central learns it was
         // dropped, and the server sees the peripheral-role disconnect that
         // clears its single-central slot.
@@ -461,6 +476,15 @@ impl Backend for MockBackend {
             },
         );
         self.network.drop_subscriptions(&self.address, peer);
+        // End the session too. Announcing a disconnect while leaving
+        // `live_sessions` intact let the central's retained handle keep
+        // reading, writing and subscribing after the server said it had
+        // dropped it — the mock accepting what both real backends reject.
+        self.network
+            .live_sessions
+            .lock()
+            .unwrap()
+            .remove(&(peer.clone(), self.address.clone()));
         Ok(())
     }
 
@@ -504,6 +528,37 @@ struct MockGattConnection {
 }
 
 impl MockGattConnection {
+    /// Reject a characteristic the peripheral never advertised with the
+    /// property this operation needs.
+    ///
+    /// Linux registers no handler and Android omits the property flag for
+    /// these, so a mock that accepted them let a test pass against a service
+    /// contract no real device would honour.
+    fn require_property(
+        &self, characteristic: CharacteristicUuid, has: impl Fn(&GattCharacteristicSpec) -> bool,
+        property: &str,
+    ) -> Result<()> {
+        let peripherals = self.network.peripherals.lock().unwrap();
+        let state = peripherals
+            .get(&self.peripheral)
+            .ok_or_else(|| BleError::NotConnected(self.peripheral.0.clone()))?;
+        let spec = state
+            .service
+            .characteristics
+            .iter()
+            .find(|spec| spec.uuid == characteristic)
+            .ok_or_else(|| {
+                BleError::Gatt(format!("unknown characteristic {}", characteristic.0))
+            })?;
+        if !has(spec) {
+            return Err(BleError::Gatt(format!(
+                "characteristic {} is not {property}",
+                characteristic.0
+            )));
+        }
+        Ok(())
+    }
+
     /// Refuse to act when a newer connection to this peer has superseded us.
     fn ensure_current(&self) -> Result<()> {
         let current = self
@@ -538,6 +593,7 @@ impl GattConnection for MockGattConnection {
 
     async fn read(&mut self, characteristic: CharacteristicUuid) -> Result<Vec<u8>> {
         self.ensure_current()?;
+        self.require_property(characteristic, |spec| spec.readable, "readable")?;
         let peripherals = self.network.peripherals.lock().unwrap();
         let state = peripherals
             .get(&self.peripheral)
@@ -631,6 +687,7 @@ impl GattConnection for MockGattConnection {
         // Lock order is `live_sessions` then `peripherals`, matching
         // `disconnect`; taking them the other way round here would have been
         // a deadlock rather than a fix.
+        self.require_property(characteristic, |spec| spec.notifiable, "notifiable")?;
         let live = self.network.live_sessions.lock().unwrap();
         if live
             .get(&(self.central.clone(), self.peripheral.clone()))

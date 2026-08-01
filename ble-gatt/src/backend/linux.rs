@@ -836,7 +836,16 @@ impl Backend for LinuxBackend {
         .await
     }
 
-    async fn disconnect_peer(&self, peer: &PeerAddress) -> Result<()> {
+    async fn disconnect_peer(&self, peer: &PeerAddress, session: Option<u64>) -> Result<()> {
+        // A caller naming a session must be told to drop *that* one. Since
+        // `Device` is address-backed, acting on a mismatch would disconnect
+        // whichever link now holds the address — typically the replacement
+        // the caller's stale state knows nothing about.
+        if let Some(session) = session {
+            if self.served_peers.lock().unwrap().get(peer) != Some(&session) {
+                return Ok(());
+            }
+        }
         let Ok(address) = peer.0.parse() else {
             return Err(BleError::Gatt(format!("malformed peer address {}", peer.0)));
         };
