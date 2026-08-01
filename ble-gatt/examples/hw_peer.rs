@@ -64,6 +64,16 @@ fn fail(what: &str) {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // The library logs through the `log` facade, which discards everything
+    // unless a logger is installed. Defaulting to `debug` for `ble_gatt`
+    // means a plain run shows the whole pipeline without the caller having
+    // to know the target name; `RUST_LOG` still overrides it.
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("ble_gatt=debug"),
+    )
+    .format_timestamp_millis()
+    .init();
+
     let mut role = None;
     let mut target: Option<String> = None;
     let mut args = std::env::args().skip(1);

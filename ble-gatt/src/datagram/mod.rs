@@ -361,6 +361,12 @@ impl DatagramChannel {
 
     pub async fn send(&mut self, payload: Vec<u8>) -> Result<()> {
         if payload.len() > self.max_message_len {
+            log::warn!(
+                "send: refusing {} bytes to {} — over the {}-byte channel limit",
+                payload.len(),
+                self.peer.0,
+                self.max_message_len
+            );
             return Err(BleError::Gatt(format!(
                 "message of {} bytes exceeds the {}-byte limit for this channel",
                 payload.len(),
@@ -371,20 +377,41 @@ impl DatagramChannel {
         self.next_msg_id = self.next_msg_id.wrapping_add(1);
 
         let fragments = split(msg_id, &payload, self.fragment_budget)?;
+        log::debug!(
+            "send: {} bytes to {} as msg_id={msg_id} in {} fragment(s)",
+            payload.len(),
+            self.peer.0,
+            fragments.len()
+        );
         let characteristic = self.characteristic;
         let mut sink = self.sink.lock().await;
-        for fragment in fragments {
+        for (index, fragment) in fragments.into_iter().enumerate() {
+            log::trace!(
+                "send: msg_id={msg_id} fragment {index} ({} bytes) to {}",
+                fragment.len(),
+                self.peer.0
+            );
             match &mut *sink {
                 Sink::Connection {
                     connection,
                     write_type,
                 } => {
-                    connection
-                        .write_with_type(characteristic, fragment, *write_type)
-                        .await?;
+                    if let Err(err) =
+                        connection.write_with_type(characteristic, fragment, *write_type).await
+                    {
+                        log::warn!(
+                            "send: write of msg_id={msg_id} fragment {index} to {} failed: {err}",
+                            self.peer.0
+                        );
+                        return Err(err);
+                    }
                 }
                 Sink::Notify { backend, active } => {
                     if !active.load(Ordering::SeqCst) {
+                        log::warn!(
+                            "send: refusing msg_id={msg_id} — channel to {} is no longer active",
+                            self.peer.0
+                        );
                         return Err(BleError::NotConnected(self.peer.0.clone()));
                     }
                     // Addressed, not broadcast. Refusing a second central is
@@ -396,12 +423,20 @@ impl DatagramChannel {
                     // channel must not route its fragments through the
                     // subscription that replaced its peer, where they would
                     // be reassembled as current data.
-                    backend
+                    if let Err(err) = backend
                         .notify_peer(&self.peer, self.session, characteristic, fragment)
-                        .await?;
+                        .await
+                    {
+                        log::warn!(
+                            "send: notify of msg_id={msg_id} fragment {index} to {} failed: {err}",
+                            self.peer.0
+                        );
+                        return Err(err);
+                    }
                 }
             }
         }
+        log::trace!("send: msg_id={msg_id} fully written to {}", self.peer.0);
         Ok(())
     }
 
@@ -416,6 +451,7 @@ impl DatagramChannel {
             // buffered: "you have lost data" is more useful now than after
             // draining everything that survived.
             if self.overflow.take() {
+                log::warn!("recv: inbound overflow from {} — a message was lost", self.peer.0);
                 return Some(Err(BleError::Gatt(format!(
                     "inbound overflow from {}: fragments were dropped and at least one \
                      message is lost",
@@ -428,7 +464,18 @@ impl DatagramChannel {
             // lost — it fires this arm immediately and the loop re-checks.
             let notified = self.overflow.notify.notified();
             tokio::select! {
-                item = self.inbound.next() => return item,
+                item = self.inbound.next() => {
+                    match &item {
+                        Some(Ok(message)) => log::debug!(
+                            "recv: {} bytes from {}", message.len(), self.peer.0
+                        ),
+                        Some(Err(err)) => {
+                            log::warn!("recv: error from {}: {err}", self.peer.0)
+                        }
+                        None => log::info!("recv: channel to {} closed", self.peer.0),
+                    }
+                    return item;
+                }
                 _ = notified => continue,
             }
         }
@@ -479,11 +526,9 @@ async fn release_peer(
         // channel from a superseded `serve` generation would otherwise
         // disconnect whatever now holds the address — the peer's own
         // replacement session, established by the server that replaced us.
+        log::info!("release: central {} session={:?}", peer.0, served.backend_session);
         if let Err(err) = backend.disconnect_peer(peer, served.backend_session).await {
-            eprintln!(
-                "[ble-gatt][datagram] could not disconnect released central {}: {err}",
-                peer.0
-            );
+            log::warn!("release: could not disconnect central {}: {err}", peer.0);
         }
     }
 }
@@ -495,9 +540,10 @@ async fn release_peer(
 /// `Backend::notify` is a broadcast that cannot be addressed to one peer on
 /// BlueZ. Disconnecting is the only portable exclusion.
 async fn disconnect_refused(backend: &dyn Backend, peer: &PeerAddress, session: Option<u64>) {
+    log::info!("refuse: disconnecting central {} session={session:?}", peer.0);
     if let Err(err) = backend.disconnect_peer(peer, session).await {
-        eprintln!(
-            "[ble-gatt][datagram] could not disconnect refused central {}: {err} \
+        log::warn!(
+            "refuse: could not disconnect central {}: {err} \
              — it may still receive broadcast notifications",
             peer.0
         );
@@ -514,7 +560,7 @@ async fn disconnect_refused(backend: &dyn Backend, peer: &PeerAddress, session: 
 /// and `recv()` hung forever on a dead link.
 fn spawn_reassembly<S>(
     mut fragments: S, limits: ReassemblyLimits, out: mpsc::Sender<Result<Vec<u8>>>,
-    overflow: Arc<OverflowSignal>,
+    overflow: Arc<OverflowSignal>, peer: PeerAddress,
 ) -> tokio::task::JoinHandle<()>
 where
     S: tokio_stream::Stream<Item = Result<Vec<u8>>> + Send + Unpin + 'static,
@@ -543,6 +589,11 @@ where
                     let raw = match raw {
                         Ok(raw) => raw,
                         Err(_) => {
+                            log::warn!(
+                                "reassembly: backend reported dropped notifications from {}; \
+                                 discarding partial messages",
+                                peer.0
+                            );
                             overflow.raise();
                             reassembler = Reassembler::new(limits);
                             continue;
@@ -551,10 +602,22 @@ where
                     let Some((header, payload)) = FragmentHeader::parse(&raw) else {
                         // Too short to be ours — a foreign write to our
                         // characteristic, not a reason to kill the channel.
+                        log::trace!(
+                            "reassembly: ignoring {}-byte write from {} — too short for a \
+                             fragment header",
+                            raw.len(),
+                            peer.0
+                        );
                         continue;
                     };
                     match reassembler.accept(header, payload, Instant::now()) {
                         Accept::Complete(message) => {
+                            log::trace!(
+                                "reassembly: msg_id={} complete from {} ({} bytes)",
+                                header.msg_id,
+                                peer.0,
+                                message.len()
+                            );
                             // Bounded, and awaited rather than dropped: an
                             // unbounded queue let a peer sending valid
                             // single-fragment messages faster than the
@@ -566,10 +629,16 @@ where
                             }
                         }
                         Accept::Pending => {}
-                        Accept::Rejected(_) => {
+                        Accept::Rejected(reason) => {
                             // Dropped by policy (bounds breach or malformed).
                             // The channel stays usable: one bad message must
                             // not deny service for the rest of the session.
+                            log::warn!(
+                                "reassembly: dropped fragment {} of msg_id={} from {}: {reason:?}",
+                                header.index,
+                                header.msg_id,
+                                peer.0
+                            );
                         }
                     }
                 }
@@ -601,9 +670,10 @@ impl Drop for PendingConnection {
         };
         let peer = self.peer.clone();
         tokio::spawn(async move {
+            log::info!("connect: tearing down {} after abandoned setup", peer.0);
             if let Err(err) = connection.disconnect().await {
-                eprintln!(
-                    "[ble-gatt][datagram] could not disconnect {} after abandoned setup: {err}",
+                log::warn!(
+                    "connect: could not disconnect {} after abandoned setup: {err}",
                     peer.0
                 );
             }
@@ -617,6 +687,7 @@ pub async fn connect(
     backend: Arc<dyn Backend>, peer: &PeerAddress, config: &DatagramConfig,
 ) -> Result<DatagramChannel> {
     config.validate()?;
+    log::info!("connect: dialling {} service={}", peer.0, config.service.0);
     // Subscribe before connecting, for the same reason `serve` subscribes
     // before advertising: `events()` is a broadcast, so a disconnect landing
     // between `connect`/`subscribe` succeeding and this call is lost. The
@@ -635,6 +706,8 @@ pub async fn connect(
         connection: Some(backend.connect(peer).await?),
         peer: peer.clone(),
     };
+
+    log::debug!("connect: link up to {}, subscribing", peer.0);
 
     let setup = async {
         let connection = pending.connection.as_mut().expect("armed above");
@@ -656,7 +729,10 @@ pub async fn connect(
     let (notifications, budget) = match setup {
         Ok(ready) => ready,
         // Returning here drops `pending`, which disconnects.
-        Err(err) => return Err(err),
+        Err(err) => {
+            log::warn!("connect: setup failed for {}: {err}", peer.0);
+            return Err(err);
+        }
     };
     // Setup succeeded: take ownership back so the guard becomes inert.
     let connection = pending.connection.take().expect("armed above");
@@ -668,7 +744,7 @@ pub async fn connect(
     let (tx, rx) = mpsc::channel(config.inbound_queue_depth);
     let overflow = Arc::new(OverflowSignal::default());
     let reassembly =
-        spawn_reassembly(notifications, config.limits(), tx, overflow.clone());
+        spawn_reassembly(notifications, config.limits(), tx, overflow.clone(), peer.clone());
     // The watcher gets an *AbortHandle*, not the JoinHandle. Handing over
     // the JoinHandle meant aborting the watcher merely dropped it — and
     // dropping a Tokio JoinHandle detaches its task rather than cancelling
@@ -679,6 +755,13 @@ pub async fn connect(
         reassembly.abort_handle(),
         overflow.clone(),
         connection.session(),
+    );
+
+    log::info!(
+        "connect: channel ready to {} session={session:?} fragment_budget={budget} \
+         max_message_len={}",
+        peer.0,
+        effective_max_message_len(config.max_message_len, budget)
     );
 
     Ok(DatagramChannel {
@@ -733,6 +816,10 @@ fn spawn_link_loss_watch(
                 } if *lost == peer
                     && (lost_session.is_none() || session.is_none() || *lost_session == session) =>
                 {
+                    log::info!(
+                        "link-loss watch: {} session={session:?} disconnected; closing channel",
+                        peer.0
+                    );
                     reassembly.abort();
                     return;
                 }
@@ -744,8 +831,8 @@ fn spawn_link_loss_watch(
                 // Report the gap first so that wait ends with an error
                 // rather than a silent close.
                 GattEvent::Lagged { dropped } => {
-                    eprintln!(
-                        "[ble-gatt][datagram] lifecycle stream lagged by {dropped} events; \
+                    log::warn!(
+                        "link-loss watch: lifecycle stream lagged by {dropped} events; \
                          ending the channel to {}, since its disconnect may have been lost",
                         peer.0
                     );
@@ -796,7 +883,12 @@ pub async fn serve(
     // waits for the server to speak first there is no later write to
     // recreate the event, so losing it hangs `serve` forever.
     let mut events = backend.events();
-    backend.advertise(config.service_spec()).await?;
+    log::info!("serve: advertising service {}", config.service.0);
+    if let Err(err) = backend.advertise(config.service_spec()).await {
+        log::warn!("serve: advertise failed for {}: {err}", config.service.0);
+        return Err(err);
+    }
+    log::info!("serve: advertising accepted, awaiting centrals");
 
     let (channels_tx, channels_rx) = mpsc::channel(config.accept_queue_depth);
     let (release_tx, mut release_rx) = mpsc::unbounded_channel::<(PeerAddress, u64)>();
@@ -908,11 +1000,12 @@ pub async fn serve(
                         continue;
                     }
                     if let Some(active) = inbound.keys().next() {
-                        eprintln!(
-                            "[ble-gatt][datagram] refusing central {} — already serving {} \
+                        log::warn!(
+                            "serve: refusing central {} — already serving {} \
                              and notify is a broadcast, so serving both would corrupt \
                              each other's messages",
-                            peer.0, active.0
+                            peer.0,
+                            active.0
                         );
                         // Refusing to allocate state is NOT refusing service.
                         // The peer subscribed without needing our consent, so
@@ -935,6 +1028,7 @@ pub async fn serve(
                         config.limits(),
                         msg_tx,
                         overflow.clone(),
+                        peer.clone(),
                     );
 
                     let channel = DatagramChannel {
@@ -964,6 +1058,11 @@ pub async fn serve(
                     // not occupy the single-central slot.
                     match channels_tx.try_send(channel) {
                         Ok(()) => {
+                            log::info!(
+                                "serve: accepted central {} session={backend_session:?} \
+                                 generation={generation} fragment_budget={peripheral_budget}",
+                                peer.0
+                            );
                             inbound.insert(
                                 peer.clone(),
                                 ServedPeer {
@@ -976,8 +1075,8 @@ pub async fn serve(
                             );
                         }
                         Err(mpsc::error::TrySendError::Full(_)) => {
-                            eprintln!(
-                                "[ble-gatt][datagram] accept queue full, refusing central {} \
+                            log::warn!(
+                                "serve: accept queue full, refusing central {} \
                                  — the caller is not draining `serve`'s stream",
                                 peer.0
                             );
@@ -1039,8 +1138,8 @@ pub async fn serve(
                                     // out. It is the only endpoint that can
                                     // still be told.
                                     overflow.raise();
-                                    eprintln!(
-                                        "[ble-gatt][datagram] fragment queue full for {} after \
+                                    log::warn!(
+                                        "serve: fragment queue full for {} after \
                                          backpressure; dropping fragment and reporting loss",
                                         peer.0
                                     );
@@ -1073,6 +1172,11 @@ pub async fn serve(
                     // the caller could still push fragments into a broadcast
                     // that the next accepted central would receive.
                     if let Some(served) = inbound.remove(&peer) {
+                        log::info!(
+                            "serve: central {} session={lost_session:?} disconnected; \
+                             slot released",
+                            peer.0
+                        );
                         served.active.store(false, Ordering::SeqCst);
                     }
                     if accept_closed && inbound.is_empty() {
@@ -1095,8 +1199,8 @@ pub async fn serve(
                     // `inbound` forever with its channel live, refusing every
                     // replacement central. Ending the sessions is
                     // recoverable; wrongly keeping one is not.
-                    eprintln!(
-                        "[ble-gatt][datagram] lifecycle stream lagged by {dropped} events; \
+                    log::warn!(
+                        "serve: lifecycle stream lagged by {dropped} events; \
                          ending every served session, since a disconnect may have been lost"
                     );
                     let served: Vec<PeerAddress> = inbound.keys().cloned().collect();

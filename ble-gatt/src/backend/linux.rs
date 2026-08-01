@@ -181,6 +181,7 @@ fn report_central_loss(
     // from it may genuinely be an inbound one.
     dialed.remove(peer);
     drop(dialed);
+    log::info!("link lost: {} session={generation} (central role)", peer.0);
     let _ = events_tx.send(GattEvent::Disconnected {
         peer: peer.clone(),
         local_role: Role::Central,
@@ -231,6 +232,11 @@ async fn watch_notify_sessions(
             let session = next_session.fetch_add(1, Ordering::Relaxed);
             served.insert(peer.clone(), session);
 
+            log::info!(
+                "notify session: central {} subscribed to {} session={session}",
+                peer.0,
+                uuid.0
+            );
             let _ = events_tx.send(GattEvent::Connected {
                 peer: peer.clone(),
                 local_role: Role::Peripheral,
@@ -332,6 +338,7 @@ fn spawn_peripheral_disconnect_watch(
         }
         served.remove(&peer);
         drop(served);
+        log::info!("link lost: {} session={session} (peripheral role)", peer.0);
         let _ = events_tx.send(GattEvent::Disconnected {
             peer: peer.clone(),
             local_role: Role::Peripheral,
@@ -383,10 +390,15 @@ impl LinuxBackend {
         let mut writers = self.notify_writers.lock().await;
         if let Some((peer, session)) = owner {
             if self.served_peers.lock().unwrap().get(peer) != Some(&session) {
+                log::warn!(
+                    "notify: refusing — session {session} for {} has been superseded",
+                    peer.0
+                );
                 return Err(BleError::NotConnected(peer.0.clone()));
             }
         }
         let Some(sessions) = writers.get_mut(&characteristic) else {
+            log::warn!("notify: no active notify session on {}", characteristic.0);
             return Err(BleError::Gatt("no active notify session for characteristic".to_string()));
         };
         sessions.retain(|w| !w.is_closed().unwrap_or(true));
@@ -405,11 +417,13 @@ impl LinuxBackend {
         sessions.retain(|w| !w.is_closed().unwrap_or(true));
 
         if !delivered {
+            log::warn!("notify: {} bytes on {} reached {nobody}", value.len(), characteristic.0);
             return Err(BleError::Gatt(match last_error {
                 Some(err) => format!("notify reached {nobody}: {err}"),
                 None => format!("notify reached {nobody}"),
             }));
         }
+        log::trace!("notify: {} bytes delivered on {}", value.len(), characteristic.0);
         Ok(())
     }
 }
@@ -424,6 +438,7 @@ impl Backend for LinuxBackend {
             .ok()
             .flatten()
             .is_some();
+        log::info!("capabilities: central=true peripheral={peripheral}");
         CapabilityReport {
             central: true,
             peripheral,
@@ -432,10 +447,11 @@ impl Backend for LinuxBackend {
 
     async fn scan(&self, service: ServiceUuid) -> Result<BoxStream<Result<DiscoveredPeer>>> {
         let adapter = self.adapter.clone();
-        let events = adapter
-            .discover_devices()
-            .await
-            .map_err(|err| BleError::AdapterUnavailable(err.to_string()))?;
+        log::info!("scan: starting discovery for service {}", service.0);
+        let events = adapter.discover_devices().await.map_err(|err| {
+            log::warn!("scan: discovery failed to start: {err}");
+            BleError::AdapterUnavailable(err.to_string())
+        })?;
         let target = service.0;
 
         let discovered = events.filter_map(move |event| {
@@ -447,6 +463,10 @@ impl Backend for LinuxBackend {
                 let device = adapter.device(address).ok()?;
                 let uuids = device.uuids().await.ok().flatten().unwrap_or_default();
                 if !uuids.contains(&target) {
+                    log::trace!(
+                        "scan: ignoring {address} — advertises {} service(s), none matching",
+                        uuids.len()
+                    );
                     return None;
                 }
                 let name = device.name().await.ok().flatten();
@@ -468,6 +488,7 @@ impl Backend for LinuxBackend {
                     .map(|(uuid, data)| (ServiceUuid(uuid), data))
                     .collect();
                 let rssi = device.rssi().await.ok().flatten();
+                log::info!("scan: discovered {address} name={name:?} rssi={rssi:?}");
                 Some(Ok(DiscoveredPeer {
                     address: PeerAddress(address.to_string()),
                     name,
@@ -503,7 +524,9 @@ impl Backend for LinuxBackend {
         // for the one that replaced it.
         let dial_generation = self.next_session.fetch_add(1, Ordering::Relaxed);
         self.dialed.lock().unwrap().insert(peer.clone(), dial_generation);
+        log::info!("connect: dialling {} generation={dial_generation}", peer.0);
         if let Err(err) = device.connect().await {
+            log::warn!("connect: {} refused the link: {err}", peer.0);
             let mut dialed = self.dialed.lock().unwrap();
             if dialed.get(peer) == Some(&dial_generation) {
                 dialed.remove(peer);
@@ -513,6 +536,7 @@ impl Backend for LinuxBackend {
                 reason: err.to_string(),
             });
         }
+        log::info!("connect: link established to {} session={dial_generation}", peer.0);
         let _ = self.events_tx.send(GattEvent::Connected {
             peer: peer.clone(),
             local_role: Role::Central,
@@ -565,6 +589,11 @@ impl Backend for LinuxBackend {
     }
 
     async fn advertise(&self, service: GattServiceSpec) -> Result<()> {
+        log::info!(
+            "advertise: registering service {} with {} characteristic(s)",
+            service.uuid.0,
+            service.characteristics.len()
+        );
         // Held for the whole setup, including both BlueZ registrations, so a
         // concurrent stop cannot interleave with installing the handles.
         let _serialise = self.advertise_lock.lock().await;
@@ -770,22 +799,21 @@ impl Backend for LinuxBackend {
             ..Default::default()
         };
 
-        let app_handle = self
-            .adapter
-            .serve_gatt_application(app)
-            .await
-            .map_err(|err| BleError::Gatt(err.to_string()))?;
+        let app_handle = self.adapter.serve_gatt_application(app).await.map_err(|err| {
+            log::warn!("advertise: BlueZ rejected the GATT application: {err}");
+            BleError::Gatt(err.to_string())
+        })?;
 
         let adv = Advertisement {
             service_uuids: [service.uuid.0].into_iter().collect(),
             discoverable: Some(true),
             ..Default::default()
         };
-        let adv_handle = self
-            .adapter
-            .advertise(adv)
-            .await
-            .map_err(|err| BleError::Gatt(err.to_string()))?;
+        let adv_handle = self.adapter.advertise(adv).await.map_err(|err| {
+            log::warn!("advertise: BlueZ rejected the advertisement: {err}");
+            BleError::Gatt(err.to_string())
+        })?;
+        log::info!("advertise: registered, generation={this_generation}");
 
         *self.app_handle.lock().await = Some(app_handle);
         *self.adv_handle.lock().await = Some(adv_handle);
@@ -809,6 +837,7 @@ impl Backend for LinuxBackend {
     }
 
     async fn stop_advertising(&self) -> Result<()> {
+        log::info!("advertise: stopping");
         let _serialise = self.advertise_lock.lock().await;
         // Invalidate first, so a handler already running publishes nothing.
         // Taking the same lock the handlers publish under means an
@@ -827,6 +856,7 @@ impl Backend for LinuxBackend {
         let served: Vec<PeerAddress> =
             self.served_peers.lock().unwrap().drain().map(|(peer, _)| peer).collect();
         for peer in served {
+            log::info!("advertise: releasing served central {} on stop", peer.0);
             let _ = self.events_tx.send(GattEvent::Disconnected {
                 peer,
                 local_role: Role::Peripheral,
@@ -1004,10 +1034,16 @@ impl GattConnection for LinuxGattConnection {
             },
             ..Default::default()
         };
-        target
-            .write_ext(&value, &request)
-            .await
-            .map_err(|err| BleError::Gatt(err.to_string()))
+        log::trace!(
+            "write: {} bytes to {} on {} ({write_type:?})",
+            value.len(),
+            characteristic.0,
+            self.peer.0
+        );
+        target.write_ext(&value, &request).await.map_err(|err| {
+            log::warn!("write: {} bytes to {} failed: {err}", value.len(), self.peer.0);
+            BleError::Gatt(err.to_string())
+        })
     }
 
     async fn subscribe(
@@ -1021,9 +1057,24 @@ impl GattConnection for LinuxGattConnection {
         // channel stayed at the 23-byte spec minimum — 14 payload bytes per
         // fragment — for its whole life, however large the negotiated MTU.
         if let Ok(mtu) = target.mtu().await {
+            log::info!(
+                "subscribe: {} negotiated ATT MTU {mtu} on {}",
+                self.peer.0,
+                characteristic.0
+            );
             self.att_mtu.store(mtu as u16, Ordering::Relaxed);
+        } else {
+            log::warn!(
+                "subscribe: {} did not publish an MTU; staying at the {}-byte default",
+                self.peer.0,
+                crate::backend::DEFAULT_ATT_MTU
+            );
         }
-        let notify_stream = target.notify().await.map_err(|err| BleError::Gatt(err.to_string()))?;
+        let notify_stream = target.notify().await.map_err(|err| {
+            log::warn!("subscribe: notify failed on {}: {err}", characteristic.0);
+            BleError::Gatt(err.to_string())
+        })?;
+        log::info!("subscribe: {} subscribed to {}", self.peer.0, characteristic.0);
         // BlueZ delivers notifications over a socket this stream reads
         // directly, so there is no library-side queue to overflow — nothing
         // here can silently drop a payload.

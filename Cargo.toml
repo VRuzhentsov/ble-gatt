@@ -10,6 +10,7 @@ repository = "https://github.com/VRuzhentsov/ble-gatt"
 
 [workspace.dependencies]
 async-trait = "0.1"
+log = "0.4"
 thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["sync"] }

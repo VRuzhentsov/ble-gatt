@@ -104,7 +104,7 @@ impl Backend for LazyAndroidBackend {
         match self.inner().await {
             Ok(backend) => backend.capabilities().await,
             Err(err) => {
-                eprintln!("[ble-gatt][android] backend construction failed: {err}");
+                log::error!("backend construction failed: {err}");
                 CapabilityReport::default()
             }
         }

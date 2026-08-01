@@ -410,7 +410,7 @@ impl Backend for AndroidBackend {
         let mut env = match self.inner.env() {
             Ok(env) => env,
             Err(err) => {
-                eprintln!("[ble-gatt][android] capabilities: JNI attach failed: {err}");
+                log::error!("capabilities: JNI attach failed: {err}");
                 return CapabilityReport::default();
             }
         };
@@ -418,8 +418,8 @@ impl Backend for AndroidBackend {
             Ok(value) => value,
             Err(err) => {
                 let detail = describe_pending_exception(&mut env);
-                eprintln!(
-                    "[ble-gatt][android] capabilities: hasCentralSupport failed: {err}{}",
+                log::error!(
+                    "capabilities: hasCentralSupport failed: {err}{}",
                     detail.map(|d| format!(" ({d})")).unwrap_or_default()
                 );
                 false
@@ -429,13 +429,14 @@ impl Backend for AndroidBackend {
             Ok(value) => value,
             Err(err) => {
                 let detail = describe_pending_exception(&mut env);
-                eprintln!(
-                    "[ble-gatt][android] capabilities: hasPeripheralSupport failed: {err}{}",
+                log::error!(
+                    "capabilities: hasPeripheralSupport failed: {err}{}",
                     detail.map(|d| format!(" ({d})")).unwrap_or_default()
                 );
                 false
             }
         };
+        log::info!("capabilities: central={central} peripheral={peripheral}");
         CapabilityReport { central, peripheral }
     }
 
@@ -477,15 +478,21 @@ impl Backend for AndroidBackend {
                 // permission is the common case) would otherwise leave the
                 // exception pending on the daemon-attached Tokio worker and
                 // poison every later JNI call scheduled there.
-                Err(err) => return Err(jni_error(&mut env, "startScan", err)),
+                Err(err) => {
+                    log::error!("scan: startScan threw for service {}", service.0);
+                    return Err(jni_error(&mut env, "startScan", err));
+                }
                 // Rejected. The active scan keeps ownership untouched — we
                 // never took it away.
                 Ok(false) => {
+                    log::warn!("scan: refused — a scan is already active");
                     return Err(BleError::Gatt(
                         "a scan is already active; concurrent scans are not supported".to_string(),
-                    ))
+                    ));
                 }
-                Ok(true) => {}
+                Ok(true) => {
+                    log::info!("scan: started for service {} generation={generation}", service.0);
+                }
             }
         }
         // Ours now. Installed before the lock is released, so an
@@ -550,9 +557,11 @@ impl Backend for AndroidBackend {
                 )
         })();
         if let Err(err) = dial {
+            log::warn!("connect: JNI dial to {} failed: {err}", peer.0);
             self.inner.clear_pending_connect(&peer.0);
             return Err(err);
         }
+        log::info!("connect: dialling {} session={session}", peer.0);
 
         // Cancellation guard. `connect()` is an async fn, so its caller can
         // drop the future mid-await — a timeout, a `select!` losing a race —
@@ -569,11 +578,13 @@ impl Backend for AndroidBackend {
 
         if connected_rx.await.is_err() {
             // The guard handles cleanup on the way out.
+            log::warn!("connect: {} disconnected before the connection completed", peer.0);
             return Err(BleError::ConnectFailed {
                 peer: peer.0.clone(),
                 reason: "disconnected before connection completed".to_string(),
             });
         }
+        log::info!("connect: {} connected session={session}", peer.0);
         let mut guard = guard;
         guard.armed = false;
 
@@ -681,13 +692,22 @@ impl Backend for AndroidBackend {
         };
 
         let outcome = match rx.await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(code)) => Err(BleError::Gatt(format!(
-                "Android refused to start advertising (AdvertiseCallback error {code})"
-            ))),
-            Err(_) => Err(BleError::Gatt(
-                "advertise outcome was never reported".to_string(),
-            )),
+            Ok(Ok(())) => {
+                log::info!("advertise: started, generation={advertise_generation}");
+                Ok(())
+            }
+            Ok(Err(code)) => {
+                log::warn!("advertise: Android refused to start (AdvertiseCallback error {code})");
+                Err(BleError::Gatt(format!(
+                    "Android refused to start advertising (AdvertiseCallback error {code})"
+                )))
+            }
+            Err(_) => {
+                log::warn!("advertise: outcome was never reported");
+                Err(BleError::Gatt(
+                    "advertise outcome was never reported".to_string(),
+                ))
+            }
         };
         // Disarmed whenever an outcome was actually observed, success or
         // failure: success hands the caller a server it now owns, and a
@@ -716,6 +736,7 @@ impl Backend for AndroidBackend {
         if let Some(pending) = self.inner.advertise_tx.lock().unwrap().take() {
             let _ = pending.send(Err(ADVERTISE_ERROR_STOPPED));
         }
+        log::info!("advertise: stopping");
         let mut env = self.inner.env()?;
         self.inner.call_void(&mut env, "stopAdvertising", "()V", &[])
     }
@@ -793,6 +814,11 @@ impl Backend for AndroidBackend {
             // Nothing was queued, so no callback is coming — drop the waiter
             // rather than leaving this future to hang forever.
             Ok(false) | Err(_) => {
+                log::warn!(
+                    "notify: {} was not queued for {} — no live notify session",
+                    value.len(),
+                    peer.0
+                );
                 self.inner.notify_waiters.lock().unwrap().remove(&request_id);
                 queued?;
                 return Err(BleError::Gatt(format!(
@@ -807,12 +833,21 @@ impl Backend for AndroidBackend {
         // Returning Ok on initiation alone would tell a reliable caller a
         // fragment was sent when transmission had actually failed.
         match rx.await {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(BleError::Gatt(format!("notify to {} failed", peer.0))),
-            Err(_) => Err(BleError::Gatt(format!(
-                "notify to {} was abandoned before completion",
-                peer.0
-            ))),
+            Ok(true) => {
+                log::trace!("notify: {} bytes delivered to {}", value.len(), peer.0);
+                Ok(())
+            }
+            Ok(false) => {
+                log::warn!("notify: {} bytes to {} failed in transmission", value.len(), peer.0);
+                Err(BleError::Gatt(format!("notify to {} failed", peer.0)))
+            }
+            Err(_) => {
+                log::warn!("notify: send to {} was abandoned before completion", peer.0);
+                Err(BleError::Gatt(format!(
+                    "notify to {} was abandoned before completion",
+                    peer.0
+                )))
+            }
         }
     }
 
@@ -1330,6 +1365,9 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onPeerDiscovered<'local>(
     // without this it would be delivered as a *later* scan's discovery —
     // reporting a peer that never matched the new scan's service filter.
     if scan.generation != generation as u64 {
+        log::trace!(
+            "jni onPeerDiscovered: ignoring result from superseded scan generation {generation}"
+        );
         return;
     }
     if let Some(tx) = scan.tx.as_ref() {
@@ -1344,9 +1382,10 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onPeerDiscovered<'local>(
             service_data,
             rssi: Some(rssi as i16),
         };
+        log::info!("jni onPeerDiscovered: {} rssi={rssi}", peer.address.0);
         if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(Ok(peer)) {
-            eprintln!(
-                "[ble-gatt][android] discovery queue full, dropping scan result; \
+            log::warn!(
+                "jni onPeerDiscovered: discovery queue full, dropping scan result; \
                  the peer will reappear on its next advertisement"
             );
         }
@@ -1359,9 +1398,16 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onAdvertiseResult<'local>(
     error_code: jint,
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
+    if success != 0 {
+        log::info!("jni onAdvertiseResult: advertising started");
+    } else {
+        log::error!("jni onAdvertiseResult: advertising failed, error_code={error_code}");
+    }
     let pending = inner.advertise_tx.lock().unwrap().take();
     if let Some(tx) = pending {
         let _ = tx.send(if success != 0 { Ok(()) } else { Err(error_code) });
+    } else {
+        log::warn!("jni onAdvertiseResult: no pending advertise request to complete");
     }
 }
 
@@ -1382,8 +1428,10 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onScanFailed<'local>(
     let mut scan = inner.scan.lock().unwrap();
     // A stale failure must not terminate the scan that replaced it.
     if scan.generation != generation as u64 {
+        log::trace!("jni onScanFailed: ignoring failure from superseded generation {generation}");
         return;
     }
+    log::error!("jni onScanFailed: ScanCallback error code {error_code}");
     scan.error = Some(BleError::Gatt(format!(
         "Android scan failed (ScanCallback error code {error_code})"
     )));
@@ -1399,6 +1447,7 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onMtuChanged<'local>(
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
     let address = read_jstring(&mut env, &address);
+    log::info!("jni onMtuChanged: {address} negotiated ATT MTU {mtu}");
     inner.att_mtus.lock().unwrap().insert(address, mtu as u16);
 }
 
@@ -1409,6 +1458,7 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onConnected<'local>(
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
     let address = read_jstring(&mut env, &address);
+    log::info!("jni onConnected: {address} from_server={}", from_server != 0);
     // Only the *client* path may resolve a pending outbound connect. A
     // server-side callback for the same address would otherwise complete it
     // before client-side service discovery had run, handing back a
@@ -1451,6 +1501,7 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onDisconnected<'local>(
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
     let address = read_jstring(&mut env, &address);
+    log::info!("jni onDisconnected: {address} from_server={}", from_server != 0);
     let disconnected_session = if from_server != 0 {
         // Server-side peers carry the session minted when they subscribed.
         inner.server_sessions.lock().unwrap().remove(&address)
@@ -1574,14 +1625,26 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onCharacteristicChanged<'local>
             // the drop must be *reported* — otherwise a single-fragment
             // message vanishes and a fragmented one merely expires, with
             // neither endpoint ever learning why.
+            log::trace!(
+                "jni onCharacteristicChanged: {} bytes from {address} on {uuid}",
+                bytes.len()
+            );
             if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(bytes) {
                 overflow.store(true, Ordering::SeqCst);
-                eprintln!(
-                    "[ble-gatt][android] notification queue full for {address}, dropping \
-                     payload and reporting the gap to the subscriber"
+                log::warn!(
+                    "jni onCharacteristicChanged: notification queue full for {address}, \
+                     dropping payload and reporting the gap to the subscriber"
                 );
             }
+        } else {
+            log::debug!(
+                "jni onCharacteristicChanged: no subscriber for {uuid} on {address}, \
+                 discarding {} bytes",
+                bytes.len()
+            );
         }
+    } else {
+        log::debug!("jni onCharacteristicChanged: no connection state for {address}");
     }
 }
 
@@ -1608,6 +1671,10 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onServerCharacteristicWritten<'
     // therefore left the channel sessionless for its whole life, so its
     // sends fell back to targeting whichever session owned the address.
     let session = session as u64;
+    log::debug!(
+        "jni onServerCharacteristicWritten: {} bytes from {address} on {uuid} session={session}",
+        bytes.len()
+    );
     inner
         .server_sessions
         .lock()
@@ -1649,6 +1716,11 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onSubscribed<'local>(
             return;
         }
         if let Some((_, tx)) = state.subscribe_tx.remove(&CharacteristicUuid(uuid)) {
+            if success != 0 {
+                log::info!("jni onSubscribed: {address} subscribed to {uuid}");
+            } else {
+                log::warn!("jni onSubscribed: {address} failed to subscribe to {uuid}");
+            }
             let _ = tx.send(success != 0);
         }
     }

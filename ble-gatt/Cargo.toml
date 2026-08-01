@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+log.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
@@ -23,3 +24,8 @@ ndk-context = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+# So `hw_peer` can actually show the library's `log` output. Without a
+# logger installed the facade discards every record, and the hardware
+# harness would prove nothing about the instrumentation it is meant to
+# exercise.
+env_logger = "0.11"
