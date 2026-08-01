@@ -67,6 +67,9 @@ pub struct MockNetwork {
     /// off" distinguishable from "no peers nearby" — is reachable in tests
     /// without a radio.
     armed_scan_failure: Mutex<Option<String>>,
+    /// Session ids handed to connections, so the mock reproduces the real
+    /// backends' ability to distinguish successive links to one address.
+    next_session: std::sync::atomic::AtomicU64,
 }
 
 impl MockNetwork {
@@ -77,6 +80,22 @@ impl MockNetwork {
     /// Peers this network has seen an explicit `disconnect()` for.
     pub fn disconnected_peers(&self) -> Vec<PeerAddress> {
         self.disconnect_log.lock().unwrap().clone()
+    }
+
+    /// Emit a central-role loss for a *specific* session.
+    ///
+    /// Lets a test replay a disconnect belonging to a connection that has
+    /// already been replaced — the case where address-only matching tears
+    /// down the link that succeeded it.
+    pub fn simulate_loss_for_session(&self, central: &PeerAddress, peer: &PeerAddress, session: u64) {
+        self.emit(
+            central,
+            GattEvent::Disconnected {
+                peer: peer.clone(),
+                local_role: Role::Central,
+                session: Some(session),
+            },
+        );
     }
 
     /// The lifecycle event stream dropped `dropped` events before a
@@ -122,6 +141,7 @@ impl MockNetwork {
             GattEvent::Disconnected {
                 peer: central.clone(),
                 local_role: Role::Peripheral,
+                session: None,
             },
         );
     }
@@ -212,6 +232,7 @@ impl MockBackend {
             GattEvent::Disconnected {
                 peer: peer.clone(),
                 local_role: Role::Peripheral,
+                session: None,
             },
         );
         self.network.emit(
@@ -219,6 +240,7 @@ impl MockBackend {
             GattEvent::Disconnected {
                 peer: self.address.clone(),
                 local_role: Role::Central,
+                session: None,
             },
         );
     }
@@ -279,9 +301,14 @@ impl Backend for MockBackend {
             GattEvent::Connected {
                 peer: peer.clone(),
                 local_role: Role::Central,
+                session: None,
             },
         );
         Ok(Box::new(MockGattConnection {
+            session: self
+                .network
+                .next_session
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             central: self.address.clone(),
             peripheral: peer.clone(),
             network: self.network.clone(),
@@ -349,6 +376,7 @@ impl Backend for MockBackend {
                 GattEvent::Disconnected {
                     peer: peer.clone(),
                     local_role: Role::Peripheral,
+                    session: None,
                 },
             );
             self.network.emit(
@@ -356,6 +384,7 @@ impl Backend for MockBackend {
                 GattEvent::Disconnected {
                     peer: self.address.clone(),
                     local_role: Role::Central,
+                    session: None,
                 },
             );
         }
@@ -398,6 +427,7 @@ impl Backend for MockBackend {
             GattEvent::Disconnected {
                 peer: self.address.clone(),
                 local_role: Role::Central,
+                session: None,
             },
         );
         self.network.emit(
@@ -405,6 +435,7 @@ impl Backend for MockBackend {
             GattEvent::Disconnected {
                 peer: peer.clone(),
                 local_role: Role::Peripheral,
+                session: None,
             },
         );
         self.network.drop_subscriptions(&self.address, peer);
@@ -444,6 +475,7 @@ impl Backend for MockBackend {
 }
 
 struct MockGattConnection {
+    session: u64,
     central: PeerAddress,
     peripheral: PeerAddress,
     network: Arc<MockNetwork>,
@@ -453,6 +485,10 @@ struct MockGattConnection {
 impl GattConnection for MockGattConnection {
     fn peer(&self) -> PeerAddress {
         self.peripheral.clone()
+    }
+
+    fn session(&self) -> Option<u64> {
+        Some(self.session)
     }
 
     fn att_mtu(&self) -> u16 {
@@ -495,6 +531,7 @@ impl GattConnection for MockGattConnection {
             GattEvent::Connected {
                 peer: self.central.clone(),
                 local_role: Role::Peripheral,
+                session: None,
             },
         );
         self.network.emit(
@@ -540,6 +577,7 @@ impl GattConnection for MockGattConnection {
             GattEvent::Connected {
                 peer: self.central.clone(),
                 local_role: Role::Peripheral,
+                session: None,
             },
         );
         Ok(Box::pin(UnboundedReceiverStream::new(rx)))
@@ -556,6 +594,7 @@ impl GattConnection for MockGattConnection {
             GattEvent::Disconnected {
                 peer: self.central.clone(),
                 local_role: Role::Peripheral,
+                session: None,
             },
         );
         self.network.emit(
@@ -563,6 +602,7 @@ impl GattConnection for MockGattConnection {
             GattEvent::Disconnected {
                 peer: self.peripheral.clone(),
                 local_role: Role::Central,
+                session: None,
             },
         );
         Ok(())

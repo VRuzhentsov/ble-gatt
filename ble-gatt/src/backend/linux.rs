@@ -150,6 +150,7 @@ fn report_central_loss(
     let _ = events_tx.send(GattEvent::Disconnected {
         peer: peer.clone(),
         local_role: Role::Central,
+        session: Some(generation),
     });
 }
 
@@ -187,6 +188,7 @@ async fn watch_notify_sessions(
         let _ = events_tx.send(GattEvent::Connected {
             peer: peer.clone(),
             local_role: Role::Peripheral,
+            session: Some(session),
         });
         let handle = spawn_peripheral_disconnect_watch(
             adapter.clone(),
@@ -278,6 +280,7 @@ fn spawn_peripheral_disconnect_watch(
         let _ = events_tx.send(GattEvent::Disconnected {
             peer: peer.clone(),
             local_role: Role::Peripheral,
+            session: Some(session),
         });
     })
 }
@@ -440,6 +443,7 @@ impl Backend for LinuxBackend {
         let _ = self.events_tx.send(GattEvent::Connected {
             peer: peer.clone(),
             local_role: Role::Central,
+            session: Some(dial_generation),
         });
 
         // Watch BlueZ's own Connected property so an *unsolicited* drop (peer
@@ -478,6 +482,7 @@ impl Backend for LinuxBackend {
         });
 
         Ok(Box::new(LinuxGattConnection {
+            session: dial_generation,
             peer: peer.clone(),
             device,
             att_mtu: AtomicU16::new(crate::backend::DEFAULT_ATT_MTU),
@@ -540,6 +545,7 @@ impl Backend for LinuxBackend {
                             let _ = events_tx.send(GattEvent::Connected {
                                 peer: peer.clone(),
                                 local_role: Role::Peripheral,
+                                session: served_peers.lock().unwrap().get(&peer).copied(),
                             });
                             // BlueZ gives a GATT *server* no connection
                             // callback at all — the write itself is the only
@@ -682,6 +688,7 @@ impl Backend for LinuxBackend {
             let _ = self.events_tx.send(GattEvent::Disconnected {
                 peer,
                 local_role: Role::Peripheral,
+                session: None,
             });
         }
         *self.app_handle.lock().await = None;
@@ -737,6 +744,8 @@ impl Backend for LinuxBackend {
 }
 
 struct LinuxGattConnection {
+    /// The dial this connection belongs to; see `GattEvent::Connected`.
+    session: u64,
     peer: PeerAddress,
     device: bluer::Device,
     /// Negotiated ATT MTU, refreshed from BlueZ whenever a characteristic
@@ -772,6 +781,10 @@ impl LinuxGattConnection {
 impl GattConnection for LinuxGattConnection {
     fn peer(&self) -> PeerAddress {
         self.peer.clone()
+    }
+
+    fn session(&self) -> Option<u64> {
+        Some(self.session)
     }
 
     fn att_mtu(&self) -> u16 {

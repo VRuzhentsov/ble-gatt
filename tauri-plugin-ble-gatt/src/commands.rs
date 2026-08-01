@@ -102,9 +102,20 @@ pub struct CharacteristicSpecDto {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum GattEventDto {
     #[serde(rename_all = "camelCase")]
-    Connected { address: String, local_role: String },
+    Connected {
+        address: String,
+        local_role: String,
+        /// Distinguishes successive connections to one address; see
+        /// `ble_gatt::GattEvent`. `null` when the backend cannot tell them
+        /// apart.
+        session: Option<u64>,
+    },
     #[serde(rename_all = "camelCase")]
-    Disconnected { address: String, local_role: String },
+    Disconnected {
+        address: String,
+        local_role: String,
+        session: Option<u64>,
+    },
     #[serde(rename_all = "camelCase")]
     CharacteristicWritten {
         address: String,
@@ -131,13 +142,23 @@ fn role_name(role: ble_gatt::Role) -> String {
 impl From<GattEvent> for GattEventDto {
     fn from(event: GattEvent) -> Self {
         match event {
-            GattEvent::Connected { peer, local_role } => Self::Connected {
+            GattEvent::Connected {
+                peer,
+                local_role,
+                session,
+            } => Self::Connected {
                 address: peer.0,
                 local_role: role_name(local_role),
+                session,
             },
-            GattEvent::Disconnected { peer, local_role } => Self::Disconnected {
+            GattEvent::Disconnected {
+                peer,
+                local_role,
+                session,
+            } => Self::Disconnected {
                 address: peer.0,
                 local_role: role_name(local_role),
+                session,
             },
             GattEvent::CharacteristicWritten {
                 peer,

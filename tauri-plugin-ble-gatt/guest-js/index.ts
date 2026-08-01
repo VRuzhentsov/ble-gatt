@@ -46,8 +46,24 @@ export interface ConnectionMtu {
 export type LocalRole = "central" | "peripheral";
 
 export type GattEvent =
-  | { type: "connected"; address: string; localRole: LocalRole }
-  | { type: "disconnected"; address: string; localRole: LocalRole }
+  /**
+   * `session` distinguishes successive connections to the same address, so a
+   * consumer can tell a genuine reconnect from a duplicate event and ignore
+   * lifecycle events belonging to a connection it has already replaced.
+   * `null` when the backend cannot distinguish them.
+   */
+  | {
+      type: "connected";
+      address: string;
+      localRole: LocalRole;
+      session: number | null;
+    }
+  | {
+      type: "disconnected";
+      address: string;
+      localRole: LocalRole;
+      session: number | null;
+    }
   | {
       type: "characteristicWritten";
       address: string;

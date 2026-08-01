@@ -42,6 +42,13 @@ pub const ATT_HEADER_LEN: usize = 3;
 pub trait GattConnection: Send {
     fn peer(&self) -> PeerAddress;
 
+    /// Identifies this connection among successive connections to the same
+    /// peer, so a consumer can ignore lifecycle events belonging to a
+    /// previous one. Matches the `session` on [`GattEvent`].
+    fn session(&self) -> Option<u64> {
+        None
+    }
+
     /// The negotiated ATT MTU for this connection. Backends request a larger
     /// MTU on connect where the platform allows it, but the peer decides —
     /// never assume this is more than [`DEFAULT_ATT_MTU`].

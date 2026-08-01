@@ -283,6 +283,9 @@ pub struct DatagramChannel {
     /// entry was never removed, and every other central was refused
     /// indefinitely.
     release: Option<(mpsc::UnboundedSender<(PeerAddress, u64)>, u64)>,
+    /// The backend session this channel is bound to, when the backend can
+    /// distinguish successive connections to one address.
+    session: Option<u64>,
     /// Raised when inbound data was dropped for this channel.
     ///
     /// Out-of-band rather than an error pushed onto the message queue:
@@ -326,6 +329,12 @@ impl Drop for DatagramChannel {
 impl DatagramChannel {
     pub fn peer(&self) -> PeerAddress {
         self.peer.clone()
+    }
+
+    /// The backend session this channel is bound to, when the backend can
+    /// distinguish successive connections to the same address.
+    pub fn session(&self) -> Option<u64> {
+        self.session
     }
 
     /// Largest payload a single `send` will accept on *this* channel.
@@ -431,6 +440,9 @@ impl DatagramChannel {
 /// A served peer's fragment sender, channel-liveness flag, and overflow
 /// signal, as held by `serve` while that peer occupies the single slot.
 struct ServedPeer {
+    /// The backend's own session id for this peer's connection, so a
+    /// lifecycle event from a previous one can be recognised and ignored.
+    backend_session: Option<u64>,
     fragments: mpsc::Sender<Vec<u8>>,
     active: Arc<AtomicBool>,
     overflow: Arc<OverflowSignal>,
@@ -635,6 +647,10 @@ pub async fn connect(
     };
     // Setup succeeded: take ownership back so the guard becomes inert.
     let connection = pending.connection.take().expect("armed above");
+    // Captured before the connection is moved into the channel: this is what
+    // lets the link-loss watcher tell our own disconnect from one belonging
+    // to a previous connection to the same address.
+    let session = connection.session();
 
     let (tx, rx) = mpsc::channel(config.inbound_queue_depth);
     let overflow = Arc::new(OverflowSignal::default());
@@ -644,8 +660,13 @@ pub async fn connect(
     // the JoinHandle meant aborting the watcher merely dropped it — and
     // dropping a Tokio JoinHandle detaches its task rather than cancelling
     // it, so reassembly outlived the channel that owned it.
-    let watcher =
-        spawn_link_loss_watch(events, peer.clone(), reassembly.abort_handle(), overflow.clone());
+    let watcher = spawn_link_loss_watch(
+        events,
+        peer.clone(),
+        reassembly.abort_handle(),
+        overflow.clone(),
+        connection.session(),
+    );
 
     Ok(DatagramChannel {
         peer: peer.clone(),
@@ -658,6 +679,7 @@ pub async fn connect(
         // Central channels are not held in anyone's slot, so nothing needs
         // telling when this one goes away.
         release: None,
+        session,
         // Set when the backend reports it dropped notifications — the
         // central-side equivalent of `serve`'s fragment-queue overflow.
         overflow,
@@ -678,13 +700,25 @@ pub async fn connect(
 /// would be waiting forever.
 fn spawn_link_loss_watch(
     mut events: BoxStream<GattEvent>, peer: PeerAddress, reassembly: tokio::task::AbortHandle,
-    overflow: Arc<OverflowSignal>,
+    overflow: Arc<OverflowSignal>, session: Option<u64>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(event) = events.next().await {
             match &event {
-                GattEvent::Disconnected { peer: lost, local_role: Role::Central }
-                    if *lost == peer =>
+                // Address *and* session must match. Subscribing happens
+                // before the connection is established (a disconnect landing
+                // in that gap would otherwise be lost), so this stream can
+                // legitimately carry a loss event belonging to a *previous*
+                // connection to the same address — and acting on it would
+                // tear down a channel that is working. When the backend
+                // cannot distinguish sessions it reports `None`, and address
+                // matching alone is the best available.
+                GattEvent::Disconnected {
+                    peer: lost,
+                    local_role: Role::Central,
+                    session: lost_session,
+                } if *lost == peer
+                    && (lost_session.is_none() || session.is_none() || *lost_session == session) =>
                 {
                     reassembly.abort();
                     return;
@@ -830,6 +864,7 @@ pub async fn serve(
                 GattEvent::Connected {
                     peer,
                     local_role: Role::Peripheral,
+                    session: backend_session,
                 } => {
                     // Drain releases first. A caller that drops a channel and
                     // immediately accepts the next peer would otherwise race:
@@ -898,6 +933,7 @@ pub async fn serve(
                         }),
                         inbound: ReceiverStream::new(msg_rx),
                         release: Some((release_tx.clone(), generation)),
+                        session: backend_session,
                         overflow: overflow.clone(),
                         next_msg_id: 0,
                         max_message_len: effective_max_message_len(
@@ -918,6 +954,7 @@ pub async fn serve(
                             inbound.insert(
                                 peer.clone(),
                                 ServedPeer {
+                                    backend_session,
                                     fragments: frag_tx,
                                     active,
                                     overflow: overflow.clone(),
@@ -1002,7 +1039,21 @@ pub async fn serve(
                 GattEvent::Disconnected {
                     peer,
                     local_role: Role::Peripheral,
+                    session: lost_session,
                 } => {
+                    // Same reasoning as the central watcher: a loss event
+                    // from a previous session for this address must not
+                    // evict the peer that replaced it.
+                    let stale = match (lost_session, inbound.get(&peer)) {
+                        (Some(lost), Some(served)) => match served.backend_session {
+                            Some(current) => lost != current,
+                            None => false,
+                        },
+                        _ => false,
+                    };
+                    if stale {
+                        continue;
+                    }
                     // Dropping the fragment sender ends that peer's
                     // reassembly task, which closes its channel's `recv()`.
                     // Clearing the flag closes the *send* half: without it

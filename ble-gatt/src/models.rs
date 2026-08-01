@@ -80,10 +80,23 @@ pub enum GattEvent {
         /// both roles at once cannot tell an outbound connection from an
         /// inbound one.
         local_role: Role,
+        /// Identifies *which* connection to `peer` this is.
+        ///
+        /// An address names a peer, not a session, so a peer that drops and
+        /// reconnects quickly produces events that are indistinguishable by
+        /// address alone — and a lifecycle event queued from the old
+        /// connection would otherwise be applied to the new one, tearing
+        /// down a link that is working. `None` from backends that cannot
+        /// distinguish sessions; consumers then fall back to address
+        /// matching.
+        session: Option<u64>,
     },
     Disconnected {
         peer: PeerAddress,
         local_role: Role,
+        /// See [`GattEvent::Connected::session`]. Matching on this is what
+        /// stops a stale loss event terminating its own replacement.
+        session: Option<u64>,
     },
     CharacteristicWritten {
         peer: PeerAddress,

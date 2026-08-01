@@ -1048,3 +1048,68 @@ async fn a_central_parked_in_recv_is_released_when_lifecycle_events_lag() {
         "the channel must end or report an error, not deliver lag as normal data"
     );
 }
+
+#[tokio::test]
+async fn a_loss_event_from_a_replaced_connection_does_not_kill_its_successor() {
+    let config = config();
+    let network = MockNetwork::new();
+    let peripheral_addr = PeerAddress("peripheral-stale-loss".to_string());
+    let central_addr = PeerAddress("central-stale-loss".to_string());
+
+    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+        peripheral_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    ));
+    let central: Arc<MockBackend> = Arc::new(MockBackend::new(
+        central_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    ));
+
+    let mut incoming = datagram::serve(peripheral.clone(), &config)
+        .await
+        .expect("serve should start");
+
+    // First connection, whose session id we capture, then abandon.
+    let first = datagram::connect(central.clone(), &peripheral_addr, &config)
+        .await
+        .expect("connect should succeed");
+    let stale_session = first.session().expect("mock supplies a session");
+    let first_served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
+        .await
+        .expect("serve should yield a channel")
+        .expect("stream open");
+
+    // Both ends of the first session go away, freeing the single-central
+    // slot — but its disconnect event has not been delivered yet.
+    drop(first);
+    drop(first_served);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // The same address reconnects and is served afresh.
+    let mut second = datagram::connect(central.clone(), &peripheral_addr, &config)
+        .await
+        .expect("reconnect should succeed");
+    let mut second_served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
+        .await
+        .expect("serve should yield a channel for the reconnect")
+        .expect("stream open");
+
+    // The *old* connection's disconnect finally arrives. Matched by address
+    // alone it would abort the replacement's reassembly and close a channel
+    // that is working.
+    network.simulate_loss_for_session(&central_addr, &peripheral_addr, stale_session);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    second_served
+        .send(b"still-alive".to_vec())
+        .await
+        .expect("the replacement channel must still be usable");
+    let received = tokio::time::timeout(Duration::from_secs(2), second.recv())
+        .await
+        .expect("a stale loss event must not close the replacement channel")
+        .expect("channel should still be open")
+        .expect("no error");
+    assert_eq!(received, b"still-alive");
+}

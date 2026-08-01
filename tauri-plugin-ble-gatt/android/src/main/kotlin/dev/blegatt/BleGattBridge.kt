@@ -286,18 +286,29 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                         // then clear its Rust state, tearing down a
                         // connection that had just succeeded — so only the
                         // GATT still owning this address may do so.
-                        val current = connectedGatts[address] === gatt
-                        if (current) {
-                            connectedGatts.remove(address)
-                            pendingCharacteristics.remove(address)
-                            clearPendingOperations(address)
-                            // Fires for unsolicited drops too (out of range,
-                            // peer powered off), which is the whole point of
-                            // surfacing this to Rust rather than only
-                            // reporting disconnects we initiated.
-                            onDisconnected(nativeHandle, address, false)
-                        } else {
-                            Log.d(TAG, "onConnectionStateChange: $address superseded, not clearing state")
+                        // The removal *and* the Rust publication happen
+                        // under `gattLock`. Deciding ownership, releasing,
+                        // then acting leaves a window in which a retry
+                        // installs a replacement — after which this callback
+                        // deletes that replacement and reports it
+                        // disconnected. Holding the lock across the JNI call
+                        // is safe here: no Rust path calls into Kotlin while
+                        // holding the `connections` mutex these callbacks
+                        // take, so there is no cycle.
+                        synchronized(gattLock) {
+                            if (connectedGatts[address] === gatt) {
+                                connectedGatts.remove(address)
+                                pendingCharacteristics.remove(address)
+                                clearPendingOperations(address)
+                                // Fires for unsolicited drops too (out of
+                                // range, peer powered off), which is the
+                                // whole point of surfacing this to Rust
+                                // rather than only reporting disconnects we
+                                // initiated.
+                                onDisconnected(nativeHandle, address, false)
+                            } else {
+                                Log.d(TAG, "onConnectionStateChange: $address superseded, not clearing state")
+                            }
                         }
                         // Closed either way: a superseded GATT still needs
                         // releasing, it just must not take the live one's
@@ -324,13 +335,24 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 // *replacement's* connect before that connection had
                 // discovered anything. `closeConnection` and the disconnect
                 // path take the same lock.
-                val outcome = synchronized(gattLock) {
+                // Ownership *and* the Rust publication under one lock.
+                // Releasing between them let a cancellation plus retry
+                // interleave, after which this callback resolved the
+                // replacement's connect with its own service map — marking a
+                // connection live before its services had been discovered.
+                val superseded = synchronized(gattLock) {
                     when {
-                        connectedGatts[address] !== gatt -> OUTCOME_SUPERSEDED
+                        connectedGatts[address] !== gatt -> true
                         status != BluetoothGatt.GATT_SUCCESS -> {
+                            // Previously ignored, so a failed discovery still
+                            // resolved connect() successfully and handed back
+                            // a connection with no usable characteristics.
+                            Log.w(TAG, "onServicesDiscovered failed for $address status=$status")
                             connectedGatts.remove(address)
                             pendingCharacteristics.remove(address)
-                            OUTCOME_FAILED
+                            clearPendingOperations(address)
+                            onDisconnected(nativeHandle, address, false)
+                            false
                         }
                         else -> {
                             val byUuid = ConcurrentHashMap<String, BluetoothGattCharacteristic>()
@@ -340,27 +362,18 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                                 }
                             }
                             pendingCharacteristics[address] = byUuid
-                            OUTCOME_OK
+                            onConnected(nativeHandle, address, false)
+                            false
                         }
                     }
                 }
-                when (outcome) {
-                    OUTCOME_SUPERSEDED -> {
-                        Log.d(TAG, "onServicesDiscovered: $address superseded, ignoring")
-                        // Release this handle without touching state that
-                        // now belongs to another GATT.
-                        gatt.close()
-                    }
-                    OUTCOME_FAILED -> {
-                        // Previously ignored, so a failed discovery still
-                        // resolved connect() successfully and handed back a
-                        // connection with no usable characteristics.
-                        Log.w(TAG, "onServicesDiscovered failed for $address status=$status")
-                        clearPendingOperations(address)
-                        onDisconnected(nativeHandle, address, false)
-                        gatt.close()
-                    }
-                    else -> onConnected(nativeHandle, address, false)
+                if (superseded) {
+                    Log.d(TAG, "onServicesDiscovered: $address superseded, ignoring")
+                }
+                // A superseded or failed GATT still needs releasing; only a
+                // published, owned one stays open.
+                if (superseded || status != BluetoothGatt.GATT_SUCCESS) {
+                    gatt.close()
                 }
             }
 
@@ -618,21 +631,24 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 // `stopAdvertising` takes the same lock to increment it, so
                 // a callback that gets here either completes entirely before
                 // the restart or is rejected.
-                val forward = synchronized(this@BleGattBridge) {
-                    if (serverGeneration != generation) {
-                        false
-                    } else {
-                        characteristic.value = value
-                        if (responseNeeded) {
-                            gattServer?.sendResponse(
-                                device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value
-                            )
-                        }
-                        true
+                // Publication inside the monitor as well. Leaving it outside
+                // let a callback decide it was current, pause while
+                // `stopAdvertising` incremented the generation and a
+                // replacement server started, and then publish its stale
+                // payload into the new session — where a datagram fragment
+                // is reassembled as current data.
+                synchronized(this@BleGattBridge) {
+                    if (serverGeneration != generation) return
+                    characteristic.value = value
+                    if (responseNeeded) {
+                        gattServer?.sendResponse(
+                            device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value
+                        )
                     }
+                    onServerCharacteristicWritten(
+                        nativeHandle, device.address, characteristic.uuid.toString(), value
+                    )
                 }
-                if (!forward) return
-                onServerCharacteristicWritten(nativeHandle, device.address, characteristic.uuid.toString(), value)
             }
 
             override fun onNotificationSent(device: BluetoothDevice, status: Int) {
@@ -993,12 +1009,6 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     }
 
     companion object {
-        /// Outcomes of the atomic ownership-and-publish decision in
-        /// `onServicesDiscovered`, kept out of the lock so the JNI calls
-        /// they trigger do not run while it is held.
-        private const val OUTCOME_SUPERSEDED: Int = 0
-        private const val OUTCOME_FAILED: Int = 1
-        private const val OUTCOME_OK: Int = 2
 
         private val CLIENT_CHARACTERISTIC_CONFIG_UUID: UUID =
             UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")

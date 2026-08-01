@@ -85,6 +85,9 @@ const EVENT_CHANNEL_CAPACITY: usize = 64;
 
 #[derive(Default)]
 struct ConnectionState {
+    /// Distinguishes successive connections to this address, so a lifecycle
+    /// callback queued from a previous one is recognisable as stale.
+    session: u64,
     /// A `BluetoothGatt` for this address is open. Distinct from
     /// `connected_tx`, which only covers a connect still in flight — once
     /// `onConnected` takes that sender, only this flag still says the link
@@ -495,6 +498,7 @@ impl Backend for AndroidBackend {
                     reason: "a connection to this peer is already open".to_string(),
                 });
             }
+            state.session = self.inner.next_op_id.fetch_add(1, Ordering::Relaxed);
             state.connected_tx = Some(connected_tx);
         }
 
@@ -537,9 +541,17 @@ impl Backend for AndroidBackend {
         let mut guard = guard;
         guard.armed = false;
 
+        let session = self
+            .inner
+            .connections
+            .lock()
+            .unwrap()
+            .get(&peer.0)
+            .map(|state| state.session);
         Ok(Box::new(AndroidGattConnection {
             inner: self.inner.clone(),
             address: peer.0.clone(),
+            session,
         }))
     }
 
@@ -815,12 +827,17 @@ impl tokio_stream::Stream for NotifyStream {
 struct AndroidGattConnection {
     inner: Arc<Inner>,
     address: String,
+    session: Option<u64>,
 }
 
 #[async_trait]
 impl GattConnection for AndroidGattConnection {
     fn peer(&self) -> PeerAddress {
         PeerAddress(self.address.clone())
+    }
+
+    fn session(&self) -> Option<u64> {
+        self.session
     }
 
     fn att_mtu(&self) -> u16 {
@@ -1248,9 +1265,16 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onConnected<'local>(
     // subscriber. The peripheral-role announcement comes from
     // `onServerSubscribed` instead.
     if from_server == 0 {
+        let session = inner
+            .connections
+            .lock()
+            .unwrap()
+            .get(&address)
+            .map(|state| state.session);
         let _ = inner.server_events_tx.send(GattEvent::Connected {
             peer: PeerAddress(address.clone()),
             local_role: Role::Central,
+            session,
         });
     }
 }
@@ -1262,6 +1286,12 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onDisconnected<'local>(
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
     let address = read_jstring(&mut env, &address);
+    let disconnected_session = inner
+        .connections
+        .lock()
+        .unwrap()
+        .get(&address)
+        .map(|state| state.session);
     // Likewise: a central leaving our GATT server says nothing about an
     // outbound connection we hold to that same address. Tearing down the
     // client state here would kill reads, writes and subscriptions on a
@@ -1291,6 +1321,9 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onDisconnected<'local>(
         } else {
             Role::Central
         },
+        // The session this disconnect belongs to, so a consumer can ignore
+        // a loss event queued from a connection that has been replaced.
+        session: disconnected_session,
     });
 }
 
@@ -1401,6 +1434,7 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onServerCharacteristicWritten<'
     let _ = inner.server_events_tx.send(GattEvent::Connected {
         peer: PeerAddress(address.clone()),
         local_role: Role::Peripheral,
+        session: None,
     });
     let _ = inner.server_events_tx.send(GattEvent::CharacteristicWritten {
         peer: PeerAddress(address),
@@ -1452,6 +1486,9 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onServerSubscribed<'local>(
     let _ = inner.server_events_tx.send(GattEvent::Connected {
         peer: PeerAddress(address),
         local_role: Role::Peripheral,
+        // Android's server callbacks carry no session of their own; the
+        // subscription itself is the session boundary here.
+        session: None,
     });
 }
 
