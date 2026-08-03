@@ -1002,6 +1002,55 @@ async fn abandoning_connect_mid_setup_still_releases_the_connection() {
 }
 
 #[tokio::test]
+async fn dropping_a_central_channel_without_close_still_disconnects_it() {
+    let config = config();
+    let network = MockNetwork::new();
+    let peripheral_addr = PeerAddress("peripheral-drop-channel".to_string());
+
+    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+        peripheral_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    ));
+    peripheral
+        .advertise(config.service_spec())
+        .await
+        .expect("advertise should succeed");
+
+    let central: Arc<MockBackend> = Arc::new(MockBackend::new(
+        PeerAddress("central-drop-channel".to_string()),
+        network.clone(),
+        full_capabilities(),
+    ));
+
+    let channel = datagram::connect(central.clone(), &peripheral_addr, &config)
+        .await
+        .expect("connect should succeed");
+
+    // Dropped without calling `close()` — cancellation, an early error, or
+    // simply forgetting are all the same case from the connection's point of
+    // view.
+    drop(channel);
+
+    // The established connection must still be released. Without this, on
+    // Android the platform GATT stays open and a later `connect` to the same
+    // address is refused as already open — see `Drop for DatagramChannel`.
+    let mut released = false;
+    for _ in 0..40 {
+        if network.disconnected_peers().contains(&peripheral_addr) {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        released,
+        "dropping a channel without close() must disconnect the connection it holds, \
+         not just drop the handle"
+    );
+}
+
+#[tokio::test]
 async fn a_central_parked_in_recv_is_released_when_lifecycle_events_lag() {
     let config = config();
     let network = MockNetwork::new();

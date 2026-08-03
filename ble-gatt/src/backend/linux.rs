@@ -890,11 +890,20 @@ impl Backend for LinuxBackend {
     }
 
     async fn disconnect_peer(&self, peer: &PeerAddress, session: Option<u64>) -> Result<()> {
-        // Serialised against dial and every other address-backed platform
-        // operation, and held across the check *and* the disconnect: `Device`
-        // resolves by address, so validating and then awaiting would let a
-        // reconnect land in between and have this call drop the replacement.
+        // Serialised against dial (`dial_lock`) and, separately, against
+        // peripheral-role session admission (`notify_writers`) — the lock
+        // `watch_notify_sessions` takes before installing a replacement
+        // `served_peers` entry. `dial_lock` alone does not serialise against
+        // that: `watch_notify_sessions` never takes it, so a new session
+        // could be installed between this call's check and its
+        // `device.disconnect()`, and this call would then tear down the
+        // replacement it just installed instead of the stale session it was
+        // asked to end. Both are held across the check *and* the disconnect,
+        // for the reason `dial_lock` already was: `Device` resolves by
+        // address, so validating and then awaiting would let either kind of
+        // reconnect land in the gap and have this call drop the replacement.
         let _dial = self.dial_lock.lock().await;
+        let _writers = self.notify_writers.lock().await;
         if let Some(session) = session {
             if self.served_peers.lock().unwrap().get(peer) != Some(&session) {
                 return Ok(());

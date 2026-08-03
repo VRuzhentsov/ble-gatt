@@ -228,7 +228,10 @@ fn effective_max_message_len(configured: usize, fragment_budget: usize) -> usize
 enum Sink {
     /// Central: write to the remote characteristic.
     Connection {
-        connection: Box<dyn GattConnection>,
+        /// `None` once `close()` or `Drop` has taken it to disconnect —
+        /// see both for why this needs to be an `Option` rather than owned
+        /// outright.
+        connection: Option<Box<dyn GattConnection>>,
         write_type: WriteType,
     },
     /// Peripheral: notify subscribed centrals. See the module-level note on
@@ -326,6 +329,29 @@ impl Drop for DatagramChannel {
         if let Some((release, generation)) = &self.release {
             let _ = release.send((self.peer.clone(), *generation));
         }
+        // Central role only: `close()` is the normal way to tear down the
+        // platform connection, but a caller that drops the channel without
+        // calling it — cancellation, an early error, simply forgetting —
+        // must not leak it. None of the backends disconnect on their own
+        // `Drop`; on Android in particular the Kotlin `BluetoothGatt` stays
+        // open, and a later `connect` to the same address is rejected as
+        // already open. `Drop` cannot await, so the connection is handed to
+        // a detached task — the same pattern `PendingConnection` already
+        // uses for a setup abandoned mid-flight.
+        if let Sink::Connection { connection, .. } = self.sink.get_mut() {
+            if let Some(mut connection) = connection.take() {
+                let peer = self.peer.clone();
+                tokio::spawn(async move {
+                    log::info!(
+                        "drop: disconnecting {} — channel dropped without close()",
+                        peer.0
+                    );
+                    if let Err(err) = connection.disconnect().await {
+                        log::warn!("drop: could not disconnect {}: {err}", peer.0);
+                    }
+                });
+            }
+        }
     }
 }
 
@@ -396,6 +422,13 @@ impl DatagramChannel {
                     connection,
                     write_type,
                 } => {
+                    let Some(connection) = connection.as_mut() else {
+                        log::warn!(
+                            "send: refusing msg_id={msg_id} — channel to {} is already closed",
+                            self.peer.0
+                        );
+                        return Err(BleError::NotConnected(self.peer.0.clone()));
+                    };
                     if let Err(err) =
                         connection.write_with_type(characteristic, fragment, *write_type).await
                     {
@@ -484,7 +517,14 @@ impl DatagramChannel {
     pub async fn close(&mut self) -> Result<()> {
         let mut sink = self.sink.lock().await;
         match &mut *sink {
-            Sink::Connection { connection, .. } => connection.disconnect().await,
+            // Takes the connection rather than borrowing it, so a second
+            // `close()` — or a later `Drop` — sees `None` and does not
+            // repeat the disconnect on a connection this call already tore
+            // down.
+            Sink::Connection { connection, .. } => match connection.take() {
+                Some(mut connection) => connection.disconnect().await,
+                None => Ok(()),
+            },
             // The peripheral does not own the link; a central disconnecting
             // is what ends it. Stopping advertising here would tear down
             // every other peer's channel too.
@@ -768,7 +808,7 @@ pub async fn connect(
         peer: peer.clone(),
         characteristic: config.characteristic,
         sink: Mutex::new(Sink::Connection {
-            connection,
+            connection: Some(connection),
             write_type: config.write_type,
         }),
         inbound: ReceiverStream::new(rx),
