@@ -4,12 +4,13 @@
 //! `backend::mock::MockBackend` for a CI-safe, radio-free stand-in.
 
 pub mod backend;
+pub mod datagram;
 pub mod error;
 pub mod models;
 
 pub use backend::{Backend, BoxStream, GattConnection};
 pub use error::{BleError, Result};
 pub use models::{
-    CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattCharacteristicSpec, GattEvent,
+    CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattCharacteristicSpec, GattEvent, WriteType,
     GattServiceSpec, PeerAddress, Role, ServiceUuid,
 };

@@ -19,26 +19,26 @@ This repo is a Cargo workspace with two published crates:
   wrapper around `ble-gatt`, following Tauri's own `tauri-plugin-*` naming
   convention for its mobile-plugin tooling.
 
-## Why hand-rolled, not an existing crate
+This library **carries bytes; it does not encrypt them.** Layering your own
+session protocol or end-to-end encryption on top is expected and
+supported — and staying out of the way is deliberate, so that consumers
+talking to third-party device firmware (which will never speak your
+protocol) can use the raw GATT API directly. See ADR-0003.
 
-Checked directly (GitHub API + READMEs) before writing a line of this:
-
-| Crate | Central | Peripheral | Android | License | Maturity |
-|---|---|---|---|---|---|
-| `btleplug` / `tauri-plugin-blec` | Yes | **No** (host-side only, by design) | Yes | Apache-2.0 | Active, healthy |
-| `bluest` | Yes | **No** (explicit in README) | Not yet ("planned") | Apache-2.0 | Active |
-| `ble-peripheral-rust` | — | Yes (by design) | **No** Android backend in source tree | MIT | Reasonably active |
-| `blew` / `tauri-plugin-blew` | Yes | Yes | Yes | **AGPL-3.0** | Author-labeled "experimental"; stale |
-
-No existing crate does BLE peripheral mode on Android under a permissive
-license. `ble-gatt` exists to close that gap without taking on AGPL.
+Design decisions live in `docs/adr/`:
+[0001](docs/adr/0001-ble-gatt-tauri-plugin-split-and-scope.md) — why this
+split, why GATT-only, why hand-rolled instead of an existing crate.
+[0002](docs/adr/0002-android-jni-bridge.md) — the Android JNI bridge, and
+exactly what is and isn't verified about it.
+[0003](docs/adr/0003-carrier-not-crypto-and-the-two-api-tiers.md) — carrier
+vs. crypto, the two API tiers, and the no-AGPL constraint.
 
 ## Platform support
 
 | Platform | Central | Peripheral | Status |
 |---|---|---|---|
 | Linux (BlueZ) | Yes | Yes | **M1 — implemented**, verified against real BlueZ hardware |
-| Android | Yes | Yes (where the chipset/driver allows — see `CapabilityReport`) | **M1 — in progress** |
+| Android | Yes | Yes (where the chipset/driver allows — see `CapabilityReport`) | **M1 — implemented, not yet verified as a working bridge.** Individual pieces confirmed on a real emulator (real `capabilities()` returning `{central: true, peripheral: true}`, real GATT-server advertise start), but no device-to-device round trip yet — physical-hardware verification is the real bar, planned for after the next minor patch/release. See ADR-0002. |
 | Windows (WinRT) | — | — | M2 — reserved, not implemented |
 | macOS / iOS | — | — | M3 — reserved, not implemented |
 
@@ -51,7 +51,7 @@ peripheral mode reports that honestly instead of failing opaquely later.
 ```
 Backend trait (async, Tokio)
 ├── linux.rs    BlueZ via bluer — central + peripheral         (M1)
-├── android.rs  raw jni + ndk-context JNI bridge                (M1, in progress)
+├── android.rs  raw jni + ndk-context JNI bridge                (M1)
 ├── windows.rs  reserved                                        (M2)
 └── mock.rs     in-process, radio-free — CI-safe protocol tests
 ```
@@ -64,8 +64,12 @@ crossing the `Backend`/`GattConnection` port boundary.
 ## Status
 
 Early, under active development. `ble-gatt`'s Linux backend is real and
-tested against BlueZ hardware; the Android backend is the current work in
-progress. Not yet published to crates.io/npm — consume as a git dependency.
+tested against BlueZ hardware. The Android backend is implemented and its
+individual pieces run correctly on a real emulator, but it is **not yet
+verified as a working bridge** — that requires a real device-to-device round
+trip, planned on physical hardware after the next minor patch/release (see
+ADR-0002). Not yet published to crates.io/npm — consume as a git
+dependency.
 
 ## License
 

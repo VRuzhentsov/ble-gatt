@@ -8,8 +8,11 @@ const COMMANDS: &[&str] = &[
     "ble_read",
     "ble_write",
     "ble_disconnect",
+    "ble_connection_mtu",
+    "ble_watch_events",
+    "ble_unwatch_events",
 ];
 
 fn main() {
-    tauri_plugin::Builder::new(COMMANDS).build();
+    tauri_plugin::Builder::new(COMMANDS).android_path("android").build();
 }

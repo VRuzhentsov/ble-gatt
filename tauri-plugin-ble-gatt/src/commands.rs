@@ -4,23 +4,38 @@
 //! deferred until Fini's Stage 3 integration defines the exact shape it
 //! needs, per the plan's staged-delivery decision.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use ble_gatt::{
-    Backend, CharacteristicUuid, GattCharacteristicSpec, GattConnection, GattServiceSpec, PeerAddress,
-    ServiceUuid,
+    Backend, CharacteristicUuid, GattCharacteristicSpec, GattConnection, GattEvent, GattServiceSpec,
+    PeerAddress, ServiceUuid, WriteType,
 };
 use serde::{Deserialize, Serialize};
+use tauri::ipc::Channel;
 use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
+/// One live GATT connection, individually locked.
+type SharedConnection = Arc<Mutex<Box<dyn GattConnection>>>;
+
 pub struct PluginState {
+    /// Live event-forwarding tasks, so a JS caller can actually stop one.
+    /// Dropping the JS handler alone does not: the `Channel` stays valid and
+    /// Rust keeps sending, so repeated subscribe/dispose cycles accumulated
+    /// tasks and IPC traffic forever.
+    /// Shared so a watcher task can remove its own entry when it exits
+    /// on its own — otherwise a channel dropped by a webview reload leaves
+    /// a completed handle here for the life of the plugin.
+    watchers: Arc<Mutex<HashMap<u64, tokio::task::JoinHandle<()>>>>,
     backend: Arc<dyn Backend>,
-    connections: Mutex<HashMap<u64, Box<dyn GattConnection>>>,
+    /// Each connection gets its own lock. A single map-wide mutex was held
+    /// across `.await`, so one slow or hung GATT operation blocked every
+    /// command on every other connection.
+    connections: Mutex<HashMap<u64, SharedConnection>>,
     next_handle: AtomicU64,
 }
 
@@ -29,8 +44,33 @@ impl PluginState {
         Self {
             backend,
             connections: Mutex::new(HashMap::new()),
+            watchers: Arc::new(Mutex::new(HashMap::new())),
             next_handle: AtomicU64::new(1),
         }
+    }
+}
+
+impl PluginState {
+    /// The backend this plugin drives.
+    ///
+    /// Exposed so a Rust-side consumer of the plugin — the hardware
+    /// verification harness in `examples/tauri-app`, for instance — can use
+    /// the `ble-gatt` API directly instead of going out through the JS
+    /// command surface and back. On Android this is the only way to reach a
+    /// working backend, since the JNI bridge is set up by the plugin.
+    pub fn backend(&self) -> Arc<dyn Backend> {
+        self.backend.clone()
+    }
+
+    /// Look up a connection and release the map lock immediately, so a slow
+    /// operation on one connection cannot block commands on another.
+    async fn connection(&self, handle: u64) -> Result<SharedConnection, String> {
+        self.connections
+            .lock()
+            .await
+            .get(&handle)
+            .cloned()
+            .ok_or_else(|| "unknown connection handle".to_string())
     }
 }
 
@@ -39,24 +79,113 @@ fn parse_uuid(raw: &str) -> Result<Uuid, String> {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CapabilitiesResponse {
     pub central: bool,
     pub peripheral: bool,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DiscoveredPeerDto {
     pub address: String,
     pub name: Option<String>,
+    /// Manufacturer-specific advertisement data, keyed by company ID as a
+    /// decimal string — JSON object keys must be strings, and JS would
+    /// silently stringify a numeric key anyway.
+    pub manufacturer_data: BTreeMap<String, Vec<u8>>,
+    /// Service advertisement data, keyed by service UUID string.
+    pub service_data: BTreeMap<String, Vec<u8>>,
+    pub rssi: Option<i16>,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CharacteristicSpecDto {
     pub uuid: String,
     pub readable: bool,
     pub writable: bool,
     pub notifiable: bool,
     pub initial_value: Vec<u8>,
+}
+
+/// Connection lifecycle as delivered to JS. Mirrors `ble_gatt::GattEvent`
+/// but flattened into a tagged shape that is natural to `switch` on from
+/// TypeScript.
+#[derive(Serialize, Clone)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum GattEventDto {
+    #[serde(rename_all = "camelCase")]
+    Connected {
+        address: String,
+        local_role: String,
+        /// Distinguishes successive connections to one address; see
+        /// `ble_gatt::GattEvent`. `null` when the backend cannot tell them
+        /// apart.
+        session: Option<u64>,
+    },
+    #[serde(rename_all = "camelCase")]
+    Disconnected {
+        address: String,
+        local_role: String,
+        session: Option<u64>,
+    },
+    #[serde(rename_all = "camelCase")]
+    CharacteristicWritten {
+        address: String,
+        characteristic_uuid: String,
+        value: Vec<u8>,
+    },
+    /// This subscriber fell behind and events were discarded. Forwarded
+    /// rather than hidden: a JS consumer tracking connection state from this
+    /// stream cannot know its view is still accurate otherwise.
+    #[serde(rename_all = "camelCase")]
+    Lagged { dropped: u64 },
+}
+
+/// Which role *this* device played. JS needs it for the same reason Rust
+/// does: an outbound connection and an inbound central are otherwise
+/// indistinguishable.
+fn role_name(role: ble_gatt::Role) -> String {
+    match role {
+        ble_gatt::Role::Central => "central".to_string(),
+        ble_gatt::Role::Peripheral => "peripheral".to_string(),
+    }
+}
+
+impl From<GattEvent> for GattEventDto {
+    fn from(event: GattEvent) -> Self {
+        match event {
+            GattEvent::Connected {
+                peer,
+                local_role,
+                session,
+            } => Self::Connected {
+                address: peer.0,
+                local_role: role_name(local_role),
+                session,
+            },
+            GattEvent::Disconnected {
+                peer,
+                local_role,
+                session,
+            } => Self::Disconnected {
+                address: peer.0,
+                local_role: role_name(local_role),
+                session,
+            },
+            GattEvent::CharacteristicWritten {
+                peer,
+                characteristic,
+                value,
+            } => Self::CharacteristicWritten {
+                address: peer.0,
+                characteristic_uuid: characteristic.0.to_string(),
+                value,
+            },
+            GattEvent::Lagged { dropped } => Self::Lagged { dropped },
+        }
+    }
 }
 
 #[tauri::command]
@@ -123,19 +252,46 @@ pub async fn ble_scan_once(
         .await
         .map_err(|err| err.to_string())?;
 
-    let mut found = Vec::new();
+    // Keyed by address, not appended. Android re-reports a matching
+    // advertiser on every advertising interval, so appending returned the
+    // same device many times and let the vector grow with the timeout rather
+    // than with the number of peers — the backend's bounded queue does not
+    // bound it, because this loop drains that queue continuously.
+    let mut found: BTreeMap<String, DiscoveredPeerDto> = BTreeMap::new();
     let deadline = tokio::time::sleep(Duration::from_millis(timeout_ms));
     tokio::pin!(deadline);
     loop {
         tokio::select! {
             _ = &mut deadline => break,
             item = stream.next() => match item {
-                Some(peer) => found.push(DiscoveredPeerDto { address: peer.address.0, name: peer.name }),
+                // A scan failure arriving mid-stream is returned as an error
+                // even though some peers may already have been collected:
+                // reporting a truncated list as success would tell the user
+                // "these are the devices nearby" when the scan was actually
+                // cut short by a powered-off adapter or a denied permission.
+                Some(Err(err)) => return Err(err.to_string()),
+                // Latest observation wins: RSSI and advertisement payload
+                // change between intervals, and the freshest is the useful one.
+                Some(Ok(peer)) => { found.insert(peer.address.0.clone(), DiscoveredPeerDto {
+                    address: peer.address.0,
+                    name: peer.name,
+                    manufacturer_data: peer
+                        .manufacturer_data
+                        .into_iter()
+                        .map(|(id, value)| (id.to_string(), value))
+                        .collect(),
+                    service_data: peer
+                        .service_data
+                        .into_iter()
+                        .map(|(uuid, value)| (uuid.0.to_string(), value))
+                        .collect(),
+                    rssi: peer.rssi,
+                }); }
                 None => break,
             }
         }
     }
-    Ok(found)
+    Ok(found.into_values().collect())
 }
 
 #[tauri::command]
@@ -146,7 +302,11 @@ pub async fn ble_connect(state: tauri::State<'_, PluginState>, address: String) 
         .await
         .map_err(|err| err.to_string())?;
     let handle = state.next_handle.fetch_add(1, Ordering::SeqCst);
-    state.connections.lock().await.insert(handle, connection);
+    state
+        .connections
+        .lock()
+        .await
+        .insert(handle, Arc::new(Mutex::new(connection)));
     Ok(handle)
 }
 
@@ -155,29 +315,130 @@ pub async fn ble_read(
     state: tauri::State<'_, PluginState>, handle: u64, characteristic_uuid: String,
 ) -> Result<Vec<u8>, String> {
     let uuid = parse_uuid(&characteristic_uuid)?;
-    let mut connections = state.connections.lock().await;
-    let connection = connections.get_mut(&handle).ok_or("unknown connection handle")?;
+    let connection = state.connection(handle).await?;
+    let mut connection = connection.lock().await;
     connection.read(CharacteristicUuid(uuid)).await.map_err(|err| err.to_string())
 }
 
+/// `without_response` opts into ATT Write Command: much faster for bulk
+/// transfer, but the peer silently drops what it can't keep up with. Absent
+/// or `false` means the acknowledged write, which is the safe default.
 #[tauri::command]
 pub async fn ble_write(
     state: tauri::State<'_, PluginState>, handle: u64, characteristic_uuid: String, value: Vec<u8>,
+    without_response: Option<bool>,
 ) -> Result<(), String> {
     let uuid = parse_uuid(&characteristic_uuid)?;
-    let mut connections = state.connections.lock().await;
-    let connection = connections.get_mut(&handle).ok_or("unknown connection handle")?;
+    let write_type = if without_response.unwrap_or(false) {
+        WriteType::WithoutResponse
+    } else {
+        WriteType::WithResponse
+    };
+    let connection = state.connection(handle).await?;
+    let mut connection = connection.lock().await;
     connection
-        .write(CharacteristicUuid(uuid), value)
+        .write_with_type(CharacteristicUuid(uuid), value, write_type)
         .await
         .map_err(|err| err.to_string())
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionMtuResponse {
+    /// Negotiated ATT MTU for this connection.
+    pub att_mtu: u16,
+    /// Largest payload that fits in one write. Chunk bulk transfers against
+    /// this rather than a hardcoded constant — it is only known after
+    /// negotiation and differs per peer and platform.
+    pub max_write_len: usize,
+}
+
+#[tauri::command]
+pub async fn ble_connection_mtu(
+    state: tauri::State<'_, PluginState>, handle: u64,
+) -> Result<ConnectionMtuResponse, String> {
+    let connection = state.connection(handle).await?;
+    let connection = connection.lock().await;
+    Ok(ConnectionMtuResponse {
+        att_mtu: connection.att_mtu(),
+        max_write_len: connection.max_write_len(),
+    })
+}
+
+/// Stream connection lifecycle events to the frontend over a `Channel`
+/// supplied by the caller.
+///
+/// A per-subscriber `Channel` rather than a global emitted event name: it
+/// scopes delivery to the caller that asked, needs no agreed-upon event
+/// string, and stops cleanly when the JS side drops it.
+///
+/// This is the only way the frontend learns about a peer disappearing
+/// without warning — every other command reports failures of operations you
+/// initiated, so a UI mid-transfer would otherwise just appear to stall.
+/// Returns a subscription id; pass it to `ble_unwatch_events` to stop.
+#[tauri::command]
+pub async fn ble_watch_events(
+    state: tauri::State<'_, PluginState>, on_event: Channel<GattEventDto>,
+) -> Result<u64, String> {
+    let mut events = state.backend.events();
+    let id = state.next_handle.fetch_add(1, Ordering::SeqCst);
+    let watchers = state.watchers.clone();
+    // The task must not be able to finish — and try to remove itself —
+    // before its handle is registered. An already-closed event stream, or a
+    // first send that fails immediately, would otherwise have the removal
+    // find nothing and the insertion below store a completed handle
+    // permanently: the exact leak the self-removal was added to fix.
+    let (registered_tx, registered) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        // Cancelled only if registration itself failed, in which case there
+        // is nothing to remove.
+        if registered.await.is_err() {
+            return;
+        }
+        while let Some(event) = events.next().await {
+            // Send failure means the JS side dropped the channel — a webview
+            // reload, a closed window — and no disposer will ever call
+            // `ble_unwatch_events`. Stop forwarding, and take this entry out
+            // of the registry on the way: leaving it behind accumulated a
+            // finished handle per page lifecycle for the life of the plugin.
+            if on_event.send(GattEventDto::from(event)).is_err() {
+                break;
+            }
+        }
+        watchers.lock().await.remove(&id);
+    });
+    state.watchers.lock().await.insert(id, task);
+    let _ = registered_tx.send(());
+    Ok(id)
+}
+
+#[tauri::command]
+pub async fn ble_unwatch_events(
+    state: tauri::State<'_, PluginState>, subscription: u64,
+) -> Result<(), String> {
+    if let Some(task) = state.watchers.lock().await.remove(&subscription) {
+        task.abort();
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn ble_disconnect(state: tauri::State<'_, PluginState>, handle: u64) -> Result<(), String> {
-    let mut connections = state.connections.lock().await;
-    if let Some(mut connection) = connections.remove(&handle) {
-        connection.disconnect().await.map_err(|err| err.to_string())?;
-    }
+    // Look up without removing. Removing first made a failed disconnect
+    // unrecoverable: the caller loses the handle it would retry or clean up
+    // with, while on Android the platform GATT may well still be live — so
+    // the backend's live-connection guard then refuses a fresh connection to
+    // that address, and the dropped Rust handle is no longer able to close
+    // the one holding it open.
+    let Some(connection) = state.connection(handle).await.ok() else {
+        return Ok(());
+    };
+    connection
+        .lock()
+        .await
+        .disconnect()
+        .await
+        .map_err(|err| err.to_string())?;
+    state.connections.lock().await.remove(&handle);
     Ok(())
 }
