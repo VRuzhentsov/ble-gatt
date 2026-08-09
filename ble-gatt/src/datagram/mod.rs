@@ -45,7 +45,7 @@
 pub mod fragment;
 pub mod reassembly;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -149,6 +149,14 @@ pub struct DatagramConfig {
     /// unbounded queue lets a peer that connects and disconnects in a loop
     /// grow the process without limit while the caller is slow to accept.
     pub accept_queue_depth: usize,
+    /// Merged into [`service_spec`](Self::service_spec)'s `GattServiceSpec.manufacturer_data`.
+    /// Empty by default — [`serve`] otherwise has no way to carry anything
+    /// beyond the bare service UUID in its advertisement, since it builds
+    /// the spec internally from this config. A caller that needs the
+    /// advertised payload to change between `serve` calls (e.g. a
+    /// discoverability flag toggled on and off) re-advertises by ending the
+    /// current `serve` stream and calling it again with an updated config.
+    pub advertised_manufacturer_data: BTreeMap<u16, Vec<u8>>,
 }
 
 impl DatagramConfig {
@@ -163,6 +171,7 @@ impl DatagramConfig {
             inbound_queue_depth: DEFAULT_INBOUND_QUEUE_DEPTH,
             fragment_queue_depth: DEFAULT_FRAGMENT_QUEUE_DEPTH,
             accept_queue_depth: DEFAULT_ACCEPT_QUEUE_DEPTH,
+            advertised_manufacturer_data: BTreeMap::new(),
         }
     }
 
@@ -200,7 +209,7 @@ impl DatagramConfig {
     /// The GATT service this tier expects on the wire. Both roles must agree,
     /// so both derive it from here rather than hand-rolling a spec.
     pub fn service_spec(&self) -> GattServiceSpec {
-        GattServiceSpec::new(
+        let mut spec = GattServiceSpec::new(
             self.service,
             vec![GattCharacteristicSpec {
                 uuid: self.characteristic,
@@ -209,7 +218,9 @@ impl DatagramConfig {
                 notifiable: true,
                 initial_value: Vec::new(),
             }],
-        )
+        );
+        spec.manufacturer_data = self.advertised_manufacturer_data.clone();
+        spec
     }
 }
 
