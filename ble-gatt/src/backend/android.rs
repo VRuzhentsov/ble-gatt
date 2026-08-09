@@ -658,12 +658,50 @@ impl Backend for AndroidBackend {
                 .map_err(|err| BleError::Gatt(err.to_string()))?;
         }
 
+        // Same parallel-array flattening `onPeerDiscovered` uses on the read
+        // side (see that callback's own comment): a `java.util.HashMap`
+        // across JNI costs several reflective calls per entry, so
+        // manufacturer/service advertisement data crosses as an id/UUID
+        // array plus a matching value array instead.
+        let manufacturer_ids: Vec<i32> =
+            service.manufacturer_data.keys().map(|id| *id as i32).collect();
+        let manufacturer_id_array = env
+            .new_int_array(manufacturer_ids.len() as i32)
+            .map_err(|err| BleError::Gatt(err.to_string()))?;
+        env.set_int_array_region(&manufacturer_id_array, 0, &manufacturer_ids)
+            .map_err(|err| BleError::Gatt(err.to_string()))?;
+        let manufacturer_value_array = env
+            .new_object_array(manufacturer_ids.len() as i32, "[B", JObject::null())
+            .map_err(|err| BleError::Gatt(err.to_string()))?;
+        for (i, value) in service.manufacturer_data.values().enumerate() {
+            let jvalue = env.byte_array_from_slice(value).map_err(|err| BleError::Gatt(err.to_string()))?;
+            env.set_object_array_element(&manufacturer_value_array, i as i32, &jvalue)
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
+        }
+
+        let service_data_uuid_array = env
+            .new_object_array(service.service_data.len() as i32, "java/lang/String", JObject::null())
+            .map_err(|err| BleError::Gatt(err.to_string()))?;
+        let service_data_value_array = env
+            .new_object_array(service.service_data.len() as i32, "[B", JObject::null())
+            .map_err(|err| BleError::Gatt(err.to_string()))?;
+        for (i, (uuid, value)) in service.service_data.iter().enumerate() {
+            let uuid_str = env
+                .new_string(uuid.0.to_string())
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
+            env.set_object_array_element(&service_data_uuid_array, i as i32, &uuid_str)
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
+            let jvalue = env.byte_array_from_slice(value).map_err(|err| BleError::Gatt(err.to_string()))?;
+            env.set_object_array_element(&service_data_value_array, i as i32, &jvalue)
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
+        }
+
         let (tx, rx) = oneshot::channel();
         *self.inner.advertise_tx.lock().unwrap() = Some(tx);
         self.inner.call_void(
             &mut env,
             "startAdvertising",
-            "(Ljava/lang/String;[Ljava/lang/String;[Z[Z[Z[[B)V",
+            "(Ljava/lang/String;[Ljava/lang/String;[Z[Z[Z[[B[I[[B[Ljava/lang/String;[[B)V",
             &[
                 JValue::Object(&service_uuid),
                 JValue::Object(&char_uuids),
@@ -671,6 +709,10 @@ impl Backend for AndroidBackend {
                 JValue::Object(&writable),
                 JValue::Object(&notifiable),
                 JValue::Object(&values),
+                JValue::Object(&manufacturer_id_array),
+                JValue::Object(&manufacturer_value_array),
+                JValue::Object(&service_data_uuid_array),
+                JValue::Object(&service_data_value_array),
             ],
         )?;
         rx

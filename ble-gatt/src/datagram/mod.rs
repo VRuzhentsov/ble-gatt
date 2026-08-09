@@ -200,16 +200,16 @@ impl DatagramConfig {
     /// The GATT service this tier expects on the wire. Both roles must agree,
     /// so both derive it from here rather than hand-rolling a spec.
     pub fn service_spec(&self) -> GattServiceSpec {
-        GattServiceSpec {
-            uuid: self.service,
-            characteristics: vec![GattCharacteristicSpec {
+        GattServiceSpec::new(
+            self.service,
+            vec![GattCharacteristicSpec {
                 uuid: self.characteristic,
                 readable: true,
                 writable: true,
                 notifiable: true,
                 initial_value: Vec::new(),
             }],
-        }
+        )
     }
 }
 

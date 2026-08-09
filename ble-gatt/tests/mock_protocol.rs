@@ -32,16 +32,16 @@ async fn central_discovers_and_reads_the_peripherals_advertised_service() {
         full_capabilities(),
     );
     peripheral
-        .advertise(GattServiceSpec {
-            uuid: service_uuid,
-            characteristics: vec![GattCharacteristicSpec {
+        .advertise(GattServiceSpec::new(
+            service_uuid,
+            vec![GattCharacteristicSpec {
                 uuid: characteristic_uuid,
                 readable: true,
                 writable: true,
                 notifiable: true,
                 initial_value: b"hello".to_vec(),
             }],
-        })
+        ))
         .await
         .expect("advertise should succeed");
 
@@ -69,16 +69,16 @@ async fn write_from_central_is_readable_back_and_fires_a_lifecycle_event() {
 
     let peripheral = MockBackend::new(peripheral_addr.clone(), network.clone(), full_capabilities());
     peripheral
-        .advertise(GattServiceSpec {
-            uuid: service_uuid,
-            characteristics: vec![GattCharacteristicSpec {
+        .advertise(GattServiceSpec::new(
+            service_uuid,
+            vec![GattCharacteristicSpec {
                 uuid: characteristic_uuid,
                 readable: true,
                 writable: true,
                 notifiable: false,
                 initial_value: Vec::new(),
             }],
-        })
+        ))
         .await
         .expect("advertise should succeed");
     let mut events = peripheral.events();
@@ -122,16 +122,16 @@ async fn server_initiated_notify_is_delivered_to_a_subscribed_central() {
 
     let peripheral = MockBackend::new(peripheral_addr.clone(), network.clone(), full_capabilities());
     peripheral
-        .advertise(GattServiceSpec {
-            uuid: service_uuid,
-            characteristics: vec![GattCharacteristicSpec {
+        .advertise(GattServiceSpec::new(
+            service_uuid,
+            vec![GattCharacteristicSpec {
                 uuid: characteristic_uuid,
                 readable: false,
                 writable: false,
                 notifiable: true,
                 initial_value: Vec::new(),
             }],
-        })
+        ))
         .await
         .expect("advertise should succeed");
 
@@ -171,10 +171,7 @@ async fn advertise_on_a_peripheral_incapable_backend_is_rejected_honestly() {
     let backend = MockBackend::new(PeerAddress("central-only".to_string()), network, central_only);
 
     let result = backend
-        .advertise(GattServiceSpec {
-            uuid: ServiceUuid(Uuid::new_v4()),
-            characteristics: vec![],
-        })
+        .advertise(GattServiceSpec::new(ServiceUuid(Uuid::new_v4()), vec![]))
         .await;
 
     assert!(matches!(result, Err(ble_gatt::BleError::PeripheralUnsupported)));
@@ -185,6 +182,42 @@ async fn advertise_on_a_peripheral_incapable_backend_is_rejected_honestly() {
 // protocols (identity-in-advertisement, bulk transfer, link loss).
 // ---------------------------------------------------------------------
 
+/// Regression test for `GattServiceSpec::manufacturer_data`/`service_data`:
+/// data attached directly to the spec passed to `advertise()` must reach a
+/// scanner, the same as `set_advertisement_data`'s test-only injection path
+/// already proven by `advertisement_payload_identifies_a_specific_peer_before_connecting`
+/// below. This is the path a real caller actually uses (Linux/Android both
+/// now read these fields off the spec itself); `set_advertisement_data`
+/// exists only for tests that want to change what a scanner sees without a
+/// full re-advertise.
+#[tokio::test]
+async fn advertise_carries_its_own_manufacturer_and_service_data_to_a_scanner() {
+    let network = MockNetwork::new();
+    let service_uuid = ServiceUuid(Uuid::new_v4());
+    let peripheral_addr = PeerAddress("peripheral-spec-adv".to_string());
+
+    let mut spec = GattServiceSpec::new(service_uuid, vec![]);
+    spec.manufacturer_data.insert(0x5678u16, vec![0x01, 0x02, 0x03]);
+    spec.service_data.insert(service_uuid, b"from-the-spec".to_vec());
+
+    let peripheral = MockBackend::new(peripheral_addr.clone(), network.clone(), full_capabilities());
+    peripheral.advertise(spec).await.expect("advertise should succeed");
+
+    let central = MockBackend::new(PeerAddress("central-spec-adv".to_string()), network.clone(), full_capabilities());
+    let mut discovered = central.scan(service_uuid).await.expect("scan should succeed");
+    let peer = discovered
+        .next()
+        .await
+        .expect("peripheral should be discovered")
+        .expect("discovery should not error");
+
+    assert_eq!(peer.manufacturer_data.get(&0x5678), Some(&vec![0x01, 0x02, 0x03]));
+    assert_eq!(
+        peer.service_data.get(&service_uuid).map(|v| v.as_slice()),
+        Some(b"from-the-spec".as_slice())
+    );
+}
+
 #[tokio::test]
 async fn advertisement_payload_identifies_a_specific_peer_before_connecting() {
     let network = MockNetwork::new();
@@ -193,10 +226,7 @@ async fn advertisement_payload_identifies_a_specific_peer_before_connecting() {
 
     let peripheral = MockBackend::new(peripheral_addr.clone(), network.clone(), full_capabilities());
     peripheral
-        .advertise(GattServiceSpec {
-            uuid: service_uuid,
-            characteristics: vec![],
-        })
+        .advertise(GattServiceSpec::new(service_uuid, vec![]))
         .await
         .expect("advertise should succeed");
 
@@ -239,10 +269,7 @@ async fn connection_reports_an_mtu_that_bounds_a_single_write() {
 
     let peripheral = MockBackend::new(peripheral_addr.clone(), network.clone(), full_capabilities());
     peripheral
-        .advertise(GattServiceSpec {
-            uuid: service_uuid,
-            characteristics: vec![],
-        })
+        .advertise(GattServiceSpec::new(service_uuid, vec![]))
         .await
         .expect("advertise should succeed");
 
@@ -268,16 +295,16 @@ async fn write_without_response_is_accepted_and_still_delivers() {
 
     let peripheral = MockBackend::new(peripheral_addr.clone(), network.clone(), full_capabilities());
     peripheral
-        .advertise(GattServiceSpec {
-            uuid: service_uuid,
-            characteristics: vec![GattCharacteristicSpec {
+        .advertise(GattServiceSpec::new(
+            service_uuid,
+            vec![GattCharacteristicSpec {
                 uuid: characteristic_uuid,
                 readable: true,
                 writable: true,
                 notifiable: false,
                 initial_value: Vec::new(),
             }],
-        })
+        ))
         .await
         .expect("advertise should succeed");
 
@@ -302,10 +329,7 @@ async fn central_learns_about_unsolicited_peer_loss_through_the_event_stream() {
 
     let peripheral = MockBackend::new(peripheral_addr.clone(), network.clone(), full_capabilities());
     peripheral
-        .advertise(GattServiceSpec {
-            uuid: service_uuid,
-            characteristics: vec![],
-        })
+        .advertise(GattServiceSpec::new(service_uuid, vec![]))
         .await
         .expect("advertise should succeed");
 
@@ -364,16 +388,16 @@ async fn a_central_refused_by_a_single_peer_server_stops_receiving_notifications
 
     let peripheral = MockBackend::new(peripheral_addr.clone(), network.clone(), full_capabilities());
     peripheral
-        .advertise(GattServiceSpec {
-            uuid: service_uuid,
-            characteristics: vec![GattCharacteristicSpec {
+        .advertise(GattServiceSpec::new(
+            service_uuid,
+            vec![GattCharacteristicSpec {
                 uuid: characteristic_uuid,
                 readable: false,
                 writable: true,
                 notifiable: true,
                 initial_value: Vec::new(),
             }],
-        })
+        ))
         .await
         .expect("advertise should succeed");
 
@@ -440,16 +464,16 @@ async fn an_addressed_notify_reaches_only_its_peer() {
 
     let peripheral = MockBackend::new(peripheral_addr.clone(), network.clone(), full_capabilities());
     peripheral
-        .advertise(GattServiceSpec {
-            uuid: service_uuid,
-            characteristics: vec![GattCharacteristicSpec {
+        .advertise(GattServiceSpec::new(
+            service_uuid,
+            vec![GattCharacteristicSpec {
                 uuid: characteristic_uuid,
                 readable: false,
                 writable: false,
                 notifiable: true,
                 initial_value: Vec::new(),
             }],
-        })
+        ))
         .await
         .expect("advertise should succeed");
 
@@ -507,16 +531,16 @@ async fn a_stale_connection_handle_cannot_disturb_the_session_that_replaced_it()
 
     let peripheral = MockBackend::new(peripheral_addr.clone(), network.clone(), full_capabilities());
     peripheral
-        .advertise(GattServiceSpec {
-            uuid: service_uuid,
-            characteristics: vec![GattCharacteristicSpec {
+        .advertise(GattServiceSpec::new(
+            service_uuid,
+            vec![GattCharacteristicSpec {
                 uuid: characteristic_uuid,
                 readable: true,
                 writable: true,
                 notifiable: true,
                 initial_value: b"v".to_vec(),
             }],
-        })
+        ))
         .await
         .expect("advertise should succeed");
 
@@ -558,16 +582,16 @@ async fn a_disconnected_handle_is_actually_closed() {
 
     let peripheral = MockBackend::new(peripheral_addr.clone(), network.clone(), full_capabilities());
     peripheral
-        .advertise(GattServiceSpec {
-            uuid: service_uuid,
-            characteristics: vec![GattCharacteristicSpec {
+        .advertise(GattServiceSpec::new(
+            service_uuid,
+            vec![GattCharacteristicSpec {
                 uuid: characteristic_uuid,
                 readable: true,
                 writable: true,
                 notifiable: true,
                 initial_value: b"v".to_vec(),
             }],
-        })
+        ))
         .await
         .expect("advertise should succeed");
 
@@ -610,16 +634,16 @@ async fn simulated_peer_loss_closes_the_link_as_well_as_announcing_it() {
 
     let peripheral = MockBackend::new(peripheral_addr.clone(), network.clone(), full_capabilities());
     peripheral
-        .advertise(GattServiceSpec {
-            uuid: service_uuid,
-            characteristics: vec![GattCharacteristicSpec {
+        .advertise(GattServiceSpec::new(
+            service_uuid,
+            vec![GattCharacteristicSpec {
                 uuid: characteristic_uuid,
                 readable: true,
                 writable: true,
                 notifiable: true,
                 initial_value: b"v".to_vec(),
             }],
-        })
+        ))
         .await
         .expect("advertise should succeed");
 
@@ -658,9 +682,9 @@ async fn writes_to_unknown_or_read_only_characteristics_are_refused() {
 
     let peripheral = MockBackend::new(peripheral_addr.clone(), network.clone(), full_capabilities());
     peripheral
-        .advertise(GattServiceSpec {
-            uuid: service_uuid,
-            characteristics: vec![
+        .advertise(GattServiceSpec::new(
+            service_uuid,
+            vec![
                 GattCharacteristicSpec {
                     uuid: writable_uuid,
                     readable: true,
@@ -676,7 +700,7 @@ async fn writes_to_unknown_or_read_only_characteristics_are_refused() {
                     initial_value: b"ro".to_vec(),
                 },
             ],
-        })
+        ))
         .await
         .expect("advertise should succeed");
 

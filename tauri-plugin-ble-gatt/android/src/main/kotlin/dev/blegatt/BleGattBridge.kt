@@ -623,6 +623,12 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     fun startAdvertising(
         serviceUuid: String, characteristicUuids: Array<String>, readable: BooleanArray, writable: BooleanArray,
         notifiable: BooleanArray, initialValues: Array<ByteArray>,
+        // Same parallel-array flattening `onPeerDiscovered` uses on the read
+        // side, mirrored here for the write side: a `java.util.HashMap`
+        // across JNI costs several reflective calls per entry, and the Rust
+        // side would have to walk it back out again either way.
+        manufacturerIds: IntArray, manufacturerValues: Array<ByteArray>,
+        serviceDataUuids: Array<String>, serviceDataValues: Array<ByteArray>,
     ) {
         // Tear down any predecessor first. This bridge holds a single
         // `gattServer`/`advertiseCallback` pair, so starting without
@@ -679,7 +685,10 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                         return
                     }
                     Log.d(TAG, "onServiceAdded ok, starting advertisement")
-                    beginAdvertising(advertiser, serviceUuid, generation)
+                    beginAdvertising(
+                        advertiser, serviceUuid, generation,
+                        manufacturerIds, manufacturerValues, serviceDataUuids, serviceDataValues,
+                    )
                 }
             }
 
@@ -997,15 +1006,27 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     private fun beginAdvertising(
         advertiser: android.bluetooth.le.BluetoothLeAdvertiser, serviceUuid: String,
         generation: Long,
+        manufacturerIds: IntArray, manufacturerValues: Array<ByteArray>,
+        serviceDataUuids: Array<String>, serviceDataValues: Array<ByteArray>,
     ) {
         val settings = AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
             .setConnectable(true)
             .build()
-        val data = AdvertiseData.Builder()
+        val dataBuilder = AdvertiseData.Builder()
             .addServiceUuid(ParcelUuid(UUID.fromString(serviceUuid)))
             .setIncludeDeviceName(false)
-            .build()
+        // Legacy advertisements are capped at 31 bytes total, and the
+        // service UUID above already spends most of that -- callers are
+        // responsible for keeping this small (see GattServiceSpec's own
+        // doc comment on manufacturer_data/service_data).
+        for (i in manufacturerIds.indices) {
+            dataBuilder.addManufacturerData(manufacturerIds[i], manufacturerValues[i])
+        }
+        for (i in serviceDataUuids.indices) {
+            dataBuilder.addServiceData(ParcelUuid(UUID.fromString(serviceDataUuids[i])), serviceDataValues[i])
+        }
+        val data = dataBuilder.build()
         val callback = object : AdvertiseCallback() {
             override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
                 // A stop/restart can leave this callback running against a

@@ -216,10 +216,7 @@ pub async fn ble_advertise(
         .collect::<Result<Vec<_>, String>>()?;
     state
         .backend
-        .advertise(GattServiceSpec {
-            uuid: ServiceUuid(uuid),
-            characteristics: specs,
-        })
+        .advertise(GattServiceSpec::new(ServiceUuid(uuid), specs))
         .await
         .map_err(|err| err.to_string())
 }

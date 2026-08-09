@@ -807,6 +807,12 @@ impl Backend for LinuxBackend {
         let adv = Advertisement {
             service_uuids: [service.uuid.0].into_iter().collect(),
             discoverable: Some(true),
+            manufacturer_data: service.manufacturer_data.clone(),
+            service_data: service
+                .service_data
+                .iter()
+                .map(|(uuid, value)| (uuid.0, value.clone()))
+                .collect(),
             ..Default::default()
         };
         let adv_handle = self.adapter.advertise(adv).await.map_err(|err| {
