@@ -354,6 +354,15 @@ impl Backend for MockBackend {
             values.insert(characteristic.uuid, characteristic.initial_value.clone());
             subscribers.insert(characteristic.uuid, HashMap::new());
         }
+        // Seeded from the spec itself, matching what the real Linux/Android
+        // backends now advertise (`GattServiceSpec::manufacturer_data`/
+        // `service_data`) -- a fresh `advertise()` call reflects its own new
+        // spec, not whatever a previous generation happened to carry.
+        // `set_advertisement_data` remains available for tests that want to
+        // change what a scanner sees without a full re-advertise, and still
+        // overwrites this unconditionally.
+        let manufacturer_data = service.manufacturer_data.clone();
+        let service_data = service.service_data.clone();
         let mut peripherals = self.network.peripherals.lock().unwrap();
         let previous = peripherals.remove(&self.address);
         peripherals.insert(
@@ -362,16 +371,8 @@ impl Backend for MockBackend {
                 service,
                 values,
                 subscribers,
-                // Advertisement payload survives a re-advertise: it's set
-                // out-of-band by the test, not part of GattServiceSpec.
-                manufacturer_data: previous
-                    .as_ref()
-                    .map(|p| p.manufacturer_data.clone())
-                    .unwrap_or_default(),
-                service_data: previous
-                    .as_ref()
-                    .map(|p| p.service_data.clone())
-                    .unwrap_or_default(),
+                manufacturer_data,
+                service_data,
                 rssi: previous.as_ref().and_then(|p| p.rssi),
             },
         );

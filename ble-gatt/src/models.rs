@@ -132,4 +132,28 @@ pub struct GattCharacteristicSpec {
 pub struct GattServiceSpec {
     pub uuid: ServiceUuid,
     pub characteristics: Vec<GattCharacteristicSpec>,
+    /// Manufacturer-specific advertisement data, keyed by the Bluetooth SIG
+    /// assigned company identifier — the outbound mirror of
+    /// `DiscoveredPeer::manufacturer_data`. Consumers use this for small,
+    /// pre-connection identity payloads (e.g. a discoverability flag) a
+    /// scanner can read without paying for a connection first. Empty by
+    /// default (via `GattServiceSpec::new`) — legacy advertisements are
+    /// capped at 31 bytes total, most of it already spent on `uuid` itself,
+    /// so callers should keep this small.
+    pub manufacturer_data: BTreeMap<u16, Vec<u8>>,
+    /// Service-specific advertisement data, keyed by service UUID — the
+    /// outbound mirror of `DiscoveredPeer::service_data`. Same size
+    /// constraints as `manufacturer_data`.
+    pub service_data: BTreeMap<ServiceUuid, Vec<u8>>,
+}
+
+impl GattServiceSpec {
+    /// Constructs a spec with no advertisement data beyond the service UUID
+    /// itself — the shape every caller needed before `manufacturer_data`/
+    /// `service_data` existed. Prefer this over the struct literal unless
+    /// you actually need those fields, both to stay terse and so a future
+    /// field addition here doesn't require touching every call site again.
+    pub fn new(uuid: ServiceUuid, characteristics: Vec<GattCharacteristicSpec>) -> Self {
+        Self { uuid, characteristics, manufacturer_data: BTreeMap::new(), service_data: BTreeMap::new() }
+    }
 }

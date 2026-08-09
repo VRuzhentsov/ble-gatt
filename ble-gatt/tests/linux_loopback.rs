@@ -36,16 +36,16 @@ async fn peripheral_advertise_and_serve_smoke_test() {
     let capabilities = backend.capabilities().await;
     assert!(capabilities.central, "BlueZ adapters are always capable of the central role");
 
-    let service = GattServiceSpec {
-        uuid: ServiceUuid(Uuid::new_v4()),
-        characteristics: vec![GattCharacteristicSpec {
+    let service = GattServiceSpec::new(
+        ServiceUuid(Uuid::new_v4()),
+        vec![GattCharacteristicSpec {
             uuid: CharacteristicUuid(Uuid::new_v4()),
             readable: true,
             writable: true,
             notifiable: true,
             initial_value: b"ble-gatt smoke test".to_vec(),
         }],
-    };
+    );
 
     backend
         .advertise(service)

@@ -1162,3 +1162,34 @@ async fn a_loss_event_from_a_replaced_connection_does_not_kill_its_successor() {
         .expect("no error");
     assert_eq!(received, b"still-alive");
 }
+
+/// Regression test for `DatagramConfig::advertised_manufacturer_data`: it
+/// reaches a scanner through the whole real pipeline (`service_spec()` ->
+/// `serve()` -> `Backend::advertise()`), not just when set directly on a
+/// `GattServiceSpec` (already covered in `mock_protocol.rs`). This is the
+/// mechanism a caller uses to change what's advertised between `serve`
+/// calls -- e.g. a discoverability flag toggled on and off by ending the
+/// current `serve` stream and starting a new one with an updated config.
+#[tokio::test]
+async fn advertised_manufacturer_data_reaches_a_scanner_through_serve() {
+    let network = MockNetwork::new();
+    let peripheral_addr = PeerAddress("peripheral-config-adv".to_string());
+
+    let mut config = config();
+    config.advertised_manufacturer_data.insert(0xABCDu16, vec![0x01]);
+
+    let peripheral = MockBackend::new(peripheral_addr.clone(), network.clone(), full_capabilities());
+    let _incoming = datagram::serve(Arc::new(peripheral), &config)
+        .await
+        .expect("serve should start");
+
+    let central = MockBackend::new(PeerAddress("central-config-adv".to_string()), network.clone(), full_capabilities());
+    let mut discovered = central.scan(config.service).await.expect("scan should succeed");
+    let peer = discovered
+        .next()
+        .await
+        .expect("peripheral should be discovered")
+        .expect("discovery should not error");
+
+    assert_eq!(peer.manufacturer_data.get(&0xABCD), Some(&vec![0x01]));
+}
