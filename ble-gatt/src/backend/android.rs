@@ -1851,9 +1851,20 @@ impl Drop for PendingOpGuard {
                 PendingOp::Read => state.read_tx.as_ref().map(|(id, _)| *id) == Some(self.request_id),
                 PendingOp::Write => state.write_tx.as_ref().map(|(id, _)| *id) == Some(self.request_id),
             };
-            match self.op {
-                PendingOp::Read => state.read_tx = None,
-                PendingOp::Write => state.write_tx = None,
+            // A P1 review finding: clearing unconditionally here reset a
+            // *replacement* request's slot too whenever this guard outlived
+            // a disconnect-and-reconnect to the same address (`connections`
+            // is keyed on address, not session, so a new connection's
+            // read_tx/write_tx lives in the very same `State`) -- silently
+            // failing or losing the callback for a live operation that had
+            // nothing to do with this abandoned one. Only clear when the
+            // slot is still actually this guard's own, exactly the
+            // condition `still_pending` already establishes.
+            if still_pending {
+                match self.op {
+                    PendingOp::Read => state.read_tx = None,
+                    PendingOp::Write => state.write_tx = None,
+                }
             }
             still_pending
         };
