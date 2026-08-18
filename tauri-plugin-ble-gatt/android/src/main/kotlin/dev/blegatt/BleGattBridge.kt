@@ -621,7 +621,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 )
                 val retry = Runnable { attemptRead(address, characteristicUuid, requestId, session, attempt + 1) }
                 pendingRetries[requestId] = retry
-                retryHandler.postDelayed(retry, GATT_BUSY_RETRY_DELAY_MS)
+                retryHandler.postDelayed(retry, gattBusyRetryDelayMs(attempt + 1))
             } else {
                 Log.w(TAG, "readCharacteristic rejected by the stack after $attempt retries: $address/$characteristicUuid")
                 synchronized(queue) { queue.remove(requestId) }
@@ -691,7 +691,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                     attemptWrite(address, characteristicUuid, value, withoutResponse, requestId, session, attempt + 1)
                 }
                 pendingRetries[requestId] = retry
-                retryHandler.postDelayed(retry, GATT_BUSY_RETRY_DELAY_MS)
+                retryHandler.postDelayed(retry, gattBusyRetryDelayMs(attempt + 1))
             } else {
                 Log.w(TAG, "writeCharacteristic rejected by the stack after $attempt retries: $address/$characteristicUuid")
                 synchronized(queue) { queue.remove(requestId) }
@@ -765,7 +765,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 )
                 val retry = Runnable { attemptSubscribe(address, characteristicUuid, requestId, session, attempt + 1) }
                 pendingRetries[requestId] = retry
-                retryHandler.postDelayed(retry, GATT_BUSY_RETRY_DELAY_MS)
+                retryHandler.postDelayed(retry, gattBusyRetryDelayMs(attempt + 1))
             } else {
                 Log.w(
                     TAG,
@@ -1506,9 +1506,31 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         /// declared, fully-writable characteristic and zero bytes ever sent
         /// on the air. That's exactly the transient condition the platform
         /// expects callers to retry, not a hard failure, so `attemptWrite`/
-        /// `attemptSubscribe` back off and retry a bounded number of times
-        /// before reporting failure and tearing down the link.
-        private const val GATT_BUSY_MAX_RETRIES = 3
-        private const val GATT_BUSY_RETRY_DELAY_MS = 200L
+        /// `attemptRead`/`attemptSubscribe` back off and retry a bounded
+        /// number of times before reporting failure and tearing down the
+        /// link.
+        ///
+        /// A P1 review finding on the original flat 3 x 200ms schedule
+        /// (~600ms total): the busy window measured on that same real
+        /// hardware run was 3.7-3.8 seconds, not milliseconds -- every one
+        /// of those three retries fired while the stack was still busy, so
+        /// the write failed exactly as it would have with no retry at all.
+        /// `gattBusyRetryDelayMs` below instead backs off exponentially,
+        /// capped, giving a ~7s cumulative window (200+400+800+1600+2000+
+        /// 2000ms) that comfortably covers the measured worst case with
+        /// margin, while still giving up well short of the ~35-45s full
+        /// reconnect-and-reauthenticate cycle this exists to avoid paying
+        /// for on every transient stall.
+        private const val GATT_BUSY_MAX_RETRIES = 6
+        private const val GATT_BUSY_RETRY_BASE_DELAY_MS = 200L
+        private const val GATT_BUSY_RETRY_MAX_DELAY_MS = 2000L
+
+        /// `attempt` is the *upcoming* attempt number (1-indexed: the first
+        /// retry is 1, matching `attempt + 1` at each call site) -- delay
+        /// doubles each time, capped, so it's cheap to retry a genuinely
+        /// brief stall quickly without spending the whole budget on retries
+        /// fired too early to have any chance during a sustained one.
+        private fun gattBusyRetryDelayMs(attempt: Int): Long =
+            (GATT_BUSY_RETRY_BASE_DELAY_MS shl (attempt - 1)).coerceAtMost(GATT_BUSY_RETRY_MAX_DELAY_MS)
     }
 }
