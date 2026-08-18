@@ -523,6 +523,26 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     private fun findCharacteristic(address: String, characteristicUuid: String): BluetoothGattCharacteristic? =
         pendingCharacteristics[address]?.get(characteristicUuid)
 
+    /// Called by Rust when a pending read/write/subscribe future is dropped
+    /// before its result arrived (a `timeout`, a losing `select!` branch) --
+    /// see `PendingOpGuard`/`SubscribeGuard`'s Drop impls on the Rust side.
+    /// Without this, a GATT-busy retry already scheduled via `retryHandler`
+    /// when the rejection happened has no way to learn its request was
+    /// abandoned: it fires anyway once the stack stops being busy,
+    /// transmitting the abandoned payload over the air, and its eventual
+    /// completion callback -- matched by FIFO position, not by id -- then
+    /// resolves whichever *different* request happens to be next in the
+    /// queue. Removing the id here, under `gattLock`, is exactly what each
+    /// `attempt*` retry checks for in its own `attempt > 0` branch before
+    /// acting, so the two can never interleave. Harmless to call for an id
+    /// that already completed normally through the real GATT callback: by
+    /// then it is simply not in any queue any more.
+    fun cancelPendingOperation(requestId: Long): Unit = synchronized(gattLock) {
+        for (queue in pendingWriteIds.values) synchronized(queue) { queue.remove(requestId) }
+        for (queue in pendingReadIds.values) synchronized(queue) { queue.remove(requestId) }
+        for (queue in pendingSubscribeIds.values) synchronized(queue) { queue.remove(requestId) }
+    }
+
     /// Every failure path must report back. An early `return` here leaves
     /// the Rust side's oneshot unresolved and its caller awaiting forever —
     /// and unknown UUIDs or incomplete service discovery are ordinary
@@ -549,6 +569,12 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         val queue = pendingReadIds.getOrPut(address) { ArrayDeque() }
         if (attempt == 0) {
             synchronized(queue) { queue.addLast(requestId) }
+        } else if (synchronized(queue) { !queue.contains(requestId) }) {
+            // Cancelled while this retry was scheduled -- see
+            // cancelPendingOperation's doc comment. Rust has already
+            // stopped listening, so there is nothing to report and nothing
+            // left to retry.
+            return
         }
         if (gatt == null || characteristic == null) {
             Log.w(TAG, "readCharacteristic could not start: $address/$characteristicUuid")
@@ -609,6 +635,12 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         val queue = pendingWriteIds.getOrPut(address) { ArrayDeque() }
         if (attempt == 0) {
             synchronized(queue) { queue.addLast(requestId) }
+        } else if (synchronized(queue) { !queue.contains(requestId) }) {
+            // Cancelled while this retry was scheduled -- see
+            // cancelPendingOperation's doc comment. Rust has already
+            // stopped listening, so there is nothing to report and nothing
+            // left to retry.
+            return
         }
         if (gatt == null || characteristic == null) {
             Log.w(TAG, "writeCharacteristic could not start: $address/$characteristicUuid")
@@ -671,6 +703,12 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             pendingSubscribeIds.getOrPut("$address/$characteristicUuid") { ArrayDeque() }
         if (attempt == 0) {
             synchronized(subscribeQueue) { subscribeQueue.addLast(requestId) }
+        } else if (synchronized(subscribeQueue) { !subscribeQueue.contains(requestId) }) {
+            // Cancelled while this retry was scheduled -- see
+            // cancelPendingOperation's doc comment. Rust has already
+            // stopped listening, so there is nothing to report and nothing
+            // left to retry.
+            return
         }
         val gatt = connectedGatts[address]
         val characteristic = findCharacteristic(address, characteristicUuid)

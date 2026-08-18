@@ -1082,6 +1082,7 @@ impl GattConnection for AndroidGattConnection {
             inner: self.inner.clone(),
             address: self.address.clone(),
             op: PendingOp::Read,
+            request_id,
         };
         {
             let mut env = self.inner.env()?;
@@ -1121,6 +1122,7 @@ impl GattConnection for AndroidGattConnection {
             inner: self.inner.clone(),
             address: self.address.clone(),
             op: PendingOp::Write,
+            request_id,
         };
         {
             let mut env = self.inner.env()?;
@@ -1823,15 +1825,49 @@ struct PendingOpGuard {
     inner: Arc<Inner>,
     address: String,
     op: PendingOp,
+    /// Which attempt this guard belongs to. Compared against the slot's own
+    /// id on drop -- see the Drop impl's own comment for why.
+    request_id: u64,
 }
 
 impl Drop for PendingOpGuard {
     fn drop(&mut self) {
-        let mut connections = self.inner.connections.lock().unwrap();
-        if let Some(state) = connections.get_mut(&self.address) {
+        // A P1 review finding: a request abandoned here (a `timeout`, a
+        // losing `select!` branch) while `attemptWrite`/`attemptRead` had a
+        // GATT-busy retry scheduled left that retry with no way to learn
+        // this side gave up. It would fire anyway once the stack stopped
+        // being busy, transmit the abandoned payload over the air, and its
+        // eventual completion callback -- Kotlin matches these by FIFO
+        // position, not by id -- would then resolve whichever *different*
+        // request happens to be next in the queue. `still_pending` is only
+        // true when nothing has consumed this slot yet, i.e. exactly the
+        // abandoned case: on a normal completion, `onCharacteristicRead`/
+        // `onCharacteristicWriteResult` already took it via `.take()`
+        // before this ever runs, so the common path pays no extra JNI call.
+        let still_pending = {
+            let mut connections = self.inner.connections.lock().unwrap();
+            let Some(state) = connections.get_mut(&self.address) else { return };
+            let still_pending = match self.op {
+                PendingOp::Read => state.read_tx.as_ref().map(|(id, _)| *id) == Some(self.request_id),
+                PendingOp::Write => state.write_tx.as_ref().map(|(id, _)| *id) == Some(self.request_id),
+            };
             match self.op {
                 PendingOp::Read => state.read_tx = None,
                 PendingOp::Write => state.write_tx = None,
+            }
+            still_pending
+        };
+        // The lock above is dropped before this: `cancelPendingOperation`
+        // takes Kotlin's own `gattLock`, and a blocking JNI call is not
+        // something to make while still holding a Rust mutex.
+        if still_pending {
+            if let Ok(mut env) = self.inner.env() {
+                let _ = self.inner.call_void(
+                    &mut env,
+                    "cancelPendingOperation",
+                    "(J)V",
+                    &[JValue::Long(self.request_id as i64)],
+                );
             }
         }
     }
@@ -1858,29 +1894,51 @@ impl Drop for SubscribeGuard {
         if !self.armed {
             return;
         }
-        let mut connections = self.inner.connections.lock().unwrap();
-        let Some(state) = connections.get_mut(&self.address) else {
-            return;
+        // Same reasoning as `PendingOpGuard`'s Drop impl: a subscribe
+        // abandoned while `attemptSubscribe` had a GATT-busy retry scheduled
+        // needs that retry cancelled, or it fires anyway and its completion
+        // callback resolves whichever different request is next in the
+        // queue. `still_pending` (the *subscribe* slot specifically --
+        // `notify_tx` is the separate route this guard also unwinds, not
+        // what `attemptSubscribe`'s retry checks) is only true when nothing
+        // has consumed it yet, so a normal completion pays no extra call.
+        let still_pending = {
+            let mut connections = self.inner.connections.lock().unwrap();
+            let Some(state) = connections.get_mut(&self.address) else {
+                return;
+            };
+            // Keyed on the *notification route's* own id, not on
+            // `subscribe_tx`: a rejected subscription has already had its
+            // `subscribe_tx` removed by `onSubscribed`, so predicating on
+            // that entry meant the dead route was never cleaned up — the
+            // exact leak this guard exists to prevent. Both entries are
+            // still conditional on ownership so a retry that has claimed
+            // them is not stranded.
+            let still_pending = state
+                .subscribe_tx
+                .get(&self.characteristic)
+                .is_some_and(|(id, _)| *id == self.request_id);
+            if still_pending {
+                state.subscribe_tx.remove(&self.characteristic);
+            }
+            if state
+                .notify_tx
+                .get(&self.characteristic)
+                .is_some_and(|(id, _, _)| *id == self.request_id)
+            {
+                state.notify_tx.remove(&self.characteristic);
+            }
+            still_pending
         };
-        // Keyed on the *notification route's* own id, not on `subscribe_tx`:
-        // a rejected subscription has already had its `subscribe_tx` removed
-        // by `onSubscribed`, so predicating on that entry meant the dead
-        // route was never cleaned up — the exact leak this guard exists to
-        // prevent. Both entries are still conditional on ownership so a
-        // retry that has claimed them is not stranded.
-        if state
-            .subscribe_tx
-            .get(&self.characteristic)
-            .is_some_and(|(id, _)| *id == self.request_id)
-        {
-            state.subscribe_tx.remove(&self.characteristic);
-        }
-        if state
-            .notify_tx
-            .get(&self.characteristic)
-            .is_some_and(|(id, _, _)| *id == self.request_id)
-        {
-            state.notify_tx.remove(&self.characteristic);
+        if still_pending {
+            if let Ok(mut env) = self.inner.env() {
+                let _ = self.inner.call_void(
+                    &mut env,
+                    "cancelPendingOperation",
+                    "(J)V",
+                    &[JValue::Long(self.request_id as i64)],
+                );
+            }
         }
     }
 }
