@@ -555,8 +555,25 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     /// only a retry that hasn't fired yet; an id with no entry here (either
     /// because it never needed a retry, or its retry already started
     /// executing) is left completely alone.
+    ///
+    /// A P1 review finding on the previous version: cancelling the Runnable
+    /// isn't enough by itself. `pendingRetries` containing this id means
+    /// its `gatt.*()` call was never actually issued to the platform, so no
+    /// real callback is *ever* coming for it -- left in its pending-id
+    /// queue, that entry would sit at the front of the FIFO forever,
+    /// silently swallowing the *next* same-kind request's real callback
+    /// instead (Rust would reject the mismatched id and that request's
+    /// future would hang indefinitely). Removing it from the queue is only
+    /// safe in this specific branch, precisely because `pendingRetries`
+    /// already proved no platform call is outstanding for it -- an id not
+    /// found here (already-issued and genuinely in flight) must still not
+    /// have its queue entry touched.
     fun cancelPendingOperation(requestId: Long) {
-        pendingRetries.remove(requestId)?.let { retryHandler.removeCallbacks(it) }
+        val retry = pendingRetries.remove(requestId) ?: return
+        retryHandler.removeCallbacks(retry)
+        for (queue in pendingWriteIds.values) synchronized(queue) { queue.remove(requestId) }
+        for (queue in pendingReadIds.values) synchronized(queue) { queue.remove(requestId) }
+        for (queue in pendingSubscribeIds.values) synchronized(queue) { queue.remove(requestId) }
     }
 
     /// Every failure path must report back. An early `return` here leaves
