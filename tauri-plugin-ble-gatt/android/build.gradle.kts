@@ -24,6 +24,15 @@ android {
         // BluetoothGattServer (peripheral role) needs API 21+; this
         // matches Fini's own minSdk, the actual consuming app.
         minSdk = 24
+        // BleGattBridge's methods are invoked by name via raw JNI from the
+        // Rust side (env.call_method / GetMethodID), not through any
+        // Kotlin/Java call site R8's static analysis can see -- so without
+        // this, a consuming app's release R8 pass has nothing telling it
+        // they're reachable, and can rename or strip them. Confirmed on
+        // real hardware as the likely cause of a NoSuchMethodError on
+        // startAdvertising that reproduced only in a release build (see
+        // docs/hardware-verification.md, 2026-08-17 entry).
+        consumerProguardFiles("consumer-rules.pro")
     }
 
     compileOptions {

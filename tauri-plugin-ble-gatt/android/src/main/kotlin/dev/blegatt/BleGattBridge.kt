@@ -20,6 +20,8 @@ import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.pm.PackageManager
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelUuid
 import android.util.Log
 import java.util.UUID
@@ -82,6 +84,13 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     /// "verify this GATT still owns the address, then publish" atomic — and
     /// that pair is exactly where a cancellation and retry can interleave.
     private val gattLock = Any()
+    /// Schedules GATT-busy retries (see `GATT_BUSY_MAX_RETRIES`) off
+    /// whichever thread the rejected call happened to run on -- often a
+    /// Tokio worker thread arriving via JNI, which must not itself block on
+    /// a sleep. `gattLock` is bridge-wide (covers every connected peer), so
+    /// a retry's backoff must also happen without holding it, or one peer's
+    /// busy backoff would stall every other peer's GATT operations too.
+    private val retryHandler = Handler(Looper.getMainLooper())
     private val connectedGatts = ConcurrentHashMap<String, BluetoothGatt>()
     /// Rust's session id for the GATT currently owning each address.
     ///
@@ -520,40 +529,87 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     /// errors, not exotic ones.
     fun readCharacteristic(
         address: String, characteristicUuid: String, requestId: Long, session: Long,
+    ) = attemptRead(address, characteristicUuid, requestId, session, attempt = 0)
+
+    /// Same GATT-busy retry as `attemptWrite`/`attemptSubscribe` — see
+    /// `GATT_BUSY_MAX_RETRIES`'s doc comment. `gatt.readCharacteristic()` is
+    /// exactly as subject to the one-outstanding-op rule as the write path.
+    private fun attemptRead(
+        address: String, characteristicUuid: String, requestId: Long, session: Long, attempt: Int,
     ): Unit = synchronized(gattLock) {
         if (gattSessions[address] != session) {
+            if (attempt > 0) {
+                pendingReadIds[address]?.let { queue -> synchronized(queue) { queue.remove(requestId) } }
+            }
             onCharacteristicRead(nativeHandle, requestId, address, characteristicUuid, ByteArray(0), false)
             return
         }
         val gatt = connectedGatts[address]
         val characteristic = findCharacteristic(address, characteristicUuid)
         val queue = pendingReadIds.getOrPut(address) { ArrayDeque() }
-        synchronized(queue) { queue.addLast(requestId) }
-        if (gatt == null || characteristic == null || !gatt.readCharacteristic(characteristic)) {
+        if (attempt == 0) {
+            synchronized(queue) { queue.addLast(requestId) }
+        }
+        if (gatt == null || characteristic == null) {
             Log.w(TAG, "readCharacteristic could not start: $address/$characteristicUuid")
             // Remove this id specifically: another operation's may be queued
             // ahead of it and must not be consumed by this failure.
             synchronized(queue) { queue.remove(requestId) }
             onCharacteristicRead(nativeHandle, requestId, address, characteristicUuid, ByteArray(0), false)
+            return
+        }
+        if (!gatt.readCharacteristic(characteristic)) {
+            if (attempt < GATT_BUSY_MAX_RETRIES) {
+                Log.w(
+                    TAG,
+                    "readCharacteristic rejected by the stack, retrying " +
+                        "(${attempt + 1}/$GATT_BUSY_MAX_RETRIES): $address/$characteristicUuid",
+                )
+                retryHandler.postDelayed(
+                    { attemptRead(address, characteristicUuid, requestId, session, attempt + 1) },
+                    GATT_BUSY_RETRY_DELAY_MS,
+                )
+            } else {
+                Log.w(TAG, "readCharacteristic rejected by the stack after $attempt retries: $address/$characteristicUuid")
+                synchronized(queue) { queue.remove(requestId) }
+                onCharacteristicRead(nativeHandle, requestId, address, characteristicUuid, ByteArray(0), false)
+            }
         }
     }
 
     /// `withoutResponse` selects ATT Write Command over Write Request —
     /// materially faster for bulk transfer, at the cost of the peer silently
     /// dropping writes it can't keep up with. See `models::WriteType`.
-    @Suppress("DEPRECATION")
     fun writeCharacteristic(
         address: String, characteristicUuid: String, value: ByteArray, withoutResponse: Boolean,
         requestId: Long, session: Long,
+    ) = attemptWrite(address, characteristicUuid, value, withoutResponse, requestId, session, attempt = 0)
+
+    /// See `GATT_BUSY_MAX_RETRIES`'s doc comment for why a `false` return
+    /// here gets retried rather than reported as failure immediately.
+    /// `requestId` is queued once, on `attempt == 0` — a retry reuses the
+    /// same slot rather than adding a second entry, since it's still the
+    /// same logical write as far as `onCharacteristicWrite`'s FIFO matching
+    /// is concerned; the platform never actually started the earlier
+    /// attempt, so there is nothing for it to complete out of order with.
+    @Suppress("DEPRECATION")
+    private fun attemptWrite(
+        address: String, characteristicUuid: String, value: ByteArray, withoutResponse: Boolean,
+        requestId: Long, session: Long, attempt: Int,
     ): Unit = synchronized(gattLock) {
         if (gattSessions[address] != session) {
+            if (attempt > 0) {
+                pendingWriteIds[address]?.let { queue -> synchronized(queue) { queue.remove(requestId) } }
+            }
             onCharacteristicWriteResult(nativeHandle, requestId, address, characteristicUuid, false)
             return
         }
         val gatt = connectedGatts[address]
         val characteristic = findCharacteristic(address, characteristicUuid)
         val queue = pendingWriteIds.getOrPut(address) { ArrayDeque() }
-        synchronized(queue) { queue.addLast(requestId) }
+        if (attempt == 0) {
+            synchronized(queue) { queue.addLast(requestId) }
+        }
         if (gatt == null || characteristic == null) {
             Log.w(TAG, "writeCharacteristic could not start: $address/$characteristicUuid")
             synchronized(queue) { queue.remove(requestId) }
@@ -567,16 +623,43 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         }
         characteristic.value = value
         if (!gatt.writeCharacteristic(characteristic)) {
-            Log.w(TAG, "writeCharacteristic rejected by the stack: $address/$characteristicUuid")
-            synchronized(queue) { queue.remove(requestId) }
-            onCharacteristicWriteResult(nativeHandle, requestId, address, characteristicUuid, false)
+            if (attempt < GATT_BUSY_MAX_RETRIES) {
+                Log.w(
+                    TAG,
+                    "writeCharacteristic rejected by the stack, retrying " +
+                        "(${attempt + 1}/$GATT_BUSY_MAX_RETRIES): $address/$characteristicUuid",
+                )
+                retryHandler.postDelayed(
+                    { attemptWrite(address, characteristicUuid, value, withoutResponse, requestId, session, attempt + 1) },
+                    GATT_BUSY_RETRY_DELAY_MS,
+                )
+            } else {
+                Log.w(TAG, "writeCharacteristic rejected by the stack after $attempt retries: $address/$characteristicUuid")
+                synchronized(queue) { queue.remove(requestId) }
+                onCharacteristicWriteResult(nativeHandle, requestId, address, characteristicUuid, false)
+            }
         }
     }
 
     fun subscribeCharacteristic(
         address: String, characteristicUuid: String, requestId: Long, session: Long,
+    ) = attemptSubscribe(address, characteristicUuid, requestId, session, attempt = 0)
+
+    /// Same GATT-busy retry as `attemptWrite` — see `GATT_BUSY_MAX_RETRIES`'s
+    /// doc comment. Only the descriptor write (`gatt.writeDescriptor`) is a
+    /// real over-the-air GATT operation subject to the platform's
+    /// one-outstanding-op rule; `setCharacteristicNotification` is purely
+    /// local bookkeeping and re-running it on a retry is harmless.
+    @Suppress("DEPRECATION")
+    private fun attemptSubscribe(
+        address: String, characteristicUuid: String, requestId: Long, session: Long, attempt: Int,
     ): Unit = synchronized(gattLock) {
         if (gattSessions[address] != session) {
+            if (attempt > 0) {
+                pendingSubscribeIds["$address/$characteristicUuid"]?.let { queue ->
+                    synchronized(queue) { queue.remove(requestId) }
+                }
+            }
             onSubscribed(nativeHandle, requestId, address, characteristicUuid, false)
             return
         }
@@ -586,7 +669,9 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         // status as the new attempt's completion.
         val subscribeQueue =
             pendingSubscribeIds.getOrPut("$address/$characteristicUuid") { ArrayDeque() }
-        synchronized(subscribeQueue) { subscribeQueue.addLast(requestId) }
+        if (attempt == 0) {
+            synchronized(subscribeQueue) { subscribeQueue.addLast(requestId) }
+        }
         val gatt = connectedGatts[address]
         val characteristic = findCharacteristic(address, characteristicUuid)
         val cccd = characteristic?.getDescriptor(CLIENT_CHARACTERISTIC_CONFIG_UUID)
@@ -606,13 +691,26 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             onSubscribed(nativeHandle, requestId, address, characteristicUuid, false)
             return
         }
-        @Suppress("DEPRECATION")
         cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-        @Suppress("DEPRECATION")
         if (!gatt.writeDescriptor(cccd)) {
-            Log.w(TAG, "subscribe descriptor write rejected: $address/$characteristicUuid")
-            synchronized(subscribeQueue) { subscribeQueue.remove(requestId) }
-            onSubscribed(nativeHandle, requestId, address, characteristicUuid, false)
+            if (attempt < GATT_BUSY_MAX_RETRIES) {
+                Log.w(
+                    TAG,
+                    "subscribe descriptor write rejected by the stack, retrying " +
+                        "(${attempt + 1}/$GATT_BUSY_MAX_RETRIES): $address/$characteristicUuid",
+                )
+                retryHandler.postDelayed(
+                    { attemptSubscribe(address, characteristicUuid, requestId, session, attempt + 1) },
+                    GATT_BUSY_RETRY_DELAY_MS,
+                )
+            } else {
+                Log.w(
+                    TAG,
+                    "subscribe descriptor write rejected by the stack after $attempt retries: $address/$characteristicUuid",
+                )
+                synchronized(subscribeQueue) { subscribeQueue.remove(requestId) }
+                onSubscribed(nativeHandle, requestId, address, characteristicUuid, false)
+            }
         }
     }
 
@@ -1332,5 +1430,22 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         /// confused with a real controller error.
         private const val ADVERTISE_ERROR_UNAVAILABLE: Int = 100
         private const val ADVERTISE_ERROR_SERVICE_REJECTED: Int = 101
+
+        /// Android allows exactly one outstanding GATT operation per
+        /// connection (an MTU request, a characteristic read/write, a
+        /// descriptor write); calling the platform API for a new one before
+        /// the previous op's callback has landed makes it return `false`
+        /// immediately -- before anything is attempted over the air, not a
+        /// protocol-level rejection. Confirmed on real hardware (2026-08-17,
+        /// see ble-gatt/docs/hardware-verification.md) as reliably
+        /// reproducible under external radio contention -- a classic-profile
+        /// reconnect sharing the same radio -- even with a correctly
+        /// declared, fully-writable characteristic and zero bytes ever sent
+        /// on the air. That's exactly the transient condition the platform
+        /// expects callers to retry, not a hard failure, so `attemptWrite`/
+        /// `attemptSubscribe` back off and retry a bounded number of times
+        /// before reporting failure and tearing down the link.
+        private const val GATT_BUSY_MAX_RETRIES = 3
+        private const val GATT_BUSY_RETRY_DELAY_MS = 200L
     }
 }

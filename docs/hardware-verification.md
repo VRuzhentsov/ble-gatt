@@ -18,9 +18,110 @@ This document is how that is done.
 | Linux peripheral genuinely on the air | `LEAdvertisingManager1.ActiveInstances = 1` |
 | Android peripheral role end to end | `HWVERIFY: READY peripheral` + `onAdvertisingSetStarted … status=0` |
 | Android↔Android discovery | **Blocked** — platform gap, see below |
+| Android central → Linux peripheral: connect, MTU, service discovery, subscribe | All succeed — see "First live attempt", below |
+| Android central → Linux peripheral: the auth write | **Blocked** — two independent causes found, neither is the platform gap above |
+| Android peripheral role (advertise) against a real release build | **Blocked** — `NoSuchMethodError`, see below |
 
 The remaining route to a round trip is Linux ↔ Android or Linux ↔ Linux,
 both of which need real radios.
+
+### First live attempt: real fini release build ↔ real Android phone (2026-08-17)
+
+Not the `hw_peer`/datagram-tier harness below — this was fini's actual
+production app (`v0.1.45`, pinning this repo at `af4ed1e`) against a real
+Pixel 6 Pro, both already paired, diagnosed read-only over `adb logcat` +
+`journalctl` + a user-run `btmon` capture (no reinstall, no rebuild). Two
+independent defects, plus a third contributing factor, all found from the
+same session:
+
+**1. Android peripheral role: `startAdvertising` `NoSuchMethodError`, every
+retry, forever.**
+
+```
+System.err: java.lang.NoSuchMethodError: no non-static method
+  "Ldev/blegatt/BleGattBridge;.startAdvertising(Ljava/lang/String;[Ljava/lang/String;[Z[Z[Z[[B[I[[B[Ljava/lang/String;[[B)V"
+[transport][ble] advertise failed, retrying in 60s: ...
+```
+
+Current source (`BleGattBridge.kt:623`) has a matching 10-arg
+`startAdvertising` and the JNI call site (`android.rs:701`) matches it
+exactly — so this isn't a source-level mismatch today. Leading hypothesis:
+build/version skew between the Rust JNI signature and the Kotlin bytecode
+actually baked into that specific release APK. The `manufacturer_data`/
+`service_data` fields (this branch, `feat/advertise-manufacturer-service-
+data`) are a recent addition to that exact signature — a release built
+before the two sides were rebuilt from the same rev would reproduce exactly
+this. Worth confirming against the actual `v0.1.45` build provenance before
+assuming this is the whole story; an R8/consumer-rules gap (see below) is a
+second plausible contributor and hasn't been ruled out.
+
+The plugin module ships no `consumer-rules.pro` / `consumerProguardFiles`
+(`tauri-plugin-ble-gatt/android/build.gradle.kts` has neither), so a
+consuming app's release R8 pass has nothing telling it `BleGattBridge`'s
+JNI-invoked methods are reachable. Whether or not it's the cause of this
+specific error, it's a live gap: add a consumer ProGuard rule keeping
+`dev.blegatt.**` (or at least the methods called by name from
+`android.rs`) before shipping another release.
+
+**2. Android central role: connects, negotiates MTU, discovers services,
+subscribes — then the very first characteristic write is rejected locally,
+never reaching the air.**
+
+```
+D BleGattBridge: onMtuChanged: 88:D8:2E:BA:72:27 negotiated mtu=517
+W BleGattBridge: writeCharacteristic rejected by the stack: 88:D8:2E:BA:72:27/b1e6a001-...
+[transport][ble] auth with ... failed: GATT operation failed: characteristic write failed
+```
+
+A `btmon` capture across this exact window is conclusive: BlueZ correctly
+declares the characteristic as `Properties: 0x1e` (Read | Write | Write
+Without Response | Notify) — service discovery reads this straight off the
+air — and the CCCD subscribe write completes cleanly (`ATT Write Request` →
+`Write Response`, sub-millisecond). No `ATT Write Request` for the
+characteristic itself ever appears on the air; the link goes quiet and
+times out (`Disconnect Complete … Reason: Connection Timeout`) about 5s
+later. So this rules out a declared-property mismatch (the mock's own
+blind spot per this doc's opening paragraph) — `gatt.writeCharacteristic()`
+is refusing locally, before attempting anything over the air.
+
+**3. Contributing factor: classic-profile radio contention can turn "rejected
+by the stack" from rare into routine.**
+
+The same capture shows normal ATT round trips (30-90ms) degrading to
+**3.7-3.8 second** per-packet latencies during service discovery, correlated
+with `bluetoothd`'s `policy.c:reconnect_timeout()` repeatedly retrying a
+*classic* (BR/EDR) Audio Source/Handsfree profile connection to the same
+phone address — bonded for an entirely unrelated reason (using the phone as
+a Bluetooth audio device with this machine). Each retry re-runs Inquiry/Page
+scanning, which shares the same radio as the BLE link. This is not
+something fini can prevent — pairing a phone for audio with the same
+machine it also uses fini on is an ordinary, unpreventable user scenario,
+not a lab artifact.
+
+Android's local single-outstanding-GATT-operation rule (a second op called
+before the previous op's callback lands returns `false` immediately) is the
+standard explanation for exactly this failure shape, and radio contention
+that stretches every op's air time by 100x is exactly what turns a rare
+race into a reliable repro. This doesn't need to be the *only* explanation
+for defect 2 above, but it's a real, evidenced amplifier and worth fixing
+regardless of whether it's the sole cause.
+
+**Proposed fix (not yet implemented):** `BleGattBridge`'s GATT operations
+(write, and likely read/subscribe — same failure shape) treat a `false`
+return from the underlying `BluetoothGatt` call as terminal today, failing
+the whole connection on the very first rejection. Android's own guidance
+(and every mature Android BLE library) treats "stack busy" as expected and
+transient, not an error — the standard mitigation is a small bounded retry
+with backoff (e.g. 3 attempts, ~150-300ms apart) before giving up. Adding
+that at the point of rejection would absorb both transient scheduling
+jitter and exactly this kind of external radio contention, at a fraction of
+the cost of the current behaviour (tear down the whole link, wait for the
+outer ~35-45s reconnect loop). Needs a design pass before implementing:
+where the retry lives (Kotlin-side in `BleGattBridge`, closest to the
+platform quirk, vs. Rust-side in `android.rs`), how many attempts, whether
+it's shared plumbing across write/read/subscribe, and how a still-failing
+retry should surface (today's `BleError::Gatt` path is probably still
+right, just reached later).
 
 ## The harness
 
