@@ -527,15 +527,9 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     /// fired yet -- present *only* for that window, never for an id whose
     /// underlying platform call already returned `true` and is genuinely
     /// in flight awaiting its real `onCharacteristicRead`/`onCharacteristicWrite`/
-    /// `onDescriptorWrite` callback. That distinction is the whole point:
-    /// the pending-id queues (`pendingReadIds` etc.) exist to FIFO-match a
-    /// real platform callback to its request, and an in-flight operation's
-    /// entry there must survive untouched until that callback arrives, or
-    /// the callback's `removeFirstOrNull()` pops a *different*, newer
-    /// request's id instead and resolves it with the wrong result. A
-    /// scheduled-but-unfired retry has no such callback coming -- nothing
-    /// was ever issued to the platform for it -- so it alone is safe to
-    /// cancel outright.
+    /// `onDescriptorWrite` callback. Removed either by `cancelPendingOperation`
+    /// or by the retry itself -- both under `gattLock`, see
+    /// `cancelPendingOperation`'s own comment for why that matters.
     private val pendingRetries = ConcurrentHashMap<Long, Runnable>()
 
     /// Called by Rust when a pending read/write/subscribe future is dropped
@@ -546,29 +540,31 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     /// abandoned: it fires anyway once the stack stops being busy,
     /// transmitting the abandoned payload over the air.
     ///
-    /// A P1 review finding on the first version of this method: it removed
-    /// the id from the pending-id queue directly, which also corrupts FIFO
-    /// matching for an id whose call had *already* been accepted by the
-    /// platform (`gatt.writeCharacteristic()` returned `true`) and was
-    /// genuinely in flight -- that id's queue entry must survive for the
-    /// real callback to find. `Handler.removeCallbacks` instead cancels
-    /// only a retry that hasn't fired yet; an id with no entry here (either
-    /// because it never needed a retry, or its retry already started
-    /// executing) is left completely alone.
-    ///
-    /// A P1 review finding on the previous version: cancelling the Runnable
-    /// isn't enough by itself. `pendingRetries` containing this id means
-    /// its `gatt.*()` call was never actually issued to the platform, so no
-    /// real callback is *ever* coming for it -- left in its pending-id
-    /// queue, that entry would sit at the front of the FIFO forever,
-    /// silently swallowing the *next* same-kind request's real callback
-    /// instead (Rust would reject the mismatched id and that request's
-    /// future would hang indefinitely). Removing it from the queue is only
-    /// safe in this specific branch, precisely because `pendingRetries`
-    /// already proved no platform call is outstanding for it -- an id not
-    /// found here (already-issued and genuinely in flight) must still not
-    /// have its queue entry touched.
-    fun cancelPendingOperation(requestId: Long) {
+    /// Three P1 review findings shaped this method, in order:
+    /// 1. Removing the id from the pending-id queue unconditionally
+    ///    corrupts FIFO matching for an id whose call had *already* been
+    ///    accepted by the platform and was genuinely in flight -- that
+    ///    entry must survive untouched for the real callback to find.
+    /// 2. Cancelling only the `Runnable` without also removing the queue
+    ///    entry leaves a permanent orphan for an id that really was only
+    ///    scheduled, never issued -- no real callback is ever coming for
+    ///    it, so left in place it silently swallows the *next* same-kind
+    ///    request's callback instead.
+    /// 3. Removing the `pendingRetries` entry from inside the retry's own
+    ///    `Runnable`, before it entered `synchronized(gattLock)`, left a
+    ///    window where a concurrent cancellation could see nothing left
+    ///    to cancel and return early while the retry -- already past that
+    ///    point -- fired anyway. `gattLock` is the actual correctness
+    ///    mechanism now: both this method and each `attempt*` (for
+    ///    `attempt > 0`, see their own first line) perform their
+    ///    `pendingRetries.remove` as the very first thing *inside* the
+    ///    lock, so whichever side acquires it first is unconditionally
+    ///    the one that gets to act. `Handler.removeCallbacks` below is
+    ///    only an optimisation that skips a wasted dispatch in the common
+    ///    case -- if the retry's `Runnable` ran anyway, its own
+    ///    `pendingRetries.remove` would find nothing and abort the same
+    ///    way `cancelPendingOperation` finding nothing here does.
+    fun cancelPendingOperation(requestId: Long): Unit = synchronized(gattLock) {
         val retry = pendingRetries.remove(requestId) ?: return
         retryHandler.removeCallbacks(retry)
         for (queue in pendingWriteIds.values) synchronized(queue) { queue.remove(requestId) }
@@ -590,6 +586,11 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     private fun attemptRead(
         address: String, characteristicUuid: String, requestId: Long, session: Long, attempt: Int,
     ): Unit = synchronized(gattLock) {
+        // Must be the very first thing done under gattLock -- see
+        // cancelPendingOperation's doc comment (finding 3). A `null` here
+        // means cancellation already claimed this attempt; Rust has
+        // stopped listening, so there is nothing left to do.
+        if (attempt > 0 && pendingRetries.remove(requestId) == null) return
         if (gattSessions[address] != session) {
             if (attempt > 0) {
                 pendingReadIds[address]?.let { queue -> synchronized(queue) { queue.remove(requestId) } }
@@ -618,10 +619,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                     "readCharacteristic rejected by the stack, retrying " +
                         "(${attempt + 1}/$GATT_BUSY_MAX_RETRIES): $address/$characteristicUuid",
                 )
-                val retry = Runnable {
-                    pendingRetries.remove(requestId)
-                    attemptRead(address, characteristicUuid, requestId, session, attempt + 1)
-                }
+                val retry = Runnable { attemptRead(address, characteristicUuid, requestId, session, attempt + 1) }
                 pendingRetries[requestId] = retry
                 retryHandler.postDelayed(retry, GATT_BUSY_RETRY_DELAY_MS)
             } else {
@@ -652,6 +650,11 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         address: String, characteristicUuid: String, value: ByteArray, withoutResponse: Boolean,
         requestId: Long, session: Long, attempt: Int,
     ): Unit = synchronized(gattLock) {
+        // Must be the very first thing done under gattLock -- see
+        // cancelPendingOperation's doc comment (finding 3). A `null` here
+        // means cancellation already claimed this attempt; Rust has
+        // stopped listening, so there is nothing left to do.
+        if (attempt > 0 && pendingRetries.remove(requestId) == null) return
         if (gattSessions[address] != session) {
             if (attempt > 0) {
                 pendingWriteIds[address]?.let { queue -> synchronized(queue) { queue.remove(requestId) } }
@@ -685,7 +688,6 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                         "(${attempt + 1}/$GATT_BUSY_MAX_RETRIES): $address/$characteristicUuid",
                 )
                 val retry = Runnable {
-                    pendingRetries.remove(requestId)
                     attemptWrite(address, characteristicUuid, value, withoutResponse, requestId, session, attempt + 1)
                 }
                 pendingRetries[requestId] = retry
@@ -711,6 +713,11 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     private fun attemptSubscribe(
         address: String, characteristicUuid: String, requestId: Long, session: Long, attempt: Int,
     ): Unit = synchronized(gattLock) {
+        // Must be the very first thing done under gattLock -- see
+        // cancelPendingOperation's doc comment (finding 3). A `null` here
+        // means cancellation already claimed this attempt; Rust has
+        // stopped listening, so there is nothing left to do.
+        if (attempt > 0 && pendingRetries.remove(requestId) == null) return
         if (gattSessions[address] != session) {
             if (attempt > 0) {
                 pendingSubscribeIds["$address/$characteristicUuid"]?.let { queue ->
@@ -756,10 +763,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                     "subscribe descriptor write rejected by the stack, retrying " +
                         "(${attempt + 1}/$GATT_BUSY_MAX_RETRIES): $address/$characteristicUuid",
                 )
-                val retry = Runnable {
-                    pendingRetries.remove(requestId)
-                    attemptSubscribe(address, characteristicUuid, requestId, session, attempt + 1)
-                }
+                val retry = Runnable { attemptSubscribe(address, characteristicUuid, requestId, session, attempt + 1) }
                 pendingRetries[requestId] = retry
                 retryHandler.postDelayed(retry, GATT_BUSY_RETRY_DELAY_MS)
             } else {
