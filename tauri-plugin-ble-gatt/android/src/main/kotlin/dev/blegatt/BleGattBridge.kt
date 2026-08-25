@@ -589,6 +589,31 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         for (queue in pendingSubscribeIds.values) synchronized(queue) { queue.remove(requestId) }
     }
 
+    /// Diagnostic only, logged once a GATT op has exhausted its busy-retry
+    /// budget (see `GATT_BUSY_MAX_RETRIES`'s doc comment) — never reaches
+    /// Rust and never changes retry/error behavior. A classic-profile
+    /// (BR/EDR) reconnect sharing this radio is a real, hardware-confirmed
+    /// cause of sustained `writeCharacteristic`/etc. rejection (see
+    /// docs/hardware-verification.md), and it can itself be caused by a
+    /// bonded device that has nothing to do with this connection — there
+    /// is nothing this bridge can do about that, but logging the
+    /// classic-profile state alongside the failure turns a future
+    /// occurrence into a grep instead of a live-hardware capture.
+    /// `bondedDevices`/`getProfileConnectionState` can throw
+    /// `SecurityException` on API 31+ without `BLUETOOTH_CONNECT` — caught
+    /// here rather than propagated, since permission checks are
+    /// deliberately this bridge's caller's job (see class doc comment).
+    private fun radioContentionSnapshot(): String {
+        val a = adapter ?: return "adapter=null"
+        return try {
+            val headset = a.getProfileConnectionState(BluetoothProfile.HEADSET)
+            val a2dp = a.getProfileConnectionState(BluetoothProfile.A2DP)
+            "bondedDevices=${a.bondedDevices?.size} headsetProfileState=$headset a2dpProfileState=$a2dp"
+        } catch (e: SecurityException) {
+            "unavailable: $e"
+        }
+    }
+
     /// Every failure path must report back. An early `return` here leaves
     /// the Rust side's oneshot unresolved and its caller awaiting forever —
     /// and unknown UUIDs or incomplete service discovery are ordinary
@@ -640,7 +665,11 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 pendingRetries[requestId] = retry
                 retryHandler.postDelayed(retry, gattBusyRetryDelayMs(attempt + 1))
             } else {
-                Log.w(TAG, "readCharacteristic rejected by the stack after $attempt retries: $address/$characteristicUuid")
+                Log.w(
+                    TAG,
+                    "readCharacteristic rejected by the stack after $attempt retries: " +
+                        "$address/$characteristicUuid (${radioContentionSnapshot()})",
+                )
                 synchronized(queue) { queue.remove(requestId) }
                 onCharacteristicRead(nativeHandle, requestId, address, characteristicUuid, ByteArray(0), false)
             }
@@ -710,7 +739,11 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 pendingRetries[requestId] = retry
                 retryHandler.postDelayed(retry, gattBusyRetryDelayMs(attempt + 1))
             } else {
-                Log.w(TAG, "writeCharacteristic rejected by the stack after $attempt retries: $address/$characteristicUuid")
+                Log.w(
+                    TAG,
+                    "writeCharacteristic rejected by the stack after $attempt retries: " +
+                        "$address/$characteristicUuid (${radioContentionSnapshot()})",
+                )
                 synchronized(queue) { queue.remove(requestId) }
                 onCharacteristicWriteResult(nativeHandle, requestId, address, characteristicUuid, false)
             }
@@ -786,7 +819,8 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             } else {
                 Log.w(
                     TAG,
-                    "subscribe descriptor write rejected by the stack after $attempt retries: $address/$characteristicUuid",
+                    "subscribe descriptor write rejected by the stack after $attempt retries: " +
+                        "$address/$characteristicUuid (${radioContentionSnapshot()})",
                 )
                 synchronized(subscribeQueue) { subscribeQueue.remove(requestId) }
                 onSubscribed(nativeHandle, requestId, address, characteristicUuid, false)
