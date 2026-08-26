@@ -218,3 +218,53 @@ async fn killing_a_clients_connection_tells_the_survivor_it_disconnected() {
         other => panic!("expected Disconnected, got {other:?}"),
     }
 }
+
+/// Regression test for a P1 review finding on `RemoteClient`'s
+/// reader-loop cleanup: it resolved every pending `call()` when the
+/// connection died, but left live `subscribe()` senders untouched, so a
+/// subscriber's notify stream just hung forever instead of ending —
+/// exactly what would leave `DatagramChannel::recv()` waiting indefinitely
+/// after the broker connection is gone.
+///
+/// This kills the *subscribing* client's own connection to the broker
+/// (central), not the peripheral's — the path the fix's `subscriptions.
+/// lock().unwrap().clear()` covers, distinct from
+/// `killing_a_clients_connection_tells_the_survivor_it_disconnected` above,
+/// which exercises the broker's connection-drop sweep instead.
+#[tokio::test]
+async fn a_clients_own_connection_dying_ends_its_subscription_stream_instead_of_hanging() {
+    let (peripheral_network, central_network) = broker_and_two_clients().await;
+    let service_uuid = ServiceUuid(Uuid::new_v4());
+    let characteristic_uuid = CharacteristicUuid(Uuid::new_v4());
+    let peripheral_addr = PeerAddress("peripheral-central-dies".to_string());
+
+    let peripheral = MockBackend::new(peripheral_addr.clone(), peripheral_network, full_capabilities());
+    peripheral
+        .advertise(GattServiceSpec::new(
+            service_uuid,
+            vec![GattCharacteristicSpec {
+                uuid: characteristic_uuid,
+                readable: false,
+                writable: false,
+                notifiable: true,
+                initial_value: Vec::new(),
+            }],
+        ))
+        .await
+        .expect("advertise should succeed");
+
+    let central = MockBackend::new(PeerAddress("central-dies".to_string()), central_network, full_capabilities());
+    let mut connection = central.connect(&peripheral_addr).await.expect("connect should succeed");
+    let mut notifications = connection.subscribe(characteristic_uuid).await.expect("subscribe should succeed");
+
+    // Drop every `Arc<MockNetwork>` reference this central holds -- both
+    // `central` and `connection` clone it -- so `RemoteClient::drop` aborts
+    // its reader/writer tasks and closes this central's own socket.
+    drop(central);
+    drop(connection);
+
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(5), notifications.next())
+        .await
+        .expect("the subscription stream must end once this client's own connection dies, not hang forever");
+    assert!(ended.is_none(), "expected the stream to end with None, got {ended:?}");
+}

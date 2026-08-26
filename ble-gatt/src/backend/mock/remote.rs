@@ -132,6 +132,17 @@ impl RemoteClient {
         for (_, tx) in state.calls.drain() {
             let _ = tx.send(Response::Err(BleError::Transport("broker connection closed".to_string())));
         }
+        drop(state);
+        // Every live `subscribe()` stream must end, not hang forever: with
+        // this reader gone, nothing will ever push another `NotifyItem` to
+        // any of these senders. Dropping each `tx` closes its receiver,
+        // which is what makes `UnboundedReceiverStream::next()` finally
+        // return `None` instead of waiting on a connection that no longer
+        // exists. A `subscribe()` racing this drain is still safe: if its
+        // insert lands first it gets swept here; if it lands after, `call()`
+        // already sees `pending`'s `closed` flag and fails fast, and
+        // `subscribe()`'s own error path removes the entry it just added.
+        subscriptions.lock().unwrap().clear();
     }
 
     /// `closed` and the waiter map share one lock (`PendingState`) so this
