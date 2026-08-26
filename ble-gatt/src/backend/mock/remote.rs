@@ -21,7 +21,17 @@ use crate::models::{
 
 use super::wire::{read_frame, write_frame, Envelope, Frame, Push, Request, Response};
 
-type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Response>>>>;
+/// `closed` lives under the *same* lock as the waiter map, not as a
+/// separate flag — see `RemoteClient::call`'s doc comment for why that
+/// matters: it's what makes "check closed, then register a waiter" atomic
+/// with "mark closed, then drain every waiter," so no `call()` can register
+/// a waiter after the reader has already given up resolving one.
+#[derive(Default)]
+struct PendingState {
+    calls: HashMap<u64, oneshot::Sender<Response>>,
+    closed: bool,
+}
+type PendingMap = Arc<Mutex<PendingState>>;
 type EventsMap = Arc<Mutex<HashMap<PeerAddress, broadcast::Sender<GattEvent>>>>;
 type SubscriptionsMap = Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Result<Vec<u8>>>>>>;
 
@@ -56,7 +66,7 @@ impl RemoteClient {
         let (read_half, write_half) = tokio::io::split(stream);
         let (outbox_tx, outbox_rx) = mpsc::unbounded_channel::<Envelope>();
 
-        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let pending = Arc::new(Mutex::new(PendingState::default()));
         let events = Arc::new(Mutex::new(HashMap::new()));
         let subscriptions = Arc::new(Mutex::new(HashMap::new()));
 
@@ -93,7 +103,7 @@ impl RemoteClient {
             };
             match env.frame {
                 Frame::Resp(resp) => {
-                    if let Some(tx) = pending.lock().unwrap().remove(&env.correlation_id) {
+                    if let Some(tx) = pending.lock().unwrap().calls.remove(&env.correlation_id) {
                         let _ = tx.send(resp);
                     }
                 }
@@ -113,18 +123,35 @@ impl RemoteClient {
             }
         }
         // Connection lost — every in-flight `call()` must resolve rather
-        // than hang forever awaiting a response that will never arrive.
-        for (_, tx) in pending.lock().unwrap().drain() {
+        // than hang forever awaiting a response that will never arrive. Set
+        // `closed` under the same lock as the drain, not after it: a `call()`
+        // that raced in between would otherwise register a waiter this
+        // reader has already stopped watching for, and never resolve.
+        let mut state = pending.lock().unwrap();
+        state.closed = true;
+        for (_, tx) in state.calls.drain() {
             let _ = tx.send(Response::Err(BleError::Transport("broker connection closed".to_string())));
         }
     }
 
+    /// `closed` and the waiter map share one lock (`PendingState`) so this
+    /// check-then-insert is atomic with `reader_loop`'s mark-then-drain on
+    /// the other side: whichever runs first under the lock determines
+    /// whether this call is rejected immediately or resolved (with an
+    /// error) once the reader's cleanup catches it — either way, `call()`
+    /// can never register a waiter with nobody left to ever resolve it.
     async fn call(&self, request: Request) -> Result<Response> {
         let correlation_id = self.next_correlation.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(correlation_id, tx);
+        {
+            let mut state = self.pending.lock().unwrap();
+            if state.closed {
+                return Err(BleError::Transport("broker connection closed".to_string()));
+            }
+            state.calls.insert(correlation_id, tx);
+        }
         if self.outbox.send(Envelope { correlation_id, frame: Frame::Req(request) }).is_err() {
-            self.pending.lock().unwrap().remove(&correlation_id);
+            self.pending.lock().unwrap().calls.remove(&correlation_id);
             return Err(BleError::Transport("broker connection closed".to_string()));
         }
         match rx.await {
