@@ -3,12 +3,15 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "mock-broker", derive(serde::Serialize, serde::Deserialize))]
 pub struct ServiceUuid(pub Uuid);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "mock-broker", derive(serde::Serialize, serde::Deserialize))]
 pub struct CharacteristicUuid(pub Uuid);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "mock-broker", derive(serde::Serialize, serde::Deserialize))]
 pub enum Role {
     Central,
     Peripheral,
@@ -30,9 +33,11 @@ pub struct CapabilityReport {
 /// Linux, a Bluetooth device address on Android, etc). Callers must not
 /// parse or format it themselves.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "mock-broker", derive(serde::Serialize, serde::Deserialize))]
 pub struct PeerAddress(pub String);
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "mock-broker", derive(serde::Serialize, serde::Deserialize))]
 pub struct DiscoveredPeer {
     pub address: PeerAddress,
     pub name: Option<String>,
@@ -56,6 +61,7 @@ pub struct DiscoveredPeer {
 
 /// How a characteristic write should be delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "mock-broker", derive(serde::Serialize, serde::Deserialize))]
 pub enum WriteType {
     /// ATT Write Request: the peer acknowledges each write. Slower, but you
     /// learn about failures. The right default for command/response
@@ -71,6 +77,7 @@ pub enum WriteType {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "mock-broker", derive(serde::Serialize, serde::Deserialize))]
 pub enum GattEvent {
     Connected {
         peer: PeerAddress,
@@ -117,6 +124,7 @@ pub enum GattEvent {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "mock-broker", derive(serde::Serialize, serde::Deserialize))]
 pub struct GattCharacteristicSpec {
     pub uuid: CharacteristicUuid,
     pub readable: bool,
@@ -129,6 +137,7 @@ pub struct GattCharacteristicSpec {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "mock-broker", derive(serde::Serialize, serde::Deserialize))]
 pub struct GattServiceSpec {
     pub uuid: ServiceUuid,
     pub characteristics: Vec<GattCharacteristicSpec>,

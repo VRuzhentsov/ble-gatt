@@ -13,6 +13,9 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 uuid.workspace = true
+# Optional, only compiled in behind `mock-broker` — see docs/adr/0004.
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 bluer = { version = "0.17", features = ["bluetoothd"] }
@@ -29,3 +32,14 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 # harness would prove nothing about the instrumentation it is meant to
 # exercise.
 env_logger = "0.11"
+
+[features]
+# Lets `backend::mock::MockNetwork` run as a broker process that separate OS
+# processes connect to over a socket, instead of sharing an `Arc` in one
+# process — see docs/adr/0004-mock-broker-for-cross-process-e2e.md. Off by
+# default: zero new deps/behavior change for existing consumers.
+mock-broker = ["dep:serde", "dep:serde_json", "uuid/serde", "tokio/net", "tokio/io-util"]
+
+[[test]]
+name = "mock_broker"
+required-features = ["mock-broker"]
