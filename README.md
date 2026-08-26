@@ -32,6 +32,9 @@ split, why GATT-only, why hand-rolled instead of an existing crate.
 exactly what is and isn't verified about it.
 [0003](docs/adr/0003-carrier-not-crypto-and-the-two-api-tiers.md) — carrier
 vs. crypto, the two API tiers, and the no-AGPL constraint.
+[0004](docs/adr/0004-mock-broker-for-cross-process-e2e.md) — the optional
+`mock-broker` feature letting `backend::mock` bridge two real OS processes
+over a socket instead of sharing an in-process `Arc`.
 
 ## Platform support
 
@@ -53,7 +56,9 @@ Backend trait (async, Tokio)
 ├── linux.rs    BlueZ via bluer — central + peripheral         (M1)
 ├── android.rs  raw jni + ndk-context JNI bridge                (M1)
 ├── windows.rs  reserved                                        (M2)
-└── mock.rs     in-process, radio-free — CI-safe protocol tests
+└── mock/       in-process, radio-free — CI-safe protocol tests;
+                optionally a cross-process broker behind the
+                `mock-broker` feature — see ADR-0004
 ```
 
 Every backend speaks the same generic GATT vocabulary
