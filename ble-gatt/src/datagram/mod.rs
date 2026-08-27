@@ -1161,40 +1161,71 @@ pub async fn serve(
                     if characteristic != config.characteristic {
                         continue;
                     }
-                    if let Some(served) = inbound.get(&peer) {
-                        let (tx, overflow) = (&served.fragments, &served.overflow);
-                        // Try first, then apply real backpressure before
-                        // considering a drop. The sender's ATT write has
-                        // already been acknowledged by the stack by the time
-                        // this event exists, so a dropped fragment is loss
-                        // that the *sender* cannot be told about — worth
-                        // waiting to avoid.
-                        //
-                        // The wait is bounded because this loop also carries
-                        // disconnects: blocking it indefinitely on a peer
-                        // that has stopped draining would stall cleanup for
-                        // everyone, including the peer that is stuck.
-                        match tx.try_send(value) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Closed(_)) => {}
-                            Err(mpsc::error::TrySendError::Full(value)) => {
-                                let queued = tokio::time::timeout(
-                                    FRAGMENT_BACKPRESSURE_TIMEOUT,
-                                    tx.send(value),
-                                )
-                                .await;
-                                if queued.is_err() {
-                                    // Report the loss to the receiver rather
-                                    // than letting the message quietly time
-                                    // out. It is the only endpoint that can
-                                    // still be told.
-                                    overflow.raise();
-                                    log::warn!(
-                                        "serve: fragment queue full for {} after \
-                                         backpressure; dropping fragment and reporting loss",
-                                        peer.0
-                                    );
-                                }
+                    let Some(served) = inbound.get(&peer) else {
+                        // Every other drop path in this loop logs — this one
+                        // didn't, making it indistinguishable from "nothing
+                        // happened" for a peer whose write is silently going
+                        // nowhere. Genuinely reachable, not just defensive:
+                        // a write from a peer this task never accepted (its
+                        // `Connected` was refused or hasn't been processed
+                        // yet), or from one it already released (`inbound`
+                        // entry removed on disconnect/generation release)
+                        // but whose sender doesn't know that yet and keeps
+                        // writing/resending to the same address.
+                        log::warn!(
+                            "serve: dropping a write from {} — not a peer this task is \
+                             currently serving",
+                            peer.0
+                        );
+                        continue;
+                    };
+                    let (tx, overflow) = (&served.fragments, &served.overflow);
+                    // Try first, then apply real backpressure before
+                    // considering a drop. The sender's ATT write has
+                    // already been acknowledged by the stack by the time
+                    // this event exists, so a dropped fragment is loss
+                    // that the *sender* cannot be told about — worth
+                    // waiting to avoid.
+                    //
+                    // The wait is bounded because this loop also carries
+                    // disconnects: blocking it indefinitely on a peer
+                    // that has stopped draining would stall cleanup for
+                    // everyone, including the peer that is stuck.
+                    match tx.try_send(value) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            // The reassembly task for this peer already
+                            // ended (its `DatagramChannel` was dropped),
+                            // but `inbound` hasn't been cleaned up yet —
+                            // a real window: cleanup happens when this
+                            // same loop later processes the release/
+                            // disconnect notification, not synchronously
+                            // with the drop. Every write arriving in
+                            // that window vanished with no trace before
+                            // this log line existed.
+                            log::warn!(
+                                "serve: dropping a write from {} — its channel was \
+                                 already closed, awaiting this task's own cleanup",
+                                peer.0
+                            );
+                        }
+                        Err(mpsc::error::TrySendError::Full(value)) => {
+                            let queued = tokio::time::timeout(
+                                FRAGMENT_BACKPRESSURE_TIMEOUT,
+                                tx.send(value),
+                            )
+                            .await;
+                            if queued.is_err() {
+                                // Report the loss to the receiver rather
+                                // than letting the message quietly time
+                                // out. It is the only endpoint that can
+                                // still be told.
+                                overflow.raise();
+                                log::warn!(
+                                    "serve: fragment queue full for {} after \
+                                     backpressure; dropping fragment and reporting loss",
+                                    peer.0
+                                );
                             }
                         }
                     }

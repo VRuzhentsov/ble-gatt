@@ -157,7 +157,20 @@ impl LocalRadio {
 
     fn emit(&self, to: &PeerAddress, event: GattEvent) {
         if let Some(tx) = self.event_senders.lock().unwrap().get(to) {
-            let _ = tx.send(event);
+            // `send` fails only when every receiver for `to` has been
+            // dropped. Logged rather than silently discarded (as it was
+            // before) after a real report of a peripheral write vanishing
+            // with zero corresponding log output anywhere in the pipeline —
+            // this and the broker's own now-fixed `RecvError::Lagged`
+            // swallowing were the two candidate silent-discard points found
+            // while investigating it. `debug`, not `warn`: unlike the
+            // broker path, a momentary zero-receiver window here isn't
+            // necessarily a bug in this mock (nothing pins `event_senders`
+            // entries to a receiver's lifetime), so this is diagnostic
+            // evidence for the next investigation, not an asserted fault.
+            if let Err(err) = tx.send(event) {
+                log::debug!("emit: {} has no live event receiver right now, discarding {:?}", to.0, err.0);
+            }
         }
     }
 
