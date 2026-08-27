@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
 use crate::error::{BleError, Result};
-use crate::models::PeerAddress;
+use crate::models::{GattEvent, PeerAddress};
 
 use super::local::LocalRadio;
 use super::wire::{read_frame, write_frame, Envelope, Frame, Push, Request, Response};
@@ -113,7 +113,33 @@ async fn dispatch(request: Request, radio: &Arc<LocalRadio>, conn: &Arc<ConnHand
                                 break;
                             }
                         }
-                        Err(RecvError::Lagged(_)) => continue,
+                        // Forward the gap as `GattEvent::Lagged`, exactly as
+                        // the local backend's own `events()` converts a
+                        // `BroadcastStreamRecvError::Lagged` — not swallow
+                        // it. The datagram layer's `serve`/`connect` treat
+                        // `Lagged` as terminal specifically because the
+                        // discarded events may include this peer's own
+                        // `CharacteristicWritten`/`Disconnected`, and
+                        // silently continuing left a receiver with no way to
+                        // learn a fragment vanished: the channel looked
+                        // perfectly healthy (no overflow signal, no forced
+                        // reconnect) while a message that will now never
+                        // arrive sat missing a piece. Confirmed as the root
+                        // cause of a real "clean session, one message never
+                        // arrives" bug found running fini's actors-ble e2e
+                        // under bursty resend traffic.
+                        Err(RecvError::Lagged(dropped)) => {
+                            let env = Envelope {
+                                correlation_id: 0,
+                                frame: Frame::Push(Push::Event {
+                                    address: address.clone(),
+                                    event: GattEvent::Lagged { dropped },
+                                }),
+                            };
+                            if outbox.send(env).is_err() {
+                                break;
+                            }
+                        }
                         Err(RecvError::Closed) => break,
                     }
                 }
