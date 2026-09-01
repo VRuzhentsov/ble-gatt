@@ -437,6 +437,7 @@ struct LinuxConnectGuard {
     adapter: Adapter,
     address: bluer::Address,
     dialed: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
+    dial_lock: Arc<AsyncMutex<()>>,
     peer: PeerAddress,
     generation: u64,
     armed: bool,
@@ -455,8 +456,30 @@ impl Drop for LinuxConnectGuard {
         }
         let adapter = self.adapter.clone();
         let address = self.address;
+        let dial_lock = self.dial_lock.clone();
+        let dialed = self.dialed.clone();
         let peer = self.peer.clone();
         tokio::spawn(async move {
+            // Every other operation in this file that touches `Device`
+            // holds `dial_lock` across the platform call, precisely because
+            // `Device` resolves by address: an unguarded disconnect here
+            // could land on a connection a retry has since legitimately
+            // established, not the abandoned attempt this guard owns. See
+            // `LinuxGattConnection::disconnect`'s doc comment for the same
+            // reasoning at the sharpest edge of it.
+            let _dial = dial_lock.lock().await;
+            // While this task waited for the lock, a retry may already have
+            // claimed `peer` — `connect()` inserts its own generation into
+            // `dialed` before it ever reaches `device.connect()`, under this
+            // same lock. If any entry exists now, something newer than this
+            // cancelled attempt owns this address; back off rather than
+            // risk dropping a connection this guard was never responsible
+            // for. The synchronous removal above only ever clears *this*
+            // generation's own entry, so any presence here is necessarily
+            // someone else's.
+            if dialed.lock().unwrap().contains_key(&peer) {
+                return;
+            }
             let Ok(device) = adapter.device(address) else {
                 return;
             };
@@ -585,6 +608,7 @@ impl Backend for LinuxBackend {
             adapter: self.adapter.clone(),
             address,
             dialed: self.dialed.clone(),
+            dial_lock: self.dial_lock.clone(),
             peer: peer.clone(),
             generation: dial_generation,
             armed: true,
