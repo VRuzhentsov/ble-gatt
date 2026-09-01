@@ -428,6 +428,71 @@ impl LinuxBackend {
     }
 }
 
+/// Cancellation guard for `LinuxBackend::connect`'s `device.connect().await`
+/// -- see the doc comment at its construction site for why this exists.
+/// `bluer::Device::disconnect()` is async and `Drop::drop` cannot await, so
+/// the actual BlueZ teardown is a detached `tokio::spawn`; only the local
+/// `dialed` bookkeeping is cleared synchronously here.
+struct LinuxConnectGuard {
+    adapter: Adapter,
+    address: bluer::Address,
+    dialed: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
+    dial_lock: Arc<AsyncMutex<()>>,
+    peer: PeerAddress,
+    generation: u64,
+    armed: bool,
+}
+
+impl Drop for LinuxConnectGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        {
+            let mut dialed = self.dialed.lock().unwrap();
+            if dialed.get(&self.peer) == Some(&self.generation) {
+                dialed.remove(&self.peer);
+            }
+        }
+        let adapter = self.adapter.clone();
+        let address = self.address;
+        let dial_lock = self.dial_lock.clone();
+        let dialed = self.dialed.clone();
+        let peer = self.peer.clone();
+        tokio::spawn(async move {
+            // Every other operation in this file that touches `Device`
+            // holds `dial_lock` across the platform call, precisely because
+            // `Device` resolves by address: an unguarded disconnect here
+            // could land on a connection a retry has since legitimately
+            // established, not the abandoned attempt this guard owns. See
+            // `LinuxGattConnection::disconnect`'s doc comment for the same
+            // reasoning at the sharpest edge of it.
+            let _dial = dial_lock.lock().await;
+            // While this task waited for the lock, a retry may already have
+            // claimed `peer` — `connect()` inserts its own generation into
+            // `dialed` before it ever reaches `device.connect()`, under this
+            // same lock. If any entry exists now, something newer than this
+            // cancelled attempt owns this address; back off rather than
+            // risk dropping a connection this guard was never responsible
+            // for. The synchronous removal above only ever clears *this*
+            // generation's own entry, so any presence here is necessarily
+            // someone else's.
+            if dialed.lock().unwrap().contains_key(&peer) {
+                return;
+            }
+            let Ok(device) = adapter.device(address) else {
+                return;
+            };
+            if let Err(err) = device.disconnect().await {
+                log::warn!(
+                    "connect: {} cleanup disconnect after a cancelled connect attempt failed: {err}",
+                    peer.0
+                );
+            }
+        });
+    }
+}
+
 #[async_trait]
 impl Backend for LinuxBackend {
     async fn capabilities(&self) -> CapabilityReport {
@@ -525,7 +590,32 @@ impl Backend for LinuxBackend {
         let dial_generation = self.next_session.fetch_add(1, Ordering::Relaxed);
         self.dialed.lock().unwrap().insert(peer.clone(), dial_generation);
         log::info!("connect: dialling {} generation={dial_generation}", peer.0);
-        if let Err(err) = device.connect().await {
+        // Cancellation guard, mirroring the Android backend's `ConnectGuard`
+        // -- `connect()` is an async fn, so a caller can drop this future
+        // mid-await (a timeout, a `select!` losing a race) while suspended
+        // inside `device.connect().await` below. Without this, neither of
+        // that call's own two return paths ever runs: the pending `dialed`
+        // entry stays behind (every retry then refused as "already
+        // dialling"), and more damagingly, BlueZ's own connect request keeps
+        // running independently of the cancelled Rust future and can
+        // complete anyway -- leaving a real ACL/GATT link with nothing on
+        // the Rust side ever owning it, so even an explicit retry can fail
+        // with "already connected" until that orphaned link drops
+        // externally. Disarmed right after `device.connect()` actually
+        // returns, on both its Ok and Err paths (each already does its own
+        // correct cleanup/handoff).
+        let mut guard = LinuxConnectGuard {
+            adapter: self.adapter.clone(),
+            address,
+            dialed: self.dialed.clone(),
+            dial_lock: self.dial_lock.clone(),
+            peer: peer.clone(),
+            generation: dial_generation,
+            armed: true,
+        };
+        let connect_result = device.connect().await;
+        guard.armed = false;
+        if let Err(err) = connect_result {
             log::warn!("connect: {} refused the link: {err}", peer.0);
             let mut dialed = self.dialed.lock().unwrap();
             if dialed.get(peer) == Some(&dial_generation) {
