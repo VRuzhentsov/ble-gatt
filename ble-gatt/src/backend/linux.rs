@@ -66,6 +66,33 @@ use crate::models::{
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 
+/// How long `LinuxBackend::connect` waits for BlueZ's `Connect` D-Bus method
+/// to reply before giving up.
+///
+/// Real-hardware evidence: with no bound at all, a `Connect` call to an
+/// unresponsive/out-of-range peer can hang effectively forever — not just
+/// past a caller's own external timeout, since `dial_lock` is held across
+/// the whole call and every subsequent dial (and, evidence suggests, the
+/// shared D-Bus connection's own capacity for outstanding calls) piles up
+/// behind it rather than that one dial simply failing slowly. A caller-side
+/// `tokio::time::timeout` around the whole `connect()` future does not fix
+/// this: dropping that future does not cancel BlueZ's own in-progress
+/// Connect (see `LinuxConnectGuard`'s doc comment), so the stuck D-Bus call
+/// and the `dial_lock` hold both outlive the caller giving up on it.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long a cancelled connect attempt's cleanup waits for BlueZ's
+/// `Disconnect` to reply. BlueZ documents `Disconnect` as the sanctioned way
+/// to cancel a pending `Connect`, but real-hardware evidence shows it can
+/// itself hit the same D-Bus timeout the stuck `Connect` was already
+/// sitting on ("cleanup disconnect ... failed: ... D-Bus error ...
+/// Timeout waiting for reply") — an unbounded cleanup call holding the same
+/// `dial_lock` is just as capable of starving every other dial as the
+/// original stuck connect was. Shorter than `CONNECT_TIMEOUT`: this is a
+/// best-effort cancellation signal, not an operation worth waiting as long
+/// for.
+const CLEANUP_DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub struct LinuxBackend {
     // Held only to keep the D-Bus session connection alive for the
     // lifetime of the backend; `Adapter` clones its own `Arc` into the
@@ -552,11 +579,28 @@ impl Drop for LinuxConnectGuard {
             let Ok(device) = adapter.device(address) else {
                 return;
             };
-            if let Err(err) = device.disconnect().await {
-                log::warn!(
-                    "connect: {} cleanup disconnect after a cancelled connect attempt failed: {err}",
-                    peer.0
-                );
+            // Bounded for the same reason CONNECT_TIMEOUT exists: BlueZ
+            // documents Disconnect as the way to cancel a pending Connect,
+            // but real-hardware evidence shows this call can itself hit the
+            // same D-Bus timeout the original Connect was stuck on — an
+            // unbounded cleanup holding this same dial_lock is exactly as
+            // capable of starving every later dial as the stuck connect it
+            // was meant to clean up after.
+            match tokio::time::timeout(CLEANUP_DISCONNECT_TIMEOUT, device.disconnect()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    log::warn!(
+                        "connect: {} cleanup disconnect after a cancelled connect attempt failed: {err}",
+                        peer.0
+                    );
+                }
+                Err(_elapsed) => {
+                    log::warn!(
+                        "connect: {} cleanup disconnect after a cancelled connect attempt timed out \
+                         after {CLEANUP_DISCONNECT_TIMEOUT:?}",
+                        peer.0
+                    );
+                }
             }
         });
     }
@@ -682,8 +726,39 @@ impl Backend for LinuxBackend {
             generation: dial_generation,
             armed: true,
         };
-        let connect_result = device.connect().await;
-        guard.armed = false;
+        // Bounded, not just cancellation-safe: without this, an unresponsive
+        // peer's Connect reply never arriving holds `dial_lock` (and, real-
+        // hardware evidence suggests, whatever capacity the shared D-Bus
+        // connection has for outstanding calls) forever, so every later dial
+        // queues up behind one that will never finish. See
+        // `CONNECT_TIMEOUT`'s doc comment.
+        let connect_result = match tokio::time::timeout(CONNECT_TIMEOUT, device.connect()).await {
+            Ok(result) => {
+                // The D-Bus call genuinely completed (Ok or Err) — nothing
+                // left for the guard to cancel.
+                guard.armed = false;
+                result
+            }
+            Err(_elapsed) => {
+                // Guard stays armed: unlike a completed call, BlueZ's own
+                // Connect may still resolve later on its own schedule — the
+                // exact orphaned-link scenario this guard exists to clean up
+                // after, just triggered by our own timeout instead of a
+                // caller dropping the future.
+                log::warn!(
+                    "connect: {} timed out after {CONNECT_TIMEOUT:?} waiting for BlueZ's Connect reply",
+                    peer.0
+                );
+                let mut dialed = self.dialed.lock().unwrap();
+                if dialed.get(peer) == Some(&dial_generation) {
+                    dialed.remove(peer);
+                }
+                return Err(BleError::ConnectFailed {
+                    peer: peer.0.clone(),
+                    reason: format!("timed out after {CONNECT_TIMEOUT:?} waiting for BlueZ to respond to Connect"),
+                });
+            }
+        };
         if let Err(err) = connect_result {
             log::warn!("connect: {} refused the link: {err}", peer.0);
             let mut dialed = self.dialed.lock().unwrap();
