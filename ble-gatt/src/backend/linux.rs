@@ -802,6 +802,27 @@ impl Backend for LinuxBackend {
         // Held across the platform call, so a concurrent `disconnect` on an
         // older handle cannot land midway and drop this link.
         let _dial = self.dial_lock.lock().await;
+        // Re-checked now that `dial_lock` is actually held: the check above
+        // only sees state as of *before* this call queued for the lock.
+        // Real-hardware evidence (Codex review): a cancelled attempt's
+        // cleanup can still be inside its own bounded `Disconnect` — itself
+        // holding `dial_lock` — when this call's pre-check ran and found
+        // `pending_cleanup` empty. If that cleanup times out and publishes
+        // the quarantine *while this call is already queued* for the lock
+        // it just released, the earlier check never sees it — this call
+        // would dial straight into the address the fresh, now-unbounded
+        // cleanup disconnect is still targeting. `in_flight` needs no
+        // matching re-check: unlike `pending_cleanup`, it can only become
+        // *un*-set while queued (this call's own entry persists for as
+        // long as it holds it), never newly set against this same peer out
+        // from under it.
+        if self.pending_cleanup.lock().unwrap().contains(peer) {
+            self.in_flight.lock().unwrap().remove(peer);
+            return Err(BleError::ConnectFailed {
+                peer: peer.0.clone(),
+                reason: "a previous cancelled connect attempt is still being cleaned up".to_string(),
+            });
+        }
         // The generation distinguishes successive dials to the same address,
         // so a watcher from a previous connection cannot report a disconnect
         // for the one that replaced it.
