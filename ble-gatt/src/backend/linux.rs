@@ -13,7 +13,7 @@
 //! handshake over the link, not by this event), revisit if a consumer needs
 //! precise link-level connect/disconnect timing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -157,6 +157,14 @@ pub struct LinuxBackend {
     /// initiated, so without this an outbound connection would be
     /// misreported as a central arriving at our server.
     dialed: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
+    /// Addresses with a cancelled connect attempt's cleanup `Disconnect`
+    /// still genuinely unresolved on BlueZ's side, past
+    /// `CLEANUP_DISCONNECT_TIMEOUT`. `connect()` refuses to dial a
+    /// quarantined address rather than risk that stale `Disconnect`
+    /// eventually landing on the replacement it would establish — see
+    /// `LinuxConnectGuard::drop`'s doc comment for why timing that call out
+    /// cannot simply mean "forget about it."
+    pending_cleanup: Arc<StdMutex<HashSet<PeerAddress>>>,
 }
 
 impl LinuxBackend {
@@ -194,6 +202,7 @@ impl LinuxBackend {
             adv_handle: AsyncMutex::new(None),
             server_watch: Arc::new(StdMutex::new(Vec::new())),
             dialed: Arc::new(StdMutex::new(HashMap::new())),
+            pending_cleanup: Arc::new(StdMutex::new(HashSet::new())),
         })
     }
 }
@@ -534,6 +543,7 @@ struct LinuxConnectGuard {
     address: bluer::Address,
     dialed: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
     dial_lock: Arc<AsyncMutex<()>>,
+    pending_cleanup: Arc<StdMutex<HashSet<PeerAddress>>>,
     peer: PeerAddress,
     generation: u64,
     armed: bool,
@@ -554,6 +564,7 @@ impl Drop for LinuxConnectGuard {
         let address = self.address;
         let dial_lock = self.dial_lock.clone();
         let dialed = self.dialed.clone();
+        let pending_cleanup = self.pending_cleanup.clone();
         let peer = self.peer.clone();
         tokio::spawn(async move {
             // Every other operation in this file that touches `Device`
@@ -579,13 +590,25 @@ impl Drop for LinuxConnectGuard {
             let Ok(device) = adapter.device(address) else {
                 return;
             };
-            // Bounded for the same reason CONNECT_TIMEOUT exists: BlueZ
-            // documents Disconnect as the way to cancel a pending Connect,
-            // but real-hardware evidence shows this call can itself hit the
-            // same D-Bus timeout the original Connect was stuck on — an
+            // Bounded for the same reason CONNECT_TIMEOUT exists: an
             // unbounded cleanup holding this same dial_lock is exactly as
             // capable of starving every later dial as the stuck connect it
-            // was meant to clean up after.
+            // exists to clean up after.
+            //
+            // But a timeout here only ever gives up on *our* wait — the
+            // underlying D-Bus `Disconnect` request already sent to BlueZ
+            // is not thereby cancelled or recalled (dropping a future never
+            // un-sends the request it represents). If we simply forgot
+            // about it and released `dial_lock`, a retry could establish a
+            // replacement connection to this same address, and the still-
+            // pending `Disconnect` could later land on *that* link instead
+            // — the exact race `dial_lock` exists to prevent, just moved
+            // one level down to an operation we can no longer observe or
+            // bound. So a timeout here does not mean "forget it": it means
+            // "stop blocking everyone else on it," while `pending_cleanup`
+            // keeps `connect()` from redialling this specific address until
+            // a *fresh* `Disconnect` call — not the abandoned one — is
+            // actually confirmed to have finished, however long that takes.
             match tokio::time::timeout(CLEANUP_DISCONNECT_TIMEOUT, device.disconnect()).await {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
@@ -597,9 +620,36 @@ impl Drop for LinuxConnectGuard {
                 Err(_elapsed) => {
                     log::warn!(
                         "connect: {} cleanup disconnect after a cancelled connect attempt timed out \
-                         after {CLEANUP_DISCONNECT_TIMEOUT:?}",
+                         after {CLEANUP_DISCONNECT_TIMEOUT:?}; quarantining the address until a fresh \
+                         disconnect actually completes",
                         peer.0
                     );
+                    pending_cleanup.lock().unwrap().insert(peer.clone());
+                    // Deliberately outside this task's own `_dial` hold —
+                    // that lock is about to be released either way once
+                    // this function returns, and this new wait must not
+                    // reacquire it: doing so would recreate the exact
+                    // starvation this timeout exists to end, just with an
+                    // unbounded wait behind the lock again.
+                    tokio::spawn(async move {
+                        // No timeout: this one has to actually resolve, not
+                        // give up again, or `pending_cleanup` would need a
+                        // second escape hatch with the identical problem.
+                        // The address stays quarantined for as long as this
+                        // takes, however long that is — bounded only by
+                        // however long BlueZ itself takes to answer.
+                        match device.disconnect().await {
+                            Ok(()) => log::info!(
+                                "connect: {} delayed cleanup disconnect eventually completed",
+                                peer.0
+                            ),
+                            Err(err) => log::warn!(
+                                "connect: {} delayed cleanup disconnect eventually failed: {err}",
+                                peer.0
+                            ),
+                        }
+                        pending_cleanup.lock().unwrap().remove(&peer);
+                    });
                 }
             }
         });
@@ -689,6 +739,18 @@ impl Backend for LinuxBackend {
             peer: peer.0.clone(),
             reason: err.to_string(),
         })?;
+        // A previous cancelled attempt's cleanup Disconnect to this exact
+        // address may still be genuinely in flight on BlueZ's side — see
+        // `LinuxConnectGuard::drop`'s doc comment. Dialling in now would
+        // risk that stale Disconnect landing on the replacement link this
+        // call is about to establish. Checked before `dial_lock` so a
+        // quarantined address fails fast rather than queuing behind it.
+        if self.pending_cleanup.lock().unwrap().contains(peer) {
+            return Err(BleError::ConnectFailed {
+                peer: peer.0.clone(),
+                reason: "a previous cancelled connect attempt is still being cleaned up".to_string(),
+            });
+        }
         // Recorded *before* dialling: BlueZ can publish the Connected
         // property before `connect()` returns, and the inbound watcher would
         // otherwise race us and announce our own outbound link as a central
@@ -722,6 +784,7 @@ impl Backend for LinuxBackend {
             address,
             dialed: self.dialed.clone(),
             dial_lock: self.dial_lock.clone(),
+            pending_cleanup: self.pending_cleanup.clone(),
             peer: peer.clone(),
             generation: dial_generation,
             armed: true,
