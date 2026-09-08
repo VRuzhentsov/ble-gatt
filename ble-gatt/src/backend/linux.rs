@@ -295,6 +295,17 @@ fn spawn_peripheral_disconnect_watch(
     session: u64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // This session's own writer may still be mid-`AcquireNotify` — see
+        // `NOTIFY_WRITER_ACQUIRE_TIMEOUT`'s doc comment on `notify_matching`.
+        // Without this grace period, this watcher's first poll (500ms,
+        // `NOTIFY_SESSION_POLL`) fires well before that 3s window has any
+        // chance to complete: a session this young genuinely having no live
+        // writer yet is indistinguishable from one that never will, so
+        // `has_live_session` alone would race ahead of `notify_matching`'s
+        // own wait, remove `served_peers` first, and turn the first reply's
+        // "no live notify session" into "session has been superseded" —
+        // still a failure, just reported by a different code path.
+        let spawned_at = tokio::time::Instant::now();
         // Any exit path must clear the guard, or a peer that failed to be
         // watched once could never be watched again.
         let _ = async {
@@ -330,7 +341,9 @@ fn spawn_peripheral_disconnect_watch(
                     tokio::select! {
                         _ = disconnected => break,
                         _ = tokio::time::sleep(NOTIFY_SESSION_POLL) => {
-                            if !has_live_session(&writers, &peer).await {
+                            let past_acquire_grace =
+                                spawned_at.elapsed() >= NOTIFY_WRITER_ACQUIRE_TIMEOUT;
+                            if past_acquire_grace && !has_live_session(&writers, &peer).await {
                                 break;
                             }
                         }
