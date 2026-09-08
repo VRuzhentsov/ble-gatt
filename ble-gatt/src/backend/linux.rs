@@ -644,6 +644,19 @@ impl Drop for LinuxConnectGuard {
                 dialed.remove(&self.peer);
             }
         }
+        // Quarantined *synchronously*, before this function — and so
+        // `connect()`'s own stack frame — ever returns to its caller.
+        // Codex P1: publishing this only later (e.g. only once a first
+        // bounded cleanup attempt itself times out) left a real window
+        // where an immediate retry raced in before any quarantine existed
+        // at all — `connect()`'s own quarantine checks have nothing to see
+        // until *something* inserts into this set, and previously nothing
+        // did until well after this guard had already returned control to
+        // the caller. BlueZ's original Connect() request may still be
+        // genuinely in flight the instant this guard drops; nothing has
+        // confirmed otherwise yet, so the quarantine cannot wait for that
+        // confirmation either.
+        self.pending_cleanup.lock().unwrap().insert(self.peer.clone());
         let adapter = self.adapter.clone();
         let address = self.address;
         let dial_lock = self.dial_lock.clone();
@@ -651,106 +664,76 @@ impl Drop for LinuxConnectGuard {
         let pending_cleanup = self.pending_cleanup.clone();
         let peer = self.peer.clone();
         tokio::spawn(async move {
-            // Every other operation in this file that touches `Device`
-            // holds `dial_lock` across the platform call, precisely because
-            // `Device` resolves by address: an unguarded disconnect here
-            // could land on a connection a retry has since legitimately
-            // established, not the abandoned attempt this guard owns. See
-            // `LinuxGattConnection::disconnect`'s doc comment for the same
-            // reasoning at the sharpest edge of it.
-            let _dial = dial_lock.lock().await;
-            // While this task waited for the lock, a retry may already have
-            // claimed `peer` — `connect()` inserts its own generation into
-            // `dialed` before it ever reaches `device.connect()`, under this
-            // same lock. If any entry exists now, something newer than this
-            // cancelled attempt owns this address; back off rather than
-            // risk dropping a connection this guard was never responsible
-            // for. The synchronous removal above only ever clears *this*
-            // generation's own entry, so any presence here is necessarily
-            // someone else's.
-            if dialed.lock().unwrap().contains_key(&peer) {
-                return;
-            }
-            let Ok(device) = adapter.device(address) else {
-                return;
-            };
-            // Bounded for the same reason CONNECT_TIMEOUT exists: an
-            // unbounded cleanup holding this same dial_lock is exactly as
-            // capable of starving every later dial as the stuck connect it
-            // exists to clean up after.
-            //
-            // But a timeout here only ever gives up on *our* wait — the
-            // underlying D-Bus `Disconnect` request already sent to BlueZ
-            // is not thereby cancelled or recalled (dropping a future never
-            // un-sends the request it represents). If we simply forgot
-            // about it and released `dial_lock`, a retry could establish a
-            // replacement connection to this same address, and the still-
-            // pending `Disconnect` could later land on *that* link instead
-            // — the exact race `dial_lock` exists to prevent, just moved
-            // one level down to an operation we can no longer observe or
-            // bound. So a timeout here does not mean "forget it": it means
-            // "stop blocking everyone else on it," while `pending_cleanup`
-            // keeps `connect()` from redialling this specific address until
-            // a *fresh* `Disconnect` call — not the abandoned one — is
-            // actually confirmed to have finished, however long that takes.
-            match tokio::time::timeout(CLEANUP_DISCONNECT_TIMEOUT, device.disconnect()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    log::warn!(
-                        "connect: {} cleanup disconnect after a cancelled connect attempt failed: {err}",
-                        peer.0
-                    );
-                }
-                Err(_elapsed) => {
-                    log::warn!(
-                        "connect: {} cleanup disconnect after a cancelled connect attempt timed out \
-                         after {CLEANUP_DISCONNECT_TIMEOUT:?}; quarantining the address until a fresh \
-                         disconnect actually completes",
-                        peer.0
-                    );
-                    pending_cleanup.lock().unwrap().insert(peer.clone());
-                    // Deliberately outside this task's own `_dial` hold —
-                    // that lock is about to be released either way once
-                    // this function returns, and this new wait must not
-                    // reacquire it: doing so would recreate the exact
-                    // starvation this timeout exists to end, just with an
-                    // unbounded wait behind the lock again.
-                    tokio::spawn(async move {
-                        // No timeout, and does not lift the quarantine on a
-                        // definitive Err either (Codex P1) — an error here
-                        // means the peer's fate is *still* unknown, not that
-                        // it is now safe: the original, abandoned Disconnect
-                        // remains unresolved regardless of what this fresh
-                        // one just reported, so clearing the quarantine on
-                        // failure would readmit a dial with the same risk
-                        // this whole mechanism exists to prevent. Retries
-                        // until an attempt actually reports Ok — the address
-                        // stays quarantined for as long as that takes,
-                        // bounded only by however long BlueZ takes to
-                        // eventually answer one of them.
-                        loop {
-                            match device.disconnect().await {
-                                Ok(()) => {
-                                    log::info!(
-                                        "connect: {} delayed cleanup disconnect eventually completed",
-                                        peer.0
-                                    );
-                                    break;
-                                }
-                                Err(err) => {
-                                    log::warn!(
-                                        "connect: {} delayed cleanup disconnect attempt failed ({err}), \
-                                         retrying in {PENDING_CLEANUP_RETRY_DELAY:?} — still quarantined",
-                                        peer.0
-                                    );
-                                    tokio::time::sleep(PENDING_CLEANUP_RETRY_DELAY).await;
-                                }
-                            }
-                        }
-                        pending_cleanup.lock().unwrap().remove(&peer);
-                    });
+            // Retries until an attempt actually reports Ok — a definitive
+            // Err no more confirms cancellation than a timeout does (Codex
+            // P1): either way the peer's fate is still unknown, and the
+            // original, abandoned Disconnect remains unresolved regardless
+            // of what a fresh attempt just reported. The address stays
+            // quarantined for as long as that takes, bounded only by
+            // however long BlueZ takes to eventually answer one of them.
+            loop {
+                let outcome = {
+                    // Every other operation in this file that touches
+                    // `Device` holds `dial_lock` across the platform call,
+                    // precisely because `Device` resolves by address: an
+                    // unguarded disconnect here could land on a connection
+                    // a retry has since legitimately established, not the
+                    // abandoned attempt this guard owns. See
+                    // `LinuxGattConnection::disconnect`'s doc comment for
+                    // the same reasoning at the sharpest edge of it.
+                    //
+                    // Reacquired fresh each retry, not held across the
+                    // whole loop, for the same starvation reason
+                    // `CONNECT_TIMEOUT`/`GATT_OP_MAX_RETRIES` bound their
+                    // own waits rather than holding this lock throughout.
+                    let _dial = dial_lock.lock().await;
+                    // A newer dial claiming this address while quarantined
+                    // should be structurally impossible now — connect()'s
+                    // own quarantine checks (before and after acquiring
+                    // this same lock) refuse a dial to a quarantined peer
+                    // outright. Kept as a defensive check, not a load-
+                    // bearing one: the synchronous removal above only ever
+                    // clears *this* generation's own entry, so any presence
+                    // here would necessarily be someone else's.
+                    if dialed.lock().unwrap().contains_key(&peer) {
+                        break;
+                    }
+                    let Ok(device) = adapter.device(address) else {
+                        break;
+                    };
+                    // Bounded per attempt for the same reason CONNECT_TIMEOUT
+                    // exists — an unbounded single attempt holding this same
+                    // dial_lock is exactly as capable of starving every
+                    // later dial as the stuck connect it exists to clean up
+                    // after. The loop itself has no overall bound; only
+                    // each individual attempt does.
+                    tokio::time::timeout(CLEANUP_DISCONNECT_TIMEOUT, device.disconnect()).await
+                };
+                match outcome {
+                    Ok(Ok(())) => {
+                        log::info!("connect: {} cleanup disconnect completed", peer.0);
+                        break;
+                    }
+                    Ok(Err(err)) => {
+                        log::warn!(
+                            "connect: {} cleanup disconnect attempt failed ({err}), retrying in \
+                             {PENDING_CLEANUP_RETRY_DELAY:?} — still quarantined",
+                            peer.0
+                        );
+                        tokio::time::sleep(PENDING_CLEANUP_RETRY_DELAY).await;
+                    }
+                    Err(_elapsed) => {
+                        log::warn!(
+                            "connect: {} cleanup disconnect attempt timed out after \
+                             {CLEANUP_DISCONNECT_TIMEOUT:?}, retrying — still quarantined",
+                            peer.0
+                        );
+                        // No extra sleep: the timeout itself already spent
+                        // CLEANUP_DISCONNECT_TIMEOUT waiting.
+                    }
                 }
             }
+            pending_cleanup.lock().unwrap().remove(&peer);
         });
     }
 }
