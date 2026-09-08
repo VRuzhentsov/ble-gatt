@@ -429,7 +429,20 @@ impl LinuxBackend {
             // peer's very first reply after a fresh, fast reconnect can lose
             // that race and fail immediately with "no live notify session"
             // even though the peer's subscription is genuinely in flight.
-            let has_match = writers.get(&characteristic).is_some_and(|sessions| sessions.iter().any(&want));
+            //
+            // Must check `is_closed()` here too, not just `want` — a
+            // reconnect's *previous* session can leave a closed writer for
+            // this same address still sitting in the vector (nothing prunes
+            // it until the next `AcquireNotify` event runs its own
+            // retain-before-push, which for this exact race hasn't happened
+            // yet). Matching on address alone made this see a stale, dead
+            // writer as "already live," skip waiting entirely, and fail
+            // immediately once the real prune ran a few lines down —
+            // silently turning the bound-wait into a no-op for precisely
+            // the reconnect case it exists to cover.
+            let has_match = writers
+                .get(&characteristic)
+                .is_some_and(|sessions| sessions.iter().any(|w| !w.is_closed().unwrap_or(true) && want(w)));
             if !has_match {
                 if let Some(deadline) = deadline {
                     if tokio::time::Instant::now() < deadline {
