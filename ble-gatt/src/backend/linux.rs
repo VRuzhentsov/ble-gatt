@@ -93,6 +93,27 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 /// for.
 const CLEANUP_DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How many times `read`/`write_with_type` retry a GATT operation BlueZ
+/// rejects, and how long they wait between attempts.
+///
+/// Real-hardware evidence: a central-role write to a peer that just
+/// finished connecting (services already resolved — `find_characteristic`
+/// waits for that itself) can still fail immediately with BlueZ's own
+/// "Not connected", 100% reproducibly, on the very first fragment of the
+/// very first message on a fresh channel — then recover if simply retried
+/// a moment later. `bluer` maps this to the generic `ErrorKind::Failed`,
+/// not a distinguishable "not ready yet" kind, so there is no structured
+/// way to retry *only* this specific case; a short, bounded retry on any
+/// rejection is the same trade this codebase already made for the exact
+/// analogous condition on Android (`GATT_BUSY_MAX_RETRIES` in
+/// `BleGattBridge.kt`): the platform's own "briefly not ready" signal is
+/// far more common right after a connection than an application ever
+/// seeing this on an established, quiescent link, so a genuinely permanent
+/// failure just fails a few hundred milliseconds later than before instead
+/// of being masked.
+const GATT_OP_MAX_RETRIES: u32 = 3;
+const GATT_OP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
 pub struct LinuxBackend {
     // Held only to keep the D-Bus session connection alive for the
     // lifetime of the backend; `Adapter` clones its own `Arc` into the
@@ -1389,7 +1410,25 @@ impl GattConnection for LinuxGattConnection {
         if let Ok(mtu) = target.mtu().await {
             self.att_mtu.store(mtu as u16, Ordering::Relaxed);
         }
-        target.read().await.map_err(|err| BleError::Gatt(err.to_string()))
+        let mut attempt = 0;
+        loop {
+            match target.read().await {
+                Ok(value) => return Ok(value),
+                Err(err) if attempt < GATT_OP_MAX_RETRIES => {
+                    attempt += 1;
+                    log::warn!(
+                        "read: {} on {} rejected ({err}), retrying ({attempt}/{GATT_OP_MAX_RETRIES})",
+                        characteristic.0,
+                        self.peer.0
+                    );
+                    tokio::time::sleep(GATT_OP_RETRY_DELAY).await;
+                }
+                Err(err) => {
+                    log::warn!("read: {} on {} failed: {err}", characteristic.0, self.peer.0);
+                    return Err(BleError::Gatt(err.to_string()));
+                }
+            }
+        }
     }
 
     async fn write_with_type(
@@ -1417,10 +1456,25 @@ impl GattConnection for LinuxGattConnection {
             characteristic.0,
             self.peer.0
         );
-        target.write_ext(&value, &request).await.map_err(|err| {
-            log::warn!("write: {} bytes to {} failed: {err}", value.len(), self.peer.0);
-            BleError::Gatt(err.to_string())
-        })
+        let mut attempt = 0;
+        loop {
+            match target.write_ext(&value, &request).await {
+                Ok(()) => return Ok(()),
+                Err(err) if attempt < GATT_OP_MAX_RETRIES => {
+                    attempt += 1;
+                    log::warn!(
+                        "write: {} bytes to {} rejected ({err}), retrying ({attempt}/{GATT_OP_MAX_RETRIES})",
+                        value.len(),
+                        self.peer.0
+                    );
+                    tokio::time::sleep(GATT_OP_RETRY_DELAY).await;
+                }
+                Err(err) => {
+                    log::warn!("write: {} bytes to {} failed: {err}", value.len(), self.peer.0);
+                    return Err(BleError::Gatt(err.to_string()));
+                }
+            }
+        }
     }
 
     async fn subscribe(
