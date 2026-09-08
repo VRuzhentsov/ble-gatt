@@ -100,6 +100,21 @@ const CLEANUP_DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// must not lift the quarantine either.
 const PENDING_CLEANUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Hard cap on how many connect-cleanup disconnects this backend will have
+/// actively in flight at once, across every quarantined peer combined.
+/// Codex P1 ("bound cleanup attempts across peer addresses"): bounding
+/// concurrency to one live attempt *per address* (`LinuxConnectGuard::drop`'s
+/// own retry loop) still leaves no bound *across* addresses — enough
+/// distinct, simultaneously-unresponsive peers could still accumulate an
+/// unbounded number of outstanding D-Bus calls, tasks, and `Adapter` handles
+/// overall, just spread across more addresses instead of piled onto one.
+/// A quarantined address whose cleanup task is still waiting for a permit
+/// here is nonetheless fully quarantined — `pending_cleanup` is set
+/// synchronously and unconditionally well before this is ever acquired — so
+/// this only bounds how many are actively doing disconnect work at once, not
+/// how many can be queued waiting their turn.
+const MAX_CONCURRENT_CLEANUP_DISCONNECTS: usize = 4;
+
 /// `read`/`write_with_type` do **not** retry a GATT operation BlueZ rejects
 /// — that used to live here as an internal exponential backoff (6 attempts,
 /// 200ms doubling to 2000ms, ~7s total), modeled on Android's real-hardware-
@@ -242,6 +257,10 @@ pub struct LinuxBackend {
     /// behind `dial_lock` just to fail the same way after burning a real
     /// D-Bus round trip.
     in_flight: Arc<StdMutex<HashSet<PeerAddress>>>,
+    /// Bounds how many connect-cleanup disconnects (see `LinuxConnectGuard`)
+    /// can be actively in flight at once, across every quarantined peer
+    /// combined. See `MAX_CONCURRENT_CLEANUP_DISCONNECTS`'s doc comment.
+    cleanup_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl LinuxBackend {
@@ -281,6 +300,7 @@ impl LinuxBackend {
             dialed: Arc::new(StdMutex::new(HashMap::new())),
             pending_cleanup: Arc::new(StdMutex::new(HashSet::new())),
             in_flight: Arc::new(StdMutex::new(HashSet::new())),
+            cleanup_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CLEANUP_DISCONNECTS)),
         })
     }
 }
@@ -622,6 +642,8 @@ struct LinuxConnectGuard {
     dialed: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
     dial_lock: Arc<AsyncMutex<()>>,
     pending_cleanup: Arc<StdMutex<HashSet<PeerAddress>>>,
+    /// See `MAX_CONCURRENT_CLEANUP_DISCONNECTS`'s doc comment.
+    cleanup_permits: Arc<tokio::sync::Semaphore>,
     peer: PeerAddress,
     generation: u64,
     armed: bool,
@@ -690,8 +712,28 @@ impl Drop for LinuxConnectGuard {
         let dial_lock = self.dial_lock.clone();
         let dialed = self.dialed.clone();
         let pending_cleanup = self.pending_cleanup.clone();
+        let cleanup_permits = self.cleanup_permits.clone();
         let peer = self.peer.clone();
         tokio::spawn(async move {
+            // Bounds how many peers' cleanup can be actively disconnecting
+            // at once, across this whole backend — not just within this one
+            // guard. Held for this task's entire lifetime, acquired before
+            // any disconnect work begins. Codex P1 ("bound cleanup attempts
+            // across peer addresses"): the per-attempt bound below stops one
+            // *address* from accumulating unbounded outstanding calls, but
+            // says nothing about how many *different* addresses can be
+            // doing this simultaneously — enough distinct unresponsive
+            // peers could still exhaust the same resources overall. The
+            // address is already fully quarantined via `pending_cleanup`
+            // above regardless of how long this wait takes; a permit only
+            // gates when actual disconnect work is allowed to start.
+            let Ok(_permit) = cleanup_permits.acquire_owned().await else {
+                // Only closes if the semaphore itself is explicitly closed,
+                // which this file never does — unreachable in practice, but
+                // failing open (skip cleanup) rather than panicking a
+                // detached task is the safer default if it ever changes.
+                return;
+            };
             // At most one disconnect attempt is ever outstanding at a time.
             // Each is spawned as its own task rather than raced directly
             // against CLEANUP_DISCONNECT_TIMEOUT: dropping a future when a
@@ -716,21 +758,28 @@ impl Drop for LinuxConnectGuard {
             // outstanding to join once the loop breaks.
             let mut handle: Option<tokio::task::JoinHandle<bluer::Result<()>>> = None;
             loop {
-                // Every other operation in this file that touches `Device`
-                // holds `dial_lock` across the platform call, precisely
-                // because `Device` resolves by address: an unguarded
-                // disconnect here could land on a connection a retry has
-                // since legitimately established, not the abandoned attempt
-                // this guard owns. See `LinuxGattConnection::disconnect`'s
-                // doc comment for the same reasoning at the sharpest edge
-                // of it.
-                //
-                // Reacquired fresh each iteration, not held across the
-                // whole loop, for the same starvation reason
-                // `CONNECT_TIMEOUT` bounds its own wait rather than holding
-                // this lock throughout.
-                let _dial = dial_lock.lock().await;
                 if handle.is_none() {
+                    // Every other operation in this file that touches
+                    // `Device` holds `dial_lock` across the platform call,
+                    // precisely because `Device` resolves by address: an
+                    // unguarded disconnect here could land on a connection
+                    // a retry has since legitimately established, not the
+                    // abandoned attempt this guard owns. See
+                    // `LinuxGattConnection::disconnect`'s doc comment for
+                    // the same reasoning at the sharpest edge of it.
+                    //
+                    // Codex P1 ("poll timed-out cleanup without reacquiring
+                    // the global lock"): held only around *starting* a
+                    // fresh attempt, not around waiting on one already
+                    // running — that D-Bus call proceeds independently of
+                    // this lock once issued, and the address is already
+                    // quarantined regardless, so holding a backend-wide
+                    // lock for another `CLEANUP_DISCONNECT_TIMEOUT` just to
+                    // poll an existing task needlessly blocked every other
+                    // peer's dial/read/write for that whole span, repeated
+                    // on every timeout, and multiple stuck peers could
+                    // compound the delay past any caller's own timeout.
+                    let _dial = dial_lock.lock().await;
                     // A newer dial claiming this address while quarantined
                     // should be structurally impossible now — connect()'s
                     // own quarantine checks (before and after acquiring
@@ -738,11 +787,7 @@ impl Drop for LinuxConnectGuard {
                     // outright. Kept as a defensive check, not a load-
                     // bearing one: the synchronous removal above only ever
                     // clears *this* generation's own entry, so any presence
-                    // here would necessarily be someone else's. Only
-                    // checked when about to start a fresh attempt — an
-                    // already-issued disconnect is left to run to
-                    // completion regardless, since it cannot be recalled
-                    // anyway.
+                    // here would necessarily be someone else's.
                     if dialed.lock().unwrap().contains_key(&peer) {
                         break;
                     }
@@ -750,14 +795,18 @@ impl Drop for LinuxConnectGuard {
                         break;
                     };
                     handle = Some(tokio::spawn(async move { device.disconnect().await }));
+                    // Dropped here, before the wait below — see the comment
+                    // above for why holding it that long is unnecessary and
+                    // was itself a Codex P1.
                 }
                 // Bounded per wait for the same reason CONNECT_TIMEOUT
-                // exists — an unbounded wait holding this same dial_lock is
-                // exactly as capable of starving every later dial as the
-                // stuck connect it exists to clean up after. Only the wait
-                // is bounded, not the attempt: on a timeout the spawned
-                // task keeps running in the background and is polled again
-                // next iteration, never abandoned for a fresh one.
+                // exists — an unbounded wait is exactly as capable of
+                // starving this task's own progress as the stuck connect it
+                // exists to clean up after (though, unlike before, it no
+                // longer holds `dial_lock` while doing so). Only the wait is
+                // bounded, not the attempt: on a timeout the spawned task
+                // keeps running in the background and is polled again next
+                // iteration, never abandoned for a fresh one.
                 let outcome = tokio::time::timeout(CLEANUP_DISCONNECT_TIMEOUT, handle.as_mut().unwrap()).await;
                 match outcome {
                     Ok(Ok(Ok(()))) => {
@@ -787,7 +836,6 @@ impl Drop for LinuxConnectGuard {
                             peer.0
                         );
                         handle = None; // resolved (failed); a fresh attempt may start next iteration
-                        drop(_dial);
                         tokio::time::sleep(PENDING_CLEANUP_RETRY_DELAY).await;
                     }
                     Ok(Err(join_err)) => {
@@ -797,7 +845,6 @@ impl Drop for LinuxConnectGuard {
                             peer.0
                         );
                         handle = None;
-                        drop(_dial);
                         tokio::time::sleep(PENDING_CLEANUP_RETRY_DELAY).await;
                     }
                     Err(_elapsed) => {
@@ -989,6 +1036,7 @@ impl Backend for LinuxBackend {
             dialed: self.dialed.clone(),
             dial_lock: self.dial_lock.clone(),
             pending_cleanup: self.pending_cleanup.clone(),
+            cleanup_permits: self.cleanup_permits.clone(),
             peer: peer.clone(),
             generation: dial_generation,
             armed: true,
