@@ -137,6 +137,34 @@ fn gatt_op_retry_delay(attempt: u32) -> std::time::Duration {
     GATT_OP_RETRY_BASE_DELAY.saturating_mul(1 << (attempt - 1)).min(GATT_OP_RETRY_MAX_DELAY)
 }
 
+/// True only for the specific `bluer::ErrorKind` that represents a
+/// transient, momentary GATT rejection worth spending `GATT_OP_MAX_RETRIES`
+/// attempts on. Codex P2: retrying *every* error kind for up to ~7s
+/// (`gatt_op_retry_delay`'s doc comment) needlessly delays reporting a
+/// structured, permanent refusal — `NotAuthorized`, `NotPermitted`,
+/// `NotSupported`, and the like — that six retries can never turn into a
+/// success. The transient "briefly not ready" condition this retry exists
+/// for (see `GATT_OP_MAX_RETRIES`'s doc comment) is specifically the
+/// generic `Failed` kind, so gate retrying on that alone.
+fn is_transient_gatt_error(err: &bluer::Error) -> bool {
+    err.kind == bluer::ErrorKind::Failed
+}
+
+/// True when `err` is BlueZ reporting `org.bluez.Error.NotConnected` — a
+/// D-Bus error name with no dedicated `bluer::ErrorKind` variant, so it
+/// surfaces as `ErrorKind::Internal(InternalErrorKind::DBus(name))` with
+/// the original D-Bus error name preserved verbatim in `name` (see
+/// `bluer::Error`'s `From<dbus::Error>` impl). Matched structurally on that
+/// name rather than on `err.message()`'s free-form text, which BlueZ does
+/// not guarantee stays stable.
+fn is_not_connected(err: &bluer::Error) -> bool {
+    matches!(
+        &err.kind,
+        bluer::ErrorKind::Internal(bluer::InternalErrorKind::DBus(name))
+            if name == "org.bluez.Error.NotConnected"
+    )
+}
+
 pub struct LinuxBackend {
     // Held only to keep the D-Bus session connection alive for the
     // lifetime of the backend; `Adapter` clones its own `Arc` into the
@@ -727,6 +755,22 @@ impl Drop for LinuxConnectGuard {
                 match outcome {
                     Ok(Ok(())) => {
                         log::info!("connect: {} cleanup disconnect completed", peer.0);
+                        break;
+                    }
+                    // Codex P1: an unconditional retry-forever here left the
+                    // address quarantined permanently once BlueZ ever
+                    // answered NotConnected — which it does precisely when
+                    // the abandoned Connect had already failed on its own,
+                    // or an earlier Disconnect completed but its D-Bus
+                    // reply was lost. Either way, the state this cleanup
+                    // exists to reach — not connected — is already true, so
+                    // treat it exactly like a successful disconnect rather
+                    // than an error to retry past.
+                    Ok(Err(err)) if is_not_connected(&err) => {
+                        log::info!(
+                            "connect: {} cleanup disconnect reports not connected; treating as already clean",
+                            peer.0
+                        );
                         break;
                     }
                     Ok(Err(err)) => {
@@ -1474,7 +1518,11 @@ impl GattConnection for LinuxGattConnection {
             }
             match target.read().await {
                 Ok(value) => return Ok(value),
-                Err(err) if attempt < GATT_OP_MAX_RETRIES => {
+                // Codex P2: gated on `is_transient_gatt_error` — retrying a
+                // structured, permanent refusal (NotAuthorized, NotPermitted,
+                // NotSupported, ...) for up to ~7s only delays reporting it,
+                // since no number of retries changes BlueZ's answer.
+                Err(err) if attempt < GATT_OP_MAX_RETRIES && is_transient_gatt_error(&err) => {
                     attempt += 1;
                     log::warn!(
                         "read: {} on {} rejected ({err}), retrying ({attempt}/{GATT_OP_MAX_RETRIES})",
@@ -1526,7 +1574,8 @@ impl GattConnection for LinuxGattConnection {
             );
             match target.write_ext(&value, &request).await {
                 Ok(()) => return Ok(()),
-                Err(err) if attempt < GATT_OP_MAX_RETRIES => {
+                // See `read`'s matching comment (Codex P2).
+                Err(err) if attempt < GATT_OP_MAX_RETRIES && is_transient_gatt_error(&err) => {
                     attempt += 1;
                     log::warn!(
                         "write: {} bytes to {} rejected ({err}), retrying ({attempt}/{GATT_OP_MAX_RETRIES})",
