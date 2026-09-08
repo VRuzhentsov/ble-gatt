@@ -93,6 +93,13 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 /// for.
 const CLEANUP_DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long the delayed cleanup task (armed once `CLEANUP_DISCONNECT_TIMEOUT`
+/// itself elapses) waits between retries of its own `Disconnect` call, while
+/// an address stays quarantined in `pending_cleanup`. Not itself bounded by
+/// a timeout — see that task's own doc comment for why a definitive Err
+/// must not lift the quarantine either.
+const PENDING_CLEANUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// How many times `read`/`write_with_type` retry a GATT operation BlueZ
 /// rejects, and how long they wait between attempts.
 ///
@@ -586,21 +593,32 @@ struct LinuxConnectGuard {
     dialed: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
     dial_lock: Arc<AsyncMutex<()>>,
     pending_cleanup: Arc<StdMutex<HashSet<PeerAddress>>>,
-    in_flight: Arc<StdMutex<HashSet<PeerAddress>>>,
     peer: PeerAddress,
     generation: u64,
     armed: bool,
 }
 
+/// Releases `in_flight`'s entry for `peer` on every exit from `connect()`,
+/// from the moment it is inserted onward — including a cancellation while
+/// still queued for `dial_lock`, before `LinuxConnectGuard` even exists.
+/// Codex P1: without this, a caller giving up while queued (a timeout, a
+/// `select!` losing a race, all while another peer's operation holds
+/// `dial_lock`) left the entry stuck forever, since nothing was yet
+/// constructed to remove it — permanently refusing every future dial to
+/// that same peer as "already in flight" for a dial that no longer exists.
+struct InFlightGuard {
+    in_flight: Arc<StdMutex<HashSet<PeerAddress>>>,
+    peer: PeerAddress,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.in_flight.lock().unwrap().remove(&self.peer);
+    }
+}
+
 impl Drop for LinuxConnectGuard {
     fn drop(&mut self) {
-        // Unconditional, unlike everything below this point: this dial
-        // attempt is no longer in flight the moment this guard goes away,
-        // however it ended — a later dial to this same peer must be free
-        // to proceed regardless of whether *this* one succeeded, failed, or
-        // timed out.
-        self.in_flight.lock().unwrap().remove(&self.peer);
-
         if !self.armed {
             return;
         }
@@ -682,21 +700,36 @@ impl Drop for LinuxConnectGuard {
                     // starvation this timeout exists to end, just with an
                     // unbounded wait behind the lock again.
                     tokio::spawn(async move {
-                        // No timeout: this one has to actually resolve, not
-                        // give up again, or `pending_cleanup` would need a
-                        // second escape hatch with the identical problem.
-                        // The address stays quarantined for as long as this
-                        // takes, however long that is — bounded only by
-                        // however long BlueZ itself takes to answer.
-                        match device.disconnect().await {
-                            Ok(()) => log::info!(
-                                "connect: {} delayed cleanup disconnect eventually completed",
-                                peer.0
-                            ),
-                            Err(err) => log::warn!(
-                                "connect: {} delayed cleanup disconnect eventually failed: {err}",
-                                peer.0
-                            ),
+                        // No timeout, and does not lift the quarantine on a
+                        // definitive Err either (Codex P1) — an error here
+                        // means the peer's fate is *still* unknown, not that
+                        // it is now safe: the original, abandoned Disconnect
+                        // remains unresolved regardless of what this fresh
+                        // one just reported, so clearing the quarantine on
+                        // failure would readmit a dial with the same risk
+                        // this whole mechanism exists to prevent. Retries
+                        // until an attempt actually reports Ok — the address
+                        // stays quarantined for as long as that takes,
+                        // bounded only by however long BlueZ takes to
+                        // eventually answer one of them.
+                        loop {
+                            match device.disconnect().await {
+                                Ok(()) => {
+                                    log::info!(
+                                        "connect: {} delayed cleanup disconnect eventually completed",
+                                        peer.0
+                                    );
+                                    break;
+                                }
+                                Err(err) => {
+                                    log::warn!(
+                                        "connect: {} delayed cleanup disconnect attempt failed ({err}), \
+                                         retrying in {PENDING_CLEANUP_RETRY_DELAY:?} — still quarantined",
+                                        peer.0
+                                    );
+                                    tokio::time::sleep(PENDING_CLEANUP_RETRY_DELAY).await;
+                                }
+                            }
                         }
                         pending_cleanup.lock().unwrap().remove(&peer);
                     });
@@ -815,6 +848,11 @@ impl Backend for LinuxBackend {
                 reason: "a connect attempt to this peer is already in flight".to_string(),
             });
         }
+        // Constructed immediately — no `.await` between the insert above
+        // and here — so a cancellation from this point on, including one
+        // that arrives while merely queued for `dial_lock` below, always
+        // has something alive to release the entry it just claimed.
+        let _in_flight_guard = InFlightGuard { in_flight: self.in_flight.clone(), peer: peer.clone() };
         // Recorded *before* dialling: BlueZ can publish the Connected
         // property before `connect()` returns, and the inbound watcher would
         // otherwise race us and announce our own outbound link as a central
@@ -838,7 +876,8 @@ impl Backend for LinuxBackend {
         // long as it holds it), never newly set against this same peer out
         // from under it.
         if self.pending_cleanup.lock().unwrap().contains(peer) {
-            self.in_flight.lock().unwrap().remove(peer);
+            // `_in_flight_guard` releases `in_flight` on this return; no
+            // manual cleanup needed here.
             return Err(BleError::ConnectFailed {
                 peer: peer.0.clone(),
                 reason: "a previous cancelled connect attempt is still being cleaned up".to_string(),
@@ -870,7 +909,6 @@ impl Backend for LinuxBackend {
             dialed: self.dialed.clone(),
             dial_lock: self.dial_lock.clone(),
             pending_cleanup: self.pending_cleanup.clone(),
-            in_flight: self.in_flight.clone(),
             peer: peer.clone(),
             generation: dial_generation,
             armed: true,
