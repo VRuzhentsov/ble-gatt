@@ -692,24 +692,29 @@ impl Drop for LinuxConnectGuard {
         let pending_cleanup = self.pending_cleanup.clone();
         let peer = self.peer.clone();
         tokio::spawn(async move {
-            // Every disconnect attempt below is spawned as its own task
-            // rather than raced directly against CLEANUP_DISCONNECT_TIMEOUT:
-            // dropping a future when a timeout elapses does not cancel the
-            // underlying D-Bus call already sent to BlueZ (the same
-            // reasoning `CONNECT_TIMEOUT`'s own guard rests on) — so simply
-            // discarding a timed-out attempt's future here would just
-            // relocate the exact orphaned-call problem this whole mechanism
-            // exists to prevent one level down: a still-outstanding stray
-            // Disconnect from an earlier timed-out attempt could later act
-            // on whatever connection replaces this one. Spawning keeps each
-            // attempt running to completion in the background regardless of
-            // whether this loop gives up waiting on it locally, and
-            // `outstanding` remembers every attempt whose outcome this loop
-            // never actually observed, so the quarantine isn't lifted until
-            // every one of them — not just the latest — is known to have
-            // actually finished (Codex P1: "keep quarantine until every
-            // timed-out disconnect resolves").
-            let mut outstanding: Vec<tokio::task::JoinHandle<bluer::Result<()>>> = Vec::new();
+            // At most one disconnect attempt is ever outstanding at a time.
+            // Each is spawned as its own task rather than raced directly
+            // against CLEANUP_DISCONNECT_TIMEOUT: dropping a future when a
+            // timeout elapses does not cancel the underlying D-Bus call
+            // already sent to BlueZ (the same reasoning `CONNECT_TIMEOUT`'s
+            // own guard rests on), so a timeout here just means *this
+            // loop's wait* gave up, not that the attempt itself is gone —
+            // `handle` stays `Some` and the next iteration keeps polling the
+            // very same task instead of spawning a new one alongside it.
+            // Codex caught this the first time as an unbounded-accumulation
+            // risk ("avoid accumulating unresolved disconnect calls"): an
+            // earlier version of this loop spawned a fresh attempt on every
+            // iteration regardless, so a peer whose BlueZ simply never
+            // replies could pile up an unbounded number of outstanding
+            // D-Bus calls and task handles — the exact request pile-up this
+            // mechanism exists to prevent, just recursed into its own retry
+            // loop. Never starting attempt N+1 before attempt N is known to
+            // have actually finished (Ok, Err, or panic — not merely timed
+            // out waiting) also fully subsumes the earlier, separate fix for
+            // "keep quarantine until every timed-out disconnect resolves":
+            // with only ever one attempt alive, there is nothing left
+            // outstanding to join once the loop breaks.
+            let mut handle: Option<tokio::task::JoinHandle<bluer::Result<()>>> = None;
             loop {
                 // Every other operation in this file that touches `Device`
                 // holds `dial_lock` across the platform call, precisely
@@ -720,35 +725,41 @@ impl Drop for LinuxConnectGuard {
                 // doc comment for the same reasoning at the sharpest edge
                 // of it.
                 //
-                // Reacquired fresh each retry, not held across the whole
-                // loop, for the same starvation reason `CONNECT_TIMEOUT`
-                // bounds its own wait rather than holding this lock
-                // throughout.
+                // Reacquired fresh each iteration, not held across the
+                // whole loop, for the same starvation reason
+                // `CONNECT_TIMEOUT` bounds its own wait rather than holding
+                // this lock throughout.
                 let _dial = dial_lock.lock().await;
-                // A newer dial claiming this address while quarantined
-                // should be structurally impossible now — connect()'s own
-                // quarantine checks (before and after acquiring this same
-                // lock) refuse a dial to a quarantined peer outright. Kept
-                // as a defensive check, not a load-bearing one: the
-                // synchronous removal above only ever clears *this*
-                // generation's own entry, so any presence here would
-                // necessarily be someone else's.
-                if dialed.lock().unwrap().contains_key(&peer) {
-                    break;
+                if handle.is_none() {
+                    // A newer dial claiming this address while quarantined
+                    // should be structurally impossible now — connect()'s
+                    // own quarantine checks (before and after acquiring
+                    // this same lock) refuse a dial to a quarantined peer
+                    // outright. Kept as a defensive check, not a load-
+                    // bearing one: the synchronous removal above only ever
+                    // clears *this* generation's own entry, so any presence
+                    // here would necessarily be someone else's. Only
+                    // checked when about to start a fresh attempt — an
+                    // already-issued disconnect is left to run to
+                    // completion regardless, since it cannot be recalled
+                    // anyway.
+                    if dialed.lock().unwrap().contains_key(&peer) {
+                        break;
+                    }
+                    let Ok(device) = adapter.device(address) else {
+                        break;
+                    };
+                    handle = Some(tokio::spawn(async move { device.disconnect().await }));
                 }
-                let Ok(device) = adapter.device(address) else {
-                    break;
-                };
-                // Bounded per attempt for the same reason CONNECT_TIMEOUT
-                // exists — an unbounded single attempt holding this same
-                // dial_lock is exactly as capable of starving every later
-                // dial as the stuck connect it exists to clean up after.
-                // The loop itself has no overall bound, and neither does an
-                // individual attempt any more once it outlives this local
-                // wait — only the wait is bounded; the spawned task backing
-                // it can run arbitrarily longer in the background.
-                let mut handle = tokio::spawn(async move { device.disconnect().await });
-                match tokio::time::timeout(CLEANUP_DISCONNECT_TIMEOUT, &mut handle).await {
+                // Bounded per wait for the same reason CONNECT_TIMEOUT
+                // exists — an unbounded wait holding this same dial_lock is
+                // exactly as capable of starving every later dial as the
+                // stuck connect it exists to clean up after. Only the wait
+                // is bounded, not the attempt: on a timeout the spawned
+                // task keeps running in the background and is polled again
+                // next iteration, never abandoned for a fresh one.
+                let outcome = tokio::time::timeout(CLEANUP_DISCONNECT_TIMEOUT, handle.as_mut().unwrap()).await;
+                match outcome {
                     Ok(Ok(Ok(()))) => {
                         log::info!("connect: {} cleanup disconnect completed", peer.0);
                         break;
@@ -775,6 +786,7 @@ impl Drop for LinuxConnectGuard {
                              {PENDING_CLEANUP_RETRY_DELAY:?} — still quarantined",
                             peer.0
                         );
+                        handle = None; // resolved (failed); a fresh attempt may start next iteration
                         drop(_dial);
                         tokio::time::sleep(PENDING_CLEANUP_RETRY_DELAY).await;
                     }
@@ -784,30 +796,23 @@ impl Drop for LinuxConnectGuard {
                              in {PENDING_CLEANUP_RETRY_DELAY:?} — still quarantined",
                             peer.0
                         );
+                        handle = None;
                         drop(_dial);
                         tokio::time::sleep(PENDING_CLEANUP_RETRY_DELAY).await;
                     }
                     Err(_elapsed) => {
                         log::warn!(
                             "connect: {} cleanup disconnect attempt timed out after \
-                             {CLEANUP_DISCONNECT_TIMEOUT:?}, still running in the background; retrying — \
-                             still quarantined",
+                             {CLEANUP_DISCONNECT_TIMEOUT:?}, still running in the background; waiting on it \
+                             again rather than starting another — still quarantined",
                             peer.0
                         );
-                        outstanding.push(handle);
-                        // No extra sleep: the timeout itself already spent
-                        // CLEANUP_DISCONNECT_TIMEOUT waiting.
+                        // `handle` stays Some: keep polling the same
+                        // attempt next iteration instead of accumulating a
+                        // second one. No extra sleep: the timeout itself
+                        // already spent CLEANUP_DISCONNECT_TIMEOUT waiting.
                     }
                 }
-            }
-            // Don't lift the quarantine while an earlier timed-out attempt
-            // might still be running in the background: it could yet act on
-            // whatever connection replaces this one. Join every one of them
-            // — including any that themselves error or panic — before
-            // clearing pending_cleanup; only that each has actually
-            // finished matters here, not what it reported.
-            for handle in outstanding {
-                let _ = handle.await;
             }
             pending_cleanup.lock().unwrap().remove(&peer);
         });
