@@ -100,52 +100,37 @@ const CLEANUP_DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// must not lift the quarantine either.
 const PENDING_CLEANUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// How many times `read`/`write_with_type` retry a GATT operation BlueZ
-/// rejects, backing off exponentially between attempts.
+/// `read`/`write_with_type` do **not** retry a GATT operation BlueZ rejects
+/// — that used to live here as an internal exponential backoff (6 attempts,
+/// 200ms doubling to 2000ms, ~7s total), modeled on Android's real-hardware-
+/// proven `gattBusyRetryDelayMs`/`GATT_BUSY_MAX_RETRIES`. It was removed:
+/// fini's peer traced its two real call sites (the add-mode scan pass and
+/// `find_peer_address`'s per-candidate probe) and confirmed both cap a
+/// single GATT operation at ~4s, so a ~7s internal retry chain could never
+/// run to completion inside either caller's actual timeout — any dial that
+/// needed the later attempts just looked like a caller-abandoned future
+/// instead of a real retry outcome, and there is no fixed internal budget
+/// that suits every caller. Retrying is now the caller's decision, sized to
+/// whatever budget that specific caller actually has: this returns after a
+/// single attempt, classified via `is_transient_gatt_error`/
+/// `BleError::GattBusy` below so a caller that wants to retry can tell a
+/// worth-retrying rejection apart from a permanent one without guessing.
 ///
-/// Real-hardware evidence: a central-role write to a peer that just
-/// finished connecting (services already resolved — `find_characteristic`
-/// waits for that itself) can still fail immediately with BlueZ's own
-/// "Not connected", 100% reproducibly, on the very first fragment of the
-/// very first message on a fresh channel. `bluer` maps this to the generic
-/// `ErrorKind::Failed`, not a distinguishable "not ready yet" kind — its
-/// `Error` carries a `kind` and a raw `message` and nothing more, both
-/// already surfaced by `Display`, so there is no structured way to retry
-/// *only* this specific case or extract more signal from the error itself.
+/// Real-hardware evidence motivating retrying *at all* still stands: a
+/// central-role write to a peer that just finished connecting (services
+/// already resolved — `find_characteristic` waits for that itself) can
+/// fail immediately with BlueZ's own "Not connected", 100% reproducibly, on
+/// the very first fragment of the very first message on a fresh channel.
+/// `bluer` maps this to the generic `ErrorKind::Failed`, not a
+/// distinguishable "not ready yet" kind.
 ///
-/// A flat 3 x 300ms retry (~900ms total) was tried first and confirmed
-/// insufficient on real hardware: all three attempts failed identically,
-/// meaning this condition is stable for at least a second, not a few-
-/// hundred-millisecond blip. This instead matches the exact shape and
-/// reasoning already proven on real hardware for the analogous condition
-/// on Android (`gattBusyRetryDelayMs`/`GATT_BUSY_MAX_RETRIES` in
-/// `BleGattBridge.kt`): 6 attempts doubling from 200ms and capped at
-/// 2000ms (200+400+800+1600+2000+2000ms, ~7s total) — the platform's own
-/// "briefly not ready" signal is far more common right after a connection
-/// than an application ever seeing this on an established, quiescent link,
-/// so a genuinely permanent failure just fails a few seconds later than
-/// before instead of being masked.
-const GATT_OP_MAX_RETRIES: u32 = 6;
-const GATT_OP_RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
-const GATT_OP_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// `attempt` is 1-indexed (the first retry is 1), matching Android's
-/// `gattBusyRetryDelayMs` exactly: delay doubles each time, capped, so a
-/// genuinely brief rejection is retried quickly without spending the whole
-/// budget on retries fired too early to matter for a sustained one.
-fn gatt_op_retry_delay(attempt: u32) -> std::time::Duration {
-    GATT_OP_RETRY_BASE_DELAY.saturating_mul(1 << (attempt - 1)).min(GATT_OP_RETRY_MAX_DELAY)
-}
-
 /// True only for the specific `bluer::ErrorKind` that represents a
-/// transient, momentary GATT rejection worth spending `GATT_OP_MAX_RETRIES`
-/// attempts on. Codex P2: retrying *every* error kind for up to ~7s
-/// (`gatt_op_retry_delay`'s doc comment) needlessly delays reporting a
-/// structured, permanent refusal — `NotAuthorized`, `NotPermitted`,
-/// `NotSupported`, and the like — that six retries can never turn into a
-/// success. The transient "briefly not ready" condition this retry exists
-/// for (see `GATT_OP_MAX_RETRIES`'s doc comment) is specifically the
-/// generic `Failed` kind, so gate retrying on that alone.
+/// transient, momentary GATT rejection worth a caller retrying, surfaced as
+/// `BleError::GattBusy` rather than `BleError::Gatt`. A structured,
+/// permanent refusal — `NotAuthorized`, `NotPermitted`, `NotSupported`, and
+/// the like — is never worth retrying, so only the generic `Failed` kind
+/// (BlueZ's own catch-all for a transient, momentary rejection) is treated
+/// as busy.
 fn is_transient_gatt_error(err: &bluer::Error) -> bool {
     err.kind == bluer::ErrorKind::Failed
 }
@@ -727,8 +712,8 @@ impl Drop for LinuxConnectGuard {
                     //
                     // Reacquired fresh each retry, not held across the
                     // whole loop, for the same starvation reason
-                    // `CONNECT_TIMEOUT`/`GATT_OP_MAX_RETRIES` bound their
-                    // own waits rather than holding this lock throughout.
+                    // `CONNECT_TIMEOUT` bounds its own wait rather than
+                    // holding this lock throughout.
                     let _dial = dial_lock.lock().await;
                     // A newer dial claiming this address while quarantined
                     // should be structurally impossible now — connect()'s
@@ -1495,47 +1480,25 @@ impl GattConnection for LinuxGattConnection {
     }
 
     async fn read(&mut self, characteristic: CharacteristicUuid) -> Result<Vec<u8>> {
-        let mut attempt = 0;
-        loop {
-            // Reacquired every attempt, not held across the whole retry
-            // budget: `GATT_OP_MAX_RETRIES` can span several seconds
-            // (`gatt_op_retry_delay`'s doc comment), and `dial_lock` is
-            // backend-wide — holding it that long over one peer's retry
-            // would block every other peer's dial/read/write/subscribe for
-            // the same span, exactly the kind of starvation this file's
-            // other fixes exist to prevent. Re-checking `ensure_current`
-            // and re-resolving the characteristic on every attempt (rather
-            // than once, reused across retries) is a deliberate part of
-            // that, not just a side effect of releasing the lock: a
-            // reconnect landing between retries must be seen immediately,
-            // and re-resolving fresh guards against a stale characteristic
-            // object being the actual reason a retry is needed at all.
-            let _dial = self.dial_lock.lock().await;
-            self.ensure_current()?;
-            let target = self.find_characteristic(characteristic).await?;
-            if let Ok(mtu) = target.mtu().await {
-                self.att_mtu.store(mtu as u16, Ordering::Relaxed);
+        let _dial = self.dial_lock.lock().await;
+        self.ensure_current()?;
+        let target = self.find_characteristic(characteristic).await?;
+        if let Ok(mtu) = target.mtu().await {
+            self.att_mtu.store(mtu as u16, Ordering::Relaxed);
+        }
+        // A single attempt — no internal retry. See `is_transient_gatt_error`'s
+        // doc comment for why: no fixed backend-side retry budget fits every
+        // caller, so a caller that wants to retry a `BleError::GattBusy`
+        // does so itself, sized to its own timeout.
+        match target.read().await {
+            Ok(value) => Ok(value),
+            Err(err) if is_transient_gatt_error(&err) => {
+                log::warn!("read: {} on {} rejected, possibly transient: {err}", characteristic.0, self.peer.0);
+                Err(BleError::GattBusy(err.to_string()))
             }
-            match target.read().await {
-                Ok(value) => return Ok(value),
-                // Codex P2: gated on `is_transient_gatt_error` — retrying a
-                // structured, permanent refusal (NotAuthorized, NotPermitted,
-                // NotSupported, ...) for up to ~7s only delays reporting it,
-                // since no number of retries changes BlueZ's answer.
-                Err(err) if attempt < GATT_OP_MAX_RETRIES && is_transient_gatt_error(&err) => {
-                    attempt += 1;
-                    log::warn!(
-                        "read: {} on {} rejected ({err}), retrying ({attempt}/{GATT_OP_MAX_RETRIES})",
-                        characteristic.0,
-                        self.peer.0
-                    );
-                    drop(_dial);
-                    tokio::time::sleep(gatt_op_retry_delay(attempt)).await;
-                }
-                Err(err) => {
-                    log::warn!("read: {} on {} failed: {err}", characteristic.0, self.peer.0);
-                    return Err(BleError::Gatt(err.to_string()));
-                }
+            Err(err) => {
+                log::warn!("read: {} on {} failed: {err}", characteristic.0, self.peer.0);
+                Err(BleError::Gatt(err.to_string()))
             }
         }
     }
@@ -1550,45 +1513,27 @@ impl GattConnection for LinuxGattConnection {
             },
             ..Default::default()
         };
-        let mut attempt = 0;
-        loop {
-            // See `read`'s matching comment: reacquired every attempt, not
-            // held across the whole retry budget, and the characteristic is
-            // re-resolved fresh each time rather than reused across
-            // retries.
-            let _dial = self.dial_lock.lock().await;
-            self.ensure_current()?;
-            let target = self.find_characteristic(characteristic).await?;
-            // Cache the negotiated MTU opportunistically: BlueZ only
-            // publishes a characteristic's MTU once the link is up, so this
-            // is the first point it can be observed without a speculative
-            // extra round trip.
-            if let Ok(mtu) = target.mtu().await {
-                self.att_mtu.store(mtu as u16, Ordering::Relaxed);
+        // A single attempt — no internal retry; see `read`'s matching
+        // comment and `is_transient_gatt_error`'s doc comment.
+        let _dial = self.dial_lock.lock().await;
+        self.ensure_current()?;
+        let target = self.find_characteristic(characteristic).await?;
+        // Cache the negotiated MTU opportunistically: BlueZ only publishes a
+        // characteristic's MTU once the link is up, so this is the first
+        // point it can be observed without a speculative extra round trip.
+        if let Ok(mtu) = target.mtu().await {
+            self.att_mtu.store(mtu as u16, Ordering::Relaxed);
+        }
+        log::trace!("write: {} bytes to {} on {} ({write_type:?})", value.len(), characteristic.0, self.peer.0);
+        match target.write_ext(&value, &request).await {
+            Ok(()) => Ok(()),
+            Err(err) if is_transient_gatt_error(&err) => {
+                log::warn!("write: {} bytes to {} rejected, possibly transient: {err}", value.len(), self.peer.0);
+                Err(BleError::GattBusy(err.to_string()))
             }
-            log::trace!(
-                "write: {} bytes to {} on {} ({write_type:?})",
-                value.len(),
-                characteristic.0,
-                self.peer.0
-            );
-            match target.write_ext(&value, &request).await {
-                Ok(()) => return Ok(()),
-                // See `read`'s matching comment (Codex P2).
-                Err(err) if attempt < GATT_OP_MAX_RETRIES && is_transient_gatt_error(&err) => {
-                    attempt += 1;
-                    log::warn!(
-                        "write: {} bytes to {} rejected ({err}), retrying ({attempt}/{GATT_OP_MAX_RETRIES})",
-                        value.len(),
-                        self.peer.0
-                    );
-                    drop(_dial);
-                    tokio::time::sleep(gatt_op_retry_delay(attempt)).await;
-                }
-                Err(err) => {
-                    log::warn!("write: {} bytes to {} failed: {err}", value.len(), self.peer.0);
-                    return Err(BleError::Gatt(err.to_string()));
-                }
+            Err(err) => {
+                log::warn!("write: {} bytes to {} failed: {err}", value.len(), self.peer.0);
+                Err(BleError::Gatt(err.to_string()))
             }
         }
     }
