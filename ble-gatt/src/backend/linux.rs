@@ -36,6 +36,24 @@ use futures::stream::StreamExt;
 /// surely as a link drop but produces no device property change.
 const NOTIFY_SESSION_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How long `notify_matching` waits for a peer's `AcquireNotify` writer to
+/// register before giving up, when the peer is already a known served
+/// session (see the module doc comment on why `Connected` is derived from
+/// GATT activity, not a single D-Bus signal). A central subscribes before
+/// writing, and BLE delivers ATT operations on one link in order — but
+/// `AcquireNotify` and a characteristic write are two independently driven
+/// D-Bus round trips on the bluer side, with no ordering guarantee between
+/// them even though the *air* traffic that triggered them was ordered
+/// correctly. On a fresh, fast reconnect the write's handler can fire and
+/// even reply before the slower `AcquireNotify` round trip completes,
+/// making the very first reply to a legitimately subscribed peer fail with
+/// "no live notify session" purely on timing. Bounded so a peer that
+/// genuinely never subscribes (the raw-GATT-tier, write-only use case this
+/// backend also serves) still fails promptly rather than stalling every
+/// `notify`/`notify_peer` caller for this long.
+const NOTIFY_WRITER_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const NOTIFY_WRITER_ACQUIRE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
@@ -277,6 +295,17 @@ fn spawn_peripheral_disconnect_watch(
     session: u64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // This session's own writer may still be mid-`AcquireNotify` — see
+        // `NOTIFY_WRITER_ACQUIRE_TIMEOUT`'s doc comment on `notify_matching`.
+        // Without this grace period, this watcher's first poll (500ms,
+        // `NOTIFY_SESSION_POLL`) fires well before that 3s window has any
+        // chance to complete: a session this young genuinely having no live
+        // writer yet is indistinguishable from one that never will, so
+        // `has_live_session` alone would race ahead of `notify_matching`'s
+        // own wait, remove `served_peers` first, and turn the first reply's
+        // "no live notify session" into "session has been superseded" —
+        // still a failure, just reported by a different code path.
+        let spawned_at = tokio::time::Instant::now();
         // Any exit path must clear the guard, or a peer that failed to be
         // watched once could never be watched again.
         let _ = async {
@@ -312,7 +341,9 @@ fn spawn_peripheral_disconnect_watch(
                     tokio::select! {
                         _ = disconnected => break,
                         _ = tokio::time::sleep(NOTIFY_SESSION_POLL) => {
-                            if !has_live_session(&writers, &peer).await {
+                            let past_acquire_grace =
+                                spawned_at.elapsed() >= NOTIFY_WRITER_ACQUIRE_TIMEOUT;
+                            if past_acquire_grace && !has_live_session(&writers, &peer).await {
                                 break;
                             }
                         }
@@ -378,53 +409,91 @@ impl LinuxBackend {
         owner: Option<(&PeerAddress, u64)>, want: impl Fn(&CharacteristicWriter) -> bool,
         nobody: &str,
     ) -> Result<()> {
-        // The writers lock is taken *first*, and the session is validated
-        // while holding it. Checking before acquiring it left a gap in which
-        // the named session could drop and the same address acquire a
-        // replacement writer — after which the address predicate selects the
-        // replacement and the stale channel's fragment is reassembled there
-        // as current data.
-        //
-        // Every mutation of `served_peers` takes this lock first as well, so
-        // the check and the selection below cannot be separated.
-        let mut writers = self.notify_writers.lock().await;
-        if let Some((peer, session)) = owner {
-            if self.served_peers.lock().unwrap().get(peer) != Some(&session) {
-                log::warn!(
-                    "notify: refusing — session {session} for {} has been superseded",
-                    peer.0
-                );
-                return Err(BleError::NotConnected(peer.0.clone()));
+        // Only an addressed call (`owner: Some`, i.e. `notify_peer`) waits.
+        // `notify()`'s broadcast has no specific peer to wait *for* — with
+        // `owner: None` this deadline is simply never consulted below.
+        let deadline = owner.map(|_| tokio::time::Instant::now() + NOTIFY_WRITER_ACQUIRE_TIMEOUT);
+        loop {
+            // The writers lock is taken *first*, and the session is validated
+            // while holding it. Checking before acquiring it left a gap in which
+            // the named session could drop and the same address acquire a
+            // replacement writer — after which the address predicate selects the
+            // replacement and the stale channel's fragment is reassembled there
+            // as current data.
+            //
+            // Every mutation of `served_peers` takes this lock first as well, so
+            // the check and the selection below cannot be separated.
+            let mut writers = self.notify_writers.lock().await;
+            if let Some((peer, session)) = owner {
+                if self.served_peers.lock().unwrap().get(peer) != Some(&session) {
+                    log::warn!(
+                        "notify: refusing — session {session} for {} has been superseded",
+                        peer.0
+                    );
+                    return Err(BleError::NotConnected(peer.0.clone()));
+                }
             }
-        }
-        let Some(sessions) = writers.get_mut(&characteristic) else {
-            log::warn!("notify: no active notify session on {}", characteristic.0);
-            return Err(BleError::Gatt("no active notify session for characteristic".to_string()));
-        };
-        sessions.retain(|w| !w.is_closed().unwrap_or(true));
-
-        let mut delivered = false;
-        let mut last_error = None;
-        for writer in sessions.iter_mut().filter(|w| want(w)) {
-            // write_all, not write: a short write would truncate a fragment,
-            // and reassembly would then fail on the far side with nothing
-            // reported here.
-            match writer.write_all(&value).await {
-                Ok(()) => delivered = true,
-                Err(err) => last_error = Some(err),
+            // Bridges a real race, not a defensive check: a central
+            // subscribes before writing, and BLE delivers one link's ATT
+            // operations in order, but `AcquireNotify` and a characteristic
+            // write are two independently driven D-Bus round trips on the
+            // bluer side with no ordering guarantee between them — see
+            // `NOTIFY_WRITER_ACQUIRE_TIMEOUT`'s doc comment. Without this, a
+            // peer's very first reply after a fresh, fast reconnect can lose
+            // that race and fail immediately with "no live notify session"
+            // even though the peer's subscription is genuinely in flight.
+            //
+            // Must check `is_closed()` here too, not just `want` — a
+            // reconnect's *previous* session can leave a closed writer for
+            // this same address still sitting in the vector (nothing prunes
+            // it until the next `AcquireNotify` event runs its own
+            // retain-before-push, which for this exact race hasn't happened
+            // yet). Matching on address alone made this see a stale, dead
+            // writer as "already live," skip waiting entirely, and fail
+            // immediately once the real prune ran a few lines down —
+            // silently turning the bound-wait into a no-op for precisely
+            // the reconnect case it exists to cover.
+            let has_match = writers
+                .get(&characteristic)
+                .is_some_and(|sessions| sessions.iter().any(|w| !w.is_closed().unwrap_or(true) && want(w)));
+            if !has_match {
+                if let Some(deadline) = deadline {
+                    if tokio::time::Instant::now() < deadline {
+                        drop(writers);
+                        tokio::time::sleep(NOTIFY_WRITER_ACQUIRE_POLL).await;
+                        continue;
+                    }
+                }
             }
-        }
-        sessions.retain(|w| !w.is_closed().unwrap_or(true));
+            let Some(sessions) = writers.get_mut(&characteristic) else {
+                log::warn!("notify: no active notify session on {}", characteristic.0);
+                return Err(BleError::Gatt("no active notify session for characteristic".to_string()));
+            };
+            sessions.retain(|w| !w.is_closed().unwrap_or(true));
 
-        if !delivered {
-            log::warn!("notify: {} bytes on {} reached {nobody}", value.len(), characteristic.0);
-            return Err(BleError::Gatt(match last_error {
-                Some(err) => format!("notify reached {nobody}: {err}"),
-                None => format!("notify reached {nobody}"),
-            }));
+            let mut delivered = false;
+            let mut last_error = None;
+            for writer in sessions.iter_mut().filter(|w| want(w)) {
+                // write_all, not write: a short write would truncate a fragment,
+                // and reassembly would then fail on the far side with nothing
+                // reported here.
+                match writer.write_all(&value).await {
+                    Ok(()) => delivered = true,
+                    Err(err) => last_error = Some(err),
+                }
+            }
+            sessions.retain(|w| !w.is_closed().unwrap_or(true));
+
+            if !delivered {
+                log::warn!("notify: {} bytes on {} reached {nobody}", value.len(), characteristic.0);
+                return Err(BleError::Gatt(match last_error {
+                    Some(err) => format!("notify reached {nobody}: {err}"),
+                    None => format!("notify reached {nobody}"),
+                }));
+            }
+            log::trace!("notify: {} bytes delivered on {}", value.len(), characteristic.0);
+            return Ok(());
         }
-        log::trace!("notify: {} bytes delivered on {}", value.len(), characteristic.0);
-        Ok(())
     }
 }
 
