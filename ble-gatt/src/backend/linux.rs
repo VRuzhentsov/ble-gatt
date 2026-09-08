@@ -165,6 +165,26 @@ pub struct LinuxBackend {
     /// `LinuxConnectGuard::drop`'s doc comment for why timing that call out
     /// cannot simply mean "forget about it."
     pending_cleanup: Arc<StdMutex<HashSet<PeerAddress>>>,
+    /// Addresses with a dial genuinely in flight right now — from the
+    /// moment `connect()` accepts the attempt until it resolves (success,
+    /// error, or `CONNECT_TIMEOUT`), tracked separately from `dialed`
+    /// because `dialed` also legitimately holds an already-*established*
+    /// generation for the whole life of a connection, which a fresh
+    /// `connect()` call is allowed to supersede.
+    ///
+    /// Real-hardware evidence: a caller that starts a new dial to the same
+    /// peer before an earlier one has resolved (rather than awaiting or
+    /// cancelling it first) produces a genuinely concurrent second
+    /// `Connect()` to the same `Device` — `dial_lock` only serialises them
+    /// at the platform call, it does not stop a second one from being
+    /// attempted at all, so both queue up, BlueZ rejects the fast loser
+    /// immediately, and this repeats every retry cycle without ever
+    /// establishing a link, unboundedly incrementing `dialed`'s generation
+    /// counter in the process. Refusing a second dial to an address already
+    /// in flight outright is cheaper and more honest than letting it queue
+    /// behind `dial_lock` just to fail the same way after burning a real
+    /// D-Bus round trip.
+    in_flight: Arc<StdMutex<HashSet<PeerAddress>>>,
 }
 
 impl LinuxBackend {
@@ -203,6 +223,7 @@ impl LinuxBackend {
             server_watch: Arc::new(StdMutex::new(Vec::new())),
             dialed: Arc::new(StdMutex::new(HashMap::new())),
             pending_cleanup: Arc::new(StdMutex::new(HashSet::new())),
+            in_flight: Arc::new(StdMutex::new(HashSet::new())),
         })
     }
 }
@@ -544,6 +565,7 @@ struct LinuxConnectGuard {
     dialed: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
     dial_lock: Arc<AsyncMutex<()>>,
     pending_cleanup: Arc<StdMutex<HashSet<PeerAddress>>>,
+    in_flight: Arc<StdMutex<HashSet<PeerAddress>>>,
     peer: PeerAddress,
     generation: u64,
     armed: bool,
@@ -551,6 +573,13 @@ struct LinuxConnectGuard {
 
 impl Drop for LinuxConnectGuard {
     fn drop(&mut self) {
+        // Unconditional, unlike everything below this point: this dial
+        // attempt is no longer in flight the moment this guard goes away,
+        // however it ended — a later dial to this same peer must be free
+        // to proceed regardless of whether *this* one succeeded, failed, or
+        // timed out.
+        self.in_flight.lock().unwrap().remove(&self.peer);
+
         if !self.armed {
             return;
         }
@@ -751,6 +780,20 @@ impl Backend for LinuxBackend {
                 reason: "a previous cancelled connect attempt is still being cleaned up".to_string(),
             });
         }
+        // Refuse outright rather than queue behind `dial_lock`: a caller
+        // that starts a new dial to this peer before an earlier one has
+        // resolved produces a genuinely concurrent second `Connect()` to
+        // the same `Device` — BlueZ rejects the loser immediately, so
+        // letting it through just burns a real D-Bus round trip to fail the
+        // same way this check already knows it will. Checked before
+        // `dial_lock` for the same reason the quarantine check above is.
+        if !self.in_flight.lock().unwrap().insert(peer.clone()) {
+            log::warn!("connect: {} refused — a dial to this peer is already in flight", peer.0);
+            return Err(BleError::ConnectFailed {
+                peer: peer.0.clone(),
+                reason: "a connect attempt to this peer is already in flight".to_string(),
+            });
+        }
         // Recorded *before* dialling: BlueZ can publish the Connected
         // property before `connect()` returns, and the inbound watcher would
         // otherwise race us and announce our own outbound link as a central
@@ -785,6 +828,7 @@ impl Backend for LinuxBackend {
             dialed: self.dialed.clone(),
             dial_lock: self.dial_lock.clone(),
             pending_cleanup: self.pending_cleanup.clone(),
+            in_flight: self.in_flight.clone(),
             peer: peer.clone(),
             generation: dial_generation,
             armed: true,
