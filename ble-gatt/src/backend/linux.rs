@@ -101,25 +101,41 @@ const CLEANUP_DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::fro
 const PENDING_CLEANUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How many times `read`/`write_with_type` retry a GATT operation BlueZ
-/// rejects, and how long they wait between attempts.
+/// rejects, backing off exponentially between attempts.
 ///
 /// Real-hardware evidence: a central-role write to a peer that just
 /// finished connecting (services already resolved — `find_characteristic`
 /// waits for that itself) can still fail immediately with BlueZ's own
 /// "Not connected", 100% reproducibly, on the very first fragment of the
-/// very first message on a fresh channel — then recover if simply retried
-/// a moment later. `bluer` maps this to the generic `ErrorKind::Failed`,
-/// not a distinguishable "not ready yet" kind, so there is no structured
-/// way to retry *only* this specific case; a short, bounded retry on any
-/// rejection is the same trade this codebase already made for the exact
-/// analogous condition on Android (`GATT_BUSY_MAX_RETRIES` in
-/// `BleGattBridge.kt`): the platform's own "briefly not ready" signal is
-/// far more common right after a connection than an application ever
-/// seeing this on an established, quiescent link, so a genuinely permanent
-/// failure just fails a few hundred milliseconds later than before instead
-/// of being masked.
-const GATT_OP_MAX_RETRIES: u32 = 3;
-const GATT_OP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+/// very first message on a fresh channel. `bluer` maps this to the generic
+/// `ErrorKind::Failed`, not a distinguishable "not ready yet" kind — its
+/// `Error` carries a `kind` and a raw `message` and nothing more, both
+/// already surfaced by `Display`, so there is no structured way to retry
+/// *only* this specific case or extract more signal from the error itself.
+///
+/// A flat 3 x 300ms retry (~900ms total) was tried first and confirmed
+/// insufficient on real hardware: all three attempts failed identically,
+/// meaning this condition is stable for at least a second, not a few-
+/// hundred-millisecond blip. This instead matches the exact shape and
+/// reasoning already proven on real hardware for the analogous condition
+/// on Android (`gattBusyRetryDelayMs`/`GATT_BUSY_MAX_RETRIES` in
+/// `BleGattBridge.kt`): 6 attempts doubling from 200ms and capped at
+/// 2000ms (200+400+800+1600+2000+2000ms, ~7s total) — the platform's own
+/// "briefly not ready" signal is far more common right after a connection
+/// than an application ever seeing this on an established, quiescent link,
+/// so a genuinely permanent failure just fails a few seconds later than
+/// before instead of being masked.
+const GATT_OP_MAX_RETRIES: u32 = 6;
+const GATT_OP_RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+const GATT_OP_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `attempt` is 1-indexed (the first retry is 1), matching Android's
+/// `gattBusyRetryDelayMs` exactly: delay doubles each time, capped, so a
+/// genuinely brief rejection is retried quickly without spending the whole
+/// budget on retries fired too early to matter for a sustained one.
+fn gatt_op_retry_delay(attempt: u32) -> std::time::Duration {
+    GATT_OP_RETRY_BASE_DELAY.saturating_mul(1 << (attempt - 1)).min(GATT_OP_RETRY_MAX_DELAY)
+}
 
 pub struct LinuxBackend {
     // Held only to keep the D-Bus session connection alive for the
@@ -1437,19 +1453,27 @@ impl GattConnection for LinuxGattConnection {
     }
 
     async fn read(&mut self, characteristic: CharacteristicUuid) -> Result<Vec<u8>> {
-        // Held across the platform call for the same reason `disconnect`
-        // holds it: `Device` is address-backed, so a reconnect landing
-        // mid-operation would have this handle acting on the replacement
-        // link. Checking and then awaiting is a check-then-act however
-        // narrow the gap.
-        let _dial = self.dial_lock.lock().await;
-        self.ensure_current()?;
-        let target = self.find_characteristic(characteristic).await?;
-        if let Ok(mtu) = target.mtu().await {
-            self.att_mtu.store(mtu as u16, Ordering::Relaxed);
-        }
         let mut attempt = 0;
         loop {
+            // Reacquired every attempt, not held across the whole retry
+            // budget: `GATT_OP_MAX_RETRIES` can span several seconds
+            // (`gatt_op_retry_delay`'s doc comment), and `dial_lock` is
+            // backend-wide — holding it that long over one peer's retry
+            // would block every other peer's dial/read/write/subscribe for
+            // the same span, exactly the kind of starvation this file's
+            // other fixes exist to prevent. Re-checking `ensure_current`
+            // and re-resolving the characteristic on every attempt (rather
+            // than once, reused across retries) is a deliberate part of
+            // that, not just a side effect of releasing the lock: a
+            // reconnect landing between retries must be seen immediately,
+            // and re-resolving fresh guards against a stale characteristic
+            // object being the actual reason a retry is needed at all.
+            let _dial = self.dial_lock.lock().await;
+            self.ensure_current()?;
+            let target = self.find_characteristic(characteristic).await?;
+            if let Ok(mtu) = target.mtu().await {
+                self.att_mtu.store(mtu as u16, Ordering::Relaxed);
+            }
             match target.read().await {
                 Ok(value) => return Ok(value),
                 Err(err) if attempt < GATT_OP_MAX_RETRIES => {
@@ -1459,7 +1483,8 @@ impl GattConnection for LinuxGattConnection {
                         characteristic.0,
                         self.peer.0
                     );
-                    tokio::time::sleep(GATT_OP_RETRY_DELAY).await;
+                    drop(_dial);
+                    tokio::time::sleep(gatt_op_retry_delay(attempt)).await;
                 }
                 Err(err) => {
                     log::warn!("read: {} on {} failed: {err}", characteristic.0, self.peer.0);
@@ -1472,15 +1497,6 @@ impl GattConnection for LinuxGattConnection {
     async fn write_with_type(
         &mut self, characteristic: CharacteristicUuid, value: Vec<u8>, write_type: WriteType,
     ) -> Result<()> {
-        let _dial = self.dial_lock.lock().await;
-        self.ensure_current()?;
-        let target = self.find_characteristic(characteristic).await?;
-        // Cache the negotiated MTU opportunistically: BlueZ only publishes a
-        // characteristic's MTU once the link is up, so this is the first
-        // point it can be observed without a speculative extra round trip.
-        if let Ok(mtu) = target.mtu().await {
-            self.att_mtu.store(mtu as u16, Ordering::Relaxed);
-        }
         let request = bluer::gatt::remote::CharacteristicWriteRequest {
             op_type: match write_type {
                 WriteType::WithResponse => bluer::gatt::WriteOp::Request,
@@ -1488,14 +1504,28 @@ impl GattConnection for LinuxGattConnection {
             },
             ..Default::default()
         };
-        log::trace!(
-            "write: {} bytes to {} on {} ({write_type:?})",
-            value.len(),
-            characteristic.0,
-            self.peer.0
-        );
         let mut attempt = 0;
         loop {
+            // See `read`'s matching comment: reacquired every attempt, not
+            // held across the whole retry budget, and the characteristic is
+            // re-resolved fresh each time rather than reused across
+            // retries.
+            let _dial = self.dial_lock.lock().await;
+            self.ensure_current()?;
+            let target = self.find_characteristic(characteristic).await?;
+            // Cache the negotiated MTU opportunistically: BlueZ only
+            // publishes a characteristic's MTU once the link is up, so this
+            // is the first point it can be observed without a speculative
+            // extra round trip.
+            if let Ok(mtu) = target.mtu().await {
+                self.att_mtu.store(mtu as u16, Ordering::Relaxed);
+            }
+            log::trace!(
+                "write: {} bytes to {} on {} ({write_type:?})",
+                value.len(),
+                characteristic.0,
+                self.peer.0
+            );
             match target.write_ext(&value, &request).await {
                 Ok(()) => return Ok(()),
                 Err(err) if attempt < GATT_OP_MAX_RETRIES => {
@@ -1505,7 +1535,8 @@ impl GattConnection for LinuxGattConnection {
                         value.len(),
                         self.peer.0
                     );
-                    tokio::time::sleep(GATT_OP_RETRY_DELAY).await;
+                    drop(_dial);
+                    tokio::time::sleep(gatt_op_retry_delay(attempt)).await;
                 }
                 Err(err) => {
                     log::warn!("write: {} bytes to {} failed: {err}", value.len(), self.peer.0);
