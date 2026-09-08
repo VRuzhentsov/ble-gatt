@@ -100,19 +100,22 @@ const CLEANUP_DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// must not lift the quarantine either.
 const PENDING_CLEANUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Hard cap on how many connect-cleanup disconnects this backend will have
-/// actively in flight at once, across every quarantined peer combined.
-/// Codex P1 ("bound cleanup attempts across peer addresses"): bounding
-/// concurrency to one live attempt *per address* (`LinuxConnectGuard::drop`'s
-/// own retry loop) still leaves no bound *across* addresses — enough
-/// distinct, simultaneously-unresponsive peers could still accumulate an
-/// unbounded number of outstanding D-Bus calls, tasks, and `Adapter` handles
-/// overall, just spread across more addresses instead of piled onto one.
-/// A quarantined address whose cleanup task is still waiting for a permit
-/// here is nonetheless fully quarantined — `pending_cleanup` is set
-/// synchronously and unconditionally well before this is ever acquired — so
-/// this only bounds how many are actively doing disconnect work at once, not
-/// how many can be queued waiting their turn.
+/// Hard cap on how many `connect()` attempts this backend will allow to be
+/// outstanding at once with no guaranteed way to clean up after them if
+/// abandoned or timed out. Codex P1 ("bound cleanup attempts across peer
+/// addresses", then "reserve cleanup capacity before issuing Connect"):
+/// bounding concurrency to one live disconnect attempt *per address*
+/// (`LinuxConnectGuard::drop`'s own retry loop) leaves no bound *across*
+/// addresses, and acquiring that bound *lazily* — only once a connect
+/// attempt has already failed and its cleanup task has already been spawned
+/// — bounds nothing either: a connect attempt that cannot get cleanup
+/// capacity has, by then, already been issued to BlueZ and already left
+/// with a cleanup task permanently queued behind the semaphore instead of
+/// ever sending the `Disconnect` needed to cancel it. So the permit is
+/// reserved by `connect()` itself, before `device.connect()` is ever
+/// issued (see the reservation site there) — a `connect()` call that
+/// cannot obtain one is rejected outright rather than proceeding into an
+/// attempt this backend cannot guarantee it can ever clean up.
 const MAX_CONCURRENT_CLEANUP_DISCONNECTS: usize = 4;
 
 /// `read`/`write_with_type` do **not** retry a GATT operation BlueZ rejects
@@ -257,9 +260,10 @@ pub struct LinuxBackend {
     /// behind `dial_lock` just to fail the same way after burning a real
     /// D-Bus round trip.
     in_flight: Arc<StdMutex<HashSet<PeerAddress>>>,
-    /// Bounds how many connect-cleanup disconnects (see `LinuxConnectGuard`)
-    /// can be actively in flight at once, across every quarantined peer
-    /// combined. See `MAX_CONCURRENT_CLEANUP_DISCONNECTS`'s doc comment.
+    /// Source of the permits `connect()` reserves before ever issuing
+    /// `device.connect()`, and that a `LinuxConnectGuard` then holds for the
+    /// life of its cleanup task if the attempt is abandoned. See
+    /// `MAX_CONCURRENT_CLEANUP_DISCONNECTS`'s doc comment.
     cleanup_permits: Arc<tokio::sync::Semaphore>,
 }
 
@@ -642,8 +646,13 @@ struct LinuxConnectGuard {
     dialed: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
     dial_lock: Arc<AsyncMutex<()>>,
     pending_cleanup: Arc<StdMutex<HashSet<PeerAddress>>>,
-    /// See `MAX_CONCURRENT_CLEANUP_DISCONNECTS`'s doc comment.
-    cleanup_permits: Arc<tokio::sync::Semaphore>,
+    /// Reserved by `connect()` before `device.connect()` was ever issued —
+    /// see `MAX_CONCURRENT_CLEANUP_DISCONNECTS`'s doc comment. `Some` for
+    /// the guard's entire life; taken and moved into the cleanup task if
+    /// `Drop::drop` finds `armed` still true, otherwise dropped (returning
+    /// the permit to the pool immediately) along with the rest of the
+    /// guard's fields once a successful connect makes it unarmed.
+    cleanup_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     peer: PeerAddress,
     generation: u64,
     armed: bool,
@@ -712,28 +721,18 @@ impl Drop for LinuxConnectGuard {
         let dial_lock = self.dial_lock.clone();
         let dialed = self.dialed.clone();
         let pending_cleanup = self.pending_cleanup.clone();
-        let cleanup_permits = self.cleanup_permits.clone();
         let peer = self.peer.clone();
+        // Reserved by `connect()` before it ever issued `device.connect()`
+        // — see `MAX_CONCURRENT_CLEANUP_DISCONNECTS`'s doc comment and the
+        // reservation site there. Moved into the cleanup task rather than
+        // acquired here: by the time this Drop runs, capacity for this
+        // specific attempt is already guaranteed, not merely hoped for.
+        // Held for the task's entire lifetime; dropped (returning the
+        // permit to the pool) only once the task itself ends, right
+        // alongside clearing `pending_cleanup` below.
+        let cleanup_permit = self.cleanup_permit.take();
         tokio::spawn(async move {
-            // Bounds how many peers' cleanup can be actively disconnecting
-            // at once, across this whole backend — not just within this one
-            // guard. Held for this task's entire lifetime, acquired before
-            // any disconnect work begins. Codex P1 ("bound cleanup attempts
-            // across peer addresses"): the per-attempt bound below stops one
-            // *address* from accumulating unbounded outstanding calls, but
-            // says nothing about how many *different* addresses can be
-            // doing this simultaneously — enough distinct unresponsive
-            // peers could still exhaust the same resources overall. The
-            // address is already fully quarantined via `pending_cleanup`
-            // above regardless of how long this wait takes; a permit only
-            // gates when actual disconnect work is allowed to start.
-            let Ok(_permit) = cleanup_permits.acquire_owned().await else {
-                // Only closes if the semaphore itself is explicitly closed,
-                // which this file never does — unreachable in practice, but
-                // failing open (skip cleanup) rather than panicking a
-                // detached task is the safer default if it ever changes.
-                return;
-            };
+            let _permit = cleanup_permit;
             // At most one disconnect attempt is ever outstanding at a time.
             // Each is spawned as its own task rather than raced directly
             // against CLEANUP_DISCONNECT_TIMEOUT: dropping a future when a
@@ -1015,6 +1014,29 @@ impl Backend for LinuxBackend {
         // for the one that replaced it.
         let dial_generation = self.next_session.fetch_add(1, Ordering::Relaxed);
         self.dialed.lock().unwrap().insert(peer.clone(), dial_generation);
+        // Reserved *before* `device.connect()` below is ever issued, not
+        // lazily once cleanup begins — see `MAX_CONCURRENT_CLEANUP_DISCONNECTS`'s
+        // doc comment (Codex P1, "reserve cleanup capacity before issuing
+        // Connect"): if this attempt is later abandoned or times out, its
+        // cleanup will need this exact capacity, and reserving it only
+        // after the fact bounds nothing — a connect this backend cannot
+        // guarantee it can ever clean up must not be issued at all.
+        let cleanup_permit = match self.cleanup_permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let mut dialed = self.dialed.lock().unwrap();
+                if dialed.get(peer) == Some(&dial_generation) {
+                    dialed.remove(peer);
+                }
+                return Err(BleError::ConnectFailed {
+                    peer: peer.0.clone(),
+                    reason: format!(
+                        "no cleanup capacity available: {MAX_CONCURRENT_CLEANUP_DISCONNECTS} peers already \
+                         awaiting cleanup"
+                    ),
+                });
+            }
+        };
         log::info!("connect: dialling {} generation={dial_generation}", peer.0);
         // Cancellation guard, mirroring the Android backend's `ConnectGuard`
         // -- `connect()` is an async fn, so a caller can drop this future
@@ -1036,7 +1058,7 @@ impl Backend for LinuxBackend {
             dialed: self.dialed.clone(),
             dial_lock: self.dial_lock.clone(),
             pending_cleanup: self.pending_cleanup.clone(),
-            cleanup_permits: self.cleanup_permits.clone(),
+            cleanup_permit: Some(cleanup_permit),
             peer: peer.clone(),
             generation: dial_generation,
             armed: true,
