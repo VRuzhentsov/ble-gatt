@@ -638,6 +638,21 @@ impl Drop for LinuxConnectGuard {
         if !self.armed {
             return;
         }
+        // Logged synchronously, unconditionally, before anything else in
+        // this function — real-hardware evidence showed a caller dropping
+        // the whole `connect()` future (e.g. a wrapping probe timeout at a
+        // higher layer) leaves no trace at all otherwise: the CONNECT_TIMEOUT
+        // branch below logs its own warning before returning, but a future
+        // dropped mid-await never reaches that code, so this is the only
+        // line that will ever record such an abandonment. A CONNECT_TIMEOUT
+        // firing does still reach here too (after already logging its own
+        // line above), which is an acceptable, informative duplicate: it
+        // confirms cleanup actually started rather than leaving that as an
+        // inference from the disconnect-completed line alone.
+        log::warn!(
+            "connect: {} abandoned before completing (connect guard dropped); quarantining and cleaning up in the background",
+            self.peer.0
+        );
         {
             let mut dialed = self.dialed.lock().unwrap();
             if dialed.get(&self.peer) == Some(&self.generation) {
