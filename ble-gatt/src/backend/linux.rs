@@ -13,7 +13,7 @@
 //! handshake over the link, not by this event), revisit if a consumer needs
 //! precise link-level connect/disconnect timing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -65,6 +65,108 @@ use crate::models::{
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
+
+/// How long `LinuxBackend::connect` waits for BlueZ's `Connect` D-Bus method
+/// to reply before giving up.
+///
+/// Real-hardware evidence: with no bound at all, a `Connect` call to an
+/// unresponsive/out-of-range peer can hang effectively forever — not just
+/// past a caller's own external timeout, since `dial_lock` is held across
+/// the whole call and every subsequent dial (and, evidence suggests, the
+/// shared D-Bus connection's own capacity for outstanding calls) piles up
+/// behind it rather than that one dial simply failing slowly. A caller-side
+/// `tokio::time::timeout` around the whole `connect()` future does not fix
+/// this: dropping that future does not cancel BlueZ's own in-progress
+/// Connect (see `LinuxConnectGuard`'s doc comment), so the stuck D-Bus call
+/// and the `dial_lock` hold both outlive the caller giving up on it.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long a cancelled connect attempt's cleanup waits for BlueZ's
+/// `Disconnect` to reply. BlueZ documents `Disconnect` as the sanctioned way
+/// to cancel a pending `Connect`, but real-hardware evidence shows it can
+/// itself hit the same D-Bus timeout the stuck `Connect` was already
+/// sitting on ("cleanup disconnect ... failed: ... D-Bus error ...
+/// Timeout waiting for reply") — an unbounded cleanup call holding the same
+/// `dial_lock` is just as capable of starving every other dial as the
+/// original stuck connect was. Shorter than `CONNECT_TIMEOUT`: this is a
+/// best-effort cancellation signal, not an operation worth waiting as long
+/// for.
+const CLEANUP_DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long the delayed cleanup task (armed once `CLEANUP_DISCONNECT_TIMEOUT`
+/// itself elapses) waits between retries of its own `Disconnect` call, while
+/// an address stays quarantined in `pending_cleanup`. Not itself bounded by
+/// a timeout — see that task's own doc comment for why a definitive Err
+/// must not lift the quarantine either.
+const PENDING_CLEANUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Hard cap on how many `connect()` attempts this backend will allow to be
+/// outstanding at once with no guaranteed way to clean up after them if
+/// abandoned or timed out. Codex P1 ("bound cleanup attempts across peer
+/// addresses", then "reserve cleanup capacity before issuing Connect"):
+/// bounding concurrency to one live disconnect attempt *per address*
+/// (`LinuxConnectGuard::drop`'s own retry loop) leaves no bound *across*
+/// addresses, and acquiring that bound *lazily* — only once a connect
+/// attempt has already failed and its cleanup task has already been spawned
+/// — bounds nothing either: a connect attempt that cannot get cleanup
+/// capacity has, by then, already been issued to BlueZ and already left
+/// with a cleanup task permanently queued behind the semaphore instead of
+/// ever sending the `Disconnect` needed to cancel it. So the permit is
+/// reserved by `connect()` itself, before `device.connect()` is ever
+/// issued (see the reservation site there) — a `connect()` call that
+/// cannot obtain one is rejected outright rather than proceeding into an
+/// attempt this backend cannot guarantee it can ever clean up.
+const MAX_CONCURRENT_CLEANUP_DISCONNECTS: usize = 4;
+
+/// `read`/`write_with_type` do **not** retry a GATT operation BlueZ rejects
+/// — that used to live here as an internal exponential backoff (6 attempts,
+/// 200ms doubling to 2000ms, ~7s total), modeled on Android's real-hardware-
+/// proven `gattBusyRetryDelayMs`/`GATT_BUSY_MAX_RETRIES`. It was removed:
+/// fini's peer traced its two real call sites (the add-mode scan pass and
+/// `find_peer_address`'s per-candidate probe) and confirmed both cap a
+/// single GATT operation at ~4s, so a ~7s internal retry chain could never
+/// run to completion inside either caller's actual timeout — any dial that
+/// needed the later attempts just looked like a caller-abandoned future
+/// instead of a real retry outcome, and there is no fixed internal budget
+/// that suits every caller. Retrying is now the caller's decision, sized to
+/// whatever budget that specific caller actually has: this returns after a
+/// single attempt, classified via `is_transient_gatt_error`/
+/// `BleError::GattBusy` below so a caller that wants to retry can tell a
+/// worth-retrying rejection apart from a permanent one without guessing.
+///
+/// Real-hardware evidence motivating retrying *at all* still stands: a
+/// central-role write to a peer that just finished connecting (services
+/// already resolved — `find_characteristic` waits for that itself) can
+/// fail immediately with BlueZ's own "Not connected", 100% reproducibly, on
+/// the very first fragment of the very first message on a fresh channel.
+/// `bluer` maps this to the generic `ErrorKind::Failed`, not a
+/// distinguishable "not ready yet" kind.
+///
+/// True only for the specific `bluer::ErrorKind` that represents a
+/// transient, momentary GATT rejection worth a caller retrying, surfaced as
+/// `BleError::GattBusy` rather than `BleError::Gatt`. A structured,
+/// permanent refusal — `NotAuthorized`, `NotPermitted`, `NotSupported`, and
+/// the like — is never worth retrying, so only the generic `Failed` kind
+/// (BlueZ's own catch-all for a transient, momentary rejection) is treated
+/// as busy.
+fn is_transient_gatt_error(err: &bluer::Error) -> bool {
+    err.kind == bluer::ErrorKind::Failed
+}
+
+/// True when `err` is BlueZ reporting `org.bluez.Error.NotConnected` — a
+/// D-Bus error name with no dedicated `bluer::ErrorKind` variant, so it
+/// surfaces as `ErrorKind::Internal(InternalErrorKind::DBus(name))` with
+/// the original D-Bus error name preserved verbatim in `name` (see
+/// `bluer::Error`'s `From<dbus::Error>` impl). Matched structurally on that
+/// name rather than on `err.message()`'s free-form text, which BlueZ does
+/// not guarantee stays stable.
+fn is_not_connected(err: &bluer::Error) -> bool {
+    matches!(
+        &err.kind,
+        bluer::ErrorKind::Internal(bluer::InternalErrorKind::DBus(name))
+            if name == "org.bluez.Error.NotConnected"
+    )
+}
 
 pub struct LinuxBackend {
     // Held only to keep the D-Bus session connection alive for the
@@ -130,6 +232,39 @@ pub struct LinuxBackend {
     /// initiated, so without this an outbound connection would be
     /// misreported as a central arriving at our server.
     dialed: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
+    /// Addresses with a cancelled connect attempt's cleanup `Disconnect`
+    /// still genuinely unresolved on BlueZ's side, past
+    /// `CLEANUP_DISCONNECT_TIMEOUT`. `connect()` refuses to dial a
+    /// quarantined address rather than risk that stale `Disconnect`
+    /// eventually landing on the replacement it would establish — see
+    /// `LinuxConnectGuard::drop`'s doc comment for why timing that call out
+    /// cannot simply mean "forget about it."
+    pending_cleanup: Arc<StdMutex<HashSet<PeerAddress>>>,
+    /// Addresses with a dial genuinely in flight right now — from the
+    /// moment `connect()` accepts the attempt until it resolves (success,
+    /// error, or `CONNECT_TIMEOUT`), tracked separately from `dialed`
+    /// because `dialed` also legitimately holds an already-*established*
+    /// generation for the whole life of a connection, which a fresh
+    /// `connect()` call is allowed to supersede.
+    ///
+    /// Real-hardware evidence: a caller that starts a new dial to the same
+    /// peer before an earlier one has resolved (rather than awaiting or
+    /// cancelling it first) produces a genuinely concurrent second
+    /// `Connect()` to the same `Device` — `dial_lock` only serialises them
+    /// at the platform call, it does not stop a second one from being
+    /// attempted at all, so both queue up, BlueZ rejects the fast loser
+    /// immediately, and this repeats every retry cycle without ever
+    /// establishing a link, unboundedly incrementing `dialed`'s generation
+    /// counter in the process. Refusing a second dial to an address already
+    /// in flight outright is cheaper and more honest than letting it queue
+    /// behind `dial_lock` just to fail the same way after burning a real
+    /// D-Bus round trip.
+    in_flight: Arc<StdMutex<HashSet<PeerAddress>>>,
+    /// Source of the permits `connect()` reserves before ever issuing
+    /// `device.connect()`, and that a `LinuxConnectGuard` then holds for the
+    /// life of its cleanup task if the attempt is abandoned. See
+    /// `MAX_CONCURRENT_CLEANUP_DISCONNECTS`'s doc comment.
+    cleanup_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl LinuxBackend {
@@ -167,6 +302,9 @@ impl LinuxBackend {
             adv_handle: AsyncMutex::new(None),
             server_watch: Arc::new(StdMutex::new(Vec::new())),
             dialed: Arc::new(StdMutex::new(HashMap::new())),
+            pending_cleanup: Arc::new(StdMutex::new(HashSet::new())),
+            in_flight: Arc::new(StdMutex::new(HashSet::new())),
+            cleanup_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CLEANUP_DISCONNECTS)),
         })
     }
 }
@@ -507,9 +645,36 @@ struct LinuxConnectGuard {
     address: bluer::Address,
     dialed: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
     dial_lock: Arc<AsyncMutex<()>>,
+    pending_cleanup: Arc<StdMutex<HashSet<PeerAddress>>>,
+    /// Reserved by `connect()` before `device.connect()` was ever issued —
+    /// see `MAX_CONCURRENT_CLEANUP_DISCONNECTS`'s doc comment. `Some` for
+    /// the guard's entire life; taken and moved into the cleanup task if
+    /// `Drop::drop` finds `armed` still true, otherwise dropped (returning
+    /// the permit to the pool immediately) along with the rest of the
+    /// guard's fields once a successful connect makes it unarmed.
+    cleanup_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     peer: PeerAddress,
     generation: u64,
     armed: bool,
+}
+
+/// Releases `in_flight`'s entry for `peer` on every exit from `connect()`,
+/// from the moment it is inserted onward — including a cancellation while
+/// still queued for `dial_lock`, before `LinuxConnectGuard` even exists.
+/// Codex P1: without this, a caller giving up while queued (a timeout, a
+/// `select!` losing a race, all while another peer's operation holds
+/// `dial_lock`) left the entry stuck forever, since nothing was yet
+/// constructed to remove it — permanently refusing every future dial to
+/// that same peer as "already in flight" for a dial that no longer exists.
+struct InFlightGuard {
+    in_flight: Arc<StdMutex<HashSet<PeerAddress>>>,
+    peer: PeerAddress,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.in_flight.lock().unwrap().remove(&self.peer);
+    }
 }
 
 impl Drop for LinuxConnectGuard {
@@ -517,47 +682,185 @@ impl Drop for LinuxConnectGuard {
         if !self.armed {
             return;
         }
+        // Logged synchronously, unconditionally, before anything else in
+        // this function — real-hardware evidence showed a caller dropping
+        // the whole `connect()` future (e.g. a wrapping probe timeout at a
+        // higher layer) leaves no trace at all otherwise: the CONNECT_TIMEOUT
+        // branch below logs its own warning before returning, but a future
+        // dropped mid-await never reaches that code, so this is the only
+        // line that will ever record such an abandonment. A CONNECT_TIMEOUT
+        // firing does still reach here too (after already logging its own
+        // line above), which is an acceptable, informative duplicate: it
+        // confirms cleanup actually started rather than leaving that as an
+        // inference from the disconnect-completed line alone.
+        log::warn!(
+            "connect: {} abandoned before completing (connect guard dropped); quarantining and cleaning up in the background",
+            self.peer.0
+        );
         {
             let mut dialed = self.dialed.lock().unwrap();
             if dialed.get(&self.peer) == Some(&self.generation) {
                 dialed.remove(&self.peer);
             }
         }
+        // Quarantined *synchronously*, before this function — and so
+        // `connect()`'s own stack frame — ever returns to its caller.
+        // Codex P1: publishing this only later (e.g. only once a first
+        // bounded cleanup attempt itself times out) left a real window
+        // where an immediate retry raced in before any quarantine existed
+        // at all — `connect()`'s own quarantine checks have nothing to see
+        // until *something* inserts into this set, and previously nothing
+        // did until well after this guard had already returned control to
+        // the caller. BlueZ's original Connect() request may still be
+        // genuinely in flight the instant this guard drops; nothing has
+        // confirmed otherwise yet, so the quarantine cannot wait for that
+        // confirmation either.
+        self.pending_cleanup.lock().unwrap().insert(self.peer.clone());
         let adapter = self.adapter.clone();
         let address = self.address;
         let dial_lock = self.dial_lock.clone();
         let dialed = self.dialed.clone();
+        let pending_cleanup = self.pending_cleanup.clone();
         let peer = self.peer.clone();
+        // Reserved by `connect()` before it ever issued `device.connect()`
+        // — see `MAX_CONCURRENT_CLEANUP_DISCONNECTS`'s doc comment and the
+        // reservation site there. Moved into the cleanup task rather than
+        // acquired here: by the time this Drop runs, capacity for this
+        // specific attempt is already guaranteed, not merely hoped for.
+        // Held for the task's entire lifetime; dropped (returning the
+        // permit to the pool) only once the task itself ends, right
+        // alongside clearing `pending_cleanup` below.
+        let cleanup_permit = self.cleanup_permit.take();
         tokio::spawn(async move {
-            // Every other operation in this file that touches `Device`
-            // holds `dial_lock` across the platform call, precisely because
-            // `Device` resolves by address: an unguarded disconnect here
-            // could land on a connection a retry has since legitimately
-            // established, not the abandoned attempt this guard owns. See
-            // `LinuxGattConnection::disconnect`'s doc comment for the same
-            // reasoning at the sharpest edge of it.
-            let _dial = dial_lock.lock().await;
-            // While this task waited for the lock, a retry may already have
-            // claimed `peer` — `connect()` inserts its own generation into
-            // `dialed` before it ever reaches `device.connect()`, under this
-            // same lock. If any entry exists now, something newer than this
-            // cancelled attempt owns this address; back off rather than
-            // risk dropping a connection this guard was never responsible
-            // for. The synchronous removal above only ever clears *this*
-            // generation's own entry, so any presence here is necessarily
-            // someone else's.
-            if dialed.lock().unwrap().contains_key(&peer) {
-                return;
+            let _permit = cleanup_permit;
+            // At most one disconnect attempt is ever outstanding at a time.
+            // Each is spawned as its own task rather than raced directly
+            // against CLEANUP_DISCONNECT_TIMEOUT: dropping a future when a
+            // timeout elapses does not cancel the underlying D-Bus call
+            // already sent to BlueZ (the same reasoning `CONNECT_TIMEOUT`'s
+            // own guard rests on), so a timeout here just means *this
+            // loop's wait* gave up, not that the attempt itself is gone —
+            // `handle` stays `Some` and the next iteration keeps polling the
+            // very same task instead of spawning a new one alongside it.
+            // Codex caught this the first time as an unbounded-accumulation
+            // risk ("avoid accumulating unresolved disconnect calls"): an
+            // earlier version of this loop spawned a fresh attempt on every
+            // iteration regardless, so a peer whose BlueZ simply never
+            // replies could pile up an unbounded number of outstanding
+            // D-Bus calls and task handles — the exact request pile-up this
+            // mechanism exists to prevent, just recursed into its own retry
+            // loop. Never starting attempt N+1 before attempt N is known to
+            // have actually finished (Ok, Err, or panic — not merely timed
+            // out waiting) also fully subsumes the earlier, separate fix for
+            // "keep quarantine until every timed-out disconnect resolves":
+            // with only ever one attempt alive, there is nothing left
+            // outstanding to join once the loop breaks.
+            let mut handle: Option<tokio::task::JoinHandle<bluer::Result<()>>> = None;
+            loop {
+                if handle.is_none() {
+                    // Every other operation in this file that touches
+                    // `Device` holds `dial_lock` across the platform call,
+                    // precisely because `Device` resolves by address: an
+                    // unguarded disconnect here could land on a connection
+                    // a retry has since legitimately established, not the
+                    // abandoned attempt this guard owns. See
+                    // `LinuxGattConnection::disconnect`'s doc comment for
+                    // the same reasoning at the sharpest edge of it.
+                    //
+                    // Codex P1 ("poll timed-out cleanup without reacquiring
+                    // the global lock"): held only around *starting* a
+                    // fresh attempt, not around waiting on one already
+                    // running — that D-Bus call proceeds independently of
+                    // this lock once issued, and the address is already
+                    // quarantined regardless, so holding a backend-wide
+                    // lock for another `CLEANUP_DISCONNECT_TIMEOUT` just to
+                    // poll an existing task needlessly blocked every other
+                    // peer's dial/read/write for that whole span, repeated
+                    // on every timeout, and multiple stuck peers could
+                    // compound the delay past any caller's own timeout.
+                    let _dial = dial_lock.lock().await;
+                    // A newer dial claiming this address while quarantined
+                    // should be structurally impossible now — connect()'s
+                    // own quarantine checks (before and after acquiring
+                    // this same lock) refuse a dial to a quarantined peer
+                    // outright. Kept as a defensive check, not a load-
+                    // bearing one: the synchronous removal above only ever
+                    // clears *this* generation's own entry, so any presence
+                    // here would necessarily be someone else's.
+                    if dialed.lock().unwrap().contains_key(&peer) {
+                        break;
+                    }
+                    let Ok(device) = adapter.device(address) else {
+                        break;
+                    };
+                    handle = Some(tokio::spawn(async move { device.disconnect().await }));
+                    // Dropped here, before the wait below — see the comment
+                    // above for why holding it that long is unnecessary and
+                    // was itself a Codex P1.
+                }
+                // Bounded per wait for the same reason CONNECT_TIMEOUT
+                // exists — an unbounded wait is exactly as capable of
+                // starving this task's own progress as the stuck connect it
+                // exists to clean up after (though, unlike before, it no
+                // longer holds `dial_lock` while doing so). Only the wait is
+                // bounded, not the attempt: on a timeout the spawned task
+                // keeps running in the background and is polled again next
+                // iteration, never abandoned for a fresh one.
+                let outcome = tokio::time::timeout(CLEANUP_DISCONNECT_TIMEOUT, handle.as_mut().unwrap()).await;
+                match outcome {
+                    Ok(Ok(Ok(()))) => {
+                        log::info!("connect: {} cleanup disconnect completed", peer.0);
+                        break;
+                    }
+                    // Codex P1: an unconditional retry-forever here left the
+                    // address quarantined permanently once BlueZ ever
+                    // answered NotConnected — which it does precisely when
+                    // the abandoned Connect had already failed on its own,
+                    // or an earlier Disconnect completed but its D-Bus
+                    // reply was lost. Either way, the state this cleanup
+                    // exists to reach — not connected — is already true, so
+                    // treat it exactly like a successful disconnect rather
+                    // than an error to retry past.
+                    Ok(Ok(Err(err))) if is_not_connected(&err) => {
+                        log::info!(
+                            "connect: {} cleanup disconnect reports not connected; treating as already clean",
+                            peer.0
+                        );
+                        break;
+                    }
+                    Ok(Ok(Err(err))) => {
+                        log::warn!(
+                            "connect: {} cleanup disconnect attempt failed ({err}), retrying in \
+                             {PENDING_CLEANUP_RETRY_DELAY:?} — still quarantined",
+                            peer.0
+                        );
+                        handle = None; // resolved (failed); a fresh attempt may start next iteration
+                        tokio::time::sleep(PENDING_CLEANUP_RETRY_DELAY).await;
+                    }
+                    Ok(Err(join_err)) => {
+                        log::warn!(
+                            "connect: {} cleanup disconnect task ended unexpectedly ({join_err}), retrying \
+                             in {PENDING_CLEANUP_RETRY_DELAY:?} — still quarantined",
+                            peer.0
+                        );
+                        handle = None;
+                        tokio::time::sleep(PENDING_CLEANUP_RETRY_DELAY).await;
+                    }
+                    Err(_elapsed) => {
+                        log::warn!(
+                            "connect: {} cleanup disconnect attempt timed out after \
+                             {CLEANUP_DISCONNECT_TIMEOUT:?}, still running in the background; waiting on it \
+                             again rather than starting another — still quarantined",
+                            peer.0
+                        );
+                        // `handle` stays Some: keep polling the same
+                        // attempt next iteration instead of accumulating a
+                        // second one. No extra sleep: the timeout itself
+                        // already spent CLEANUP_DISCONNECT_TIMEOUT waiting.
+                    }
+                }
             }
-            let Ok(device) = adapter.device(address) else {
-                return;
-            };
-            if let Err(err) = device.disconnect().await {
-                log::warn!(
-                    "connect: {} cleanup disconnect after a cancelled connect attempt failed: {err}",
-                    peer.0
-                );
-            }
+            pending_cleanup.lock().unwrap().remove(&peer);
         });
     }
 }
@@ -645,6 +948,37 @@ impl Backend for LinuxBackend {
             peer: peer.0.clone(),
             reason: err.to_string(),
         })?;
+        // A previous cancelled attempt's cleanup Disconnect to this exact
+        // address may still be genuinely in flight on BlueZ's side — see
+        // `LinuxConnectGuard::drop`'s doc comment. Dialling in now would
+        // risk that stale Disconnect landing on the replacement link this
+        // call is about to establish. Checked before `dial_lock` so a
+        // quarantined address fails fast rather than queuing behind it.
+        if self.pending_cleanup.lock().unwrap().contains(peer) {
+            return Err(BleError::ConnectFailed {
+                peer: peer.0.clone(),
+                reason: "a previous cancelled connect attempt is still being cleaned up".to_string(),
+            });
+        }
+        // Refuse outright rather than queue behind `dial_lock`: a caller
+        // that starts a new dial to this peer before an earlier one has
+        // resolved produces a genuinely concurrent second `Connect()` to
+        // the same `Device` — BlueZ rejects the loser immediately, so
+        // letting it through just burns a real D-Bus round trip to fail the
+        // same way this check already knows it will. Checked before
+        // `dial_lock` for the same reason the quarantine check above is.
+        if !self.in_flight.lock().unwrap().insert(peer.clone()) {
+            log::warn!("connect: {} refused — a dial to this peer is already in flight", peer.0);
+            return Err(BleError::ConnectFailed {
+                peer: peer.0.clone(),
+                reason: "a connect attempt to this peer is already in flight".to_string(),
+            });
+        }
+        // Constructed immediately — no `.await` between the insert above
+        // and here — so a cancellation from this point on, including one
+        // that arrives while merely queued for `dial_lock` below, always
+        // has something alive to release the entry it just claimed.
+        let _in_flight_guard = InFlightGuard { in_flight: self.in_flight.clone(), peer: peer.clone() };
         // Recorded *before* dialling: BlueZ can publish the Connected
         // property before `connect()` returns, and the inbound watcher would
         // otherwise race us and announce our own outbound link as a central
@@ -653,11 +987,56 @@ impl Backend for LinuxBackend {
         // Held across the platform call, so a concurrent `disconnect` on an
         // older handle cannot land midway and drop this link.
         let _dial = self.dial_lock.lock().await;
+        // Re-checked now that `dial_lock` is actually held: the check above
+        // only sees state as of *before* this call queued for the lock.
+        // Real-hardware evidence (Codex review): a cancelled attempt's
+        // cleanup can still be inside its own bounded `Disconnect` — itself
+        // holding `dial_lock` — when this call's pre-check ran and found
+        // `pending_cleanup` empty. If that cleanup times out and publishes
+        // the quarantine *while this call is already queued* for the lock
+        // it just released, the earlier check never sees it — this call
+        // would dial straight into the address the fresh, now-unbounded
+        // cleanup disconnect is still targeting. `in_flight` needs no
+        // matching re-check: unlike `pending_cleanup`, it can only become
+        // *un*-set while queued (this call's own entry persists for as
+        // long as it holds it), never newly set against this same peer out
+        // from under it.
+        if self.pending_cleanup.lock().unwrap().contains(peer) {
+            // `_in_flight_guard` releases `in_flight` on this return; no
+            // manual cleanup needed here.
+            return Err(BleError::ConnectFailed {
+                peer: peer.0.clone(),
+                reason: "a previous cancelled connect attempt is still being cleaned up".to_string(),
+            });
+        }
         // The generation distinguishes successive dials to the same address,
         // so a watcher from a previous connection cannot report a disconnect
         // for the one that replaced it.
         let dial_generation = self.next_session.fetch_add(1, Ordering::Relaxed);
         self.dialed.lock().unwrap().insert(peer.clone(), dial_generation);
+        // Reserved *before* `device.connect()` below is ever issued, not
+        // lazily once cleanup begins — see `MAX_CONCURRENT_CLEANUP_DISCONNECTS`'s
+        // doc comment (Codex P1, "reserve cleanup capacity before issuing
+        // Connect"): if this attempt is later abandoned or times out, its
+        // cleanup will need this exact capacity, and reserving it only
+        // after the fact bounds nothing — a connect this backend cannot
+        // guarantee it can ever clean up must not be issued at all.
+        let cleanup_permit = match self.cleanup_permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let mut dialed = self.dialed.lock().unwrap();
+                if dialed.get(peer) == Some(&dial_generation) {
+                    dialed.remove(peer);
+                }
+                return Err(BleError::ConnectFailed {
+                    peer: peer.0.clone(),
+                    reason: format!(
+                        "no cleanup capacity available: {MAX_CONCURRENT_CLEANUP_DISCONNECTS} peers already \
+                         awaiting cleanup"
+                    ),
+                });
+            }
+        };
         log::info!("connect: dialling {} generation={dial_generation}", peer.0);
         // Cancellation guard, mirroring the Android backend's `ConnectGuard`
         // -- `connect()` is an async fn, so a caller can drop this future
@@ -678,12 +1057,45 @@ impl Backend for LinuxBackend {
             address,
             dialed: self.dialed.clone(),
             dial_lock: self.dial_lock.clone(),
+            pending_cleanup: self.pending_cleanup.clone(),
+            cleanup_permit: Some(cleanup_permit),
             peer: peer.clone(),
             generation: dial_generation,
             armed: true,
         };
-        let connect_result = device.connect().await;
-        guard.armed = false;
+        // Bounded, not just cancellation-safe: without this, an unresponsive
+        // peer's Connect reply never arriving holds `dial_lock` (and, real-
+        // hardware evidence suggests, whatever capacity the shared D-Bus
+        // connection has for outstanding calls) forever, so every later dial
+        // queues up behind one that will never finish. See
+        // `CONNECT_TIMEOUT`'s doc comment.
+        let connect_result = match tokio::time::timeout(CONNECT_TIMEOUT, device.connect()).await {
+            Ok(result) => {
+                // The D-Bus call genuinely completed (Ok or Err) — nothing
+                // left for the guard to cancel.
+                guard.armed = false;
+                result
+            }
+            Err(_elapsed) => {
+                // Guard stays armed: unlike a completed call, BlueZ's own
+                // Connect may still resolve later on its own schedule — the
+                // exact orphaned-link scenario this guard exists to clean up
+                // after, just triggered by our own timeout instead of a
+                // caller dropping the future.
+                log::warn!(
+                    "connect: {} timed out after {CONNECT_TIMEOUT:?} waiting for BlueZ's Connect reply",
+                    peer.0
+                );
+                let mut dialed = self.dialed.lock().unwrap();
+                if dialed.get(peer) == Some(&dial_generation) {
+                    dialed.remove(peer);
+                }
+                return Err(BleError::ConnectFailed {
+                    peer: peer.0.clone(),
+                    reason: format!("timed out after {CONNECT_TIMEOUT:?} waiting for BlueZ to respond to Connect"),
+                });
+            }
+        };
         if let Err(err) = connect_result {
             log::warn!("connect: {} refused the link: {err}", peer.0);
             let mut dialed = self.dialed.lock().unwrap();
@@ -1175,23 +1587,41 @@ impl GattConnection for LinuxGattConnection {
     }
 
     async fn read(&mut self, characteristic: CharacteristicUuid) -> Result<Vec<u8>> {
-        // Held across the platform call for the same reason `disconnect`
-        // holds it: `Device` is address-backed, so a reconnect landing
-        // mid-operation would have this handle acting on the replacement
-        // link. Checking and then awaiting is a check-then-act however
-        // narrow the gap.
         let _dial = self.dial_lock.lock().await;
         self.ensure_current()?;
         let target = self.find_characteristic(characteristic).await?;
         if let Ok(mtu) = target.mtu().await {
             self.att_mtu.store(mtu as u16, Ordering::Relaxed);
         }
-        target.read().await.map_err(|err| BleError::Gatt(err.to_string()))
+        // A single attempt — no internal retry. See `is_transient_gatt_error`'s
+        // doc comment for why: no fixed backend-side retry budget fits every
+        // caller, so a caller that wants to retry a `BleError::GattBusy`
+        // does so itself, sized to its own timeout.
+        match target.read().await {
+            Ok(value) => Ok(value),
+            Err(err) if is_transient_gatt_error(&err) => {
+                log::warn!("read: {} on {} rejected, possibly transient: {err}", characteristic.0, self.peer.0);
+                Err(BleError::GattBusy(err.to_string()))
+            }
+            Err(err) => {
+                log::warn!("read: {} on {} failed: {err}", characteristic.0, self.peer.0);
+                Err(BleError::Gatt(err.to_string()))
+            }
+        }
     }
 
     async fn write_with_type(
         &mut self, characteristic: CharacteristicUuid, value: Vec<u8>, write_type: WriteType,
     ) -> Result<()> {
+        let request = bluer::gatt::remote::CharacteristicWriteRequest {
+            op_type: match write_type {
+                WriteType::WithResponse => bluer::gatt::WriteOp::Request,
+                WriteType::WithoutResponse => bluer::gatt::WriteOp::Command,
+            },
+            ..Default::default()
+        };
+        // A single attempt — no internal retry; see `read`'s matching
+        // comment and `is_transient_gatt_error`'s doc comment.
         let _dial = self.dial_lock.lock().await;
         self.ensure_current()?;
         let target = self.find_characteristic(characteristic).await?;
@@ -1201,23 +1631,18 @@ impl GattConnection for LinuxGattConnection {
         if let Ok(mtu) = target.mtu().await {
             self.att_mtu.store(mtu as u16, Ordering::Relaxed);
         }
-        let request = bluer::gatt::remote::CharacteristicWriteRequest {
-            op_type: match write_type {
-                WriteType::WithResponse => bluer::gatt::WriteOp::Request,
-                WriteType::WithoutResponse => bluer::gatt::WriteOp::Command,
-            },
-            ..Default::default()
-        };
-        log::trace!(
-            "write: {} bytes to {} on {} ({write_type:?})",
-            value.len(),
-            characteristic.0,
-            self.peer.0
-        );
-        target.write_ext(&value, &request).await.map_err(|err| {
-            log::warn!("write: {} bytes to {} failed: {err}", value.len(), self.peer.0);
-            BleError::Gatt(err.to_string())
-        })
+        log::trace!("write: {} bytes to {} on {} ({write_type:?})", value.len(), characteristic.0, self.peer.0);
+        match target.write_ext(&value, &request).await {
+            Ok(()) => Ok(()),
+            Err(err) if is_transient_gatt_error(&err) => {
+                log::warn!("write: {} bytes to {} rejected, possibly transient: {err}", value.len(), self.peer.0);
+                Err(BleError::GattBusy(err.to_string()))
+            }
+            Err(err) => {
+                log::warn!("write: {} bytes to {} failed: {err}", value.len(), self.peer.0);
+                Err(BleError::Gatt(err.to_string()))
+            }
+        }
     }
 
     async fn subscribe(
