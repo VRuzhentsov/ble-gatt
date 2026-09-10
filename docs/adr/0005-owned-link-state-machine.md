@@ -225,10 +225,15 @@ and every per-peer machine.
 |---|---|---|
 | One enum or three machines | Three | A set-owning machine is a scheduler, not a table; the flat table is most of the readability. |
 | Radio state: per-peer fact or its own machine | Own machine, fanned out | Single source of truth for "is the radio up"; a new backend wires one thing. |
-| `Draining` (Linux `pending_cleanup`) in v1 | Yes | Leaving it a side map is exactly the pattern this ADR removes; doing it later is a second migration of the same code. |
-| Deadline constants | Unified in `link_state.rs` | The machine is the source of truth for "too long"; per-backend drift is what the scatter looked like. |
-| Mock backend | Fault injector only | No real radio or callbacks to model; a `simulate_radio_off()` driving the same fan-out is enough. |
-| Rollout | One PR | User's call. Pure table + tests green before any wiring, so only the wiring is unverified on first hardware contact. |
+| `Draining` (Linux `pending_cleanup`) in v1 | Yes | Leaving it a side map is exactly the pattern this ADR removes; doing it later is a second migration of the same code. `pending_cleanup` shipped in #14 after ~6 automated-review P1 rounds — its retry loop, per-attempt bound, and `cleanup_permits` semaphore map to transitions/effects and are preserved verbatim in behaviour. |
+| Which discovered peers get a link | Explicit `track()` only; no auto-track mode | The library must not connect to a peer just because it advertises the service — discovery is untrusted metadata. A consumer that wants "connect to all" writes a two-line loop over `discover()`. |
+| `RetryBudget` config | `default()` (reasoned ladder), fully overridable | Matches Fini's existing `AUTO_RETRY_WINDOW` shape; a consumer with different timing needs is not blocked on a follow-up, and the default keeps the common case zero-config. |
+| `RadioState::Resetting` in v1 | No — fold Android `STATE_TURNING_*` into `Off` | Add it only when hardware shows a flapping adapter causing reconnect churn. `Off` → `On` already models a bounce correctly; `Resetting` would only suppress churn, which we have no evidence of yet. |
+| Deadline driver | One `Tick` loop per backend, 1s | 1s granularity is fine for 5–60s deadlines; one loop is less machinery than N timers and the dispatch is cheap. |
+| Deadline constants | Unified in `link_state.rs`, seeded from today's values | `DIAL_WINDOW` 20s / `DISCONNECT_WINDOW` 5s / `DRAIN_WINDOW` 10s (= current `CONNECT_TIMEOUT` / `DISCONNECT_TIMEOUT` / `CLEANUP_DISCONNECT_TIMEOUT`); tuned on hardware evidence. The machine is the source of truth for "too long"; per-backend drift is what the scatter looked like. |
+| `GattConnection` after `RadioLost` | `read`/`write` → `NotConnected`, decided from the machine | Same observable behaviour as today's `ensure_current`, one source instead of a separate check. |
+| Mock backend | Fault injector only (`stall_dial`, `simulate_radio_off`) | No real radio or callbacks to model; the injectors drive the same fan-out and cover the isolation + adapter-bounce tests without hardware. |
+| Rollout | One PR, docs + implementation together | Pure tables + property tests green before any wiring, so only the wiring is unverified on first hardware contact. |
 
 ## Consequences
 
@@ -299,12 +304,6 @@ effect and must be preserved, not re-derived.
 
 ## Open questions
 
-- One `Tick` loop per backend (current lean) vs. per-machine timers.
-- `GattConnection` after `RadioLost`: `read`/`write` → `NotConnected` via the
-  machine instead of `ensure_current`. Same behaviour, one source — confirm
-  that is the contract.
-- Whether `RadioState` needs `Resetting` in v1 or can fold TURNING_* into `Off`
-  until hardware shows a flapping adapter causing churn.
-- `DIAL_WINDOW` / `DISCONNECT_WINDOW` / `DRAIN_WINDOW` values — start from the
-  current `CONNECT_TIMEOUT` (20s) / `DISCONNECT_TIMEOUT` (5s) /
-  `CLEANUP_DISCONNECT_TIMEOUT` (10s), tune on hardware evidence.
+None blocking. Tuning to revisit on hardware evidence: the three deadline
+windows, and whether `RadioState` needs a `Resetting` state for a flapping
+adapter.

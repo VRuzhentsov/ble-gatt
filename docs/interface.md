@@ -271,11 +271,13 @@ let link = PeerLink::new(PeerLinkConfig {
     role: LinkRole::Symmetric { local_id: my_node_id.into() },
     limits: Default::default(),
     retry_budget: RetryBudget::default(),
+    max_links: MaxLinks::default(),
 });
 
 link.track(device.ble_address);   // when a paired device is known
 
-while let Some(ev) = link.events().next().await {
+let mut events = link.events();
+while let Some(ev) = events.next().await {
     match ev {
         PeerLinkEvent::Up { peer, channel } => {
             let session = secure_channel::authenticate(channel).await?;
@@ -283,7 +285,7 @@ while let Some(ev) = link.events().next().await {
         }
         PeerLinkEvent::Down { peer, .. } => { sessions.remove(&peer); }
         PeerLinkEvent::Status { peer, status } => { device_rows.update(peer, project(status)); }
-        PeerLinkEvent::RadioOff => device_rows.all_grey(),
+        PeerLinkEvent::RadioChanged { status } => { device_rows.set_radio(status); }
         _ => {}
     }
 }
@@ -303,16 +305,15 @@ LinkState>` for the transport layer, `should_dial_peer` wiring beyond supplying
   possible, and the "connected but isn't" bug class it removes.
 - `src/datagram/mod.rs` — the fragmentation primitive and its wire-shape limits.
 
-## Open questions
+## Settled
 
-- `discover` + explicit `track`, vs. an opt-in "auto-track anything advertising
-  the service" mode. (lean: explicit only.)
-- `RetryBudget` shape — a fixed default (redial ladder 1/2/4/8s cap 30s; give up
-  after ~60s total; acceptor inbound deadline ~60s) plus override, vs.
-  consumer-supplied only. (lean: default + override.)
-- Whether `PeerLink` exposes the negotiated MTU / `max_message_len` per peer.
-  (lean: yes, on `Up` — a consumer sizing its own payloads needs it.)
-- Does `PeerLink` build the backend internally (`new`) *and* accept an injected
-  one (`with_backend`), or only the latter? (lean: both — `new` for the normal
-  case so a Tier 3 consumer never touches `Backend`; `with_backend` for tests
-  and the mock.)
+- **Track model:** explicit `track()` only. Discovery is untrusted; a consumer
+  that wants "connect to everything advertising the service" writes a loop over
+  `discover()`.
+- **`RetryBudget`:** `default()` (redial ladder 1/2/4/8s cap 30s, give up after
+  ~60s total, acceptor inbound deadline ~60s), fully overridable.
+- **`Up` carries the peer's `max_message_len`** — a consumer sizing its own
+  payloads needs it.
+- **Construction:** `new(config)` builds the backend internally (a Tier-3
+  consumer never touches `Backend`); `with_backend(backend, config)` injects
+  one, for tests and the mock.
