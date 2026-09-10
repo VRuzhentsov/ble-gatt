@@ -71,15 +71,14 @@ library owns keeping links alive; you consume channels and status.
 ```rust
 // Normal case: PeerLink builds and owns the platform backend.
 let link: Arc<PeerLink> = PeerLink::new(PeerLinkConfig {
-    service:         MY_SERVICE,
-    characteristic:  MY_CHARACTERISTIC,
-    role:            LinkRole::Symmetric { local_id: my_node_id.into() },
-    limits:          Default::default(),
-    retry_budget:    RetryBudget::default(),
-    max_links:       MaxLinks::default(),   // concurrent-link cap; conservative default
+    // service + characteristic + fragmentation bounds all live here
+    datagram:     DatagramConfig::new(MY_SERVICE, MY_CHARACTERISTIC),
+    role:         LinkRole::Symmetric { local_id: my_node_id.into() },
+    retry_budget: RetryBudget::default(),
+    max_links:    MaxLinks::default(),   // concurrent-link cap; conservative default
 });
 
-// Tests / advanced: inject an already-built backend (e.g. a MockNetwork).
+// Tests / advanced: inject an already-built backend (e.g. a MockBackend).
 let link = PeerLink::with_backend(backend, config);
 ```
 
@@ -94,11 +93,11 @@ exists, the radio may not" is a cleaner story than "the handle may not exist
 yet," and "one call, works anywhere" beats "one call, but only from async
 context" — a requirement a sync signature does not advertise.
 
-Because the driver owns its own runtime, the `DatagramChannel` handed out by
+Because the driver owns its own runtime, the `PeerChannel` handed out by
 `PeerLinkEvent::Up` is a **message-passing handle** — `send` / `recv` move bytes
 across a channel to the driver thread, which does the GATT work. It is usable
-from any context (the consumer's runtime, or none). This differs from Tier 2,
-whose `DatagramChannel` holds the `GattConnection` directly and runs on the
+from any context (the consumer's runtime, or none). This differs from Tier 2's
+`DatagramChannel`, which holds the `GattConnection` directly and runs on the
 caller's runtime.
 
 The handle's contract across that hop:
@@ -113,11 +112,11 @@ The handle's contract across that hop:
 - **A full internal send queue surfaces as `BleError::GattBusy`**, not as
   backpressure indistinguishable from a stall — so it slots into the same retry.
 
-Fields. `service` + `characteristic` are the wire contract. `role` is the one
-genuine protocol decision — who dials for a pair that can both see each other —
-and has no sensible default, because it needs a stable identity both peers
-compare the same way (glare; `docs/adr/0003` revision). `limits`,
-`retry_budget`, and `max_links` have defaults.
+Fields. `datagram` carries the wire contract (service + characteristic) and
+the fragmentation bounds. `role` is the one genuine protocol decision — who
+dials for a pair that can both see each other — and has no sensible default,
+because it needs a stable identity both peers compare the same way (glare;
+`docs/adr/0003` revision). `retry_budget` and `max_links` have defaults.
 
 `max_links` caps how many peers hold a live link at once, because a BLE central
 has a hard concurrent-link limit (commonly ~7 on Android, higher on BlueZ). You
@@ -135,11 +134,13 @@ you know your platform allows more.
 ### Declare interest
 
 ```rust
-link.track(peer_address);     // keep a link to this peer alive
-link.untrack(peer_address);   // stop; drop the channel, disconnect, forget
-link.retry(peer_address);     // a tracked peer that gave up: try again now
+// peer_id is the identity for the dial tiebreak — only consulted for
+// LinkRole::Symmetric; pass anything comparable for the other roles.
+link.track(peer_address, peer_id);   // keep a link to this peer alive
+link.untrack(peer_address);          // stop; drop the channel, disconnect, forget
+link.retry(peer_address);            // a tracked peer that gave up: try again now
 
-let mut found = link.discover().await?;   // peers advertising the service
+let found: Vec<PeerAddress> = link.discover().await?;   // a bounded snapshot
 // discovery is untrusted metadata — you decide which to track()
 ```
 
@@ -151,10 +152,10 @@ let mut found = link.discover().await?;   // peers advertising the service
 let mut events = link.events();
 while let Some(ev) = events.next().await {
     match ev {
-        PeerLinkEvent::Up { peer, channel }   => { /* a message pipe, valid until Down */ }
-        PeerLinkEvent::Down { peer, reason }  => { /* the channel is dead */ }
-        PeerLinkEvent::Status { peer, status } => { /* Connecting / Connected / Waiting / GaveUp / … */ }
-        PeerLinkEvent::RadioChanged { status } => { /* On | Off | Unsupported */ }
+        PeerLinkEvent::Up { peer, max_message_len, channel } => { /* a PeerChannel, valid until Down */ }
+        PeerLinkEvent::Down { peer }              => { /* the channel is dead */ }
+        PeerLinkEvent::Status { peer, status }    => { /* Connecting / Connected / Waiting / GaveUp / … */ }
+        PeerLinkEvent::RadioChanged { status }    => { /* On | Off | Unsupported */ }
     }
 }
 
@@ -166,11 +167,11 @@ let r = link.radio();                 // On | Off | Unsupported, without waiting
 
 ```
 Untracked
-Unavailable { reason: RadioOff | Unsupported | RoleCannotReach }
+Unavailable                      // radio Off / Unsupported
 Queued                           // tracked, but max_links is full — waiting for a slot
 Connecting                       // trying — dialing, or waiting for an inbound link
 Connected
-Waiting { retry_at: Instant }    // a previous attempt failed; backing off before the next
+Waiting                          // a previous attempt failed; backing off before the next
 GaveUp                           // the retry budget is spent; left by retry() or an inbound link
 ```
 
@@ -267,26 +268,24 @@ DB-backed eligibility, and the non-radio preconditions above.
 ```rust
 // Built where DeviceConnectionState is built — sync, infallible, no await.
 let link = PeerLink::new(PeerLinkConfig {
-    service: FINI_SERVICE, characteristic: FINI_CHAR,
+    datagram: DatagramConfig::new(FINI_SERVICE, FINI_CHAR),
     role: LinkRole::Symmetric { local_id: my_node_id.into() },
-    limits: Default::default(),
     retry_budget: RetryBudget::default(),
     max_links: MaxLinks::default(),
 });
 
-link.track(device.ble_address);   // when a paired device is known
+link.track(device.ble_address, device.node_id.into());   // when a paired device is known
 
 let mut events = link.events();
 while let Some(ev) = events.next().await {
     match ev {
-        PeerLinkEvent::Up { peer, channel } => {
+        PeerLinkEvent::Up { peer, channel, .. } => {
             let session = secure_channel::authenticate(channel).await?;
             sessions.insert(peer, session);
         }
-        PeerLinkEvent::Down { peer, .. } => { sessions.remove(&peer); }
+        PeerLinkEvent::Down { peer } => { sessions.remove(&peer); }
         PeerLinkEvent::Status { peer, status } => { device_rows.update(peer, project(status)); }
         PeerLinkEvent::RadioChanged { status } => { device_rows.set_radio(status); }
-        _ => {}
     }
 }
 ```
