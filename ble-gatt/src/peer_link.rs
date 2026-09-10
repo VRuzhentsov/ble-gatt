@@ -393,11 +393,25 @@ impl Driver {
                 return;
             }
         };
-        // Ask the backend, do not assume `On` — a PeerLink created while
-        // Bluetooth is off must not spend the retry budget dialing into a
-        // dead radio.
+        // Initial usability = the radio is on AND the backend can do the
+        // role this config needs. A `PeerLink` created while Bluetooth is off
+        // must not spend the retry budget dialing a dead radio; one asked to
+        // `AcceptOnly` on a central-only platform must report `Unsupported`,
+        // not churn every peer to `GaveUp`.
         let mut events = backend.events();
-        let initial = backend.radio_status().await;
+        let caps = backend.capabilities().await;
+        let role_supported = match self.config.role {
+            LinkRole::DialOnly => caps.central,
+            LinkRole::AcceptOnly => caps.peripheral,
+            // Symmetric needs central to dial at all; accepting is a bonus
+            // it degrades to giving up on if peripheral is missing.
+            LinkRole::Symmetric { .. } => caps.central,
+        };
+        let initial = if !role_supported {
+            RadioStatus::Unsupported
+        } else {
+            backend.radio_status().await
+        };
         self.set_radio(initial);
         let _ = self
             .events_tx
@@ -703,7 +717,13 @@ impl Driver {
             central: CentralLink::new(),
             peripheral: PeripheralLink::new(),
             dials,
-            trying_since: Some(Instant::now()),
+            // The give-up clock starts when the peer actually starts trying —
+            // for the acceptor that is now (it is waiting for an inbound
+            // link); for the dialer it is when it gets a slot and its first
+            // dial fires (`pump_dials`), so a peer sitting `Queued` behind a
+            // full `max_links` is not ticked to `GaveUp` while it never had a
+            // chance.
+            trying_since: if dials { None } else { Some(Instant::now()) },
             attempts: 0,
             retry_at: None,
             gave_up: false,
@@ -750,6 +770,10 @@ impl Driver {
             let (next, _) = p.central.apply(CentralEvent::DialStarted { session: next_session }, now);
             p.central = next;
             p.attempts += 1;
+            // The give-up clock starts here, on the first real attempt — not
+            // at `track()` — so a peer that queued behind a full cap is not
+            // charged for the wait.
+            p.trying_since.get_or_insert(now);
 
             let backend = backend.clone();
             let cfg = self.config.datagram.clone();
@@ -910,7 +934,11 @@ impl Driver {
                         p.gave_up = false;
                         p.attempts = 0;
                         p.retry_at = None;
-                        p.trying_since = Some(now);
+                        // Same rule as `track`: the dialer's clock restarts
+                        // when it next actually dials; the acceptor's runs
+                        // from now (it will be waiting for an inbound link
+                        // once the radio is back).
+                        p.trying_since = if p.dials { None } else { Some(now) };
                     }
                 }
                 if radio.usable() {

@@ -211,6 +211,32 @@ async fn max_links_queues_the_overflow_and_promotes_on_a_free_slot() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_role_the_backend_cannot_do_reports_unsupported() {
+    let network = MockNetwork::new();
+    // Central-only backend (like most Android devices).
+    let central_only = CapabilityReport { central: true, peripheral: false };
+    let backend = Arc::new(MockBackend::new(PeerAddress("me".into()), network, central_only));
+
+    let link = PeerLink::with_backend(
+        backend,
+        PeerLinkConfig {
+            datagram: datagram_config(),
+            role: LinkRole::AcceptOnly, // needs peripheral, which the backend lacks
+            retry_budget: tight_budget(),
+            max_links: MaxLinks(4),
+        },
+    );
+
+    assert_eventually(|| link.radio() == RadioStatus::Unsupported).await;
+    link.track(PeerAddress("someone".into()), "someone".into());
+    // The peer is unreachable, not "gave up" — the radio can't do this role.
+    assert_eventually(|| {
+        link.status(&PeerAddress("someone".into())) == PeerStatus::Unavailable
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn two_symmetric_peers_connect_one_dialing_one_accepting() {
     let network = MockNetwork::new();
     let low = Arc::new(MockBackend::new(PeerAddress("aaa".into()), network.clone(), caps()));
