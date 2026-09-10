@@ -233,7 +233,18 @@ process-global maps (`in_flight_dials`, `dial_backoff_until`, `dial_exhausted`,
 `accepting_side_unconnected_since`) move out. The one thing the consumer keeps
 touching is *rendering* "gave up" — so `PeerLink` must expose `PeerStatus::GaveUp`
 plus a `retry(peer)` call, or the consumer rebuilds a shadow of the exhaustion
-tracking just to draw its UI row.
+tracking just to draw its UI row. `GaveUp` is reachable from both roles: the
+dialer by exhausting its redial budget, the acceptor by no inbound link
+arriving within the same budget (`accepting_side_unconnected_since` in fini —
+its absence was a past P1: the acceptor's row sat on "connecting" forever).
+
+Two implications this pushes down onto the machines: (a) `RadioState` starts
+before a backend exists, so `PeerLink::new` can be synchronous and infallible —
+the driver task acquires the platform backend lazily and feeds `RadioState`
+`Unsupported` / `PoweredOn` as it learns; a consumer builds the handle wherever
+its own state is built. (b) `PeerLink::events()` is a broadcast (fresh
+subscription per call), so a second lifecycle consumer is an addition rather
+than a breaking change.
 
 This is a large change touching the connection path on both backends and the
 Kotlin bridge. Comments on the deleted maps document past P1 fixes

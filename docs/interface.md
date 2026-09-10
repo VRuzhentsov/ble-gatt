@@ -70,20 +70,31 @@ library owns keeping links alive; you consume channels and status.
 ### Configure once
 
 ```rust
-let link = PeerLink::start(backend, PeerLinkConfig {
+// Normal case: PeerLink builds and owns the platform backend.
+let link: Arc<PeerLink> = PeerLink::new(PeerLinkConfig {
     service:        MY_SERVICE,
     characteristic: MY_CHARACTERISTIC,
     role:           LinkRole::Symmetric { local_id: my_node_id.into() },
     limits:         Default::default(),
-    redial_backoff: Some(BackoffLadder::default()),
-}).await?;
+    retry_budget:   RetryBudget::default(),
+});
+
+// Tests / advanced: inject an already-built backend (e.g. a MockNetwork).
+let link = PeerLink::with_backend(backend, config);
 ```
 
-Four fields. `service` + `characteristic` are the wire contract. `role` is the
-one genuine protocol decision — who dials for a pair that can both see each
-other — and has no sensible default, because it needs a stable identity both
-peers compare the same way (glare; `docs/adr/0003` revision). `limits` and
-`redial_backoff` have defaults.
+**`PeerLink::new` is synchronous and infallible.** It returns a handle
+immediately; adapter acquisition happens inside, asynchronously, and may fail
+or be slow — that shows up as `radio()` reporting `Off` or `Unsupported`, not as
+a construction error. "A handle exists, the radio may not" is a cleaner story
+for a consumer than "the handle may not exist yet" — and it means a consumer
+can build the handle wherever its own state is built, sync or not.
+
+Fields. `service` + `characteristic` are the wire contract. `role` is the one
+genuine protocol decision — who dials for a pair that can both see each other —
+and has no sensible default, because it needs a stable identity both peers
+compare the same way (glare; `docs/adr/0003` revision). `limits` and
+`retry_budget` have defaults.
 
 | `LinkRole` | Behaviour |
 |---|---|
@@ -102,10 +113,13 @@ let mut found = link.discover().await?;   // peers advertising the service
 // discovery is untrusted metadata — you decide which to track()
 ```
 
-### Consume one event stream
+### Consume the event stream
 
 ```rust
-while let Some(ev) = link.events().next().await {
+// Each call is an independent subscription — events() is a broadcast, so a
+// second consumer is an addition, not a breaking change.
+let mut events = link.events();
+while let Some(ev) = events.next().await {
     match ev {
         PeerLinkEvent::Up { peer, channel }   => { /* a message pipe, valid until Down */ }
         PeerLinkEvent::Down { peer, reason }  => { /* the channel is dead */ }
@@ -123,19 +137,23 @@ let r = link.radio();                 // On | Off | Unsupported, without waiting
 ```
 Untracked
 Unavailable { reason: RadioOff | Unsupported | RoleCannotReach }
-Connecting                       // dialing or accepting, not up
+Connecting                       // trying — dialing, or waiting for an inbound link
 Connected
-Waiting { retry_at: Instant }    // dropped, backing off before the next redial
-GaveUp                           // redial ladder exhausted; left by retry() or an inbound link
+Waiting { retry_at: Instant }    // a previous attempt failed; backing off before the next
+GaveUp                           // the retry budget is spent; left by retry() or an inbound link
 ```
 
 A projection of the library's internal state — you never see the state machine.
 
-**`GaveUp` is deliberately observable, not swallowed.** A consumer that renders
-a "gave up — tap to retry" row needs to *see* that the library stopped, and
-needs `retry(peer)` to restart it. Without both, the consumer rebuilds a shadow
-of the exhaustion tracking just to draw the row — which is the seam drawn one
-notch too tight.
+**`GaveUp` is reachable in *both* roles.** The dialer reaches it by exhausting
+its redial budget. The acceptor — the side that is *not* the designated dialer
+for a pair — reaches it when no inbound link arrives within the same budget.
+Without the second path an acceptor's row would sit on `Connecting` forever
+(a real past defect in Fini's `accepting_side_unconnected_since` /
+`check_accepting_side_exhaustion`). `GaveUp` is deliberately observable, not
+swallowed: a consumer rendering a "gave up — tap to retry" row needs to *see*
+it and needs `retry(peer)` to restart. `retry_budget` therefore covers both
+"how many redials" and "how long to wait for an inbound link."
 
 **`RadioStatus::Unsupported`** is reported when the platform has no usable BLE
 adapter for the configured `role` at all (as opposed to `Off`, a toggle). This
@@ -143,8 +161,10 @@ replaces a consumer polling `capabilities()` to guess.
 
 ### The library owns
 
+- building and owning the platform backend (Tier 3 consumers never touch `Backend`)
 - dialing tracked peers (when `role` and the tiebreak allow)
-- the redial ladder on drop — backoff, and giving up (observable as `GaveUp`)
+- the retry budget on *both* sides — redials for the dialer, an inbound-link
+  deadline for the acceptor — and giving up (observable as `GaveUp`)
 - accepting inbound links
 - exactly one link per peer; resolving glare via `role`
 - tearing everything down on radio-off and re-establishing on radio-on
@@ -195,12 +215,13 @@ DB-backed eligibility, and the non-radio preconditions above.
 ## Worked example — Fini
 
 ```rust
-let link = PeerLink::start(backend, PeerLinkConfig {
+// Built where DeviceConnectionState is built — sync, infallible, no await.
+let link = PeerLink::new(PeerLinkConfig {
     service: FINI_SERVICE, characteristic: FINI_CHAR,
     role: LinkRole::Symmetric { local_id: my_node_id.into() },
     limits: Default::default(),
-    redial_backoff: Some(BackoffLadder::default()),
-}).await?;
+    retry_budget: RetryBudget::default(),
+});
 
 link.track(device.ble_address);   // when a paired device is known
 
@@ -238,7 +259,12 @@ LinkState>` for the transport layer, `should_dial_peer` wiring beyond supplying
   (lean: sit above; Tier 2 stays public.)
 - `discover` + explicit `track`, vs. an opt-in "auto-track anything advertising
   the service" mode. (lean: explicit only.)
-- Backoff ladder: a fixed default (1/2/4/8s, 30s cap) plus override, vs.
+- `RetryBudget` shape — a fixed default (redial ladder 1/2/4/8s cap 30s; give up
+  after ~60s total; acceptor inbound deadline ~60s) plus override, vs.
   consumer-supplied only. (lean: default + override.)
 - Whether `PeerLink` exposes the negotiated MTU / `max_message_len` per peer.
   (lean: yes, on `Up` — a consumer sizing its own payloads needs it.)
+- Does `PeerLink` build the backend internally (`new`) *and* accept an injected
+  one (`with_backend`), or only the latter? (lean: both — `new` for the normal
+  case so a Tier 3 consumer never touches `Backend`; `with_backend` for tests
+  and the mock.)
