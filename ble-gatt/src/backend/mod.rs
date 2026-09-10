@@ -200,3 +200,19 @@ pub trait Backend: Send + Sync {
     /// notifications come back through `GattConnection::subscribe`.
     fn events(&self) -> BoxStream<GattEvent>;
 }
+
+/// Construct the backend for the platform this binary runs on. Used by
+/// `PeerLink::new`; a consumer using the `Backend` trait directly picks its
+/// own constructor (`linux::LinuxBackend::new`, `android::AndroidBackend::new`,
+/// or `mock::MockBackend::new`).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub async fn platform() -> Result<std::sync::Arc<dyn Backend>> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok(std::sync::Arc::new(linux::LinuxBackend::new().await?))
+    }
+    #[cfg(target_os = "android")]
+    {
+        Ok(std::sync::Arc::new(android::AndroidBackend::new().await?))
+    }
+}

@@ -49,6 +49,10 @@ pub(crate) struct LocalRadio {
     /// connection rather than merely dropping the Rust handle.
     disconnect_log: Mutex<Vec<PeerAddress>>,
     subscribe_delay: Mutex<Option<std::time::Duration>>,
+    /// Per-peer artificial `connect` stall, armed by `stall_connect`. Models
+    /// a peer whose dial hangs — used to prove one wedged peer does not
+    /// block dials to the others.
+    connect_delay: Mutex<HashMap<PeerAddress, std::time::Duration>>,
     /// Armed by `arm_scan_failure`, consumed by the next `scan`. Exists so
     /// the asynchronous scan-failure path — the one that makes "Bluetooth is
     /// off" distinguishable from "no peers nearby" — is reachable in tests
@@ -122,6 +126,10 @@ impl LocalRadio {
 
     pub(crate) fn stall_subscribe(&self, delay: std::time::Duration) {
         *self.subscribe_delay.lock().unwrap() = Some(delay);
+    }
+
+    pub(crate) fn stall_connect(&self, peer: &PeerAddress, delay: std::time::Duration) {
+        self.connect_delay.lock().unwrap().insert(peer.clone(), delay);
     }
 
     pub(crate) fn arm_scan_failure(&self, message: impl Into<String>) {
@@ -226,6 +234,10 @@ impl LocalRadio {
     }
 
     pub(crate) async fn connect(&self, central: &PeerAddress, peer: &PeerAddress) -> Result<u64> {
+        let stall = self.connect_delay.lock().unwrap().get(peer).copied();
+        if let Some(delay) = stall {
+            tokio::time::sleep(delay).await;
+        }
         {
             let peripherals = self.peripherals.lock().unwrap();
             peripherals
