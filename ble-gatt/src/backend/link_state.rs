@@ -18,10 +18,11 @@
 //!
 //! Nothing here is exposed to consumers; `PeerLink` projects a `PeerStatus`.
 
-// The backend wiring and `PeerLink` land in the same change; until every
-// phase of that is in, parts of this surface have only their tests as
-// callers. Remove this once `android.rs` / `linux.rs` / `peer_link.rs` are
-// wired.
+// `PeripheralLink` / `PeripheralEvent` and a few `CentralLink` helpers have
+// only their tests as callers until the backend fold-in follow-up wires the
+// per-peer machines into `android.rs` / `linux.rs` (see ADR-0005 — the Linux
+// `Draining` migration in particular is deferred). `PeerLink` already
+// consumes `CentralLink` / `RadioState`.
 #![allow(dead_code)]
 
 use std::time::{Duration, Instant};

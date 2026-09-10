@@ -66,6 +66,31 @@ Every backend speaks the same generic GATT vocabulary
 callers never see platform types (no `bluer::Device`, no JNI handles)
 crossing the `Backend`/`GattConnection` port boundary.
 
+### Three tiers, one carrier
+
+`ble-gatt` carries bytes; it does not interpret them (ADR-0003). A consumer
+picks the tier that fits:
+
+| Tier | Use for | Owns the connection? |
+|---|---|---|
+| **raw GATT** (`Backend`) | a vendor device with its own protocol | you |
+| **datagram** (`datagram::connect` / `serve`) | one message pipe, driven by hand | you |
+| **`PeerLink`** | app-to-app links to a set of peers | the library |
+
+See **`docs/interface.md`** for how `PeerLink` is meant to be used, and
+**`docs/adr/0005`** for the owned link-state machine underneath it.
+
+### Load-bearing files
+
+Read the doc next to each before changing it:
+
+| File | What it governs | Doc |
+|---|---|---|
+| `src/backend/link_state.rs` | `RadioState` / `CentralLink` / `PeripheralLink` — whether a dial happens, whether a stale record blocks one, whether a consumer is told a link died | `docs/adr/0005` |
+| `src/peer_link.rs` | the tier-3 API and its dedicated-thread driver | `docs/interface.md`, `docs/adr/0005` |
+| `src/backend/linux.rs` — `LinuxConnectGuard` / `pending_cleanup` | abandoned-connect cleanup, hardware-proven over ~6 review rounds | code comments + `docs/adr/0005` |
+| `src/datagram/mod.rs` | fragmentation, the one-central and one-link-per-peer limits | ADR-0003 |
+
 ## Status
 
 Early, under active development. `ble-gatt`'s Linux backend is real and
