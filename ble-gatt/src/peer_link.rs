@@ -34,6 +34,9 @@ use crate::models::{GattEvent, PeerAddress, RadioStatus, Role};
 
 const EVENT_CHANNEL_CAPACITY: usize = 128;
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
+/// Backoff before restarting the inbound server after a transient
+/// serve/advertise failure.
+const SERVE_RETRY_DELAY: Duration = Duration::from_secs(2);
 const CHANNEL_SEND_QUEUE: usize = 16;
 const CHANNEL_RECV_QUEUE: usize = 64;
 const DISCOVER_WINDOW: Duration = Duration::from_secs(3);
@@ -410,21 +413,37 @@ impl Driver {
             mpsc::unbounded_channel::<(PeerAddress, Result<DatagramChannel>)>();
         let (linkgone_tx, mut linkgone_rx) = mpsc::unbounded_channel::<PeerAddress>();
         let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<DatagramChannel>();
-        let mut serve_task: Option<tokio::task::AbortHandle> = None;
+        // The inbound server: a task, plus when to (re)start it. `serve`
+        // exits on a transient advertise/setup failure, so the driver must
+        // notice and restart it rather than sitting without a server until
+        // the radio next toggles.
+        let mut serve: Option<tokio::task::JoinHandle<()>> = None;
+        let mut serve_retry_at: Option<Instant> = None;
         let mut tick = tokio::time::interval(TICK_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         if self.accepts() && radio.usable() {
-            serve_task = Some(self.spawn_serve(&backend, &inbound_tx));
+            serve = Some(self.spawn_serve(&backend, &inbound_tx));
         }
 
         loop {
+            // (Re)start the inbound server when it is wanted, absent, and off
+            // any backoff.
+            if self.accepts()
+                && radio.usable()
+                && serve.is_none()
+                && serve_retry_at.is_none_or(|at| Instant::now() >= at)
+            {
+                serve = Some(self.spawn_serve(&backend, &inbound_tx));
+                serve_retry_at = None;
+            }
+
             // Wake at the earliest per-peer deadline (a backoff expiring, a
             // give-up clock running out) rather than only on the 1s tick —
             // with a short retry budget the tick alone lets a peer give up
             // before its own retry_at fires.
             let wake = self
-                .next_wake(&peers)
+                .next_wake(&peers, radio, serve_retry_at)
                 .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
 
             tokio::select! {
@@ -432,6 +451,18 @@ impl Driver {
 
                 _ = tokio::time::sleep_until(wake) => {
                     self.on_tick(&mut peers, radio);
+                }
+
+                Some(()) = async {
+                    match serve.as_mut() {
+                        Some(h) => { let _ = h.await; Some(()) }
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // The server task ended — a transient serve/advertise
+                    // failure. Back off, then the top of the loop restarts it.
+                    serve = None;
+                    serve_retry_at = Some(Instant::now() + SERVE_RETRY_DELAY);
                 }
 
                 cmd = self.cmd_rx.recv() => match cmd {
@@ -465,17 +496,13 @@ impl Driver {
                 Some(ev) = events.next() => {
                     let was_usable = radio.usable();
                     self.on_backend_event(&mut peers, &mut radio, ev);
-                    // Start / stop the inbound server with the radio.
-                    if self.accepts() {
-                        match (was_usable, radio.usable()) {
-                            (false, true) => {
-                                serve_task = Some(self.spawn_serve(&backend, &inbound_tx));
-                            }
-                            (true, false) => {
-                                if let Some(h) = serve_task.take() { h.abort(); }
-                            }
-                            _ => {}
+                    // Stop the inbound server when the radio goes down; the
+                    // top of the loop restarts it when the radio is back.
+                    if self.accepts() && was_usable && !radio.usable() {
+                        if let Some(h) = serve.take() {
+                            h.abort();
                         }
+                        serve_retry_at = None;
                     }
                 }
 
@@ -484,7 +511,7 @@ impl Driver {
                 }
 
                 Some(channel) = inbound_rx.recv() => {
-                    self.on_inbound(&mut peers, channel, &linkgone_tx);
+                    self.on_inbound(&mut peers, channel, radio, &linkgone_tx);
                 }
 
                 Some(peer) = linkgone_rx.recv() => {
@@ -499,7 +526,7 @@ impl Driver {
             self.refresh_all_status(&peers, radio);
         }
 
-        if let Some(h) = serve_task.take() {
+        if let Some(h) = serve.take() {
             h.abort();
         }
         for (_, mut p) in peers.drain() {
@@ -512,9 +539,12 @@ impl Driver {
         !matches!(self.config.role, LinkRole::DialOnly)
     }
 
-    /// The earliest instant any peer needs the driver to wake — a backoff
-    /// expiring, or a give-up clock running out.
-    fn next_wake(&self, peers: &HashMap<PeerAddress, Peer>) -> Option<tokio::time::Instant> {
+    /// The earliest instant the driver needs to wake — a backoff expiring, a
+    /// give-up clock running out, or the inbound server's restart backoff.
+    fn next_wake(
+        &self, peers: &HashMap<PeerAddress, Peer>, radio: RadioState,
+        serve_retry_at: Option<Instant>,
+    ) -> Option<tokio::time::Instant> {
         let now = Instant::now();
         let base = tokio::time::Instant::now();
         let mut earliest: Option<Duration> = None;
@@ -528,21 +558,29 @@ impl Driver {
             if let Some(at) = p.retry_at {
                 consider(at.saturating_duration_since(now));
             }
-            if let Some(since) = p.trying_since {
-                let deadline = if p.dials {
-                    self.config.retry_budget.give_up_after
-                } else {
-                    self.config.retry_budget.acceptor_deadline
-                };
-                consider((since + deadline).saturating_duration_since(now));
+            // The give-up clock only counts while the radio is usable (see
+            // `on_tick`); scheduling a wake for an already-expired deadline
+            // during an outage would just spin the loop.
+            if radio.usable() {
+                if let Some(since) = p.trying_since {
+                    let deadline = if p.dials {
+                        self.config.retry_budget.give_up_after
+                    } else {
+                        self.config.retry_budget.acceptor_deadline
+                    };
+                    consider((since + deadline).saturating_duration_since(now));
+                }
             }
+        }
+        if let Some(at) = serve_retry_at {
+            consider(at.saturating_duration_since(now));
         }
         earliest.map(|d| base + d)
     }
 
     fn spawn_serve(
         &self, backend: &Arc<dyn Backend>, inbound_tx: &mpsc::UnboundedSender<DatagramChannel>,
-    ) -> tokio::task::AbortHandle {
+    ) -> tokio::task::JoinHandle<()> {
         let backend = backend.clone();
         let cfg = self.config.datagram.clone();
         let inbound_tx = inbound_tx.clone();
@@ -558,22 +596,30 @@ impl Driver {
                 Err(err) => log::warn!("peer_link: serve failed: {err}"),
             }
         })
-        .abort_handle()
     }
 
     fn on_inbound(
-        &self, peers: &mut HashMap<PeerAddress, Peer>, channel: DatagramChannel,
+        &self, peers: &mut HashMap<PeerAddress, Peer>, channel: DatagramChannel, radio: RadioState,
         linkgone_tx: &mpsc::UnboundedSender<PeerAddress>,
     ) {
         let peer = channel.peer();
+        // `datagram::serve` already serves one central at a time (its wire
+        // shape — notify is a broadcast that cannot be addressed), so the
+        // acceptor side of `PeerLink` holds at most one inbound link. A
+        // second tracked acceptor peer stays `Connecting` until the slot
+        // frees or it gives up. Beyond that, honour `max_links` across both
+        // directions so a `Symmetric` instance at its outbound cap does not
+        // exceed it on an inbound link.
+        let over_cap = Self::committed(peers) >= self.config.max_links.0;
         let Some(p) = peers.get_mut(&peer) else {
             // Not a tracked peer — do not serve a stranger. Dropping the
             // channel disconnects it.
             return;
         };
-        // If we are the designated dialer for this pair, or already linked,
-        // this inbound connection loses: drop it.
-        if p.dials || p.link.is_some() {
+        // If we are the designated dialer for this pair, already linked, over
+        // the link cap, or the radio is not usable, this inbound connection
+        // loses: drop it (which disconnects it).
+        if p.dials || p.link.is_some() || over_cap || !radio.usable() {
             return;
         }
         let now = Instant::now();

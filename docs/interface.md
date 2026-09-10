@@ -131,6 +131,14 @@ you know your platform allows more.
 | `DialOnly` | only ever dials (central-only platform, a hub) |
 | `AcceptOnly` | only ever advertises and accepts (a peripheral) |
 
+**The accepting side holds one inbound link at a time.** The datagram tier
+serves one central at a time (its wire shape — notify is a broadcast that
+cannot be addressed to one peer). So on the acceptor side of `Symmetric`, or
+in `AcceptOnly`, a second tracked peer stays `Connecting` until the first
+inbound link frees or it gives up. `max_links > 1` only widens the *dialer*
+side. A consumer that needs to serve many peers at once wants a per-peer
+notify on the `Backend` port first (tracked separately).
+
 ### Declare interest
 
 ```rust
