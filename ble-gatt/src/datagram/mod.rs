@@ -64,14 +64,23 @@
 //!   *not* a cross-role takeover — it only stops a stale fragment from a
 //!   re-served address leaking into the new peripheral-role session).
 //! - Simultaneous dials (both peers call `connect` before either link
-//!   exists) are glare: resolving them needs a tiebreaker both peers agree
-//!   on (lowest address backs off, inbound always wins, …), which is a
-//!   protocol convention this library cannot pick for its consumers.
+//!   exists) are glare. The tiebreaker that resolves it must be
+//!   *identity-based* — derived from the two addresses, so both peers
+//!   independently name the *same* physical link. A symmetric rule such as
+//!   "keep my inbound link" or "keep my own `connect` channel" does the
+//!   opposite: each peer's inbound is the other's outbound, so the two ends
+//!   drop different links and both collapse. Workable conventions: the
+//!   lower-address peer is the sole dialer (no second link ever forms), or
+//!   — if both links did briefly form — keep the one whose *central* is the
+//!   lower-address peer. Which convention to use is a protocol decision
+//!   this library cannot make for its consumers.
 //!
-//! When both links do briefly coexist they are not equal: a `connect`
-//! channel negotiates a real MTU, while a `serve` channel is fixed at the
-//! 23-byte spec minimum (the peripheral has no `GattConnection` to query).
-//! A consumer choosing which link to keep should prefer the `connect` one.
+//! The two directions of any single link are also not symmetric: the
+//! central→peripheral direction fragments against the negotiated MTU, while
+//! the peripheral→central (notify) direction is fixed at the 23-byte spec
+//! minimum because the peripheral has no `GattConnection` to query. So the
+//! sole-dialer choice above also decides which peer's *outbound* gets the
+//! larger budget — the dialer's does.
 
 pub mod fragment;
 pub mod reassembly;
