@@ -1487,6 +1487,14 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         retryHandler.postDelayed(fallback, PRIORITY_BOOTSTRAP_TIMEOUT_MS)
     }
 
+    /// ABI version of this bridge — must match `BRIDGE_ABI_VERSION` in
+    /// `android.rs`. Bumped whenever the Rust side adds a JNI call or
+    /// callback this file must implement. `android.rs` logs a loud error on
+    /// a mismatch, which is the only signal a consumer vendoring an
+    /// out-of-date copy of this file will get. v2: added `onRadioState` /
+    /// `isRadioEnabled` / this method (ADR-0005).
+    fun bridgeAbiVersion(): Int = 2
+
     /// Whether the adapter is present and switched on. Rust's
     /// `Backend::radio_status()` calls this once at startup, so a `PeerLink`
     /// created while Bluetooth is off does not wrongly assume it is on.

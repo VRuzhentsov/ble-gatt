@@ -292,6 +292,25 @@ Kotlin bridge. Comments on the deleted maps document past P1 fixes
 a corresponding transition or it regresses, and they are enumerated in those
 comments to be walked one by one.
 
+### Distribution: the Rust and Kotlin halves must move together
+
+`android.rs` gained a JNI entry point (`onRadioState`) and two calls
+(`isRadioEnabled`, `bridgeAbiVersion`); `BleGattBridge.kt` gained the
+`ACTION_STATE_CHANGED` receiver that calls the first. **The Kotlin bridge is
+not published with this crate.** A consumer that pins `ble-gatt` by git rev
+gets the new `android.rs` but keeps whatever `BleGattBridge.kt` it vendors —
+so the adapter-state receiver is absent from the APK, its JNI entry point is
+never called, and the adapter-bounce bug simply persists. Nothing errors:
+the Rust is new, everything compiles.
+
+Made loud, not fatal: `android.rs` carries `BRIDGE_ABI_VERSION` (now `2`);
+`BleGattBridge.kt::bridgeAbiVersion()` returns the matching number;
+`AndroidBackend::new` logs an error at construction on a mismatch and a
+warning if the method is absent entirely (a bridge predating this scheme). A
+consumer vendoring the bridge must copy `BleGattBridge.kt` **and** `Native.kt`
+from the crate's revision in lockstep and bump both when they land a change
+that adds a JNI method.
+
 ## Risks
 
 Landing in one piece means no intermediate version verifiable on hardware —

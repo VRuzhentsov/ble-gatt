@@ -81,6 +81,13 @@ use crate::models::{
 const BRIDGE_CLASS_BINARY_NAME: &str = "dev.blegatt.BleGattBridge";
 const CALLBACK_CLASS: &str = "dev/blegatt/NativeKt";
 
+/// Bumped whenever `android.rs` gains a JNI call or callback the Kotlin
+/// bridge must implement. `BleGattBridge.kt::bridgeAbiVersion()` returns the
+/// matching number; a mismatch is logged at construction (see
+/// `AndroidBackend::new`). v2 added `onRadioState` / `bridgeAbiVersion` /
+/// `isRadioEnabled` (ADR-0005's adapter-state receiver).
+const BRIDGE_ABI_VERSION: i32 = 2;
+
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 
 /// A live notification route: the subscribe request that created it, where
@@ -247,6 +254,15 @@ impl Inner {
             Err(err) => Err(jni_error(env, method, err)),
         }
     }
+
+    fn call_int(&self, env: &mut JNIEnv, method: &str, sig: &str) -> Result<i32> {
+        let bridge = self.bridge()?;
+        let result = env.call_method(bridge.as_obj(), method, sig, &[]).and_then(|v| v.i());
+        match result {
+            Ok(value) => Ok(value),
+            Err(err) => Err(jni_error(env, method, err)),
+        }
+    }
 }
 
 /// Turn a failed JNI call into a `BleError`, **describing and clearing any
@@ -380,6 +396,32 @@ impl AndroidBackend {
             .bridge
             .set(bridge_ref)
             .map_err(|_| BleError::AdapterUnavailable("bridge already initialized".to_string()))?;
+
+        // The Kotlin bridge does not travel with this crate — a consumer that
+        // vendors its own copy (fini does) can be running an older
+        // `BleGattBridge.kt` than this `android.rs` expects. That failure is
+        // otherwise silent: everything compiles, the Rust is new, and a
+        // feature like the adapter-state receiver simply never fires because
+        // nothing on the Java side calls its JNI entry point. A version
+        // mismatch is logged loudly rather than made fatal, since a consumer
+        // may legitimately be mid-migration.
+        let bridge_abi = inner
+            .env()
+            .ok()
+            .and_then(|mut env| inner.call_int(&mut env, "bridgeAbiVersion", "()I").ok());
+        match bridge_abi {
+            Some(v) if v == BRIDGE_ABI_VERSION => {}
+            Some(v) => log::error!(
+                "BleGattBridge.kt ABI v{v} but this ble-gatt expects v{BRIDGE_ABI_VERSION} — \
+                 the vendored bridge is out of date; features added since v{v} will not work. \
+                 Copy tauri-plugin-ble-gatt/android/src/main/kotlin/dev/blegatt/BleGattBridge.kt \
+                 (and Native.kt) from this crate's revision."
+            ),
+            None => log::warn!(
+                "BleGattBridge.kt predates ABI versioning (no bridgeAbiVersion method) — \
+                 update the vendored bridge to this crate's revision"
+            ),
+        }
 
         Ok(Self { inner })
     }
