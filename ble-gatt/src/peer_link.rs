@@ -24,7 +24,9 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
-use crate::backend::link_state::{CentralEvent, CentralLink, RadioEvent, RadioState};
+use crate::backend::link_state::{
+    CentralEvent, CentralLink, PeripheralEvent, PeripheralLink, RadioEvent, RadioState,
+};
 use crate::backend::{Backend, BoxStream};
 use crate::datagram::{self, DatagramChannel, DatagramConfig};
 use crate::error::{BleError, Result};
@@ -355,7 +357,9 @@ struct Driver {
 /// Per-tracked-peer state the driver owns.
 struct Peer {
     central: CentralLink,
-    /// `true` when this side is the designated dialer for the pair.
+    peripheral: PeripheralLink,
+    /// `true` when this side is the designated dialer for the pair. The
+    /// other side accepts an inbound link instead.
     dials: bool,
     /// When the current run of attempts started, for the give-up clocks.
     trying_since: Option<Instant>,
@@ -386,23 +390,49 @@ impl Driver {
                 return;
             }
         };
-        self.set_radio(RadioStatus::On);
+        // Ask the backend, do not assume `On` — a PeerLink created while
+        // Bluetooth is off must not spend the retry budget dialing into a
+        // dead radio.
+        let mut events = backend.events();
+        let initial = backend.radio_status().await;
+        self.set_radio(initial);
         let _ = self
             .events_tx
-            .send(PeerLinkEvent::RadioChanged { status: RadioStatus::On });
+            .send(PeerLinkEvent::RadioChanged { status: initial });
 
-        let mut radio = RadioState::On;
+        let mut radio = match initial {
+            RadioStatus::On => RadioState::On,
+            RadioStatus::Off => RadioState::Off,
+            RadioStatus::Unsupported => RadioState::Unsupported,
+        };
         let mut peers: HashMap<PeerAddress, Peer> = HashMap::new();
-        let mut events = backend.events();
         let (conn_tx, mut conn_rx) =
             mpsc::unbounded_channel::<(PeerAddress, Result<DatagramChannel>)>();
         let (linkgone_tx, mut linkgone_rx) = mpsc::unbounded_channel::<PeerAddress>();
+        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<DatagramChannel>();
+        let mut serve_task: Option<tokio::task::AbortHandle> = None;
         let mut tick = tokio::time::interval(TICK_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        if self.accepts() && radio.usable() {
+            serve_task = Some(self.spawn_serve(&backend, &inbound_tx));
+        }
+
         loop {
+            // Wake at the earliest per-peer deadline (a backoff expiring, a
+            // give-up clock running out) rather than only on the 1s tick —
+            // with a short retry budget the tick alone lets a peer give up
+            // before its own retry_at fires.
+            let wake = self
+                .next_wake(&peers)
+                .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
+
             tokio::select! {
                 _ = &mut shutdown => break,
+
+                _ = tokio::time::sleep_until(wake) => {
+                    self.on_tick(&mut peers, radio);
+                }
 
                 cmd = self.cmd_rx.recv() => match cmd {
                     None => break,
@@ -433,11 +463,28 @@ impl Driver {
                 },
 
                 Some(ev) = events.next() => {
+                    let was_usable = radio.usable();
                     self.on_backend_event(&mut peers, &mut radio, ev);
+                    // Start / stop the inbound server with the radio.
+                    if self.accepts() {
+                        match (was_usable, radio.usable()) {
+                            (false, true) => {
+                                serve_task = Some(self.spawn_serve(&backend, &inbound_tx));
+                            }
+                            (true, false) => {
+                                if let Some(h) = serve_task.take() { h.abort(); }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
 
                 Some((peer, result)) = conn_rx.recv() => {
                     self.on_dial_result(&mut peers, peer, result, &linkgone_tx);
+                }
+
+                Some(channel) = inbound_rx.recv() => {
+                    self.on_inbound(&mut peers, channel, &linkgone_tx);
                 }
 
                 Some(peer) = linkgone_rx.recv() => {
@@ -452,9 +499,100 @@ impl Driver {
             self.refresh_all_status(&peers, radio);
         }
 
+        if let Some(h) = serve_task.take() {
+            h.abort();
+        }
         for (_, mut p) in peers.drain() {
             self.tear_down(&mut p);
         }
+    }
+
+    /// Whether this role ever accepts an inbound link.
+    fn accepts(&self) -> bool {
+        !matches!(self.config.role, LinkRole::DialOnly)
+    }
+
+    /// The earliest instant any peer needs the driver to wake — a backoff
+    /// expiring, or a give-up clock running out.
+    fn next_wake(&self, peers: &HashMap<PeerAddress, Peer>) -> Option<tokio::time::Instant> {
+        let now = Instant::now();
+        let base = tokio::time::Instant::now();
+        let mut earliest: Option<Duration> = None;
+        let mut consider = |d: Duration| {
+            earliest = Some(earliest.map_or(d, |e| e.min(d)));
+        };
+        for p in peers.values() {
+            if p.link.is_some() || p.gave_up {
+                continue;
+            }
+            if let Some(at) = p.retry_at {
+                consider(at.saturating_duration_since(now));
+            }
+            if let Some(since) = p.trying_since {
+                let deadline = if p.dials {
+                    self.config.retry_budget.give_up_after
+                } else {
+                    self.config.retry_budget.acceptor_deadline
+                };
+                consider((since + deadline).saturating_duration_since(now));
+            }
+        }
+        earliest.map(|d| base + d)
+    }
+
+    fn spawn_serve(
+        &self, backend: &Arc<dyn Backend>, inbound_tx: &mpsc::UnboundedSender<DatagramChannel>,
+    ) -> tokio::task::AbortHandle {
+        let backend = backend.clone();
+        let cfg = self.config.datagram.clone();
+        let inbound_tx = inbound_tx.clone();
+        tokio::spawn(async move {
+            match datagram::serve(backend, &cfg).await {
+                Ok(mut stream) => {
+                    while let Some(channel) = stream.next().await {
+                        if inbound_tx.send(channel).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(err) => log::warn!("peer_link: serve failed: {err}"),
+            }
+        })
+        .abort_handle()
+    }
+
+    fn on_inbound(
+        &self, peers: &mut HashMap<PeerAddress, Peer>, channel: DatagramChannel,
+        linkgone_tx: &mpsc::UnboundedSender<PeerAddress>,
+    ) {
+        let peer = channel.peer();
+        let Some(p) = peers.get_mut(&peer) else {
+            // Not a tracked peer — do not serve a stranger. Dropping the
+            // channel disconnects it.
+            return;
+        };
+        // If we are the designated dialer for this pair, or already linked,
+        // this inbound connection loses: drop it.
+        if p.dials || p.link.is_some() {
+            return;
+        }
+        let now = Instant::now();
+        let session = now.elapsed().as_nanos() as u64;
+        let (pl, _) = p.peripheral.apply(PeripheralEvent::CentralConnected { session }, now);
+        p.peripheral = pl;
+        let (pl, _) = p.peripheral.apply(PeripheralEvent::CentralSubscribed, now);
+        p.peripheral = pl;
+        p.gave_up = false;
+        p.trying_since = None;
+        p.retry_at = None;
+        let max_len = channel.max_message_len();
+        let (link, handle) = self.start_pump(channel, peer.clone(), linkgone_tx.clone());
+        p.link = Some(link);
+        let _ = self.events_tx.send(PeerLinkEvent::Up {
+            peer,
+            max_message_len: max_len,
+            channel: handle,
+        });
     }
 
     async fn acquire_backend(&mut self) -> Option<Arc<dyn Backend>> {
@@ -517,6 +655,7 @@ impl Driver {
         };
         peers.entry(peer.clone()).or_insert_with(|| Peer {
             central: CentralLink::new(),
+            peripheral: PeripheralLink::new(),
             dials,
             trying_since: Some(Instant::now()),
             attempts: 0,
@@ -536,8 +675,14 @@ impl Driver {
             return;
         }
         let now = Instant::now();
-        let live = peers.values().filter(|p| p.link.is_some()).count();
-        let mut budget = self.config.max_links.0.saturating_sub(live);
+        // A dial in flight reserves a slot too — otherwise with max_links = 1
+        // a stalled dial for one peer lets a second dial start, and both can
+        // land, exceeding the cap.
+        let committed = peers
+            .values()
+            .filter(|p| p.link.is_some() || matches!(p.central, CentralLink::Dialing { .. }))
+            .count();
+        let mut budget = self.config.max_links.0.saturating_sub(committed);
 
         let mut candidates: Vec<PeerAddress> = peers.keys().cloned().collect();
         candidates.sort_by(|a, b| a.0.cmp(&b.0));
@@ -583,6 +728,15 @@ impl Driver {
             Ok(channel) => {
                 let (next, _) = p.central.apply(CentralEvent::DialSucceeded, now);
                 p.central = next;
+                // The state may have moved past `Dialing` while this dial ran
+                // — a radio-off, an untrack/retrack, the dial deadline. If so
+                // `apply(DialSucceeded)` was a no-op and this result is stale:
+                // drop the channel (its `Drop` disconnects) rather than
+                // installing a link nothing is expecting.
+                if !matches!(p.central, CentralLink::Connected { .. }) {
+                    drop(channel);
+                    return;
+                }
                 p.attempts = 0;
                 p.trying_since = None;
                 p.retry_at = None;
@@ -607,8 +761,12 @@ impl Driver {
         if let Some(p) = peers.get_mut(&peer) {
             if p.link.take().is_some() {
                 let now = Instant::now();
-                let (next, _) = p.central.apply(CentralEvent::LinkDropped, now);
-                p.central = next;
+                // One of the two applies; the other is a no-op from its
+                // current state.
+                let (c, _) = p.central.apply(CentralEvent::LinkDropped, now);
+                p.central = c;
+                let (pl, _) = p.peripheral.apply(PeripheralEvent::CentralDropped, now);
+                p.peripheral = pl;
                 p.trying_since = Some(now);
                 p.attempts = 0;
                 p.retry_at = None;
@@ -697,7 +855,10 @@ impl Driver {
                     for (peer, p) in peers.iter_mut() {
                         let (c, _) = p.central.apply(CentralEvent::RadioLost, now);
                         p.central = c;
-                        if p.link.take().is_some() {
+                        let (pl, _) = p.peripheral.apply(PeripheralEvent::RadioLost, now);
+                        p.peripheral = pl;
+                        if let Some(link) = p.link.take() {
+                            link.pump.abort();
                             let _ = self.events_tx.send(PeerLinkEvent::Down { peer: peer.clone() });
                         }
                         p.gave_up = false;
@@ -711,6 +872,8 @@ impl Driver {
                     for p in peers.values_mut() {
                         let (c, _) = p.central.apply(CentralEvent::RadioBack, now);
                         p.central = c;
+                        let (pl, _) = p.peripheral.apply(PeripheralEvent::RadioBack, now);
+                        p.peripheral = pl;
                     }
                 }
             }
@@ -727,13 +890,19 @@ impl Driver {
         }
     }
 
-    fn on_tick(&self, peers: &mut HashMap<PeerAddress, Peer>, _radio: RadioState) {
+    fn on_tick(&self, peers: &mut HashMap<PeerAddress, Peer>, radio: RadioState) {
         let now = Instant::now();
         for p in peers.values_mut() {
             let (c, _) = p.central.apply(CentralEvent::Tick, now);
             p.central = c;
 
-            if p.link.is_some() || p.gave_up {
+            // The give-up clock only runs while there is actually a chance of
+            // connecting. With the radio off, nothing is being attempted —
+            // ticking a peer to `gave_up` here would make `RadioBack` leave
+            // it permanently skipped (`RadioLost` already reset `trying_since`,
+            // so without this the deadline would still elapse against a dead
+            // radio).
+            if !radio.usable() || p.link.is_some() || p.gave_up {
                 continue;
             }
             let deadline = if p.dials {
@@ -755,20 +924,23 @@ impl Driver {
             link.pump.abort();
             drop(link);
         }
-        let now = Instant::now();
-        // Force the machine back to a clean stop without touching the
-        // platform beyond what the dropped channel already did.
-        let (c, _) = p.central.apply(CentralEvent::RadioLost, now);
-        p.central = c;
-        let (c, _) = p.central.apply(CentralEvent::RadioBack, now);
-        p.central = c;
+        // Reset both machines to their start state; the dropped channel has
+        // already done the platform teardown.
+        p.central = CentralLink::new();
+        p.peripheral = PeripheralLink::new();
     }
 
     // ---- status projection ------------------------------------------------
 
+    fn committed(peers: &HashMap<PeerAddress, Peer>) -> usize {
+        peers
+            .values()
+            .filter(|p| p.link.is_some() || matches!(p.central, CentralLink::Dialing { .. }))
+            .count()
+    }
+
     fn refresh_all_status(&self, peers: &HashMap<PeerAddress, Peer>, radio: RadioState) {
-        let live = peers.values().filter(|p| p.link.is_some()).count();
-        let over_cap = live >= self.config.max_links.0;
+        let over_cap = Self::committed(peers) >= self.config.max_links.0;
         for (peer, p) in peers {
             self.publish_status(peer, project(p, radio, over_cap));
         }
@@ -778,8 +950,7 @@ impl Driver {
         &self, peers: &HashMap<PeerAddress, Peer>, peer: &PeerAddress, radio: RadioState,
     ) {
         if let Some(p) = peers.get(peer) {
-            let live = peers.values().filter(|p| p.link.is_some()).count();
-            let over_cap = live >= self.config.max_links.0;
+            let over_cap = Self::committed(peers) >= self.config.max_links.0;
             self.publish_status(peer, project(p, radio, over_cap));
         }
     }

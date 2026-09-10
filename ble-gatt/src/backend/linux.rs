@@ -276,16 +276,12 @@ impl LinuxBackend {
             .default_adapter()
             .await
             .map_err(|err| BleError::AdapterUnavailable(err.to_string()))?;
-        let powered = adapter
-            .is_powered()
-            .await
-            .map_err(|err| BleError::AdapterUnavailable(err.to_string()))?;
-        if !powered {
-            return Err(BleError::AdapterUnavailable(format!(
-                "adapter {} is not powered on",
-                adapter.name()
-            )));
-        }
+        // An adapter that exists but is powered off is *not* a construction
+        // failure: `PeerLink` needs the backend to exist so its `Powered`
+        // watcher can report the adapter coming back, and `radio_status()`
+        // reports the current state. Only a missing adapter (handled above)
+        // is unrecoverable. Operations attempted while unpowered fail on
+        // their own, honestly.
         let (events_tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
 
         // Watch the adapter's `Powered` property and forward it as
@@ -1542,6 +1538,14 @@ impl Backend for LinuxBackend {
                     }
                 }),
         )
+    }
+
+    async fn radio_status(&self) -> crate::models::RadioStatus {
+        if self.adapter.is_powered().await.unwrap_or(false) {
+            crate::models::RadioStatus::On
+        } else {
+            crate::models::RadioStatus::Off
+        }
     }
 }
 

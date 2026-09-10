@@ -199,6 +199,15 @@ pub trait Backend: Send + Sync {
     /// Characteristic *values* are not carried here — client-side
     /// notifications come back through `GattConnection::subscribe`.
     fn events(&self) -> BoxStream<GattEvent>;
+
+    /// The radio's usability *right now*. `events()` carries the
+    /// [`GattEvent::RadioChanged`] transitions; this is the initial value a
+    /// consumer needs before the first transition arrives (a `PeerLink`
+    /// created while Bluetooth is already off must not assume `On`).
+    /// Defaults to `On` for backends with no notion of a togglable radio.
+    async fn radio_status(&self) -> crate::models::RadioStatus {
+        crate::models::RadioStatus::On
+    }
 }
 
 /// Construct the backend for the platform this binary runs on. Used by

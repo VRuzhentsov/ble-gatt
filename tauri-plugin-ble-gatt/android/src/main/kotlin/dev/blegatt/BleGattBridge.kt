@@ -1487,6 +1487,11 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         retryHandler.postDelayed(fallback, PRIORITY_BOOTSTRAP_TIMEOUT_MS)
     }
 
+    /// Whether the adapter is present and switched on. Rust's
+    /// `Backend::radio_status()` calls this once at startup, so a `PeerLink`
+    /// created while Bluetooth is off does not wrongly assume it is on.
+    fun isRadioEnabled(): Boolean = adapter?.isEnabled == true
+
     /// Close every outbound `BluetoothGatt` and clear the per-connection
     /// client-side bookkeeping. Shared by `closeAll` and the adapter-state
     /// receiver — the latter also fires the `onDisconnected` JNI callbacks

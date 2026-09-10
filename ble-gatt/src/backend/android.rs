@@ -923,6 +923,21 @@ impl Backend for AndroidBackend {
             }
         }))
     }
+
+    async fn radio_status(&self) -> RadioStatus {
+        let enabled = (|| -> Result<bool> {
+            let mut env = self.inner.env()?;
+            self.inner.call_bool(&mut env, "isRadioEnabled", "()Z")
+        })();
+        match enabled {
+            Ok(true) => RadioStatus::On,
+            Ok(false) => RadioStatus::Off,
+            // A JNI failure here is not itself a radio state — assume the
+            // common case and let the receiver correct it on the next
+            // toggle.
+            Err(_) => RadioStatus::On,
+        }
+    }
 }
 
 /// Wraps the discovery channel so dropping the stream (the caller losing

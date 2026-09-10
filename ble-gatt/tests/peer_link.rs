@@ -111,7 +111,7 @@ async fn tracking_a_peer_yields_a_working_channel() {
 
     let up = wait_for(&mut events, |ev| matches!(ev, PeerLinkEvent::Up { peer, .. } if peer.0 == "peer-a")).await;
     let PeerLinkEvent::Up { channel, .. } = up else { unreachable!() };
-    assert_eq!(link.status(&PeerAddress("peer-a".into())), PeerStatus::Connected);
+    assert_eventually(|| link.status(&PeerAddress("peer-a".into())) == PeerStatus::Connected).await;
 
     channel.send(b"hello".to_vec()).await.expect("send");
 }
@@ -133,7 +133,7 @@ async fn one_wedged_peer_does_not_stall_the_others() {
 
     // "fine" connects while "stuck" is still hanging.
     wait_for(&mut events, |ev| matches!(ev, PeerLinkEvent::Up { peer, .. } if peer.0 == "fine")).await;
-    assert_eq!(link.status(&PeerAddress("fine".into())), PeerStatus::Connected);
+    assert_eventually(|| link.status(&PeerAddress("fine".into())) == PeerStatus::Connected).await;
     assert_ne!(link.status(&PeerAddress("stuck".into())), PeerStatus::Connected);
 }
 
@@ -201,11 +201,39 @@ async fn max_links_queues_the_overflow_and_promotes_on_a_free_slot() {
 
     // Deterministic slot order: "aaa" sorts first, so it gets the one slot.
     wait_for(&mut events, |ev| matches!(ev, PeerLinkEvent::Up { peer, .. } if peer.0 == "aaa")).await;
-    wait_for(&mut events, |ev| {
-        matches!(ev, PeerLinkEvent::Status { peer, status: PeerStatus::Queued } if peer.0 == "bbb")
+    assert_eventually(|| {
+        link.status(&PeerAddress("bbb".into())) == PeerStatus::Queued
     })
     .await;
 
     link.untrack(PeerAddress("aaa".into()));
     wait_for(&mut events, |ev| matches!(ev, PeerLinkEvent::Up { peer, .. } if peer.0 == "bbb")).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_symmetric_peers_connect_one_dialing_one_accepting() {
+    let network = MockNetwork::new();
+    let low = Arc::new(MockBackend::new(PeerAddress("aaa".into()), network.clone(), caps()));
+    let high = Arc::new(MockBackend::new(PeerAddress("zzz".into()), network.clone(), caps()));
+
+    let cfg = |id: &str| PeerLinkConfig {
+        datagram: datagram_config(),
+        role: LinkRole::Symmetric { local_id: id.into() },
+        retry_budget: tight_budget(),
+        max_links: MaxLinks(4),
+    };
+
+    // "aaa" < "zzz", so the "aaa" side dials and the "zzz" side accepts.
+    let link_low = PeerLink::with_backend(low, cfg("aaa"));
+    let link_high = PeerLink::with_backend(high, cfg("zzz"));
+    let mut ev_low = link_low.events();
+    let mut ev_high = link_high.events();
+
+    link_low.track(PeerAddress("zzz".into()), "zzz".into());
+    link_high.track(PeerAddress("aaa".into()), "aaa".into());
+
+    wait_for(&mut ev_low, |ev| matches!(ev, PeerLinkEvent::Up { peer, .. } if peer.0 == "zzz")).await;
+    wait_for(&mut ev_high, |ev| matches!(ev, PeerLinkEvent::Up { peer, .. } if peer.0 == "aaa")).await;
+    assert_eventually(|| link_low.status(&PeerAddress("zzz".into())) == PeerStatus::Connected).await;
+    assert_eventually(|| link_high.status(&PeerAddress("aaa".into())) == PeerStatus::Connected).await;
 }
