@@ -375,6 +375,11 @@ struct Peer {
     /// `linkgone` notification from a superseded pump (an untrack/track +
     /// fast reconnect can outrun it) is recognised as stale and ignored.
     link_gen: u64,
+    /// The in-flight `datagram::connect` task, while `central` is `Dialing`.
+    /// Aborted when the state leaves `Dialing` (deadline, radio loss,
+    /// untrack) so the abandoned attempt does not keep the backend's
+    /// connection slot while `pump_dials` starts another.
+    dial_task: Option<tokio::task::AbortHandle>,
 }
 
 struct LiveLink {
@@ -398,25 +403,15 @@ impl Driver {
                 return;
             }
         };
-        // Initial usability = the radio is on AND the backend can do the
-        // role this config needs. A `PeerLink` created while Bluetooth is off
-        // must not spend the retry budget dialing a dead radio; one asked to
-        // `AcceptOnly` on a central-only platform must report `Unsupported`,
-        // not churn every peer to `GaveUp`.
+        // Radio state first, capability classification only once it is on.
+        // On Android `capabilities()` reads `bluetoothLeScanner` /
+        // `bluetoothLeAdvertiser`, both null while the adapter is *off* — so
+        // checking capabilities first would turn a recoverable `Off` into a
+        // permanent `Unsupported` that ignores the later `On` broadcast.
+        // `Off` is recoverable; `Unsupported` is not, so it must only be
+        // concluded against a usable radio.
         let mut events = backend.events();
-        let caps = backend.capabilities().await;
-        let role_supported = match self.config.role {
-            LinkRole::DialOnly => caps.central,
-            LinkRole::AcceptOnly => caps.peripheral,
-            // Symmetric needs central to dial at all; accepting is a bonus
-            // it degrades to giving up on if peripheral is missing.
-            LinkRole::Symmetric { .. } => caps.central,
-        };
-        let initial = if !role_supported {
-            RadioStatus::Unsupported
-        } else {
-            backend.radio_status().await
-        };
+        let initial = self.assess_radio(&backend).await;
         self.set_radio(initial);
         let _ = self
             .events_tx
@@ -518,6 +513,17 @@ impl Driver {
 
                 Some(ev) = events.next() => {
                     let was_usable = radio.usable();
+                    // A `RadioChanged { On }` from a backend that cannot do
+                    // this role (Android reporting the adapter back but
+                    // still no advertiser for `AcceptOnly`) becomes
+                    // `Unsupported` — the capability check that could not run
+                    // while the adapter was off runs now.
+                    let ev = match ev {
+                        GattEvent::RadioChanged { status: RadioStatus::On } => {
+                            GattEvent::RadioChanged { status: self.assess_radio(&backend).await }
+                        }
+                        other => other,
+                    };
                     self.on_backend_event(&mut peers, &mut radio, ev);
                     // Stop the inbound server when the radio goes down; the
                     // top of the loop restarts it when the radio is back.
@@ -560,6 +566,31 @@ impl Driver {
     /// Whether this role ever accepts an inbound link.
     fn accepts(&self) -> bool {
         !matches!(self.config.role, LinkRole::DialOnly)
+    }
+
+    /// The radio's status *and* whether the backend can do the configured
+    /// role. `Off` (recoverable) is decided from the radio alone; the
+    /// permanent `Unsupported` is only concluded against a usable radio,
+    /// since `capabilities()` under-reports while the adapter is off.
+    async fn assess_radio(&self, backend: &Arc<dyn Backend>) -> RadioStatus {
+        match backend.radio_status().await {
+            RadioStatus::On => {
+                let caps = backend.capabilities().await;
+                let ok = match self.config.role {
+                    LinkRole::DialOnly => caps.central,
+                    LinkRole::AcceptOnly => caps.peripheral,
+                    // Symmetric needs central to dial at all; accepting is a
+                    // bonus it degrades to giving up on without peripheral.
+                    LinkRole::Symmetric { .. } => caps.central,
+                };
+                if ok {
+                    RadioStatus::On
+                } else {
+                    RadioStatus::Unsupported
+                }
+            }
+            other => other,
+        }
     }
 
     /// The earliest instant the driver needs to wake — a backoff expiring, a
@@ -739,6 +770,7 @@ impl Driver {
             gave_up: false,
             link: None,
             link_gen: 0,
+            dial_task: None,
         });
         self.refresh_status(peers, &peer, radio);
     }
@@ -790,10 +822,22 @@ impl Driver {
             let cfg = self.config.datagram.clone();
             let conn_tx = conn_tx.clone();
             let peer2 = peer.clone();
-            tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 let result = datagram::connect(backend, &peer2, &cfg).await;
                 let _ = conn_tx.send((peer2, result));
             });
+            p.dial_task = Some(task.abort_handle());
+        }
+    }
+
+    /// Abort a peer's in-flight dial task if the state has left `Dialing` —
+    /// aborting drops `datagram::connect`'s future, whose `PendingConnection`
+    /// guard disconnects the half-open link.
+    fn clear_stale_dial(p: &mut Peer) {
+        if !matches!(p.central, CentralLink::Dialing { .. }) {
+            if let Some(h) = p.dial_task.take() {
+                h.abort();
+            }
         }
     }
 
@@ -804,6 +848,8 @@ impl Driver {
         let Some(p) = peers.get_mut(&peer) else {
             return;
         };
+        // This task has delivered its result; it is no longer in flight.
+        p.dial_task = None;
         let now = Instant::now();
         match result {
             Ok(channel) => {
@@ -944,6 +990,7 @@ impl Driver {
                         p.central = c;
                         let (pl, _) = p.peripheral.apply(PeripheralEvent::RadioLost, now);
                         p.peripheral = pl;
+                        Self::clear_stale_dial(p);
                         if let Some(link) = p.link.take() {
                             link.pump.abort();
                             let _ = self.events_tx.send(PeerLinkEvent::Down { peer: peer.clone() });
@@ -986,6 +1033,11 @@ impl Driver {
         for p in peers.values_mut() {
             let (c, _) = p.central.apply(CentralEvent::Tick, now);
             p.central = c;
+            // A dial that timed out (`Dialing` -> `Idle` on `Tick`) leaves a
+            // `datagram::connect` task still holding the backend's slot —
+            // abort it before `pump_dials` starts a fresh attempt Android
+            // would reject as already in progress.
+            Self::clear_stale_dial(p);
 
             // The give-up clock only runs while there is actually a chance of
             // connecting. With the radio off, nothing is being attempted —
@@ -1015,8 +1067,11 @@ impl Driver {
             link.pump.abort();
             drop(link);
         }
-        // Reset both machines to their start state; the dropped channel has
-        // already done the platform teardown.
+        if let Some(h) = p.dial_task.take() {
+            h.abort();
+        }
+        // Reset both machines to their start state; the dropped channel /
+        // aborted dial has already done the platform teardown.
         p.central = CentralLink::new();
         p.peripheral = PeripheralLink::new();
     }
