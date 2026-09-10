@@ -271,6 +271,21 @@ Implications this pushes onto `PeerLink`'s shape (not the machines themselves):
 - `PeerLink::events()` is a broadcast (fresh subscription per call), so a second
   lifecycle consumer is an addition rather than a breaking change.
 
+**The adapter-bounce fix reaches Tier 2, not just `PeerLink`.** The Android
+"connection already open" refusal is raised from `self.connections`
+(`android.rs`); `onRadioState` sweeps that *same* map, emits `Disconnected`
+per held address, and then `RadioChanged`. So a raw-`Backend` or `datagram`
+consumer that never adopts `PeerLink` still recovers from an adapter toggle —
+which is the difference between "fixed for new consumers" and "fixed" (Fini is
+a Tier 2 consumer). On Linux the equivalent is BlueZ's own `Connected(false)`
+per device driving the existing central and peripheral link-loss watchers,
+which clear `dialed` / `served_peers`; the new `Powered` watcher only adds the
+aggregate `RadioChanged` signal. The one Linux record that recovers on a
+delay rather than immediately is a `pending_cleanup` quarantine whose cleanup
+`Disconnect` cannot complete while the adapter is down — it clears when the
+adapter returns and a retry resolves. The deferred `Draining` migration tidies
+that.
+
 This is a large change touching the connection path on both backends and the
 Kotlin bridge. Comments on the deleted maps document past P1 fixes
 (`in_flight` timing, quarantine-on-failure, the `superseded` guard); each needs
