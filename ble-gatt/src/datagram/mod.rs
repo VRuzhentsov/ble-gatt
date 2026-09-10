@@ -1344,7 +1344,12 @@ pub async fn serve(
                     }
                 }
                 // Central-role lifecycle belongs to `connect`, not here.
-                GattEvent::Connected { .. } | GattEvent::Disconnected { .. } => {}
+                // `RadioChanged` is for `PeerLink` / a whole-connectivity
+                // consumer; the per-peer `Disconnected` events a radio loss
+                // also produces are what `serve` acts on.
+                GattEvent::Connected { .. }
+                | GattEvent::Disconnected { .. }
+                | GattEvent::RadioChanged { .. } => {}
             }
         }
     });
