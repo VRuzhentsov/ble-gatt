@@ -371,9 +371,14 @@ struct Peer {
     retry_at: Option<Instant>,
     gave_up: bool,
     link: Option<LiveLink>,
+    /// Incremented for every link installed for this address, so a
+    /// `linkgone` notification from a superseded pump (an untrack/track +
+    /// fast reconnect can outrun it) is recognised as stale and ignored.
+    link_gen: u64,
 }
 
 struct LiveLink {
+    gen: u64,
     pump: tokio::task::AbortHandle,
     /// Held so the pump task's `teardown` receiver stays open; dropping this
     /// (on `tear_down`) tells the pump to drop the `DatagramChannel`.
@@ -425,7 +430,7 @@ impl Driver {
         let mut peers: HashMap<PeerAddress, Peer> = HashMap::new();
         let (conn_tx, mut conn_rx) =
             mpsc::unbounded_channel::<(PeerAddress, Result<DatagramChannel>)>();
-        let (linkgone_tx, mut linkgone_rx) = mpsc::unbounded_channel::<PeerAddress>();
+        let (linkgone_tx, mut linkgone_rx) = mpsc::unbounded_channel::<(PeerAddress, u64)>();
         let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<DatagramChannel>();
         // The inbound server: a task, plus when to (re)start it. `serve`
         // exits on a transient advertise/setup failure, so the driver must
@@ -499,7 +504,11 @@ impl Driver {
                             p.gave_up = false;
                             p.attempts = 0;
                             p.retry_at = None;
-                            p.trying_since = Some(Instant::now());
+                            // Same rule as `track` / `RadioLost`: a dialer's
+                            // clock starts when it actually dials, so a retry
+                            // issued while every slot is full is not charged
+                            // for the wait.
+                            p.trying_since = if p.dials { None } else { Some(Instant::now()) };
                         }
                     }
                     Some(Command::Discover(reply)) => {
@@ -528,8 +537,8 @@ impl Driver {
                     self.on_inbound(&mut peers, channel, radio, &linkgone_tx);
                 }
 
-                Some(peer) = linkgone_rx.recv() => {
-                    self.on_link_gone(&mut peers, peer);
+                Some((peer, gen)) = linkgone_rx.recv() => {
+                    self.on_link_gone(&mut peers, peer, gen);
                 }
 
                 _ = tick.tick() => {
@@ -614,7 +623,7 @@ impl Driver {
 
     fn on_inbound(
         &self, peers: &mut HashMap<PeerAddress, Peer>, channel: DatagramChannel, radio: RadioState,
-        linkgone_tx: &mpsc::UnboundedSender<PeerAddress>,
+        linkgone_tx: &mpsc::UnboundedSender<(PeerAddress, u64)>,
     ) {
         let peer = channel.peer();
         // `datagram::serve` already serves one central at a time (its wire
@@ -645,8 +654,9 @@ impl Driver {
         p.gave_up = false;
         p.trying_since = None;
         p.retry_at = None;
+        p.link_gen += 1;
         let max_len = channel.max_message_len();
-        let (link, handle) = self.start_pump(channel, peer.clone(), linkgone_tx.clone());
+        let (link, handle) = self.start_pump(channel, peer.clone(), p.link_gen, linkgone_tx.clone());
         p.link = Some(link);
         let _ = self.events_tx.send(PeerLinkEvent::Up {
             peer,
@@ -728,6 +738,7 @@ impl Driver {
             retry_at: None,
             gave_up: false,
             link: None,
+            link_gen: 0,
         });
         self.refresh_status(peers, &peer, radio);
     }
@@ -788,7 +799,7 @@ impl Driver {
 
     fn on_dial_result(
         &self, peers: &mut HashMap<PeerAddress, Peer>, peer: PeerAddress,
-        result: Result<DatagramChannel>, linkgone_tx: &mpsc::UnboundedSender<PeerAddress>,
+        result: Result<DatagramChannel>, linkgone_tx: &mpsc::UnboundedSender<(PeerAddress, u64)>,
     ) {
         let Some(p) = peers.get_mut(&peer) else {
             return;
@@ -810,8 +821,9 @@ impl Driver {
                 p.attempts = 0;
                 p.trying_since = None;
                 p.retry_at = None;
+                p.link_gen += 1;
                 let max_len = channel.max_message_len();
-                let (link, handle) = self.start_pump(channel, peer.clone(), linkgone_tx.clone());
+                let (link, handle) = self.start_pump(channel, peer.clone(), p.link_gen, linkgone_tx.clone());
                 p.link = Some(link);
                 let _ = self.events_tx.send(PeerLinkEvent::Up {
                     peer,
@@ -827,21 +839,26 @@ impl Driver {
         }
     }
 
-    fn on_link_gone(&self, peers: &mut HashMap<PeerAddress, Peer>, peer: PeerAddress) {
+    fn on_link_gone(&self, peers: &mut HashMap<PeerAddress, Peer>, peer: PeerAddress, gen: u64) {
         if let Some(p) = peers.get_mut(&peer) {
-            if p.link.take().is_some() {
-                let now = Instant::now();
-                // One of the two applies; the other is a no-op from its
-                // current state.
-                let (c, _) = p.central.apply(CentralEvent::LinkDropped, now);
-                p.central = c;
-                let (pl, _) = p.peripheral.apply(PeripheralEvent::CentralDropped, now);
-                p.peripheral = pl;
-                p.trying_since = Some(now);
-                p.attempts = 0;
-                p.retry_at = None;
-                let _ = self.events_tx.send(PeerLinkEvent::Down { peer });
+            // Ignore a `linkgone` from a superseded pump: an untrack/track +
+            // fast reconnect for the same address can install a replacement
+            // link before the old pump's queued notification is processed.
+            if p.link.as_ref().is_none_or(|l| l.gen != gen) {
+                return;
             }
+            p.link = None;
+            let now = Instant::now();
+            // One of the two applies; the other is a no-op from its current
+            // state.
+            let (c, _) = p.central.apply(CentralEvent::LinkDropped, now);
+            p.central = c;
+            let (pl, _) = p.peripheral.apply(PeripheralEvent::CentralDropped, now);
+            p.peripheral = pl;
+            p.trying_since = Some(now);
+            p.attempts = 0;
+            p.retry_at = None;
+            let _ = self.events_tx.send(PeerLinkEvent::Down { peer });
         }
     }
 
@@ -862,8 +879,8 @@ impl Driver {
     }
 
     fn start_pump(
-        &self, mut channel: DatagramChannel, peer: PeerAddress,
-        linkgone_tx: mpsc::UnboundedSender<PeerAddress>,
+        &self, mut channel: DatagramChannel, peer: PeerAddress, gen: u64,
+        linkgone_tx: mpsc::UnboundedSender<(PeerAddress, u64)>,
     ) -> (LiveLink, Arc<PeerChannel>) {
         let max_message_len = channel.max_message_len();
         let (send_tx, mut send_rx) =
@@ -893,7 +910,7 @@ impl Driver {
                 }
             }
             drop(channel); // Drop disconnects the underlying link.
-            let _ = linkgone_tx.send(peer2);
+            let _ = linkgone_tx.send((peer2, gen));
         });
 
         let handle = Arc::new(PeerChannel {
@@ -902,7 +919,7 @@ impl Driver {
             send_tx,
             recv_rx: AsyncMutex::new(recv_rx),
         });
-        (LiveLink { pump: task.abort_handle(), _teardown: teardown_tx }, handle)
+        (LiveLink { gen, pump: task.abort_handle(), _teardown: teardown_tx }, handle)
     }
 
     fn on_backend_event(
