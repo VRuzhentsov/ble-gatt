@@ -9,6 +9,8 @@ pub mod android;
 #[cfg(target_os = "linux")]
 pub mod linux;
 
+pub(crate) mod link_state;
+
 pub mod mock;
 
 #[cfg(target_os = "windows")]
