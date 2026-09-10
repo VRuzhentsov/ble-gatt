@@ -41,6 +41,37 @@
 //! straightforward on Android (`notifyCharacteristicChanged` already takes a
 //! device), unresolved on BlueZ where `bluer`'s notifier does not identify
 //! its subscriber.
+//!
+//! ## Known limitation: one link per peer is the consumer's responsibility
+//!
+//! `connect` (central role) and `serve` (peripheral role) are independent.
+//! They share no state, draw separate sessions, and build different channel
+//! kinds — a `connect` channel writes out and subscribes for inbound; a
+//! `serve` channel notifies out and takes characteristic writes for inbound.
+//! Neither is bidirectional *across roles*, and nothing here reconciles the
+//! two: a peer this process has dialled with `connect` can also be accepted
+//! by `serve`, and vice versa.
+//!
+//! A consumer that speaks *both* roles to the *same* peer (two app-to-app
+//! devices that each advertise and each dial) must ensure exactly one link
+//! per peer itself, because the layers below cannot:
+//!
+//! - BlueZ keeps a single address-keyed device object per peer, and a pair
+//!   of LE devices does not reliably hold two concurrent links — a second
+//!   connection between an already-connected pair races, briefly
+//!   double-links, then collapses, leaving whichever role's channel
+//!   survived pointing at a dead link (`serve`'s `superseded` guard is
+//!   *not* a cross-role takeover — it only stops a stale fragment from a
+//!   re-served address leaking into the new peripheral-role session).
+//! - Simultaneous dials (both peers call `connect` before either link
+//!   exists) are glare: resolving them needs a tiebreaker both peers agree
+//!   on (lowest address backs off, inbound always wins, …), which is a
+//!   protocol convention this library cannot pick for its consumers.
+//!
+//! When both links do briefly coexist they are not equal: a `connect`
+//! channel negotiates a real MTU, while a `serve` channel is fixed at the
+//! 23-byte spec minimum (the peripheral has no `GattConnection` to query).
+//! A consumer choosing which link to keep should prefer the `connect` one.
 
 pub mod fragment;
 pub mod reassembly;
