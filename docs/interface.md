@@ -1,13 +1,10 @@
 # How `ble-gatt` is meant to be used
 
-> **Status: DRAFT for review.** This describes the *intended* shape. Tier 3
-> (`PeerLink`) does not exist yet — it is the subject of `docs/adr/0005`.
-> Tiers 1 and 2 exist today.
-
 `ble-gatt` is a **carrier**. It moves bytes between two devices over BLE GATT
 and does not interpret them — no framing, no session protocol, no encryption
 (`docs/adr/0003`). This document is about *which shape of carrier* a given
-consumer should reach for.
+consumer should reach for. The internals behind the tier-3 API are in
+`docs/adr/0005`.
 
 ## The one-sentence decision
 

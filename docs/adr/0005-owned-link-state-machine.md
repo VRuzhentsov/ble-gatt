@@ -2,9 +2,8 @@
 
 ## Status
 
-**Proposed — draft under review.** Not yet accepted. `PeerLink` (the consumer
-API in `docs/interface.md`) depends on this; the internal state machine here is
-the prerequisite.
+Accepted. Delivered with its implementation in one change. `PeerLink` (the
+consumer API in `docs/interface.md`) is built on the machine described here.
 
 ## Context
 
@@ -198,14 +197,14 @@ Linux `in_flight` / `dialed`-as-lifecycle / `pending_cleanup`; both backends'
 `served_peers` / `server_sessions`. All fold into the three machines.
 `cleanup_permits` stays (it bounds concurrency, not lifecycle).
 
-**Per-peer isolation.** The machines are already independent (pure, per-peer).
-The execution layer is not yet: Linux's backend-wide `dial_lock` is held across
-every dial, so one stuck peer freezes every peer and the host app — the exact
-defect reported from hardware. It is backend-wide only because `bluer::Device`
-resolves by address and concurrent operations *on the same address* race —
-different addresses do not. So `dial_lock` becomes a per-`PeerAddress` lock as
-part of this work, and a test asserts one wedged peer leaves the others
-connecting. With N tracked peers this stops being a corner case.
+**Per-peer isolation.** The machines are independent (pure, per-peer), and so
+is the execution layer: Linux's `dial_lock` — previously one backend-wide lock
+held across every dial, so a single stuck peer froze every peer and the host
+app (the exact defect reported from hardware) — becomes per-`PeerAddress`. It
+was backend-wide only because `bluer::Device` resolves by address and
+concurrent operations *on the same address* race; different addresses do not. A
+test asserts one wedged peer leaves the others connecting. With N tracked peers
+this is the normal case, not a corner one.
 
 **`PeerLink` link cap.** A `max_links` slot queue is the *only* cross-peer
 arbitration; per-peer retry budgets stay independent. A tracked peer with no
@@ -237,8 +236,8 @@ The pure transition tables are exhaustively testable without a radio, a peer,
 or a runtime — which the current design is not, and that is why every defect in
 this area was found on hardware.
 
-`PeerLink` (`docs/interface.md`) becomes possible: with the library owning an
-honest per-peer link state, it can own dialing, the redial ladder, glare, and
+`PeerLink` (`docs/interface.md`) rests on this: with the library owning an
+honest per-peer link state, it owns dialing, the redial ladder, glare, and
 adapter-bounce recovery, and a consumer stops reimplementing all of it. Fini's
 transport layer confirmed the reduction from its actual code: `dial` /
 `dial_with_backoff` / `spawn_dial_loop` / `should_dial_peer` and four
