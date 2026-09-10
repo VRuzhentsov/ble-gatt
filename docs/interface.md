@@ -74,11 +74,12 @@ library owns keeping links alive; you consume channels and status.
 ```rust
 // Normal case: PeerLink builds and owns the platform backend.
 let link: Arc<PeerLink> = PeerLink::new(PeerLinkConfig {
-    service:        MY_SERVICE,
-    characteristic: MY_CHARACTERISTIC,
-    role:           LinkRole::Symmetric { local_id: my_node_id.into() },
-    limits:         Default::default(),
-    retry_budget:   RetryBudget::default(),
+    service:         MY_SERVICE,
+    characteristic:  MY_CHARACTERISTIC,
+    role:            LinkRole::Symmetric { local_id: my_node_id.into() },
+    limits:          Default::default(),
+    retry_budget:    RetryBudget::default(),
+    max_links:       MaxLinks::default(),   // concurrent-link cap; conservative default
 });
 
 // Tests / advanced: inject an already-built backend (e.g. a MockNetwork).
@@ -118,8 +119,15 @@ The handle's contract across that hop:
 Fields. `service` + `characteristic` are the wire contract. `role` is the one
 genuine protocol decision — who dials for a pair that can both see each other —
 and has no sensible default, because it needs a stable identity both peers
-compare the same way (glare; `docs/adr/0003` revision). `limits` and
-`retry_budget` have defaults.
+compare the same way (glare; `docs/adr/0003` revision). `limits`,
+`retry_budget`, and `max_links` have defaults.
+
+`max_links` caps how many peers hold a live link at once, because a BLE central
+has a hard concurrent-link limit (commonly ~7 on Android, higher on BlueZ). You
+may `track()` more peers than that — the extra ones report
+`PeerStatus::Queued` and are promoted when a slot frees (a tracked peer
+disconnects or is `untrack()`ed). The default is conservative (4); raise it if
+you know your platform allows more.
 
 | `LinkRole` | Behaviour |
 |---|---|
@@ -162,6 +170,7 @@ let r = link.radio();                 // On | Off | Unsupported, without waiting
 ```
 Untracked
 Unavailable { reason: RadioOff | Unsupported | RoleCannotReach }
+Queued                           // tracked, but max_links is full — waiting for a slot
 Connecting                       // trying — dialing, or waiting for an inbound link
 Connected
 Waiting { retry_at: Instant }    // a previous attempt failed; backing off before the next
@@ -211,6 +220,25 @@ replaces a consumer polling `capabilities()` to guess.
 - everything **above the byte boundary**: authentication, encryption, and any
   app-level liveness proof. The library carries bytes; it cannot know your
   peer's app has stopped answering, only that the BLE link exists.
+
+### Multiple peers
+
+`PeerLink` is multi-peer from the start — `track()` per peer, `status()` and
+events per peer. Three guarantees make N peers safe rather than N times the
+risk:
+
+- **Per-peer isolation.** One unresponsive peer does not stall the others. The
+  per-peer state machines are independent, and the driver does not hold a
+  backend-wide lock across any one peer's platform call (the current Linux
+  backend does — a stuck dial there freezes every peer, and the host app; that
+  lock becomes per-address as part of this work). A test proves one wedged peer
+  leaves the rest connecting.
+- **The link cap is visible.** More tracked peers than `max_links` → the extra
+  ones are `Queued`, not an indistinguishable `Connecting`, and promote when a
+  slot frees.
+- **Retry budgets are independent and do not coordinate.** N peers back off on
+  their own ladders against the shared radio; that is deliberate — the only
+  cross-peer arbitration is the `max_links` slot queue.
 
 ---
 

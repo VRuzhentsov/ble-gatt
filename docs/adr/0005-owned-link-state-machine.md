@@ -198,6 +198,19 @@ Linux `in_flight` / `dialed`-as-lifecycle / `pending_cleanup`; both backends'
 `served_peers` / `server_sessions`. All fold into the three machines.
 `cleanup_permits` stays (it bounds concurrency, not lifecycle).
 
+**Per-peer isolation.** The machines are already independent (pure, per-peer).
+The execution layer is not yet: Linux's backend-wide `dial_lock` is held across
+every dial, so one stuck peer freezes every peer and the host app — the exact
+defect reported from hardware. It is backend-wide only because `bluer::Device`
+resolves by address and concurrent operations *on the same address* race —
+different addresses do not. So `dial_lock` becomes a per-`PeerAddress` lock as
+part of this work, and a test asserts one wedged peer leaves the others
+connecting. With N tracked peers this stops being a corner case.
+
+**`PeerLink` link cap.** A `max_links` slot queue is the *only* cross-peer
+arbitration; per-peer retry budgets stay independent. A tracked peer with no
+slot is `PeerStatus::Queued`, promoted when one frees.
+
 New Kotlin: a runtime `BroadcastReceiver` for
 `BluetoothAdapter.ACTION_STATE_CHANGED`, registered in `init {}`, unregistered
 in `closeAll()`; `STATE_OFF`/`STATE_ON` → a new `onRadioState` JNI callback →
@@ -277,6 +290,9 @@ effect and must be preserved, not re-derived.
 - Unit: every `(state, event)` pair for all three machines, no-op pairs included.
 - Unit: the two invariants, property-tested after every transition.
 - Regression: `cargo test` default and `--features mock-broker`, unchanged.
+- Unit/integration (per-peer isolation): with several tracked peers, one wedged
+  (a dial that never completes), the others still reach `Connected`. Runs on
+  the mock backend with a `stall_dial` fault injector — no radio.
 - Hardware (acceptance): establish a BLE session, toggle the phone adapter off
   then on, dial again — the dial is **accepted**, not refused; and
   `GattEvent::Disconnected` was emitted for the pre-toggle link.
