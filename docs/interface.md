@@ -96,6 +96,7 @@ peers compare the same way (glare; `docs/adr/0003` revision). `limits` and
 ```rust
 link.track(peer_address);     // keep a link to this peer alive
 link.untrack(peer_address);   // stop; drop the channel, disconnect, forget
+link.retry(peer_address);     // a tracked peer that gave up: try again now
 
 let mut found = link.discover().await?;   // peers advertising the service
 // discovery is untrusted metadata — you decide which to track()
@@ -108,32 +109,60 @@ while let Some(ev) = link.events().next().await {
     match ev {
         PeerLinkEvent::Up { peer, channel }   => { /* a message pipe, valid until Down */ }
         PeerLinkEvent::Down { peer, reason }  => { /* the channel is dead */ }
-        PeerLinkEvent::Status { peer, status } => { /* Connecting / Connected / Waiting / … */ }
-        PeerLinkEvent::RadioOff => { /* every link is down */ }
-        PeerLinkEvent::RadioOn  => { /* links to tracked peers will be re-established */ }
+        PeerLinkEvent::Status { peer, status } => { /* Connecting / Connected / Waiting / GaveUp / … */ }
+        PeerLinkEvent::RadioChanged { status } => { /* On | Off | Unsupported */ }
     }
 }
 
-let s = link.status(&peer);   // snapshot for a UI row, without waiting
+let s = link.status(&peer);           // snapshot for a UI row, without waiting
+let r = link.radio();                 // On | Off | Unsupported, without waiting
 ```
 
-`PeerStatus`: `Untracked | Unavailable | Connecting | Connected | Waiting {
-retry_at } | GaveUp`. A projection of the library's internal state — you never
-see the state machine.
+`PeerStatus`:
+
+```
+Untracked
+Unavailable { reason: RadioOff | Unsupported | RoleCannotReach }
+Connecting                       // dialing or accepting, not up
+Connected
+Waiting { retry_at: Instant }    // dropped, backing off before the next redial
+GaveUp                           // redial ladder exhausted; left by retry() or an inbound link
+```
+
+A projection of the library's internal state — you never see the state machine.
+
+**`GaveUp` is deliberately observable, not swallowed.** A consumer that renders
+a "gave up — tap to retry" row needs to *see* that the library stopped, and
+needs `retry(peer)` to restart it. Without both, the consumer rebuilds a shadow
+of the exhaustion tracking just to draw the row — which is the seam drawn one
+notch too tight.
+
+**`RadioStatus::Unsupported`** is reported when the platform has no usable BLE
+adapter for the configured `role` at all (as opposed to `Off`, a toggle). This
+replaces a consumer polling `capabilities()` to guess.
 
 ### The library owns
 
 - dialing tracked peers (when `role` and the tiebreak allow)
-- redialing on drop, with backoff
+- the redial ladder on drop — backoff, and giving up (observable as `GaveUp`)
 - accepting inbound links
 - exactly one link per peer; resolving glare via `role`
 - tearing everything down on radio-off and re-establishing on radio-on
+- reporting radio state (`On` / `Off` / `Unsupported`), so the consumer stops
+  polling `capabilities()` to guess whether an adapter exists
 - surfacing an honest per-peer status
 
 ### The consumer still owns
 
 - **which** addresses to `track` (discovery is untrusted; you choose)
 - the **identity** used for the dial tiebreak (`local_id`)
+- **every precondition the library is not** — network availability, a stored
+  address from the consumer's own pairing flow, a per-pair enable/opt-out
+  setting, OS-bond checks the consumer does for its own auth gate. `PeerLink`
+  reports exactly one precondition: the radio. A consumer whose own state
+  machine spans several transports (Fini's is keyed `(peer, transport)` and
+  also serves a network transport) must keep the rest, because `ble-gatt`
+  cannot own preconditions for a transport it is not.
 - everything **above the byte boundary**: authentication, encryption, and any
   app-level liveness proof. The library carries bytes; it cannot know your
   peer's app has stopped answering, only that the BLE link exists.
@@ -147,13 +176,19 @@ encrypted channel, a ping/ack liveness proof). The seam:
 
 | | `ble-gatt` (`PeerLink`) | consumer (e.g. Fini's `LinkState`) |
 |---|---|---|
-| Owns | transport: dial, connect, drop, redial, radio | session: auth, proof, fade |
-| Driven by | platform callbacks | `PeerLinkEvent::Up` / `Down` + its own ping ticks |
+| Owns | transport: dial, connect, drop, redial ladder + give-up, radio | session: auth, proof, fade; preconditions the library is not |
+| Driven by | platform callbacks | `PeerLinkEvent` + its own ping ticks |
 | "Link nominally up but peer silent" | not visible — a dead BLE link is just `Down` | its own `Fading` state |
+| "Gave up retrying" | owned here; exposed as `GaveUp` + `retry()` | *rendered* from that, not tracked |
 
 `PeerLinkEvent::Up` starts the consumer's auth exchange; `Down` ends its
-session. A consumer's machine keeps only what is above the byte boundary; the
-dial / backoff / precondition machinery moves into `ble-gatt`.
+session. The consumer *renders* `GaveUp` and calls `retry()` on the user's tap,
+but does not track exhaustion itself. What moves out of the consumer entirely:
+the dial loop, backoff maps, and glare/exhaustion apparatus (in Fini's case,
+`dial` / `dial_with_backoff` / `spawn_dial_loop` / `should_dial_peer` wiring and
+four process-global maps whose comments document repeated past P1 fixes). What
+stays: Fini's own pairing-protocol frames over the datagram tier, add-mode UX,
+DB-backed eligibility, and the non-radio preconditions above.
 
 ---
 

@@ -79,9 +79,9 @@ scheduler.
 **`RadioState`** — one per backend. The universal power-state seam.
 
 ```
-States:  Off | On
-Events:  PoweredOn | PoweredOff
-Effect:  InvalidateAllLinks   (on any -> Off transition)
+States:  Off | On | Unsupported
+Events:  PoweredOn | PoweredOff | NoAdapter
+Effect:  InvalidateAllLinks   (on any -> Off / -> Unsupported transition)
 ```
 
 Barely a machine, but it is the seam: a new backend implements one thing —
@@ -89,6 +89,11 @@ Barely a machine, but it is the seam: a new backend implements one thing —
 every link. It can grow (`Resetting` for Android's TURNING_OFF/ON, airplane
 mode, a headset radio sleeping) without touching per-peer code. v1 folds
 `STATE_TURNING_*` into `Off`.
+
+`Unsupported` (no usable adapter for the wanted role, ever) is distinct from
+`Off` (a toggle). `PeerLink` surfaces this so a consumer stops polling
+`capabilities()` to guess — a real request from Fini's transport layer, which
+does exactly that poll every 60s today.
 
 **`CentralLink`** — per peer address. Central-role connection lifecycle; where
 the bug lives.
@@ -174,6 +179,13 @@ machine pure.
 | `RadioOff` | `RadioBack` | `Idle` | — |
 | any other | — | unchanged | — |
 
+`CentralLink` has **no `GaveUp` state**. "Gave up after N redials" is a policy
+of the `PeerLink` tier (`docs/interface.md`), not of one attempt's transport
+lifecycle — `PeerLink` owns the redial ladder, counts attempts, and projects
+`PeerStatus::GaveUp`, leaving each individual attempt as a clean
+`Idle → Dialing → …` pass through this machine. Keeping exhaustion out of the
+machine keeps its table small and its invariant about one thing.
+
 ### Ownership and wiring
 
 Each backend holds `StdMutex<RadioState>`, `StdMutex<HashMap<PeerAddress,
@@ -213,8 +225,15 @@ or a runtime — which the current design is not, and that is why every defect i
 this area was found on hardware.
 
 `PeerLink` (`docs/interface.md`) becomes possible: with the library owning an
-honest per-peer link state, it can own dialing, redial, glare, and
-adapter-bounce recovery, and a consumer stops reimplementing all of it.
+honest per-peer link state, it can own dialing, the redial ladder, glare, and
+adapter-bounce recovery, and a consumer stops reimplementing all of it. Fini's
+transport layer confirmed the reduction from its actual code: `dial` /
+`dial_with_backoff` / `spawn_dial_loop` / `should_dial_peer` and four
+process-global maps (`in_flight_dials`, `dial_backoff_until`, `dial_exhausted`,
+`accepting_side_unconnected_since`) move out. The one thing the consumer keeps
+touching is *rendering* "gave up" — so `PeerLink` must expose `PeerStatus::GaveUp`
+plus a `retry(peer)` call, or the consumer rebuilds a shadow of the exhaustion
+tracking just to draw its UI row.
 
 This is a large change touching the connection path on both backends and the
 Kotlin bridge. Comments on the deleted maps document past P1 fixes
