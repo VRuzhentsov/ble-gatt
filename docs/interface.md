@@ -103,6 +103,18 @@ from any context (the consumer's runtime, or none). This differs from Tier 2,
 whose `DatagramChannel` holds the `GattConnection` directly and runs on the
 caller's runtime.
 
+The handle's contract across that hop:
+
+- **`send` returns the real `BleError`, not a flattened string.** In particular
+  `BleError::GattBusy` (a transient GATT rejection worth retrying) stays
+  distinguishable from a permanent refusal — the crossing must not collapse
+  them, or the caller-side retry that replaced the removed internal one
+  (`docs/adr/0005` context) silently becomes retry-everything or retry-nothing.
+- **`recv()` returns `None` when the link is closed** — and driver-thread death
+  maps to `None`, never a hang. A handle whose far end is gone reads as closed.
+- **A full internal send queue surfaces as `BleError::GattBusy`**, not as
+  backpressure indistinguishable from a stall — so it slots into the same retry.
+
 Fields. `service` + `characteristic` are the wire contract. `role` is the one
 genuine protocol decision — who dials for a pair that can both see each other —
 and has no sensible default, because it needs a stable identity both peers
