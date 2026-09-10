@@ -56,9 +56,11 @@ let incoming = channel.recv().await?;
 
 **You still own the connection lifecycle**: deciding to dial, redialing after a
 drop, ensuring one link per peer, resolving simultaneous-dial glare, recovering
-from an adapter power-cycle. For a one-shot transfer or a test that is fine. For
-a long-lived app-to-app relationship it is a lot of machinery to get right —
-which is why Tier 3 exists.
+from an adapter power-cycle. You also supply the `Backend` and run on your own
+runtime — the `DatagramChannel` here holds the `GattConnection` directly. For a
+one-shot transfer or a test that is fine. For a long-lived app-to-app
+relationship it is a lot of machinery to get right — which is why Tier 3
+exists, **on top of this**, not replacing it.
 
 ---
 
@@ -83,12 +85,23 @@ let link: Arc<PeerLink> = PeerLink::new(PeerLinkConfig {
 let link = PeerLink::with_backend(backend, config);
 ```
 
-**`PeerLink::new` is synchronous and infallible.** It returns a handle
-immediately; adapter acquisition happens inside, asynchronously, and may fail
-or be slow — that shows up as `radio()` reporting `Off` or `Unsupported`, not as
-a construction error. "A handle exists, the radio may not" is a cleaner story
-for a consumer than "the handle may not exist yet" — and it means a consumer
-can build the handle wherever its own state is built, sync or not.
+**`PeerLink::new` is synchronous, infallible, and needs no ambient runtime.**
+It returns a handle immediately. Internally it spawns **one dedicated OS thread
+hosting its own Tokio runtime** — the driver, the platform backend, and all
+per-peer machinery live there. So `new()` works in any binary, including one
+with no `#[tokio::main]` (a CLI entry point). Adapter acquisition happens on
+that thread, asynchronously, and may fail or be slow — that shows up as
+`radio()` reporting `Off` or `Unsupported`, not a construction error. "A handle
+exists, the radio may not" is a cleaner story than "the handle may not exist
+yet," and "one call, works anywhere" beats "one call, but only from async
+context" — a requirement a sync signature does not advertise.
+
+Because the driver owns its own runtime, the `DatagramChannel` handed out by
+`PeerLinkEvent::Up` is a **message-passing handle** — `send` / `recv` move bytes
+across a channel to the driver thread, which does the GATT work. It is usable
+from any context (the consumer's runtime, or none). This differs from Tier 2,
+whose `DatagramChannel` holds the `GattConnection` directly and runs on the
+caller's runtime.
 
 Fields. `service` + `characteristic` are the wire contract. `role` is the one
 genuine protocol decision — who dials for a pair that can both see each other —
@@ -255,8 +268,6 @@ LinkState>` for the transport layer, `should_dial_peer` wiring beyond supplying
 
 ## Open questions
 
-- Does `PeerLink` fully replace Tier 2's public role, or sit strictly above it?
-  (lean: sit above; Tier 2 stays public.)
 - `discover` + explicit `track`, vs. an opt-in "auto-track anything advertising
   the service" mode. (lean: explicit only.)
 - `RetryBudget` shape — a fixed default (redial ladder 1/2/4/8s cap 30s; give up

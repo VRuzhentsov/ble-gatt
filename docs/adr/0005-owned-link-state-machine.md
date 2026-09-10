@@ -238,13 +238,21 @@ dialer by exhausting its redial budget, the acceptor by no inbound link
 arriving within the same budget (`accepting_side_unconnected_since` in fini —
 its absence was a past P1: the acceptor's row sat on "connecting" forever).
 
-Two implications this pushes down onto the machines: (a) `RadioState` starts
-before a backend exists, so `PeerLink::new` can be synchronous and infallible —
-the driver task acquires the platform backend lazily and feeds `RadioState`
-`Unsupported` / `PoweredOn` as it learns; a consumer builds the handle wherever
-its own state is built. (b) `PeerLink::events()` is a broadcast (fresh
-subscription per call), so a second lifecycle consumer is an addition rather
-than a breaking change.
+Implications this pushes onto `PeerLink`'s shape (not the machines themselves):
+
+- `RadioState` starts before a backend exists, so `PeerLink::new` is
+  synchronous and infallible — the driver acquires the platform backend lazily
+  and feeds `RadioState` `Unsupported` / `PoweredOn` as it learns.
+- `PeerLink::new` spawns **one dedicated OS thread hosting its own Tokio
+  runtime** rather than `tokio::spawn`-ing its driver. A sync `new()` that
+  needed an ambient runtime would panic in a consumer's non-async binary (fini
+  has a CLI entry point with no `#[tokio::main]`; its own discovery worker uses
+  `std::thread` for the same reason). Consequence: the `DatagramChannel`
+  `PeerLink` hands out is a message-passing handle to the driver thread, not a
+  direct `GattConnection` holder like Tier 2's — so `PeerLink` sits *above*
+  Tier 2, which stays public unchanged.
+- `PeerLink::events()` is a broadcast (fresh subscription per call), so a second
+  lifecycle consumer is an addition rather than a breaking change.
 
 This is a large change touching the connection path on both backends and the
 Kotlin bridge. Comments on the deleted maps document past P1 fixes
