@@ -75,7 +75,7 @@ use crate::backend::{Backend, BoxStream, GattConnection};
 use crate::error::{BleError, Result};
 use crate::models::{
     CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress,
-    Role, ServiceUuid, WriteType,
+    RadioStatus, Role, ServiceUuid, WriteType,
 };
 
 const BRIDGE_CLASS_BINARY_NAME: &str = "dev.blegatt.BleGattBridge";
@@ -1590,6 +1590,47 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onDisconnected<'local>(
         // a loss event queued from a connection that has been replaced.
         session: disconnected_session,
     });
+}
+
+/// The local adapter's state changed. `status` is `"on"` / `"off"` /
+/// `"unsupported"`. Android does not fire a GATT disconnect callback for an
+/// adapter toggle, so the Kotlin receiver has already called
+/// `onDisconnected` for each address it held — this sweeps any straggler
+/// `connections` entry defensively and emits `GattEvent::RadioChanged` so a
+/// consumer (`PeerLink`) learns the radio's usability changed.
+#[no_mangle]
+pub extern "system" fn Java_dev_blegatt_NativeKt_onRadioState<'local>(
+    mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, status: JString<'local>,
+) {
+    let inner = unsafe { inner_from_handle(native_handle) };
+    let status = read_jstring(&mut env, &status);
+    log::info!("jni onRadioState: {status}");
+    let radio_status = match status.as_str() {
+        "on" => RadioStatus::On,
+        "unsupported" => RadioStatus::Unsupported,
+        _ => RadioStatus::Off,
+    };
+    if !matches!(radio_status, RadioStatus::On) {
+        let stale: Vec<(String, ConnectionState)> =
+            inner.connections.lock().unwrap().drain().collect();
+        for (address, mut state) in stale {
+            state.live = false;
+            inner.att_mtus.lock().unwrap().remove(&address);
+            let session = state.session;
+            if let Some(tx) = state.disconnected_tx.take() {
+                let _ = tx.send(());
+            }
+            let _ = inner.server_events_tx.send(GattEvent::Disconnected {
+                peer: PeerAddress(address),
+                local_role: Role::Central,
+                session: Some(session),
+            });
+        }
+        inner.server_sessions.lock().unwrap().clear();
+    }
+    let _ = inner
+        .server_events_tx
+        .send(GattEvent::RadioChanged { status: radio_status });
 }
 
 #[no_mangle]

@@ -18,7 +18,10 @@ import android.bluetooth.le.AdvertiseSettings
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Handler
 import android.os.Looper
@@ -50,6 +53,41 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val adapter: BluetoothAdapter? = bluetoothManager.adapter
 
+    /// Android does **not** deliver a GATT disconnect callback when the
+    /// adapter is toggled off, so every `BluetoothGatt` this bridge holds
+    /// silently dies with no `onConnectionStateChange`. Without this
+    /// receiver, Rust's per-connection state (`ConnectionState.live`) is
+    /// never cleared and every later `connect` to those addresses is
+    /// refused as "already open" — permanently. See docs/adr/0005.
+    private val radioStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(ctx: Context, intent: Intent) {
+            if (intent.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
+            when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+                BluetoothAdapter.STATE_OFF, BluetoothAdapter.STATE_TURNING_OFF -> {
+                    Log.w(TAG, "radio: adapter going down — tearing down all connections")
+                    // Same teardown as `closeAll`'s client half, plus the
+                    // JNI notifications a real disconnect would have sent.
+                    val addresses = connectedGatts.keys.toList()
+                    val serverAddresses = serverSessions.keys.toList()
+                    closeAllClientGatts()
+                    for (address in addresses) {
+                        try { onDisconnected(nativeHandle, address, false) } catch (_: Exception) {}
+                    }
+                    for (address in serverAddresses) {
+                        try { onDisconnected(nativeHandle, address, true) } catch (_: Exception) {}
+                    }
+                    stopScan()
+                    stopAdvertising()
+                    try { onRadioState(nativeHandle, "off") } catch (_: Exception) {}
+                }
+                BluetoothAdapter.STATE_ON -> {
+                    Log.i(TAG, "radio: adapter back on")
+                    try { onRadioState(nativeHandle, "on") } catch (_: Exception) {}
+                }
+            }
+        }
+    }
+
     init {
         try {
             val hasBleFeature = context.packageManager.hasSystemFeature(PackageManager.FEATURE_BLUETOOTH_LE)
@@ -64,6 +102,19 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         } catch (e: Exception) {
             Log.e(TAG, "init: capability probe threw", e)
         }
+        try {
+            context.registerReceiver(
+                radioStateReceiver,
+                IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED),
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "init: could not register adapter-state receiver", e)
+        }
+        // The current adapter state is not reported from here: the JNI
+        // callbacks are wired by the time the receiver fires, but re-entering
+        // Rust from inside the bridge constructor (which is itself called
+        // from Rust) is a needless hazard. A consumer learns the state from
+        // the first toggle, or from a dial failing while the radio is off.
     }
 
     // --- Central role state ---
@@ -1436,13 +1487,17 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         retryHandler.postDelayed(fallback, PRIORITY_BOOTSTRAP_TIMEOUT_MS)
     }
 
-    fun closeAll() {
+    /// Close every outbound `BluetoothGatt` and clear the per-connection
+    /// client-side bookkeeping. Shared by `closeAll` and the adapter-state
+    /// receiver — the latter also fires the `onDisconnected` JNI callbacks
+    /// Android itself omits on an adapter toggle.
+    private fun closeAllClientGatts() {
         for (gatt in connectedGatts.values) {
             try {
                 gatt.disconnect()
                 gatt.close()
             } catch (e: Exception) {
-                Log.w(TAG, "closeAll: error closing gatt", e)
+                Log.w(TAG, "closeAllClientGatts: error closing gatt", e)
             }
         }
         connectedGatts.clear()
@@ -1452,6 +1507,15 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         pendingWriteIds.clear()
         pendingSubscribeIds.clear()
         preparedWrites.clear()
+    }
+
+    fun closeAll() {
+        closeAllClientGatts()
+        try {
+            context.unregisterReceiver(radioStateReceiver)
+        } catch (e: Exception) {
+            // Already unregistered, or never registered — either is fine.
+        }
         stopScan()
         stopAdvertising()
     }
