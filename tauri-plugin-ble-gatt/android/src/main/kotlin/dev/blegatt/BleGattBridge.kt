@@ -67,18 +67,32 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                     Log.w(TAG, "radio: adapter going down — tearing down all connections")
                     // Same teardown as `closeAll`'s client half, plus the
                     // JNI notifications a real disconnect would have sent.
-                    val addresses = connectedGatts.keys.toList()
-                    val serverAddresses = serverSessions.keys.toList()
-                    closeAllClientGatts()
-                    for (address in addresses) {
-                        try { onDisconnected(nativeHandle, address, false) } catch (_: Exception) {}
+                    //
+                    // Under `gattLock`, for the same reason every client
+                    // callback does its ownership check plus JNI publication
+                    // under it: without the lock a callback (STATE_CONNECTED,
+                    // onServicesDiscovered) can pass its `connectedGatts`
+                    // ownership check, this sweep can clear the map and emit
+                    // "off", and the callback can then still call
+                    // `onConnected` — leaving Rust a live entry that outlives
+                    // the radio and refuses every later reconnect. Holding it
+                    // across the JNI calls is safe here: no Rust path re-enters
+                    // Kotlin while holding the mutex these callbacks take (see
+                    // the STATE_DISCONNECTED branch's note).
+                    synchronized(gattLock) {
+                        val addresses = connectedGatts.keys.toList()
+                        val serverAddresses = serverSessions.keys.toList()
+                        closeAllClientGatts()
+                        for (address in addresses) {
+                            try { onDisconnected(nativeHandle, address, false) } catch (_: Exception) {}
+                        }
+                        for (address in serverAddresses) {
+                            try { onDisconnected(nativeHandle, address, true) } catch (_: Exception) {}
+                        }
+                        stopScan()
+                        stopAdvertising()
+                        try { onRadioState(nativeHandle, "off") } catch (_: Exception) {}
                     }
-                    for (address in serverAddresses) {
-                        try { onDisconnected(nativeHandle, address, true) } catch (_: Exception) {}
-                    }
-                    stopScan()
-                    stopAdvertising()
-                    try { onRadioState(nativeHandle, "off") } catch (_: Exception) {}
                 }
                 BluetoothAdapter.STATE_ON -> {
                     Log.i(TAG, "radio: adapter back on")
