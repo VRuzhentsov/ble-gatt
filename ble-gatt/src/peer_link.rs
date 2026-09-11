@@ -947,8 +947,35 @@ impl Driver {
                     },
                     item = channel.recv() => match item {
                         Some(msg) => {
-                            if recv_tx.send(msg).await.is_err() {
-                                break;
+                            // Non-blocking: a consumer that stops calling
+                            // `recv()` must only lose messages, not wedge
+                            // this whole select loop. A blocking send here
+                            // would also stall `teardown_rx` and
+                            // `send_rx`, so `untrack()`'s drop of `LiveLink`
+                            // and outbound sends would hang right along
+                            // with it, and a physical disconnect would
+                            // never reach `linkgone_tx` -- silently pinning
+                            // a `max_links` slot to a link nothing is
+                            // draining.
+                            if let Err(err) = recv_tx.try_send(msg) {
+                                match err {
+                                    mpsc::error::TrySendError::Closed(_) => break,
+                                    mpsc::error::TrySendError::Full(_) => {
+                                        log::warn!(
+                                            "peer_link: {} recv queue full, dropping a message",
+                                            peer2.0
+                                        );
+                                        // Best-effort lag signal, mirroring
+                                        // `PeerChannel::send`'s Full ->
+                                        // GattBusy. If even this doesn't
+                                        // fit, the consumer will find out
+                                        // it's behind on its next `recv()`
+                                        // regardless.
+                                        let _ = recv_tx.try_send(Err(BleError::GattBusy(
+                                            format!("recv queue full for {}", peer2.0),
+                                        )));
+                                    }
+                                }
                             }
                         }
                         None => break,
