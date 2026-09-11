@@ -95,9 +95,16 @@ impl RadioState {
             (S::On, E::NoAdapter) => (S::Unsupported, vec![RadioEffect::InvalidateAllLinks]),
             (S::Off, E::PoweredOn) => (S::On, vec![]),
             (S::Off, E::NoAdapter) => (S::Unsupported, vec![]),
-            // Once permanently unsupported, a spurious PoweredOn is ignored:
-            // the adapter that is missing cannot power on. Only a fresh
-            // `NoAdapter -> ...` path (a new backend instance) leaves it.
+            // `Unsupported` is reached two ways: a backend genuinely has no
+            // adapter, or (the only path any backend actually takes today)
+            // `PeerLink::assess_radio` downgraded a powered, present radio
+            // because it currently lacks a capability the configured role
+            // needs. The latter is re-probed on every `RadioChanged { On }`
+            // precisely so a transient capability-probe failure (a JNI
+            // attach hiccup, a momentary D-Bus error) doesn't strand every
+            // tracked peer until the consumer reconstructs the whole
+            // `PeerLink` -- so a `PoweredOn` here must be able to recover.
+            (S::Unsupported, E::PoweredOn) => (S::On, vec![]),
             (S::Unsupported, _) => (S::Unsupported, vec![]),
             (state, _) => (*state, vec![]),
         }
@@ -437,8 +444,20 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_is_terminal() {
-        let (state, _) = RadioState::Unsupported.apply(RadioEvent::PoweredOn, t0());
+    fn unsupported_recovers_on_a_fresh_powered_on() {
+        // `PeerLink::assess_radio` re-probes capabilities on every
+        // `RadioChanged { On }` and can now report a genuine `On` again --
+        // this must not be stuck behind a stale `Unsupported`.
+        let (state, effects) = RadioState::Unsupported.apply(RadioEvent::PoweredOn, t0());
+        assert_eq!(state, RadioState::On);
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn unsupported_ignores_everything_else() {
+        let (state, _) = RadioState::Unsupported.apply(RadioEvent::PoweredOff, t0());
+        assert_eq!(state, RadioState::Unsupported);
+        let (state, _) = RadioState::Unsupported.apply(RadioEvent::NoAdapter, t0());
         assert_eq!(state, RadioState::Unsupported);
     }
 

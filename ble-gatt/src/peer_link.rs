@@ -424,7 +424,7 @@ impl Driver {
         };
         let mut peers: HashMap<PeerAddress, Peer> = HashMap::new();
         let (conn_tx, mut conn_rx) =
-            mpsc::unbounded_channel::<(PeerAddress, Result<DatagramChannel>)>();
+            mpsc::unbounded_channel::<(PeerAddress, u64, Result<DatagramChannel>)>();
         let (linkgone_tx, mut linkgone_rx) = mpsc::unbounded_channel::<(PeerAddress, u64)>();
         let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<DatagramChannel>();
         // The inbound server: a task, plus when to (re)start it. `serve`
@@ -535,8 +535,8 @@ impl Driver {
                     }
                 }
 
-                Some((peer, result)) = conn_rx.recv() => {
-                    self.on_dial_result(&mut peers, peer, result, &linkgone_tx);
+                Some((peer, session, result)) = conn_rx.recv() => {
+                    self.on_dial_result(&mut peers, peer, session, result, &linkgone_tx);
                 }
 
                 Some(channel) = inbound_rx.recv() => {
@@ -778,7 +778,7 @@ impl Driver {
     fn pump_dials(
         &self, backend: &Arc<dyn Backend>, peers: &mut HashMap<PeerAddress, Peer>,
         radio: RadioState,
-        conn_tx: &mpsc::UnboundedSender<(PeerAddress, Result<DatagramChannel>)>,
+        conn_tx: &mpsc::UnboundedSender<(PeerAddress, u64, Result<DatagramChannel>)>,
     ) {
         if !radio.usable() {
             return;
@@ -822,9 +822,10 @@ impl Driver {
             let cfg = self.config.datagram.clone();
             let conn_tx = conn_tx.clone();
             let peer2 = peer.clone();
+            let session = next_session;
             let task = tokio::spawn(async move {
                 let result = datagram::connect(backend, &peer2, &cfg).await;
-                let _ = conn_tx.send((peer2, result));
+                let _ = conn_tx.send((peer2, session, result));
             });
             p.dial_task = Some(task.abort_handle());
         }
@@ -842,12 +843,29 @@ impl Driver {
     }
 
     fn on_dial_result(
-        &self, peers: &mut HashMap<PeerAddress, Peer>, peer: PeerAddress,
+        &self, peers: &mut HashMap<PeerAddress, Peer>, peer: PeerAddress, session: u64,
         result: Result<DatagramChannel>, linkgone_tx: &mpsc::UnboundedSender<(PeerAddress, u64)>,
     ) {
         let Some(p) = peers.get_mut(&peer) else {
             return;
         };
+        // A queued result can outlive its own attempt: a dial-window
+        // timeout, a radio bounce, or an untrack+retrack can all put this
+        // peer back in `Dialing` under a *new* session before this task's
+        // result is selected. Matching only by peer address, this result
+        // would then be misapplied to that new attempt -- an old success
+        // installing an obsolete channel as the new attempt's link, or an
+        // old failure knocking the new attempt out of `Dialing` and (via
+        // the `dial_task = None` below) erasing the only handle able to
+        // abort it. Every attempt is tagged with the session `pump_dials`
+        // put it in `Dialing` under, so a session that no longer matches
+        // this peer's current one is simply not this task's problem.
+        if p.central.session() != Some(session) {
+            if let Ok(channel) = result {
+                drop(channel); // Stale success: its Drop disconnects.
+            }
+            return;
+        }
         // This task has delivered its result; it is no longer in flight.
         p.dial_task = None;
         let now = Instant::now();

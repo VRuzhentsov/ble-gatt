@@ -89,10 +89,14 @@ every link. It can grow (`Resetting` for Android's TURNING_OFF/ON, airplane
 mode, a headset radio sleeping) without touching per-peer code. v1 folds
 `STATE_TURNING_*` into `Off`.
 
-`Unsupported` (no usable adapter for the wanted role, ever) is distinct from
-`Off` (a toggle). `PeerLink` surfaces this so a consumer stops polling
+`Unsupported` (the wanted role isn't usable right now) is distinct from `Off`
+(a toggle). `PeerLink` surfaces this so a consumer stops polling
 `capabilities()` to guess — a real request from Fini's transport layer, which
-does exactly that poll every 60s today.
+does exactly that poll every 60s today. It is not a dead end: `assess_radio`
+re-probes capabilities on every `RadioChanged { On }`, and `PoweredOn`
+recovers `Unsupported` back to `On` — a transient capability-probe failure
+(a JNI attach hiccup, a momentary D-Bus error) must not stick every tracked
+peer in the same wrong verdict until the consumer rebuilds the `PeerLink`.
 
 **`CentralLink`** — per peer address. Central-role connection lifecycle; where
 the bug lives.
