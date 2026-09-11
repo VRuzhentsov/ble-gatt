@@ -65,22 +65,28 @@
 //!   re-served address leaking into the new peripheral-role session).
 //! - Simultaneous dials (both peers call `connect` before either link
 //!   exists) are glare. The tiebreaker that resolves it must be
-//!   *identity-based* — derived from the two addresses, so both peers
-//!   independently name the *same* physical link. A symmetric rule such as
-//!   "keep my inbound link" or "keep my own `connect` channel" does the
-//!   opposite: each peer's inbound is the other's outbound, so the two ends
-//!   drop different links and both collapse. Workable conventions: the
-//!   lower-address peer is the sole dialer (no second link ever forms), or
-//!   — if both links did briefly form — keep the one whose *central* is the
-//!   lower-address peer. Which convention to use is a protocol decision
-//!   this library cannot make for its consumers.
+//!   *identity-based* — keyed on a stable value both peers can compare and
+//!   agree orders them the same way — so both independently name the *same*
+//!   physical link. A symmetric rule such as "keep my inbound link" or
+//!   "keep my own `connect` channel" does the opposite: each peer's inbound
+//!   is the other's outbound, so the two ends drop different links and both
+//!   collapse. That comparable identity is the *application's* to establish
+//!   (e.g. node IDs exchanged during its own handshake): `PeerAddress` is
+//!   opaque and unordered by contract, and no local counterpart is exposed
+//!   here, so it cannot be the basis. Given such an identity, a workable
+//!   convention is to make one peer the sole dialer (no second link ever
+//!   forms), or — if both links did briefly form — to keep the one whose
+//!   *central* is the agreed-lower peer. Which convention to use is a
+//!   protocol decision this library cannot make for its consumers.
 //!
 //! The two directions of any single link are also not symmetric: the
-//! central→peripheral direction fragments against the negotiated MTU, while
-//! the peripheral→central (notify) direction is fixed at the 23-byte spec
-//! minimum because the peripheral has no `GattConnection` to query. So the
-//! sole-dialer choice above also decides which peer's *outbound* gets the
-//! larger budget — the dialer's does.
+//! central→peripheral direction fragments against the *negotiated* MTU,
+//! while the peripheral→central (notify) direction is fixed at the 23-byte
+//! spec minimum because the peripheral has no `GattConnection` to query.
+//! The negotiated MTU is only ever *potentially* larger — the peer may
+//! leave it at the 23-byte minimum (see `GattConnection::att_mtu`) — so the
+//! sole-dialer choice decides which peer *can* get the larger outbound
+//! budget when negotiation succeeds, not that it always will.
 
 pub mod fragment;
 pub mod reassembly;
@@ -1344,7 +1350,12 @@ pub async fn serve(
                     }
                 }
                 // Central-role lifecycle belongs to `connect`, not here.
-                GattEvent::Connected { .. } | GattEvent::Disconnected { .. } => {}
+                // `RadioChanged` is for `PeerLink` / a whole-connectivity
+                // consumer; the per-peer `Disconnected` events a radio loss
+                // also produces are what `serve` acts on.
+                GattEvent::Connected { .. }
+                | GattEvent::Disconnected { .. }
+                | GattEvent::RadioChanged { .. } => {}
             }
         }
     });

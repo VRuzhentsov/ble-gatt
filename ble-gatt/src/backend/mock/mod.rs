@@ -42,6 +42,11 @@ const EVENT_CHANNEL_CAPACITY: usize = 64;
 /// accidentally passing because everything fit in one write.
 const MOCK_ATT_MTU: u16 = 247;
 
+// `Local` is the always-present in-process state and is touched on every
+// mock operation; boxing it to satisfy `large_enum_variant` would add an
+// indirection to the hot path for a lint about an enum with one small
+// feature-gated sibling.
+#[allow(clippy::large_enum_variant)]
 enum Radio {
     Local(LocalRadio),
     #[cfg(feature = "mock-broker")]
@@ -287,6 +292,26 @@ impl MockBackend {
     /// surface; tests use this to prove a consumer learns about it.
     pub fn simulate_peer_loss(&self, peer: &PeerAddress) {
         self.network.as_local().simulate_peer_loss(&self.address, peer);
+    }
+
+    /// Simulate the local radio being toggled off / on (or found absent).
+    /// Pushes a `GattEvent::RadioChanged` onto this backend's own event
+    /// stream, the same signal a real backend emits from its adapter-state
+    /// watcher. `PeerLink` turns it into per-peer `Unavailable` and, on a
+    /// return to `On`, re-establishes links to tracked peers.
+    ///
+    /// Deliberately does **not** also synthesise the per-link `Disconnected`
+    /// events a real radio loss produces — a test wanting those uses
+    /// `simulate_peer_loss` per peer. `PeerLink` tears its own links down
+    /// off the `RadioChanged` alone.
+    pub fn simulate_radio(&self, status: crate::models::RadioStatus) {
+        let _ = self.events_tx.send(GattEvent::RadioChanged { status });
+    }
+
+    /// Make a dial to `peer` hang for `delay` before proceeding. Models a
+    /// wedged peer — used to prove one stuck dial does not block the others.
+    pub fn stall_connect(&self, peer: &PeerAddress, delay: std::time::Duration) {
+        self.network.as_local().stall_connect(peer, delay);
     }
 }
 

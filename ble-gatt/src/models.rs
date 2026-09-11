@@ -121,6 +121,32 @@ pub enum GattEvent {
     /// were affected is unknowable — the events are simply gone — so a
     /// consumer must treat every session it is tracking as suspect.
     Lagged { dropped: u64 },
+    /// The platform BLE radio's usability changed.
+    ///
+    /// Emitted when the adapter is toggled (`RadioStatus::Off` / `On`) or
+    /// found to be absent for this device's needs (`Unsupported`). A
+    /// transition to anything other than `On` means every link this backend
+    /// held is gone — the backend also emits the per-link `Disconnected`
+    /// events, but a consumer watching connectivity as a whole keys off
+    /// this. `PeerLink` turns it into its per-peer `Unavailable` status and
+    /// stops a consumer polling `capabilities()` to guess.
+    RadioChanged { status: RadioStatus },
+}
+
+/// Whether the platform BLE radio is usable. See
+/// [`GattEvent::RadioChanged`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "mock-broker", derive(serde::Serialize, serde::Deserialize))]
+pub enum RadioStatus {
+    /// Usable.
+    On,
+    /// The adapter exists but is switched off. A later `On` recovers every
+    /// link to a tracked peer without the consumer doing anything.
+    Off,
+    /// No usable adapter for this device's role, and not expected to
+    /// appear. Distinct from `Off` so a consumer renders it as a permanent
+    /// state rather than a temporary one.
+    Unsupported,
 }
 
 #[derive(Debug, Clone)]

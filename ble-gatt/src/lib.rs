@@ -7,10 +7,15 @@ pub mod backend;
 pub mod datagram;
 pub mod error;
 pub mod models;
+pub mod peer_link;
 
 pub use backend::{Backend, BoxStream, GattConnection};
 pub use error::{BleError, Result};
 pub use models::{
-    CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattCharacteristicSpec, GattEvent, WriteType,
-    GattServiceSpec, PeerAddress, Role, ServiceUuid,
+    CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattCharacteristicSpec, GattEvent,
+    GattServiceSpec, PeerAddress, RadioStatus, Role, ServiceUuid, WriteType,
+};
+pub use peer_link::{
+    LinkId, LinkRole, MaxLinks, PeerChannel, PeerLink, PeerLinkConfig, PeerLinkEvent, PeerStatus,
+    RetryBudget,
 };

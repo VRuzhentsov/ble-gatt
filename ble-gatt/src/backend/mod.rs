@@ -9,6 +9,8 @@ pub mod android;
 #[cfg(target_os = "linux")]
 pub mod linux;
 
+pub(crate) mod link_state;
+
 pub mod mock;
 
 #[cfg(target_os = "windows")]
@@ -197,4 +199,29 @@ pub trait Backend: Send + Sync {
     /// Characteristic *values* are not carried here — client-side
     /// notifications come back through `GattConnection::subscribe`.
     fn events(&self) -> BoxStream<GattEvent>;
+
+    /// The radio's usability *right now*. `events()` carries the
+    /// [`GattEvent::RadioChanged`] transitions; this is the initial value a
+    /// consumer needs before the first transition arrives (a `PeerLink`
+    /// created while Bluetooth is already off must not assume `On`).
+    /// Defaults to `On` for backends with no notion of a togglable radio.
+    async fn radio_status(&self) -> crate::models::RadioStatus {
+        crate::models::RadioStatus::On
+    }
+}
+
+/// Construct the backend for the platform this binary runs on. Used by
+/// `PeerLink::new`; a consumer using the `Backend` trait directly picks its
+/// own constructor (`linux::LinuxBackend::new`, `android::AndroidBackend::new`,
+/// or `mock::MockBackend::new`).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub async fn platform() -> Result<std::sync::Arc<dyn Backend>> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok(std::sync::Arc::new(linux::LinuxBackend::new().await?))
+    }
+    #[cfg(target_os = "android")]
+    {
+        Ok(std::sync::Arc::new(android::AndroidBackend::new().await?))
+    }
 }
