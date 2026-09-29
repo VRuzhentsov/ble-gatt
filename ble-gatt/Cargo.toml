@@ -19,6 +19,12 @@ serde_json = { version = "1", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 bluer = { version = "0.17", features = ["bluetoothd"] }
+# Same versions `bluer` already depends on (no new crates): discovery runs on
+# a D-Bus connection of our own, because `bluer` neither exposes
+# `StopDiscovery` nor reports its result. See `DiscoveryBus` in
+# `backend/linux.rs`.
+dbus = "0.9"
+dbus-tokio = "0.7"
 futures = "0.3"
 
 [target.'cfg(target_os = "android")'.dependencies]
@@ -32,6 +38,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 # harness would prove nothing about the instrumentation it is meant to
 # exercise.
 env_logger = "0.11"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# A fake `org.bluez` adapter for the discovery tests in `backend/linux.rs`.
+# Same version `bluer` already depends on.
+dbus-crossroads = "0.5"
 
 [features]
 # Lets `backend::mock::MockNetwork` run as a broker process that separate OS
