@@ -209,8 +209,10 @@ fn discovery_error(err: bluer::Error) -> BleError {
 struct ScanState {
     /// Scan streams handed out and not yet dropped.
     live: usize,
-    /// Our last `StartDiscovery` succeeded and no `StopDiscovery` has been
-    /// sent since.
+    /// Our last `StartDiscovery` succeeded and no `StopDiscovery` has
+    /// succeeded since. Stays set after a *failed* stop while the adapter
+    /// still reports discovering, so the stop stays owed and the next
+    /// `connect()` retries it instead of dialling into that discovery.
     running: bool,
 }
 
@@ -249,6 +251,8 @@ struct DiscoveryBus {
     conn: Arc<dbus::nonblock::SyncConnection>,
     io_task: tokio::task::JoinHandle<()>,
     adapter_path: dbus::Path<'static>,
+    /// The backend's own `bluer` adapter, only for reading `Discovering`.
+    adapter: Adapter,
     /// Serialises every `StartDiscovery`/`StopDiscovery` together with the
     /// `ScanState` decision that led to it, so a stop can never overtake
     /// the start of a scan that has already been counted, or vice versa.
@@ -257,7 +261,7 @@ struct DiscoveryBus {
 }
 
 impl DiscoveryBus {
-    async fn open(adapter_name: &str) -> Result<Self> {
+    async fn open(adapter: &Adapter) -> Result<Self> {
         let unavailable = |err: String| BleError::AdapterUnavailable(err);
         let (resource, conn) = tokio::task::spawn_blocking(dbus_tokio::connection::new_system_sync)
             .await
@@ -267,8 +271,15 @@ impl DiscoveryBus {
             let err = resource.await;
             log::warn!("scan: discovery D-Bus connection lost: {err}");
         });
-        let adapter_path = dbus::Path::new(format!("/org/bluez/{adapter_name}")).map_err(unavailable)?;
-        Ok(Self { conn, io_task, adapter_path, op: AsyncMutex::new(()), state: StdMutex::new(ScanState::default()) })
+        let adapter_path = dbus::Path::new(format!("/org/bluez/{}", adapter.name())).map_err(unavailable)?;
+        Ok(Self {
+            conn,
+            io_task,
+            adapter_path,
+            adapter: adapter.clone(),
+            op: AsyncMutex::new(()),
+            state: StdMutex::new(ScanState::default()),
+        })
     }
 
     async fn call(&self, method: &str, args: impl dbus::arg::AppendAll) -> bluer::Result<()> {
@@ -293,10 +304,10 @@ impl DiscoveryBus {
     /// `running` alone is not trusted — BlueZ drops every client's
     /// discovery when the adapter powers off, without any call of ours — so
     /// it is confirmed against the adapter's `Discovering` property.
-    async fn begin_scan(self: &Arc<Self>, adapter: &Adapter) -> Result<ScanGuard> {
+    async fn begin_scan(self: &Arc<Self>) -> Result<ScanGuard> {
         let _op = self.op.lock().await;
         let running = self.state.lock().unwrap().running;
-        let still_on = running && adapter.is_discovering().await.unwrap_or(false);
+        let still_on = running && self.adapter.is_discovering().await.unwrap_or(false);
         if !still_on {
             match self.start_discovery().await {
                 Ok(()) => {}
@@ -330,24 +341,41 @@ impl DiscoveryBus {
 
     /// Sends `StopDiscovery` if discovery is on and no scan is live. Waits
     /// for any start or stop already in flight first, so once this returns
-    /// our client's discovery has really been stopped (or the stop failed,
-    /// which is logged).
+    /// our client's discovery has really been stopped — or the stop failed,
+    /// which is logged and leaves it owed (see `ScanState::running`).
     async fn stop_if_idle(&self, why: &str) {
         let _op = self.op.lock().await;
         if !self.state.lock().unwrap().idle_running() {
             return;
         }
-        let result = self.call("StopDiscovery", ()).await;
-        // Cleared even on failure: if BlueZ still counts us as discovering,
-        // the next `StartDiscovery` gets `InProgress` and `begin_scan`
-        // recovers from it.
-        self.state.lock().unwrap().running = false;
-        match result {
-            Ok(()) => log::info!("scan: discovery stopped ({why})"),
-            Err(err) => log::warn!(
-                "scan: StopDiscovery failed ({why}): {err} — BlueZ may still count this client as \
-                 discovering; the next scan will clear it"
-            ),
+        match self.call("StopDiscovery", ()).await {
+            Ok(()) => {
+                self.state.lock().unwrap().running = false;
+                log::info!("scan: discovery stopped ({why})");
+            }
+            Err(err) => {
+                // BlueZ refuses a stop while keeping this client listed
+                // (e.g. `InProgress` while an earlier request of ours is
+                // pending) — the wedge this type exists for. Only an
+                // adapter that is not discovering at all proves there is
+                // nothing left to stop; unreadable counts as still on.
+                // `Discovering` is adapter-wide, so another process
+                // scanning keeps the stop owed: each later dial then
+                // retries it once, bounded by `DISCOVERY_STOP_TIMEOUT`.
+                let still_on = self.adapter.is_discovering().await.unwrap_or(true);
+                if still_on {
+                    log::warn!(
+                        "scan: StopDiscovery failed ({why}): {err} — the adapter is still discovering; \
+                         the stop stays owed and is retried before the next dial"
+                    );
+                } else {
+                    self.state.lock().unwrap().running = false;
+                    log::warn!(
+                        "scan: StopDiscovery failed ({why}): {err} — the adapter is not discovering, so \
+                         nothing is left to stop"
+                    );
+                }
+            }
         }
     }
 }
@@ -498,7 +526,7 @@ impl LinuxBackend {
         // reports the current state. Only a missing adapter (handled above)
         // is unrecoverable. Operations attempted while unpowered fail on
         // their own, honestly.
-        let discovery = Arc::new(DiscoveryBus::open(adapter.name()).await?);
+        let discovery = Arc::new(DiscoveryBus::open(&adapter).await?);
         let (events_tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
 
         // Watch the adapter's `Powered` property and forward it as
@@ -1150,7 +1178,7 @@ impl Backend for LinuxBackend {
         log::info!("scan: starting discovery for service {}", service.0);
         // The guard is created before the calls below, so a failure in
         // them still stops the discovery just started.
-        let scan_guard = self.discovery.begin_scan(&adapter).await?;
+        let scan_guard = self.discovery.begin_scan().await?;
         // The same stream `bluer::Adapter::discover_devices` built: already
         // known devices first, then adapter events until discovery stops.
         let changes = adapter.events().await.map_err(|err| BleError::AdapterUnavailable(err.to_string()))?;
@@ -2089,11 +2117,14 @@ mod tests {
         Some((bus, fake))
     }
 
-    /// The real-hardware wedge, end to end against the fake: a failed
-    /// `StopDiscovery` leaves our client listed, the next `StartDiscovery`
-    /// gets `InProgress`, and `begin_scan` must clear it and start anyway —
-    /// not fail every scan from then on. Also covers refcounted sharing and
-    /// `stop_if_idle` (what `connect()` awaits) really stopping discovery.
+    /// The real-hardware wedge, end to end against the fake. A failed
+    /// `StopDiscovery` that leaves our client listed must keep the stop
+    /// owed, so the next `connect()` retries it rather than dialling into
+    /// the discovery (Codex P1 on PR #21). And if our state has lost track
+    /// of a listed client (e.g. a start cancelled after BlueZ accepted it),
+    /// the next scan's `InProgress` must be cleared and the scan started
+    /// anyway, not fail every scan from then on. Also covers refcounted
+    /// sharing.
     #[tokio::test(flavor = "multi_thread")]
     async fn discovery_recovers_from_a_failed_stop() {
         let Some((_bus, fake)) = fake_bluez().await else {
@@ -2102,30 +2133,41 @@ mod tests {
         };
         let session = Session::new().await.unwrap();
         let adapter = session.adapter("hci0").unwrap();
-        let discovery = Arc::new(DiscoveryBus::open("hci0").await.unwrap());
+        let discovery = Arc::new(DiscoveryBus::open(&adapter).await.unwrap());
 
         // Two concurrent scans share one discovery.
-        let first = discovery.begin_scan(&adapter).await.unwrap();
-        let second = discovery.begin_scan(&adapter).await.unwrap();
+        let first = discovery.begin_scan().await.unwrap();
+        let second = discovery.begin_scan().await.unwrap();
         assert_eq!(fake.lock().unwrap().starts, 1);
         drop(first);
         assert!(!discovery.state.lock().unwrap().idle_running(), "a live scan still needs discovery");
 
-        // The last scan ends and its StopDiscovery fails: wedged.
+        // The last scan ends and its StopDiscovery fails: wedged, and the
+        // stop must stay owed.
         fake.lock().unwrap().fail_next_stop = true;
         drop(second);
         discovery.stop_if_idle("test").await;
         assert_eq!(fake.lock().unwrap().clients.len(), 1, "fake must now be wedged");
+        assert!(discovery.state.lock().unwrap().idle_running(), "a failed stop must stay owed");
 
-        // The next scan recovers instead of failing with InProgress.
-        let third = discovery.begin_scan(&adapter).await.expect("scan must recover from the wedge");
-        assert_eq!(fake.lock().unwrap().clients.len(), 1);
-        assert_eq!(fake.lock().unwrap().starts, 2);
-
-        // What `connect()` awaits: discovery really stopped once it returns.
-        drop(third);
+        // What `connect()` awaits: the owed stop is retried, and discovery
+        // has really stopped once it returns.
         discovery.stop_if_idle("test").await;
         assert!(fake.lock().unwrap().clients.is_empty(), "discovery must be stopped before a dial");
         assert!(!discovery.state.lock().unwrap().running);
+
+        // Our state loses track of a client BlueZ still lists: the next scan
+        // gets `InProgress`, and must recover instead of failing.
+        fake.lock().unwrap().clients.insert(session_unique_name(&discovery));
+        let third = discovery.begin_scan().await.expect("scan must recover from the wedge");
+        assert_eq!(fake.lock().unwrap().clients.len(), 1);
+        assert_eq!(fake.lock().unwrap().starts, 2);
+        drop(third);
+        discovery.stop_if_idle("test").await;
+        assert!(fake.lock().unwrap().clients.is_empty());
+    }
+
+    fn session_unique_name(discovery: &DiscoveryBus) -> String {
+        discovery.conn.unique_name().to_string()
     }
 }
