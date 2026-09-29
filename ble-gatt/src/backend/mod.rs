@@ -23,8 +23,8 @@ use tokio_stream::Stream;
 
 use crate::error::Result;
 use crate::models::{
-    CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress,
-    ServiceUuid, WriteType,
+    CapabilityReport, CharacteristicUuid, ConnectionPriority, DiscoveredPeer, GattEvent, GattServiceSpec,
+    PeerAddress, ServiceUuid, WriteType,
 };
 
 pub type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
@@ -91,6 +91,24 @@ pub trait GattConnection: Send {
         &mut self, characteristic: CharacteristicUuid,
     ) -> Result<BoxStream<Result<Vec<u8>>>>;
     async fn disconnect(&mut self) -> Result<()>;
+
+    /// Ask the platform to trade latency for power on this link — e.g.
+    /// [`ConnectionPriority::LowPower`] while it only needs to stay
+    /// reachable, [`ConnectionPriority::High`] while traffic is expected.
+    /// Can be called any number of times over the connection's life.
+    ///
+    /// A request, not a guarantee: `Ok` means the platform accepted it; the
+    /// interval actually negotiated with the peer is not reported. Returns
+    /// [`BleError::Unsupported`] where the platform has no such control
+    /// (Linux: BlueZ exposes none over D-Bus) — the default here.
+    ///
+    /// [`ConnectionPriority::LowPower`]: crate::models::ConnectionPriority::LowPower
+    /// [`ConnectionPriority::High`]: crate::models::ConnectionPriority::High
+    /// [`BleError::Unsupported`]: crate::BleError::Unsupported
+    async fn request_connection_priority(&mut self, priority: ConnectionPriority) -> Result<()> {
+        let _ = priority;
+        Err(crate::BleError::Unsupported("connection priority on this backend".into()))
+    }
 }
 
 /// Platform BLE backend: scan/connect as a GATT central, and/or

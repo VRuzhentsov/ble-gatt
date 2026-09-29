@@ -30,7 +30,7 @@ use crate::backend::link_state::{
 use crate::backend::{Backend, BoxStream};
 use crate::datagram::{self, DatagramChannel, DatagramConfig};
 use crate::error::{BleError, Result};
-use crate::models::{GattEvent, PeerAddress, RadioStatus, Role};
+use crate::models::{ConnectionPriority, GattEvent, PeerAddress, RadioStatus, Role};
 
 const EVENT_CHANNEL_CAPACITY: usize = 128;
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
@@ -39,6 +39,9 @@ const TICK_INTERVAL: Duration = Duration::from_secs(1);
 const SERVE_RETRY_DELAY: Duration = Duration::from_secs(2);
 const CHANNEL_SEND_QUEUE: usize = 16;
 const CHANNEL_RECV_QUEUE: usize = 64;
+/// Priority requests are rare (a UI state change), so a small queue only
+/// guards against a caller spamming them while a slow `send` holds the pump.
+const CHANNEL_PRIORITY_QUEUE: usize = 4;
 const DISCOVER_WINDOW: Duration = Duration::from_secs(3);
 
 /// A stable identity the two peers of a pair compare the same way, to decide
@@ -168,6 +171,7 @@ pub struct PeerChannel {
     peer: PeerAddress,
     max_message_len: usize,
     send_tx: mpsc::Sender<(Vec<u8>, oneshot::Sender<Result<()>>)>,
+    priority_tx: mpsc::Sender<(ConnectionPriority, oneshot::Sender<Result<()>>)>,
     recv_rx: AsyncMutex<mpsc::Receiver<Result<Vec<u8>>>>,
 }
 
@@ -206,6 +210,29 @@ impl PeerChannel {
 
     pub async fn recv(&self) -> Option<Result<Vec<u8>>> {
         self.recv_rx.lock().await.recv().await
+    }
+
+    /// See [`GattConnection::request_connection_priority`]: Android only,
+    /// and only on a link this side dialled — otherwise
+    /// [`BleError::Unsupported`]. Same crossing contract as `send`: the real
+    /// error comes back, a full queue is `GattBusy`, a closed link is
+    /// `NotConnected`. A reconnect starts at the platform default again, so
+    /// re-request after each `PeerLinkEvent::Up`.
+    ///
+    /// [`GattConnection::request_connection_priority`]: crate::GattConnection::request_connection_priority
+    pub async fn request_connection_priority(&self, priority: ConnectionPriority) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.priority_tx
+            .try_send((priority, reply_tx))
+            .map_err(|err| match err {
+                mpsc::error::TrySendError::Full(_) => {
+                    BleError::GattBusy(format!("priority queue full for {}", self.peer.0))
+                }
+                mpsc::error::TrySendError::Closed(_) => BleError::NotConnected(self.peer.0.clone()),
+            })?;
+        reply_rx
+            .await
+            .map_err(|_| BleError::NotConnected(self.peer.0.clone()))?
     }
 }
 
@@ -962,6 +989,8 @@ impl Driver {
         let (send_tx, mut send_rx) =
             mpsc::channel::<(Vec<u8>, oneshot::Sender<Result<()>>)>(CHANNEL_SEND_QUEUE);
         let (recv_tx, recv_rx) = mpsc::channel::<Result<Vec<u8>>>(CHANNEL_RECV_QUEUE);
+        let (priority_tx, mut priority_rx) =
+            mpsc::channel::<(ConnectionPriority, oneshot::Sender<Result<()>>)>(CHANNEL_PRIORITY_QUEUE);
         let (teardown_tx, mut teardown_rx) = oneshot::channel::<()>();
 
         let peer2 = peer.clone();
@@ -974,6 +1003,12 @@ impl Driver {
                         Some((bytes, reply)) => {
                             let _ = reply.send(channel.send(bytes).await);
                         }
+                    },
+                    // `Some` only: the handle holds `priority_tx` for as long
+                    // as it holds `send_tx`, and `send_rx` above already ends
+                    // the loop when the handle is gone.
+                    Some((priority, reply)) = priority_rx.recv() => {
+                        let _ = reply.send(channel.request_connection_priority(priority).await);
                     },
                     item = channel.recv() => match item {
                         Some(msg) => {
@@ -1020,6 +1055,7 @@ impl Driver {
             peer,
             max_message_len,
             send_tx,
+            priority_tx,
             recv_rx: AsyncMutex::new(recv_rx),
         });
         (LiveLink { gen, pump: task.abort_handle(), _teardown: teardown_tx }, handle)

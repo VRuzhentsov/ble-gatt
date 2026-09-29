@@ -74,8 +74,8 @@ use uuid::Uuid;
 use crate::backend::{Backend, BoxStream, GattConnection};
 use crate::error::{BleError, Result};
 use crate::models::{
-    CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress,
-    RadioStatus, Role, ServiceUuid, WriteType,
+    CapabilityReport, CharacteristicUuid, ConnectionPriority, DiscoveredPeer, GattEvent, GattServiceSpec,
+    PeerAddress, RadioStatus, Role, ServiceUuid, WriteType,
 };
 
 const BRIDGE_CLASS_BINARY_NAME: &str = "dev.blegatt.BleGattBridge";
@@ -85,8 +85,9 @@ const CALLBACK_CLASS: &str = "dev/blegatt/NativeKt";
 /// bridge must implement. `BleGattBridge.kt::bridgeAbiVersion()` returns the
 /// matching number; a mismatch is logged at construction (see
 /// `AndroidBackend::new`). v2 added `onRadioState` / `bridgeAbiVersion` /
-/// `isRadioEnabled` (ADR-0005's adapter-state receiver).
-const BRIDGE_ABI_VERSION: i32 = 2;
+/// `isRadioEnabled` (ADR-0005's adapter-state receiver). v3 added
+/// `requestConnectionPriority`.
+const BRIDGE_ABI_VERSION: i32 = 3;
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 
@@ -256,8 +257,12 @@ impl Inner {
     }
 
     fn call_int(&self, env: &mut JNIEnv, method: &str, sig: &str) -> Result<i32> {
+        self.call_int_with(env, method, sig, &[])
+    }
+
+    fn call_int_with(&self, env: &mut JNIEnv, method: &str, sig: &str, args: &[JValue]) -> Result<i32> {
         let bridge = self.bridge()?;
-        let result = env.call_method(bridge.as_obj(), method, sig, &[]).and_then(|v| v.i());
+        let result = env.call_method(bridge.as_obj(), method, sig, args).and_then(|v| v.i());
         match result {
             Ok(value) => Ok(value),
             Err(err) => Err(jni_error(env, method, err)),
@@ -1266,6 +1271,39 @@ impl GattConnection for AndroidGattConnection {
             rx: ReceiverStream::new(notify_rx),
             overflow,
         }))
+    }
+
+    async fn request_connection_priority(&mut self, priority: ConnectionPriority) -> Result<()> {
+        // Same ordering as `BleGattBridge.requestConnectionPriority`'s
+        // `priority` argument.
+        let code = match priority {
+            ConnectionPriority::LowPower => 0,
+            ConnectionPriority::Balanced => 1,
+            ConnectionPriority::High => 2,
+        };
+        let outcome = {
+            let mut env = self.inner.env()?;
+            let address = env.new_string(&self.address).map_err(|err| BleError::Gatt(err.to_string()))?;
+            self.inner.call_int_with(
+                &mut env,
+                "requestConnectionPriority",
+                "(Ljava/lang/String;JI)I",
+                &[
+                    JValue::Object(&address),
+                    JValue::Long(self.session.unwrap_or_default() as i64),
+                    JValue::Int(code),
+                ],
+            )?
+        };
+        // Codes documented on the Kotlin side.
+        match outcome {
+            0 => Ok(()),
+            1 => Err(BleError::NotConnected(self.address.clone())),
+            _ => Err(BleError::Gatt(format!(
+                "the platform refused the {priority:?} connection priority request for {}",
+                self.address
+            ))),
+        }
     }
 
     async fn disconnect(&mut self) -> Result<()> {

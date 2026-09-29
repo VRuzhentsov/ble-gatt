@@ -76,6 +76,30 @@ pub enum WriteType {
     WithoutResponse,
 }
 
+/// The latency/power trade-off a central asks the platform for on one live
+/// link — see [`GattConnection::request_connection_priority`].
+///
+/// Android only (`BluetoothGatt.requestConnectionPriority`); BlueZ exposes
+/// no per-connection interval control over D-Bus, so the Linux backend
+/// returns [`BleError::Unsupported`](crate::BleError::Unsupported).
+///
+/// [`GattConnection::request_connection_priority`]: crate::GattConnection::request_connection_priority
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "mock-broker", derive(serde::Serialize, serde::Deserialize))]
+pub enum ConnectionPriority {
+    /// Long connection interval: fewer radio wakeups and less battery, at
+    /// the cost of latency and throughput. For an idle link kept open only
+    /// to stay reachable.
+    LowPower,
+    /// The platform default.
+    #[default]
+    Balanced,
+    /// Short connection interval: lowest latency and highest throughput,
+    /// at the cost of battery. For bursts of traffic or while a user is
+    /// actively watching; switch back when that ends.
+    High,
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "mock-broker", derive(serde::Serialize, serde::Deserialize))]
 pub enum GattEvent {
