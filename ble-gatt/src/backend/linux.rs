@@ -54,6 +54,23 @@ const NOTIFY_SESSION_POLL: std::time::Duration = std::time::Duration::from_milli
 const NOTIFY_WRITER_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const NOTIFY_WRITER_ACQUIRE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// How long `connect()` waits for this backend's own discovery to stop
+/// before dialling anyway.
+///
+/// Dropping a scan stream used to leave discovery running for an unknown
+/// time: `bluer` sends `StopDiscovery` from a spawned task once its session
+/// token drops, so a caller that dropped its scan and dialled immediately
+/// raced `Connect()` against a still-running discovery. Real-hardware
+/// evidence (Pixel 6 Pro <-> Linux desktop, fini PR 185): that race produced
+/// `le-connection-abort-by-local` two seconds into the dial. `connect()`
+/// now issues (or waits for) the `StopDiscovery` itself; bounded so a
+/// BlueZ that never replies costs a dial this long rather than stalling it.
+const DISCOVERY_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// D-Bus reply timeout for `SetDiscoveryFilter`/`StartDiscovery`/
+/// `StopDiscovery` on the discovery connection.
+const DISCOVERY_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
@@ -168,6 +185,256 @@ fn is_not_connected(err: &bluer::Error) -> bool {
     )
 }
 
+/// True when `err` is BlueZ's `org.bluez.Error.InProgress` — which
+/// `StartDiscovery` returns when the calling D-Bus client is *already* in
+/// BlueZ's discovery list.
+fn is_in_progress(err: &bluer::Error) -> bool {
+    err.kind == bluer::ErrorKind::InProgress
+}
+
+/// Maps a failure to start discovery. A busy adapter is not a missing one:
+/// only `InProgress` becomes `AdapterBusy`, everything else keeps the
+/// existing `AdapterUnavailable` mapping.
+fn discovery_error(err: bluer::Error) -> BleError {
+    if is_in_progress(&err) {
+        BleError::AdapterBusy(err.to_string())
+    } else {
+        BleError::AdapterUnavailable(err.to_string())
+    }
+}
+
+/// True when a failed `StartDiscovery` proves this client is not
+/// discovering. Not for `InProgress` (BlueZ still lists the client) nor for
+/// a reply timeout (`org.freedesktop.DBus.Error.NoReply`: BlueZ may have
+/// accepted it) — in both, a stop stays owed.
+fn start_proved_not_running(err: &bluer::Error) -> bool {
+    let no_reply = matches!(
+        &err.kind,
+        bluer::ErrorKind::Internal(bluer::InternalErrorKind::DBus(name))
+            if name == "org.freedesktop.DBus.Error.NoReply"
+    );
+    !is_in_progress(err) && !no_reply
+}
+
+/// This backend's own view of its discovery. Only touched briefly, never
+/// across an `.await`; `DiscoveryBus::op` is what orders the D-Bus calls.
+#[derive(Debug, Default)]
+struct ScanState {
+    /// Scan streams handed out and not yet dropped.
+    live: usize,
+    /// Our last `StartDiscovery` succeeded and no `StopDiscovery` has
+    /// succeeded since. Stays set after a *failed* stop while the adapter
+    /// still reports discovering, so the stop stays owed and the next
+    /// `connect()` retries it instead of dialling into that discovery.
+    running: bool,
+}
+
+impl ScanState {
+    /// Whether discovery is on with no scan left to use it — i.e. a
+    /// `StopDiscovery` is owed.
+    fn idle_running(&self) -> bool {
+        self.live == 0 && self.running
+    }
+}
+
+/// Discovery, on a D-Bus connection this backend owns instead of `bluer`'s.
+///
+/// `bluer` ignores `StopDiscovery`'s result (it is only trace-logged inside
+/// `Adapter::discovery_session`) and exposes neither a public
+/// `StopDiscovery` nor its connection to send one on. If that call failed,
+/// BlueZ kept our client in its discovery list while `bluer` believed the
+/// session ended, and every later `StartDiscovery` was refused with
+/// `InProgress` ("Operation already in progress") — nothing ever sent
+/// `StopDiscovery` again, so only an app restart (dropping the D-Bus
+/// connection) cleared it. Real-hardware evidence (fini PR 185): 591
+/// consecutive scan failures over 20 minutes after an aborted dial.
+///
+/// Replacing `bluer`'s session was not enough: a dropped `bluer::Session`
+/// stays on the bus for ~30 s (its event loop awaits `RemoveMatch` replies
+/// on a connection whose I/O task it already aborted), so BlueZ would keep
+/// discovering — and racing dials — for that long. Owning the connection
+/// lets this backend send `StopDiscovery` itself, see its result, and have
+/// `connect()` wait for it.
+///
+/// BlueZ keeps discovery per D-Bus client, not per call: a second
+/// `StartDiscovery` from the same client is refused with `InProgress`. So
+/// concurrent scans share one discovery, started by the first and stopped
+/// after the last is dropped — the refcounting `bluer` used to do.
+struct DiscoveryBus {
+    conn: Arc<dbus::nonblock::SyncConnection>,
+    io_task: tokio::task::JoinHandle<()>,
+    adapter_path: dbus::Path<'static>,
+    /// The backend's own `bluer` adapter, only for reading `Discovering`.
+    adapter: Adapter,
+    /// Serialises every `StartDiscovery`/`StopDiscovery` together with the
+    /// `ScanState` decision that led to it, so a stop can never overtake
+    /// the start of a scan that has already been counted, or vice versa.
+    op: AsyncMutex<()>,
+    state: StdMutex<ScanState>,
+}
+
+impl DiscoveryBus {
+    async fn open(adapter: &Adapter) -> Result<Self> {
+        let unavailable = |err: String| BleError::AdapterUnavailable(err);
+        let (resource, conn) = tokio::task::spawn_blocking(dbus_tokio::connection::new_system_sync)
+            .await
+            .map_err(|err| unavailable(err.to_string()))?
+            .map_err(|err| unavailable(err.to_string()))?;
+        let io_task = tokio::spawn(async move {
+            let err = resource.await;
+            log::warn!("scan: discovery D-Bus connection lost: {err}");
+        });
+        let adapter_path = dbus::Path::new(format!("/org/bluez/{}", adapter.name())).map_err(unavailable)?;
+        Ok(Self {
+            conn,
+            io_task,
+            adapter_path,
+            adapter: adapter.clone(),
+            op: AsyncMutex::new(()),
+            state: StdMutex::new(ScanState::default()),
+        })
+    }
+
+    async fn call(&self, method: &str, args: impl dbus::arg::AppendAll) -> bluer::Result<()> {
+        let proxy =
+            dbus::nonblock::Proxy::new("org.bluez", &self.adapter_path, DISCOVERY_CALL_TIMEOUT, &*self.conn);
+        proxy.method_call::<(), _, _, _>("org.bluez.Adapter1", method, args).await.map_err(bluer::Error::from)
+    }
+
+    /// `SetDiscoveryFilter` + `StartDiscovery`, with the same default filter
+    /// `bluer` sent (any UUID, interleaved LE/BR-EDR scan).
+    async fn start_discovery(&self) -> bluer::Result<()> {
+        use dbus::arg::{RefArg, Variant};
+        let mut filter: HashMap<&str, Variant<Box<dyn RefArg>>> = HashMap::new();
+        filter.insert("UUIDs", Variant(Box::new(Vec::<String>::new())));
+        filter.insert("Transport", Variant(Box::new("auto".to_string())));
+        self.call("SetDiscoveryFilter", (filter,)).await?;
+        self.call("StartDiscovery", ()).await
+    }
+
+    /// Counts a new scan, starting discovery if it is not already on.
+    ///
+    /// `running` alone is not trusted — BlueZ drops every client's
+    /// discovery when the adapter powers off, without any call of ours — so
+    /// it is confirmed against the adapter's `Discovering` property.
+    async fn begin_scan(self: &Arc<Self>) -> Result<ScanGuard> {
+        let _op = self.op.lock().await;
+        let running = self.state.lock().unwrap().running;
+        let still_on = running && self.adapter.is_discovering().await.unwrap_or(false);
+        if !still_on {
+            // Marked *before* the call: if this future is cancelled, or the
+            // reply times out, after BlueZ accepted `StartDiscovery`, the
+            // stop must already be owed — otherwise the next `connect()`
+            // would skip `settle_discovery` and dial into it (Codex P1 on
+            // PR #21). Cleared below only when BlueZ's reply proves
+            // discovery did not start.
+            self.state.lock().unwrap().running = true;
+            let result = match self.start_discovery().await {
+                Ok(()) => Ok(()),
+                // BlueZ says this client is already discovering although we
+                // have not started it: a previous `StopDiscovery` failed or
+                // BlueZ never saw it. Clear it and retry once.
+                Err(err) if is_in_progress(&err) => {
+                    log::warn!(
+                        "scan: discovery failed to start: {err} — BlueZ still counts this client as \
+                         discovering; sending StopDiscovery and retrying once"
+                    );
+                    if let Err(err) = self.call("StopDiscovery", ()).await {
+                        log::warn!("scan: StopDiscovery (wedge recovery) failed: {err}");
+                    }
+                    self.start_discovery().await.inspect_err(|err| {
+                        log::warn!("scan: discovery failed to start after StopDiscovery: {err}");
+                    })
+                }
+                Err(err) => {
+                    log::warn!("scan: discovery failed to start: {err}");
+                    Err(err)
+                }
+            };
+            if let Err(err) = result {
+                if start_proved_not_running(&err) {
+                    self.state.lock().unwrap().running = false;
+                }
+                return Err(discovery_error(err));
+            }
+        }
+        let mut state = self.state.lock().unwrap();
+        state.running = true;
+        state.live += 1;
+        Ok(ScanGuard(self.clone()))
+    }
+
+    /// Sends `StopDiscovery` if discovery is on and no scan is live. Waits
+    /// for any start or stop already in flight first, so once this returns
+    /// our client's discovery has really been stopped — or the stop failed,
+    /// which is logged and leaves it owed (see `ScanState::running`).
+    async fn stop_if_idle(&self, why: &str) {
+        let _op = self.op.lock().await;
+        if !self.state.lock().unwrap().idle_running() {
+            return;
+        }
+        match self.call("StopDiscovery", ()).await {
+            Ok(()) => {
+                self.state.lock().unwrap().running = false;
+                log::info!("scan: discovery stopped ({why})");
+            }
+            Err(err) => {
+                // BlueZ refuses a stop while keeping this client listed
+                // (e.g. `InProgress` while an earlier request of ours is
+                // pending) — the wedge this type exists for. Only an
+                // adapter that is not discovering at all proves there is
+                // nothing left to stop; unreadable counts as still on.
+                // `Discovering` is adapter-wide, so another process
+                // scanning keeps the stop owed: each later dial then
+                // retries it once, bounded by `DISCOVERY_STOP_TIMEOUT`.
+                let still_on = self.adapter.is_discovering().await.unwrap_or(true);
+                if still_on {
+                    log::warn!(
+                        "scan: StopDiscovery failed ({why}): {err} — the adapter is still discovering; \
+                         the stop stays owed and is retried before the next dial"
+                    );
+                } else {
+                    self.state.lock().unwrap().running = false;
+                    log::warn!(
+                        "scan: StopDiscovery failed ({why}): {err} — the adapter is not discovering, so \
+                         nothing is left to stop"
+                    );
+                }
+            }
+        }
+    }
+}
+
+impl Drop for DiscoveryBus {
+    fn drop(&mut self) {
+        self.io_task.abort();
+    }
+}
+
+/// Held by a scan stream. Dropping the last one schedules `StopDiscovery`;
+/// a `connect()` that runs before the scheduled task gets there sends it
+/// itself (`LinuxBackend::settle_discovery`).
+struct ScanGuard(Arc<DiscoveryBus>);
+
+impl Drop for ScanGuard {
+    fn drop(&mut self) {
+        let idle = {
+            let mut state = self.0.state.lock().unwrap();
+            state.live = state.live.saturating_sub(1);
+            state.idle_running()
+        };
+        if !idle {
+            return;
+        }
+        // No runtime (a stream dropped outside one): the next `connect()`
+        // or scan settles it instead.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let bus = self.0.clone();
+            runtime.spawn(async move { bus.stop_if_idle("last scan ended").await });
+        }
+    }
+}
+
 pub struct LinuxBackend {
     // Held only to keep the D-Bus session connection alive for the
     // lifetime of the backend; `Adapter` clones its own `Arc` into the
@@ -265,6 +532,8 @@ pub struct LinuxBackend {
     /// life of its cleanup task if the attempt is abandoned. See
     /// `MAX_CONCURRENT_CLEANUP_DISCONNECTS`'s doc comment.
     cleanup_permits: Arc<tokio::sync::Semaphore>,
+    /// See `DiscoveryBus`.
+    discovery: Arc<DiscoveryBus>,
 }
 
 impl LinuxBackend {
@@ -282,6 +551,7 @@ impl LinuxBackend {
         // reports the current state. Only a missing adapter (handled above)
         // is unrecoverable. Operations attempted while unpowered fail on
         // their own, honestly.
+        let discovery = Arc::new(DiscoveryBus::open(&adapter).await?);
         let (events_tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
 
         // Watch the adapter's `Powered` property and forward it as
@@ -332,7 +602,26 @@ impl LinuxBackend {
             pending_cleanup: Arc::new(StdMutex::new(HashSet::new())),
             in_flight: Arc::new(StdMutex::new(HashSet::new())),
             cleanup_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CLEANUP_DISCONNECTS)),
+            discovery,
         })
+    }
+
+    /// Before a dial: if discovery is still on with no scan left using it
+    /// (the caller just dropped its scan), stop it and wait for BlueZ to
+    /// confirm, so `Connect()` does not race it. See
+    /// `DISCOVERY_STOP_TIMEOUT`. A scan the caller keeps live is left
+    /// alone — overlapping it with a dial is the caller's choice. Never
+    /// fails the dial.
+    async fn settle_discovery(&self) {
+        if !self.discovery.state.lock().unwrap().idle_running() {
+            return;
+        }
+        if tokio::time::timeout(DISCOVERY_STOP_TIMEOUT, self.discovery.stop_if_idle("before dialling"))
+            .await
+            .is_err()
+        {
+            log::warn!("connect: discovery did not stop within {DISCOVERY_STOP_TIMEOUT:?}; dialling anyway");
+        }
     }
 }
 
@@ -912,13 +1201,28 @@ impl Backend for LinuxBackend {
     async fn scan(&self, service: ServiceUuid) -> Result<BoxStream<Result<DiscoveredPeer>>> {
         let adapter = self.adapter.clone();
         log::info!("scan: starting discovery for service {}", service.0);
-        let events = adapter.discover_devices().await.map_err(|err| {
-            log::warn!("scan: discovery failed to start: {err}");
-            BleError::AdapterUnavailable(err.to_string())
-        })?;
+        // The guard is created before the calls below, so a failure in
+        // them still stops the discovery just started.
+        let scan_guard = self.discovery.begin_scan().await?;
+        // The same stream `bluer::Adapter::discover_devices` built: already
+        // known devices first, then adapter events until discovery stops.
+        let changes = adapter.events().await.map_err(|err| BleError::AdapterUnavailable(err.to_string()))?;
+        let known = adapter
+            .device_addresses()
+            .await
+            .map_err(|err| BleError::AdapterUnavailable(err.to_string()))?;
+        let events = futures::stream::iter(known).map(AdapterEvent::DeviceAdded).chain(changes.take_while(
+            |event| {
+                std::future::ready(!matches!(
+                    event,
+                    AdapterEvent::PropertyChanged(bluer::AdapterProperty::Discovering(false))
+                ))
+            },
+        ));
         let target = service.0;
 
         let discovered = events.filter_map(move |event| {
+            let _scan_guard = &scan_guard;
             let adapter = adapter.clone();
             async move {
                 let AdapterEvent::DeviceAdded(address) = event else {
@@ -1006,6 +1310,9 @@ impl Backend for LinuxBackend {
         // that arrives while merely queued for `dial_lock` below, always
         // has something alive to release the entry it just claimed.
         let _in_flight_guard = InFlightGuard { in_flight: self.in_flight.clone(), peer: peer.clone() };
+        // Before `dial_lock`: this can wait up to `DISCOVERY_STOP_TIMEOUT`,
+        // which must not hold up GATT operations on other links.
+        self.settle_discovery().await;
         // Recorded *before* dialling: BlueZ can publish the Connected
         // property before `connect()` returns, and the inbound watcher would
         // otherwise race us and announce our own outbound link as a central
@@ -1727,5 +2034,214 @@ impl GattConnection for LinuxGattConnection {
         let _dial = self.dial_lock.lock().await;
         self.ensure_current()?;
         self.device.disconnect().await.map_err(|err| BleError::Gatt(err.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dbus::channel::MatchingReceiver;
+
+    #[test]
+    fn in_progress_maps_to_adapter_busy_not_unavailable() {
+        let busy = bluer::Error { kind: bluer::ErrorKind::InProgress, message: "Operation already in progress".into() };
+        assert!(matches!(discovery_error(busy), BleError::AdapterBusy(_)));
+        let off = bluer::Error { kind: bluer::ErrorKind::NotReady, message: "Resource Not Ready".into() };
+        assert!(matches!(discovery_error(off), BleError::AdapterUnavailable(_)));
+    }
+
+    #[test]
+    fn stop_is_owed_only_when_running_with_no_live_scan() {
+        let mut state = ScanState::default();
+        assert!(!state.idle_running());
+        state.running = true;
+        state.live = 1;
+        assert!(!state.idle_running());
+        state.live = 0;
+        assert!(state.idle_running());
+    }
+
+    /// A fake BlueZ adapter with BlueZ's per-client discovery rules
+    /// (`src/adapter.c`): `StartDiscovery` from a client already in the
+    /// discovery list is refused with `InProgress`, and `Discovering` is
+    /// true while any client is in it. `fail_next_stop` makes the next
+    /// `StopDiscovery` fail *and leave the client listed* — the wedge seen
+    /// on real hardware.
+    #[derive(Default)]
+    struct FakeAdapter {
+        clients: HashSet<String>,
+        fail_next_stop: bool,
+        starts: usize,
+        /// Held inside the `StartDiscovery` handler before it replies, so a
+        /// test can cancel the caller after BlueZ has accepted the call.
+        start_delay: std::time::Duration,
+    }
+
+    type Fake = Arc<StdMutex<FakeAdapter>>;
+
+    /// A private `dbus-daemon`, killed on drop.
+    ///
+    /// libdbus reads the system bus address once per process, so only one
+    /// test in this binary can use a private bus: every scenario that needs
+    /// one lives in `discovery_recovers_from_a_failed_stop`.
+    struct PrivateBus(std::process::Child);
+
+    impl Drop for PrivateBus {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Starts a private bus, points this process's *system* bus at it, and
+    /// serves `FakeAdapter` as `org.bluez` `/org/bluez/hci0` on it. `None`
+    /// when no `dbus-daemon` is installed.
+    async fn fake_bluez() -> Option<(PrivateBus, Fake)> {
+        use std::io::BufRead;
+        let mut child = std::process::Command::new("dbus-daemon")
+            .args(["--session", "--nofork", "--print-address"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .ok()?;
+        let mut address = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut address).unwrap();
+        let bus = PrivateBus(child);
+        // Only this module's tests touch the system bus.
+        std::env::set_var("DBUS_SYSTEM_BUS_ADDRESS", address.trim());
+
+        let (resource, conn) = dbus_tokio::connection::new_system_sync().unwrap();
+        tokio::spawn(resource);
+        conn.request_name("org.bluez", false, true, false).await.unwrap();
+        let fake = Fake::default();
+        let mut cr = dbus_crossroads::Crossroads::new();
+        cr.set_async_support(Some((
+            conn.clone(),
+            Box::new(|task| {
+                tokio::spawn(task);
+            }),
+        )));
+        let iface = cr.register("org.bluez.Adapter1", |b: &mut dbus_crossroads::IfaceBuilder<Fake>| {
+            b.property::<bool, _>("Discovering").get(|_, fake| Ok(!fake.lock().unwrap().clients.is_empty()));
+            b.method("SetDiscoveryFilter", ("filter",), (), |_, _, (_filter,): (dbus::arg::PropMap,)| Ok(()));
+            // Async so `start_delay` holds only this reply, not a runtime
+            // thread.
+            b.method_with_cr_async("StartDiscovery", (), (), |mut ctx, cr, ()| {
+                let fake: Fake = cr.data_mut::<Fake>(ctx.path()).unwrap().clone();
+                let sender = ctx.message().sender().unwrap().to_string();
+                async move {
+                    let delay = fake.lock().unwrap().start_delay;
+                    tokio::time::sleep(delay).await;
+                    let result = {
+                        let mut fake = fake.lock().unwrap();
+                        if fake.clients.insert(sender) {
+                            fake.starts += 1;
+                            Ok(())
+                        } else {
+                            Err(("org.bluez.Error.InProgress", "Operation already in progress").into())
+                        }
+                    };
+                    ctx.reply(result)
+                }
+            });
+            b.method("StopDiscovery", (), (), |ctx, fake, ()| {
+                let sender = ctx.message().sender().unwrap().to_string();
+                let mut fake = fake.lock().unwrap();
+                if std::mem::take(&mut fake.fail_next_stop) {
+                    return Err(("org.bluez.Error.Failed", "injected StopDiscovery failure").into());
+                }
+                if !fake.clients.remove(&sender) {
+                    return Err(("org.bluez.Error.Failed", "No discovery started").into());
+                }
+                Ok(())
+            });
+        });
+        cr.insert("/org/bluez/hci0", &[iface], fake.clone());
+        conn.start_receive(
+            dbus::message::MatchRule::new_method_call(),
+            Box::new(move |msg, conn| {
+                let _ = cr.handle_message(msg, conn);
+                true
+            }),
+        );
+        Some((bus, fake))
+    }
+
+    /// The real-hardware wedge, end to end against the fake. A failed
+    /// `StopDiscovery` that leaves our client listed must keep the stop
+    /// owed, so the next `connect()` retries it rather than dialling into
+    /// the discovery (Codex P1 on PR #21). And if our state has lost track
+    /// of a listed client (e.g. a start cancelled after BlueZ accepted it),
+    /// the next scan's `InProgress` must be cleared and the scan started
+    /// anyway, not fail every scan from then on. And a scan cancelled
+    /// mid-start must leave the stop owed. Also covers refcounted sharing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn discovery_recovers_from_a_failed_stop() {
+        let Some((_bus, fake)) = fake_bluez().await else {
+            eprintln!("dbus-daemon not installed; skipping");
+            return;
+        };
+        let session = Session::new().await.unwrap();
+        let adapter = session.adapter("hci0").unwrap();
+        let discovery = Arc::new(DiscoveryBus::open(&adapter).await.unwrap());
+
+        // Two concurrent scans share one discovery.
+        let first = discovery.begin_scan().await.unwrap();
+        let second = discovery.begin_scan().await.unwrap();
+        assert_eq!(fake.lock().unwrap().starts, 1);
+        drop(first);
+        assert!(!discovery.state.lock().unwrap().idle_running(), "a live scan still needs discovery");
+
+        // The last scan ends and its StopDiscovery fails: wedged, and the
+        // stop must stay owed.
+        fake.lock().unwrap().fail_next_stop = true;
+        drop(second);
+        discovery.stop_if_idle("test").await;
+        assert_eq!(fake.lock().unwrap().clients.len(), 1, "fake must now be wedged");
+        assert!(discovery.state.lock().unwrap().idle_running(), "a failed stop must stay owed");
+
+        // What `connect()` awaits: the owed stop is retried, and discovery
+        // has really stopped once it returns.
+        discovery.stop_if_idle("test").await;
+        assert!(fake.lock().unwrap().clients.is_empty(), "discovery must be stopped before a dial");
+        assert!(!discovery.state.lock().unwrap().running);
+
+        // Our state loses track of a client BlueZ still lists: the next scan
+        // gets `InProgress`, and must recover instead of failing.
+        fake.lock().unwrap().clients.insert(session_unique_name(&discovery));
+        let third = discovery.begin_scan().await.expect("scan must recover from the wedge");
+        assert_eq!(fake.lock().unwrap().clients.len(), 1);
+        assert_eq!(fake.lock().unwrap().starts, 2);
+        drop(third);
+        discovery.stop_if_idle("test").await;
+        assert!(fake.lock().unwrap().clients.is_empty());
+
+        // A scan cancelled after BlueZ accepted its `StartDiscovery` must
+        // leave the stop owed, so the next `connect()` stops discovery
+        // instead of dialling into it (Codex P1 on PR #21).
+        fake.lock().unwrap().start_delay = std::time::Duration::from_millis(300);
+        let cancelled =
+            tokio::time::timeout(std::time::Duration::from_millis(50), discovery.begin_scan()).await;
+        assert!(cancelled.is_err(), "the scan must be cancelled mid-start");
+        // Let the fake finish accepting the start.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        fake.lock().unwrap().start_delay = std::time::Duration::ZERO;
+        assert_eq!(fake.lock().unwrap().clients.len(), 1, "BlueZ accepted the start");
+        assert!(discovery.state.lock().unwrap().idle_running(), "the stop must be owed");
+        discovery.stop_if_idle("test").await;
+        assert!(fake.lock().unwrap().clients.is_empty(), "discovery must be stopped before a dial");
+    }
+
+    #[test]
+    fn only_a_definite_start_failure_clears_the_owed_stop() {
+        let err = |kind| bluer::Error { kind, message: String::new() };
+        assert!(start_proved_not_running(&err(bluer::ErrorKind::NotReady)));
+        assert!(!start_proved_not_running(&err(bluer::ErrorKind::InProgress)));
+        assert!(!start_proved_not_running(&err(bluer::ErrorKind::Internal(
+            bluer::InternalErrorKind::DBus("org.freedesktop.DBus.Error.NoReply".into())
+        ))));
+    }
+
+    fn session_unique_name(discovery: &DiscoveryBus) -> String {
+        discovery.conn.unique_name().to_string()
     }
 }
