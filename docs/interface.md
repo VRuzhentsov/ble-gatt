@@ -111,6 +111,17 @@ The handle's contract across that hop:
   maps to `None`, never a hang. A handle whose far end is gone reads as closed.
 - **A full internal send queue surfaces as `BleError::GattBusy`**, not as
   backpressure indistinguishable from a stall — so it slots into the same retry.
+- **`request_connection_priority` follows the same crossing rules.** It asks
+  the platform for a latency/power trade-off on the live link
+  (`ConnectionPriority::LowPower` while idle, `High` while traffic is expected)
+  and can be called any number of times. Android only, and only on a link this
+  side dialled — the Linux backend and accepted links return
+  `BleError::Unsupported`, which a cross-platform caller treats as a no-op. A
+  request, not a guarantee: `Ok` means the platform accepted it. The first
+  explicit request replaces the Android backend's automatic bootstrap priority
+  (HIGH at connect, BALANCED once bootstrap ends) for that connection; a
+  reconnect starts over, so re-request after each `Up`. Also on
+  `GattConnection` (Tier 1) and `DatagramChannel` (Tier 2).
 
 Fields. `datagram` carries the wire contract (service + characteristic) and
 the fragmentation bounds. `role` is the one genuine protocol decision — who

@@ -11,8 +11,9 @@ use std::time::Duration;
 use ble_gatt::backend::mock::{MockBackend, MockNetwork};
 use ble_gatt::datagram::DatagramConfig;
 use ble_gatt::{
-    Backend, CapabilityReport, GattCharacteristicSpec, GattServiceSpec, LinkRole, MaxLinks,
-    PeerAddress, PeerLink, PeerLinkConfig, PeerLinkEvent, PeerStatus, RadioStatus, RetryBudget,
+    Backend, BleError, CapabilityReport, ConnectionPriority, GattCharacteristicSpec, GattServiceSpec,
+    LinkRole, MaxLinks, PeerAddress, PeerLink, PeerLinkConfig, PeerLinkEvent, PeerStatus, RadioStatus,
+    RetryBudget,
 };
 use tokio_stream::StreamExt;
 use uuid::Uuid;
@@ -262,4 +263,31 @@ async fn two_symmetric_peers_connect_one_dialing_one_accepting() {
     wait_for(&mut ev_high, |ev| matches!(ev, PeerLinkEvent::Up { peer, .. } if peer.0 == "aaa")).await;
     assert_eventually(|| link_low.status(&PeerAddress("zzz".into())) == PeerStatus::Connected).await;
     assert_eventually(|| link_high.status(&PeerAddress("aaa".into())) == PeerStatus::Connected).await;
+}
+
+/// A priority request crosses to the driver's pump and returns the link's
+/// real error — here the mock's `Unsupported`, as on Linux — not a
+/// flattened one; once the link is gone it is `NotConnected`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_priority_request_returns_the_links_real_error() {
+    let network = MockNetwork::new();
+    let _peripheral = advertise_peripheral(&network, "peer-p").await;
+    let central = Arc::new(MockBackend::new(PeerAddress("me".into()), network.clone(), caps()));
+
+    let link = PeerLink::with_backend(central, peer_link_config(tight_budget(), 4));
+    let mut events = link.events();
+
+    link.track(PeerAddress("peer-p".into()), "peer-p".into());
+    let up = wait_for(&mut events, |ev| matches!(ev, PeerLinkEvent::Up { peer, .. } if peer.0 == "peer-p")).await;
+    let PeerLinkEvent::Up { channel, .. } = up else { unreachable!() };
+
+    let result = channel.request_connection_priority(ConnectionPriority::LowPower).await;
+    assert!(matches!(result, Err(BleError::Unsupported(_))), "got {result:?}");
+    // The link is still usable afterwards.
+    channel.send(b"still here".to_vec()).await.expect("send");
+
+    link.untrack(PeerAddress("peer-p".into()));
+    wait_for(&mut events, |ev| matches!(ev, PeerLinkEvent::Down { peer } if peer.0 == "peer-p")).await;
+    let result = channel.request_connection_priority(ConnectionPriority::High).await;
+    assert!(matches!(result, Err(BleError::NotConnected(_))), "got {result:?}");
 }

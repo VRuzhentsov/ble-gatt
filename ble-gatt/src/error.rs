@@ -16,6 +16,13 @@ pub enum BleError {
     #[error("peripheral (GATT server) mode not supported on this backend")]
     PeripheralUnsupported,
 
+    /// The operation exists in the API but this backend, platform or role
+    /// cannot perform it — e.g. requesting a connection priority on Linux,
+    /// where BlueZ offers no such control. Not an error in the link itself:
+    /// a caller written for several platforms can treat it as a no-op.
+    #[error("not supported: {0}")]
+    Unsupported(String),
+
     #[error("connect to {peer} failed: {reason}")]
     ConnectFailed { peer: String, reason: String },
 

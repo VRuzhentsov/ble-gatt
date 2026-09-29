@@ -12,7 +12,7 @@ pub mod peer_link;
 pub use backend::{Backend, BoxStream, GattConnection};
 pub use error::{BleError, Result};
 pub use models::{
-    CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattCharacteristicSpec, GattEvent,
+    CapabilityReport, CharacteristicUuid, ConnectionPriority, DiscoveredPeer, GattCharacteristicSpec, GattEvent,
     GattServiceSpec, PeerAddress, RadioStatus, Role, ServiceUuid, WriteType,
 };
 pub use peer_link::{

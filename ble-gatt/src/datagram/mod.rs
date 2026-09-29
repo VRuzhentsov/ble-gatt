@@ -138,8 +138,8 @@ use crate::datagram::fragment::{split, FragmentHeader, FRAGMENT_HEADER_LEN, MAX_
 use crate::datagram::reassembly::{Accept, Reassembler, ReassemblyLimits};
 use crate::error::{BleError, Result};
 use crate::models::{
-    CharacteristicUuid, GattCharacteristicSpec, GattEvent, GattServiceSpec, PeerAddress,
-    Role, ServiceUuid, WriteType,
+    CharacteristicUuid, ConnectionPriority, GattCharacteristicSpec, GattEvent, GattServiceSpec,
+    PeerAddress, Role, ServiceUuid, WriteType,
 };
 
 pub const DEFAULT_MAX_MESSAGE_LEN: usize = 1024 * 1024;
@@ -440,6 +440,23 @@ impl DatagramChannel {
     /// that it did.
     pub fn fragment_budget(&self) -> usize {
         self.fragment_budget
+    }
+
+    /// See [`GattConnection::request_connection_priority`]. Only a channel
+    /// this side dialled (`connect`) can ask: the priority is a central-side
+    /// request, so a channel accepted by `serve` returns
+    /// [`BleError::Unsupported`].
+    pub async fn request_connection_priority(&mut self, priority: ConnectionPriority) -> Result<()> {
+        match self.sink.get_mut() {
+            Sink::Connection { connection: Some(connection), .. } => {
+                connection.request_connection_priority(priority).await
+            }
+            Sink::Connection { connection: None, .. } => Err(BleError::NotConnected(self.peer.0.clone())),
+            Sink::Notify { .. } => Err(BleError::Unsupported(
+                "connection priority is requested by the central; this channel was accepted as a peripheral"
+                    .into(),
+            )),
+        }
     }
 
     pub async fn send(&mut self, payload: Vec<u8>) -> Result<()> {
