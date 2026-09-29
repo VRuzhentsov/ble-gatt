@@ -274,6 +274,7 @@ impl PeerLink {
             events_tx: events_tx.clone(),
             status: status.clone(),
             radio: radio.clone(),
+            next_link_gen: std::cell::Cell::new(0),
         };
         let join = std::thread::Builder::new()
             .name("ble-gatt-peerlink".into())
@@ -355,6 +356,13 @@ struct Driver {
     events_tx: broadcast::Sender<PeerLinkEvent>,
     status: Arc<StdMutex<HashMap<PeerAddress, PeerStatus>>>,
     radio: Arc<StdMutex<RadioStatus>>,
+    /// Source of `LiveLink` generations. Deliberately not a `Peer` field: a
+    /// `Peer` is discarded on `Untrack` and rebuilt from scratch on the next
+    /// `Track`, so a per-`Peer` counter would restart at the same values a
+    /// just-discarded pump's queued `linkgone` still carries — letting that
+    /// stale notification tear down the replacement's first link. The driver
+    /// runs on one task (see `run`'s `select!` loop), so a `Cell` is enough.
+    next_link_gen: std::cell::Cell<u64>,
 }
 
 /// Per-tracked-peer state the driver owns.
@@ -371,10 +379,6 @@ struct Peer {
     retry_at: Option<Instant>,
     gave_up: bool,
     link: Option<LiveLink>,
-    /// Incremented for every link installed for this address, so a
-    /// `linkgone` notification from a superseded pump (an untrack/track +
-    /// fast reconnect can outrun it) is recognised as stale and ignored.
-    link_gen: u64,
     /// The in-flight `datagram::connect` task, while `central` is `Dialing`.
     /// Aborted when the state leaves `Dialing` (deadline, radio loss,
     /// untrack) so the abandoned attempt does not keep the backend's
@@ -685,9 +689,9 @@ impl Driver {
         p.gave_up = false;
         p.trying_since = None;
         p.retry_at = None;
-        p.link_gen += 1;
+        let gen = self.alloc_link_gen();
         let max_len = channel.max_message_len();
-        let (link, handle) = self.start_pump(channel, peer.clone(), p.link_gen, linkgone_tx.clone());
+        let (link, handle) = self.start_pump(channel, peer.clone(), gen, linkgone_tx.clone());
         p.link = Some(link);
         let _ = self.events_tx.send(PeerLinkEvent::Up {
             peer,
@@ -769,7 +773,6 @@ impl Driver {
             retry_at: None,
             gave_up: false,
             link: None,
-            link_gen: 0,
             dial_task: None,
         });
         self.refresh_status(peers, &peer, radio);
@@ -885,9 +888,9 @@ impl Driver {
                 p.attempts = 0;
                 p.trying_since = None;
                 p.retry_at = None;
-                p.link_gen += 1;
+                let gen = self.alloc_link_gen();
                 let max_len = channel.max_message_len();
-                let (link, handle) = self.start_pump(channel, peer.clone(), p.link_gen, linkgone_tx.clone());
+                let (link, handle) = self.start_pump(channel, peer.clone(), gen, linkgone_tx.clone());
                 p.link = Some(link);
                 let _ = self.events_tx.send(PeerLinkEvent::Up {
                     peer,
@@ -940,6 +943,15 @@ impl Driver {
         }
         let idx = p.attempts.saturating_sub(1).min(backoff.len() - 1);
         p.retry_at = Some(now + backoff[idx]);
+    }
+
+    /// The next `LiveLink` generation, unique for the driver's whole
+    /// lifetime -- not just for one `Peer`'s. See `Driver::next_link_gen`'s
+    /// doc comment for why this must not reset on `Untrack`.
+    fn alloc_link_gen(&self) -> u64 {
+        let gen = self.next_link_gen.get() + 1;
+        self.next_link_gen.set(gen);
+        gen
     }
 
     fn start_pump(
