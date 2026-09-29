@@ -1206,3 +1206,37 @@ fn encryption_is_opt_in_and_reaches_the_served_characteristic() {
     encrypted.encrypted = true;
     assert!(encrypted.service_spec().characteristics.iter().all(|c| c.encrypted));
 }
+
+/// With `encrypted` on both sides, `connect`'s extra pairing read happens
+/// during setup and the server-speaks-first flow still works. (The mock does
+/// not model encryption; this covers the dialling side's path.)
+#[tokio::test]
+async fn an_encrypted_config_on_both_sides_still_connects_and_greets() {
+    let mut config = config();
+    config.encrypted = true;
+    let network = MockNetwork::new();
+    let peripheral_addr = PeerAddress("peripheral-enc".to_string());
+    let peripheral: Arc<MockBackend> =
+        Arc::new(MockBackend::new(peripheral_addr.clone(), network.clone(), full_capabilities()));
+    let central: Arc<MockBackend> = Arc::new(MockBackend::new(
+        PeerAddress("central-enc".to_string()),
+        network.clone(),
+        full_capabilities(),
+    ));
+
+    let mut incoming = datagram::serve(peripheral.clone(), &config).await.expect("serve should start");
+    let mut client =
+        datagram::connect(central.clone(), &peripheral_addr, &config).await.expect("connect should succeed");
+    let mut served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
+        .await
+        .expect("serve should yield a channel")
+        .expect("channel stream should not be closed");
+
+    served.send(b"hello".to_vec()).await.expect("send");
+    let received = tokio::time::timeout(Duration::from_secs(2), client.recv())
+        .await
+        .expect("client should receive")
+        .expect("channel open")
+        .expect("no error");
+    assert_eq!(received, b"hello");
+}

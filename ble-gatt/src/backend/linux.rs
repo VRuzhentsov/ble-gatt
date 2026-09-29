@@ -534,6 +534,21 @@ pub struct LinuxBackend {
     cleanup_permits: Arc<tokio::sync::Semaphore>,
     /// See `DiscoveryBus`.
     discovery: Arc<DiscoveryBus>,
+    /// Characteristics of the current advertisement with
+    /// `GattCharacteristicSpec::encrypted` set.
+    encrypted_chars: Arc<StdMutex<HashSet<CharacteristicUuid>>>,
+    /// Served centrals that have completed a read or write on an encrypted
+    /// characteristic during their current connection. BlueZ only delivers
+    /// such a request once the link is encrypted, so membership proves it.
+    ///
+    /// Needed because BlueZ's `encrypt-notify` flag is not exposed by
+    /// `bluer`: an unpaired central can subscribe to an encrypted
+    /// characteristic, and a notification sent to it before it has read or
+    /// written would cross an unencrypted link. So a subscription to an
+    /// encrypted characteristic does not announce the peer, and
+    /// `notify_matching` skips its session until the peer is in here.
+    /// Cleared with the peer's `served_peers` entry.
+    secured_peers: Arc<StdMutex<HashSet<PeerAddress>>>,
 }
 
 impl LinuxBackend {
@@ -603,6 +618,8 @@ impl LinuxBackend {
             in_flight: Arc::new(StdMutex::new(HashSet::new())),
             cleanup_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CLEANUP_DISCONNECTS)),
             discovery,
+            encrypted_chars: Arc::new(StdMutex::new(HashSet::new())),
+            secured_peers: Arc::new(StdMutex::new(HashSet::new())),
         })
     }
 
@@ -668,7 +685,8 @@ async fn watch_notify_sessions(
     events_tx: broadcast::Sender<GattEvent>,
     served_peers: Arc<StdMutex<HashMap<PeerAddress, u64>>>, adapter: Adapter,
     next_session: Arc<AtomicU64>, watchers: Arc<StdMutex<Vec<tokio::task::AbortHandle>>>,
-    advertise_generation: Arc<StdMutex<u64>>, this_generation: u64,
+    advertise_generation: Arc<StdMutex<u64>>, this_generation: u64, encrypted: bool,
+    secured_peers: Arc<StdMutex<HashSet<PeerAddress>>>,
 ) {
     while let Some(event) = control.next().await {
         let CharacteristicControlEvent::Notify(writer) = event else {
@@ -696,6 +714,19 @@ async fn watch_notify_sessions(
             let sessions = writers_guard.entry(uuid).or_default();
             sessions.retain(|w| !w.is_closed().unwrap_or(true));
             sessions.push(writer);
+
+            // An encrypted characteristic's subscription proves nothing about
+            // the link (see `LinuxBackend::secured_peers`): the peer is
+            // announced by its first read or write instead, and until then
+            // `notify_matching` skips this session.
+            if encrypted {
+                log::info!(
+                    "notify session: central {} subscribed to encrypted {}; waiting for an encrypted access",
+                    peer.0,
+                    uuid.0
+                );
+                continue;
+            }
 
             let mut served = served_peers.lock().unwrap();
             if served.contains_key(&peer) {
@@ -725,6 +756,7 @@ async fn watch_notify_sessions(
             events_tx.clone(),
             served_peers.clone(),
             writers.clone(),
+            secured_peers.clone(),
             session,
         );
         // Registered so `stop_advertising` cancels it; previously these were
@@ -746,7 +778,7 @@ fn spawn_peripheral_disconnect_watch(
     events_tx: broadcast::Sender<GattEvent>,
     served_peers: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
     writers: Arc<AsyncMutex<HashMap<CharacteristicUuid, Vec<CharacteristicWriter>>>>,
-    session: u64,
+    secured_peers: Arc<StdMutex<HashSet<PeerAddress>>>, session: u64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // This session's own writer may still be mid-`AcquireNotify` — see
@@ -823,6 +855,7 @@ fn spawn_peripheral_disconnect_watch(
         }
         served.remove(&peer);
         drop(served);
+        secured_peers.lock().unwrap().remove(&peer);
         log::info!("link lost: {} session={session} (peripheral role)", peer.0);
         let _ = events_tx.send(GattEvent::Disconnected {
             peer: peer.clone(),
@@ -830,6 +863,62 @@ fn spawn_peripheral_disconnect_watch(
             session: Some(session),
         });
     })
+}
+
+/// What an encrypted characteristic's read handler needs to admit a central
+/// — see `LinuxBackend::secured_peers`.
+struct SecureAdmission {
+    adapter: Adapter,
+    events_tx: broadcast::Sender<GattEvent>,
+    served_peers: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
+    notify_writers: Arc<AsyncMutex<HashMap<CharacteristicUuid, Vec<CharacteristicWriter>>>>,
+    next_session: Arc<AtomicU64>,
+    server_watch: Arc<StdMutex<Vec<tokio::task::AbortHandle>>>,
+    advertise_generation: Arc<StdMutex<u64>>,
+    this_generation: u64,
+    secured_peers: Arc<StdMutex<HashSet<PeerAddress>>>,
+}
+
+impl SecureAdmission {
+    /// A read on an encrypted characteristic reached this server, so
+    /// `address`'s link is encrypted: mark it secured and, once per
+    /// connection, announce it — the effects the write handler has for a
+    /// first write, under the same generation check and with no await.
+    fn admit(&self, address: bluer::Address) {
+        let peer = PeerAddress(address.to_string());
+        let current = self.advertise_generation.lock().unwrap();
+        if *current != self.this_generation {
+            return;
+        }
+        self.secured_peers.lock().unwrap().insert(peer.clone());
+        let session = {
+            let mut served = self.served_peers.lock().unwrap();
+            if served.contains_key(&peer) {
+                return;
+            }
+            let session = self.next_session.fetch_add(1, Ordering::Relaxed);
+            served.insert(peer.clone(), session);
+            session
+        };
+        log::info!("encrypted read: central {} admitted session={session}", peer.0);
+        let _ = self.events_tx.send(GattEvent::Connected {
+            peer: peer.clone(),
+            local_role: Role::Peripheral,
+            session: Some(session),
+        });
+        let handle = spawn_peripheral_disconnect_watch(
+            self.adapter.clone(),
+            address,
+            peer,
+            self.events_tx.clone(),
+            self.served_peers.clone(),
+            self.notify_writers.clone(),
+            self.secured_peers.clone(),
+            session,
+        );
+        self.server_watch.lock().unwrap().push(handle.abort_handle());
+        drop(current);
+    }
 }
 
 /// Whether `peer` still holds any open notify session.
@@ -867,6 +956,16 @@ impl LinuxBackend {
         // `notify()`'s broadcast has no specific peer to wait *for* — with
         // `owner: None` this deadline is simply never consulted below.
         let deadline = owner.map(|_| tokio::time::Instant::now() + NOTIFY_WRITER_ACQUIRE_TIMEOUT);
+        // On an encrypted characteristic, only sessions of centrals that
+        // have proven an encrypted link — see `LinuxBackend::secured_peers`.
+        // A not-yet-secured subscriber is treated as absent, so an addressed
+        // send waits for it like any other missing session.
+        let gated = self.encrypted_chars.lock().unwrap().contains(&characteristic);
+        let admitted = |w: &CharacteristicWriter| {
+            want(w)
+                && (!gated
+                    || self.secured_peers.lock().unwrap().contains(&PeerAddress(w.device_address().to_string())))
+        };
         loop {
             // The writers lock is taken *first*, and the session is validated
             // while holding it. Checking before acquiring it left a gap in which
@@ -909,7 +1008,7 @@ impl LinuxBackend {
             // the reconnect case it exists to cover.
             let has_match = writers
                 .get(&characteristic)
-                .is_some_and(|sessions| sessions.iter().any(|w| !w.is_closed().unwrap_or(true) && want(w)));
+                .is_some_and(|sessions| sessions.iter().any(|w| !w.is_closed().unwrap_or(true) && admitted(w)));
             if !has_match {
                 if let Some(deadline) = deadline {
                     if tokio::time::Instant::now() < deadline {
@@ -927,7 +1026,7 @@ impl LinuxBackend {
 
             let mut delivered = false;
             let mut last_error = None;
-            for writer in sessions.iter_mut().filter(|w| want(w)) {
+            for writer in sessions.iter_mut().filter(|w| admitted(w)) {
                 // write_all, not write: a short write would truncate a fragment,
                 // and reassembly would then fail on the far side with nothing
                 // reported here.
@@ -1524,6 +1623,9 @@ impl Backend for LinuxBackend {
         let served_peers = self.served_peers.clone();
         let adapter = self.adapter.clone();
         let events_tx = self.events_tx.clone();
+        let secured_peers = self.secured_peers.clone();
+        *self.encrypted_chars.lock().unwrap() =
+            service.characteristics.iter().filter(|c| c.encrypted).map(|c| c.uuid).collect();
 
         let mut local_characteristics = Vec::with_capacity(service.characteristics.len());
         for spec in &service.characteristics {
@@ -1532,17 +1634,34 @@ impl Backend for LinuxBackend {
 
             let read = spec.readable.then(|| {
                 let values = values.clone();
+                // Only an encrypted characteristic's read announces the peer:
+                // it is the proof `secured_peers` waits for, and for a
+                // server-speaks-first protocol the only access a central may
+                // make before the server sends (`datagram::connect` reads
+                // once after subscribing for exactly this).
+                let secure = spec.encrypted.then(|| Arc::new(SecureAdmission {
+                    adapter: adapter.clone(),
+                    events_tx: events_tx.clone(),
+                    served_peers: served_peers.clone(),
+                    notify_writers: notify_writers.clone(),
+                    next_session: next_session.clone(),
+                    server_watch: server_watch.clone(),
+                    advertise_generation: advertise_generation.clone(),
+                    this_generation,
+                    secured_peers: secured_peers.clone(),
+                }));
                 CharacteristicRead {
                     read: true,
-                    // See `GattCharacteristicSpec::encrypted`. bluer has no
-                    // matching flag for notify, so a notify-only
-                    // characteristic's subscription is not gated on Linux —
-                    // but any encrypted read or write here encrypts the
-                    // whole link, notifications included.
+                    // See `GattCharacteristicSpec::encrypted`; bluer has no
+                    // notify flag, which `secured_peers` stands in for.
                     encrypt_read: spec.encrypted,
-                    fun: Box::new(move |_req| {
+                    fun: Box::new(move |req| {
                         let values = values.clone();
+                        let secure = secure.clone();
                         Box::pin(async move {
+                            if let Some(secure) = secure {
+                                secure.admit(req.device_address);
+                            }
                             let value = values.lock().unwrap().get(&uuid).cloned().unwrap_or_default();
                             ReqResult::Ok(value)
                         })
@@ -1560,6 +1679,8 @@ impl Backend for LinuxBackend {
                 let next_session = next_session.clone();
                 let server_watch = server_watch.clone();
                 let advertise_generation = advertise_generation.clone();
+                let secured_peers = secured_peers.clone();
+                let encrypted = spec.encrypted;
                 CharacteristicWrite {
                     write: true,
                     write_without_response: true,
@@ -1573,6 +1694,7 @@ impl Backend for LinuxBackend {
                         let next_session = next_session.clone();
                         let server_watch = server_watch.clone();
                         let advertise_generation = advertise_generation.clone();
+                        let secured_peers = secured_peers.clone();
                         let address = req.device_address;
                         let peer = PeerAddress(address.to_string());
                         Box::pin(async move {
@@ -1603,6 +1725,9 @@ impl Backend for LinuxBackend {
                             }
 
                             values.lock().unwrap().insert(uuid, value.clone());
+                            if encrypted {
+                                secured_peers.lock().unwrap().insert(peer.clone());
+                            }
 
                             // BlueZ gives a GATT *server* no connection
                             // callback at all — the write itself is the only
@@ -1643,6 +1768,7 @@ impl Backend for LinuxBackend {
                                     events_tx.clone(),
                                     served_peers,
                                     notify_writers,
+                                    secured_peers,
                                     session,
                                 );
                                 server_watch.lock().unwrap().push(handle.abort_handle());
@@ -1688,6 +1814,8 @@ impl Backend for LinuxBackend {
                     server_watch.clone(),
                     advertise_generation.clone(),
                     this_generation,
+                    spec.encrypted,
+                    secured_peers.clone(),
                 )));
             }
 
@@ -1784,6 +1912,8 @@ impl Backend for LinuxBackend {
         *self.app_handle.lock().await = None;
         *self.adv_handle.lock().await = None;
         self.notify_writers.lock().await.clear();
+        self.encrypted_chars.lock().unwrap().clear();
+        self.secured_peers.lock().unwrap().clear();
         Ok(())
     }
 

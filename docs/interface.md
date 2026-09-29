@@ -38,8 +38,9 @@ You own everything: when to reconnect, what the bytes mean, how to frame them.
 
 **Opt-in link encryption.** Set `GattCharacteristicSpec::encrypted` (or
 `DatagramConfig::encrypted` for Tiers 2–3, which sets it on the one
-characteristic they serve) and the serving side requires an encrypted link;
-the connecting central's OS pairs on demand. Off by default. This is the OS's
+characteristic they serve; set it on both sides, since the dialling side then
+reads once to trigger pairing) and the serving side requires an encrypted
+link; the connecting central's OS pairs on demand. Off by default. This is the OS's
 crypto, not a replacement for your own — see `docs/adr/0006`.
 
 ---

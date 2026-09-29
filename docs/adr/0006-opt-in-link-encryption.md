@@ -29,7 +29,9 @@ succeeds.
 
 - **One `bool`, `GattCharacteristicSpec::encrypted`**, default `false`.
   `DatagramConfig::encrypted` sets it on the single characteristic Tiers 2–3
-  serve; only the serving side's value matters.
+  serve, and on the dialling side makes `datagram::connect` read the
+  characteristic once after subscribing (see Consequences). Set it on both
+  sides.
 - **No strength levels.** Both platforms also offer MITM-protected
   ("authenticated") encryption, but it only works when both devices have a
   display or keyboard and brings its own failure modes. Nobody needs it yet;
@@ -43,11 +45,18 @@ succeeds.
 
 ## Consequences
 
-- Linux has no `bluer` flag for notify, so a *notify-only* encrypted
-  characteristic's subscription is not gated there. Any encrypted read or
-  write encrypts the whole link, notifications included — which covers the
-  datagram characteristic (readable, writable and notifiable). Android gates
-  the subscription too, through the CCCD permission.
+- BlueZ can gate the subscription (`encrypt-notify`), but `bluer` does not
+  expose that flag, so an unpaired central can subscribe on Linux. Sending to
+  it then would cross an unencrypted link. The Linux backend therefore does
+  not announce a central on its subscription to an encrypted characteristic,
+  only on its first read or write (BlueZ delivers those only once the link is
+  encrypted), and skips its notify session until then. For a
+  server-speaks-first protocol the central has nothing to write, so
+  `datagram::connect` with `encrypted` set reads once after subscribing: that
+  makes its OS pair and is the proof the server waits for. A *notify-only*
+  encrypted characteristic on Linux is only delivered to centrals that have
+  read or written another encrypted characteristic of the service. Android
+  gates the subscription itself, through the CCCD permission.
 - The Android bridge ABI goes to v4 (`startAdvertising` gained an
   `encrypted` array).
 - Windows (WinRT `GattProtectionLevel`) and Apple

@@ -203,10 +203,13 @@ pub struct DatagramConfig {
     /// discoverability flag toggled on and off) re-advertises by ending the
     /// current `serve` stream and calling it again with an updated config.
     pub advertised_manufacturer_data: BTreeMap<u16, Vec<u8>>,
-    /// Sets [`GattCharacteristicSpec::encrypted`] on the characteristic
-    /// [`service_spec`](Self::service_spec) builds, so [`serve`] requires an
-    /// encrypted link. Off by default. Only the serving side's value
-    /// matters: the dialling side's OS reacts to the server's requirement.
+    /// Serving side: sets [`GattCharacteristicSpec::encrypted`] on the
+    /// characteristic [`service_spec`](Self::service_spec) builds, so
+    /// [`serve`] requires an encrypted link. Dialling side: [`connect`] reads
+    /// the characteristic once after subscribing, which makes the OS pair
+    /// and proves the link encrypted to the server — needed on a Linux
+    /// server before it hands out the channel. Set it on both sides. Off by
+    /// default.
     pub encrypted: bool,
 }
 
@@ -833,6 +836,14 @@ pub async fn connect(
     let setup = async {
         let connection = pending.connection.as_mut().expect("armed above");
         let notifications = connection.subscribe(config.characteristic).await?;
+        // An encrypted server accepts a central only once an encrypted read
+        // or write proves the link encrypted (the Linux backend cannot gate
+        // the subscription itself), and a server-speaks-first protocol has
+        // nothing to write yet. Reading here makes this side's OS pair on
+        // demand, and is that proof. The value is not used.
+        if config.encrypted {
+            connection.read(config.characteristic).await?;
+        }
         let budget = connection
             .max_write_len()
             .checked_sub(FRAGMENT_HEADER_LEN)
