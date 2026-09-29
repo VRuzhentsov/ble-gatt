@@ -36,6 +36,12 @@ let mut notifications = conn.subscribe(TELEMETRY_CHAR).await?;
 
 You own everything: when to reconnect, what the bytes mean, how to frame them.
 
+**Opt-in link encryption.** Set `GattCharacteristicSpec::encrypted` (or
+`DatagramConfig::encrypted` for Tiers 2–3, which sets it on the one
+characteristic they serve) and the serving side requires an encrypted link;
+the connecting central's OS pairs on demand. Off by default. This is the OS's
+crypto, not a replacement for your own — see `docs/adr/0006`.
+
 ---
 
 ## Tier 2 — datagram (`datagram::connect` / `datagram::serve`)

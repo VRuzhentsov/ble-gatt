@@ -52,6 +52,7 @@ async fn central_discovers_and_reads_the_peripherals_advertised_service() {
                 writable: true,
                 notifiable: true,
                 initial_value: b"hello".to_vec(),
+                encrypted: false,
             }],
         ))
         .await
@@ -89,6 +90,7 @@ async fn write_from_central_is_readable_back_and_fires_a_lifecycle_event() {
                 writable: true,
                 notifiable: false,
                 initial_value: Vec::new(),
+                encrypted: false,
             }],
         ))
         .await
@@ -135,6 +137,7 @@ async fn server_initiated_notify_is_delivered_to_a_subscribed_central() {
                 writable: false,
                 notifiable: true,
                 initial_value: Vec::new(),
+                encrypted: false,
             }],
         ))
         .await
@@ -184,6 +187,7 @@ async fn killing_a_clients_connection_tells_the_survivor_it_disconnected() {
                 writable: false,
                 notifiable: true,
                 initial_value: Vec::new(),
+                encrypted: false,
             }],
         ))
         .await
@@ -248,6 +252,7 @@ async fn a_clients_own_connection_dying_ends_its_subscription_stream_instead_of_
                 writable: false,
                 notifiable: true,
                 initial_value: Vec::new(),
+                encrypted: false,
             }],
         ))
         .await

@@ -1193,3 +1193,16 @@ async fn advertised_manufacturer_data_reaches_a_scanner_through_serve() {
 
     assert_eq!(peer.manufacturer_data.get(&0xABCD), Some(&vec![0x01]));
 }
+
+/// `DatagramConfig::encrypted` reaches the characteristic `serve` builds, and
+/// is off unless asked for.
+#[test]
+fn encryption_is_opt_in_and_reaches_the_served_characteristic() {
+    let plain = config();
+    assert!(!plain.encrypted);
+    assert!(plain.service_spec().characteristics.iter().all(|c| !c.encrypted));
+
+    let mut encrypted = config();
+    encrypted.encrypted = true;
+    assert!(encrypted.service_spec().characteristics.iter().all(|c| c.encrypted));
+}

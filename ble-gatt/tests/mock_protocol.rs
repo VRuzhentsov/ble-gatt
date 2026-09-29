@@ -40,6 +40,7 @@ async fn central_discovers_and_reads_the_peripherals_advertised_service() {
                 writable: true,
                 notifiable: true,
                 initial_value: b"hello".to_vec(),
+                encrypted: false,
             }],
         ))
         .await
@@ -77,6 +78,7 @@ async fn write_from_central_is_readable_back_and_fires_a_lifecycle_event() {
                 writable: true,
                 notifiable: false,
                 initial_value: Vec::new(),
+                encrypted: false,
             }],
         ))
         .await
@@ -130,6 +132,7 @@ async fn server_initiated_notify_is_delivered_to_a_subscribed_central() {
                 writable: false,
                 notifiable: true,
                 initial_value: Vec::new(),
+                encrypted: false,
             }],
         ))
         .await
@@ -303,6 +306,7 @@ async fn write_without_response_is_accepted_and_still_delivers() {
                 writable: true,
                 notifiable: false,
                 initial_value: Vec::new(),
+                encrypted: false,
             }],
         ))
         .await
@@ -396,6 +400,7 @@ async fn a_central_refused_by_a_single_peer_server_stops_receiving_notifications
                 writable: true,
                 notifiable: true,
                 initial_value: Vec::new(),
+                encrypted: false,
             }],
         ))
         .await
@@ -472,6 +477,7 @@ async fn an_addressed_notify_reaches_only_its_peer() {
                 writable: false,
                 notifiable: true,
                 initial_value: Vec::new(),
+                encrypted: false,
             }],
         ))
         .await
@@ -539,6 +545,7 @@ async fn a_stale_connection_handle_cannot_disturb_the_session_that_replaced_it()
                 writable: true,
                 notifiable: true,
                 initial_value: b"v".to_vec(),
+                encrypted: false,
             }],
         ))
         .await
@@ -590,6 +597,7 @@ async fn a_disconnected_handle_is_actually_closed() {
                 writable: true,
                 notifiable: true,
                 initial_value: b"v".to_vec(),
+                encrypted: false,
             }],
         ))
         .await
@@ -642,6 +650,7 @@ async fn simulated_peer_loss_closes_the_link_as_well_as_announcing_it() {
                 writable: true,
                 notifiable: true,
                 initial_value: b"v".to_vec(),
+                encrypted: false,
             }],
         ))
         .await
@@ -691,6 +700,7 @@ async fn writes_to_unknown_or_read_only_characteristics_are_refused() {
                     writable: true,
                     notifiable: false,
                     initial_value: Vec::new(),
+                    encrypted: false,
                 },
                 GattCharacteristicSpec {
                     uuid: read_only_uuid,
@@ -698,6 +708,7 @@ async fn writes_to_unknown_or_read_only_characteristics_are_refused() {
                     writable: false,
                     notifiable: false,
                     initial_value: b"ro".to_vec(),
+                    encrypted: false,
                 },
             ],
         ))

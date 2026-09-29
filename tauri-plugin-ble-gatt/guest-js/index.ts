@@ -28,6 +28,8 @@ export interface CharacteristicSpec {
   writable: boolean;
   notifiable: boolean;
   initialValue: number[];
+  /** Require an encrypted link to access this characteristic. Default false. */
+  encrypted?: boolean;
 }
 
 export interface ConnectionMtu {
@@ -96,6 +98,7 @@ export async function advertise(
       writable: c.writable,
       notifiable: c.notifiable,
       initialValue: c.initialValue,
+      encrypted: c.encrypted ?? false,
     })),
   });
 }

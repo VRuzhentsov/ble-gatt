@@ -86,8 +86,9 @@ const CALLBACK_CLASS: &str = "dev/blegatt/NativeKt";
 /// matching number; a mismatch is logged at construction (see
 /// `AndroidBackend::new`). v2 added `onRadioState` / `bridgeAbiVersion` /
 /// `isRadioEnabled` (ADR-0005's adapter-state receiver). v3 added
-/// `requestConnectionPriority`.
-const BRIDGE_ABI_VERSION: i32 = 3;
+/// `requestConnectionPriority`. v4 added the `encrypted` array to
+/// `startAdvertising`.
+const BRIDGE_ABI_VERSION: i32 = 4;
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 
@@ -681,6 +682,7 @@ impl Backend for AndroidBackend {
         let readable = env.new_boolean_array(n).map_err(|err| BleError::Gatt(err.to_string()))?;
         let writable = env.new_boolean_array(n).map_err(|err| BleError::Gatt(err.to_string()))?;
         let notifiable = env.new_boolean_array(n).map_err(|err| BleError::Gatt(err.to_string()))?;
+        let encrypted = env.new_boolean_array(n).map_err(|err| BleError::Gatt(err.to_string()))?;
         let values = env
             .new_object_array(n, "[B", JObject::null())
             .map_err(|err| BleError::Gatt(err.to_string()))?;
@@ -697,6 +699,8 @@ impl Backend for AndroidBackend {
             env.set_boolean_array_region(&writable, i, &[characteristic.writable as jboolean])
                 .map_err(|err| BleError::Gatt(err.to_string()))?;
             env.set_boolean_array_region(&notifiable, i, &[characteristic.notifiable as jboolean])
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
+            env.set_boolean_array_region(&encrypted, i, &[characteristic.encrypted as jboolean])
                 .map_err(|err| BleError::Gatt(err.to_string()))?;
             let value = env
                 .byte_array_from_slice(&characteristic.initial_value)
@@ -748,13 +752,14 @@ impl Backend for AndroidBackend {
         self.inner.call_void(
             &mut env,
             "startAdvertising",
-            "(Ljava/lang/String;[Ljava/lang/String;[Z[Z[Z[[B[I[[B[Ljava/lang/String;[[B)V",
+            "(Ljava/lang/String;[Ljava/lang/String;[Z[Z[Z[Z[[B[I[[B[Ljava/lang/String;[[B)V",
             &[
                 JValue::Object(&service_uuid),
                 JValue::Object(&char_uuids),
                 JValue::Object(&readable),
                 JValue::Object(&writable),
                 JValue::Object(&notifiable),
+                JValue::Object(&encrypted),
                 JValue::Object(&values),
                 JValue::Object(&manufacturer_id_array),
                 JValue::Object(&manufacturer_value_array),

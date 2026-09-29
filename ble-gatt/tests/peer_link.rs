@@ -60,6 +60,7 @@ async fn advertise_peripheral(network: &Arc<MockNetwork>, address: &str) -> Mock
                 writable: true,
                 notifiable: true,
                 initial_value: vec![],
+                encrypted: false,
             }],
         ))
         .await

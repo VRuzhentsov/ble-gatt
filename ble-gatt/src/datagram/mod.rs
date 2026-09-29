@@ -203,6 +203,11 @@ pub struct DatagramConfig {
     /// discoverability flag toggled on and off) re-advertises by ending the
     /// current `serve` stream and calling it again with an updated config.
     pub advertised_manufacturer_data: BTreeMap<u16, Vec<u8>>,
+    /// Sets [`GattCharacteristicSpec::encrypted`] on the characteristic
+    /// [`service_spec`](Self::service_spec) builds, so [`serve`] requires an
+    /// encrypted link. Off by default. Only the serving side's value
+    /// matters: the dialling side's OS reacts to the server's requirement.
+    pub encrypted: bool,
 }
 
 impl DatagramConfig {
@@ -218,6 +223,7 @@ impl DatagramConfig {
             fragment_queue_depth: DEFAULT_FRAGMENT_QUEUE_DEPTH,
             accept_queue_depth: DEFAULT_ACCEPT_QUEUE_DEPTH,
             advertised_manufacturer_data: BTreeMap::new(),
+            encrypted: false,
         }
     }
 
@@ -263,6 +269,7 @@ impl DatagramConfig {
                 writable: true,
                 notifiable: true,
                 initial_value: Vec::new(),
+                encrypted: self.encrypted,
             }],
         );
         spec.manufacturer_data = self.advertised_manufacturer_data.clone();

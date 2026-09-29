@@ -44,6 +44,7 @@ async fn peripheral_advertise_and_serve_smoke_test() {
             writable: true,
             notifiable: true,
             initial_value: b"ble-gatt smoke test".to_vec(),
+            encrypted: false,
         }],
     );
 

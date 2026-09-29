@@ -1534,6 +1534,12 @@ impl Backend for LinuxBackend {
                 let values = values.clone();
                 CharacteristicRead {
                     read: true,
+                    // See `GattCharacteristicSpec::encrypted`. bluer has no
+                    // matching flag for notify, so a notify-only
+                    // characteristic's subscription is not gated on Linux —
+                    // but any encrypted read or write here encrypts the
+                    // whole link, notifications included.
+                    encrypt_read: spec.encrypted,
                     fun: Box::new(move |_req| {
                         let values = values.clone();
                         Box::pin(async move {
@@ -1557,6 +1563,7 @@ impl Backend for LinuxBackend {
                 CharacteristicWrite {
                     write: true,
                     write_without_response: true,
+                    encrypt_write: spec.encrypted,
                     method: CharacteristicWriteMethod::Fun(Box::new(move |value, req| {
                         let values = values.clone();
                         let events_tx = events_tx.clone();
