@@ -107,6 +107,9 @@ pub struct CharacteristicSpecDto {
     pub writable: bool,
     pub notifiable: bool,
     pub initial_value: Vec<u8>,
+    /// Optional in JS; see `GattCharacteristicSpec::encrypted`.
+    #[serde(default)]
+    pub encrypted: bool,
 }
 
 /// Connection lifecycle as delivered to JS. Mirrors `ble_gatt::GattEvent`
@@ -211,6 +214,7 @@ pub async fn ble_advertise(
                 writable: dto.writable,
                 notifiable: dto.notifiable,
                 initial_value: dto.initial_value,
+                encrypted: dto.encrypted,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;

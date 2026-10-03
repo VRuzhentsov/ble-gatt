@@ -36,6 +36,19 @@ let mut notifications = conn.subscribe(TELEMETRY_CHAR).await?;
 
 You own everything: when to reconnect, what the bytes mean, how to frame them.
 
+**Opt-in link encryption.** Set `GattCharacteristicSpec::encrypted` (or
+`DatagramConfig::encrypted` for Tiers 2–3, which sets it on the one
+characteristic they serve; set it on both sides, since the dialling side then
+reads once to trigger pairing) and the serving side requires an encrypted
+link; the connecting central's OS pairs on demand. Off by default. This is the OS's
+crypto, not a replacement for your own — see `docs/adr/0006`.
+
+**Advertising survives disconnects.** Once `advertise` returns, the backend
+keeps the service discoverable after each central it served disconnects. On
+Linux it re-registers the advertisement itself, because BlueZ stops
+transmitting after a peripheral-role link ends while still reporting the
+instance as active. Apps don't need to call `advertise` / `serve` again.
+
 ---
 
 ## Tier 2 — datagram (`datagram::connect` / `datagram::serve`)

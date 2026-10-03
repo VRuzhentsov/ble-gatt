@@ -184,6 +184,12 @@ pub struct GattCharacteristicSpec {
     /// central's read request. Peripheral role is a single local GATT
     /// server, so this is static state, not per-peer.
     pub initial_value: Vec<u8>,
+    /// Require an encrypted link to read or write this characteristic (and,
+    /// on Android, to subscribe to it). The connecting central's OS then
+    /// pairs on demand — usually with a system prompt — before the access
+    /// succeeds; nothing changes on the central's side of this API. Off by
+    /// default. See `docs/adr/0006-opt-in-link-encryption.md`.
+    pub encrypted: bool,
 }
 
 #[derive(Debug, Clone)]

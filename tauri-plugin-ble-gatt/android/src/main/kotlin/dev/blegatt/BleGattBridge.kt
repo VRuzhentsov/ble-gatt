@@ -647,7 +647,11 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 }
             }
         }
-        val gatt = device.connectGatt(context, false, callback)
+        // TRANSPORT_LE explicitly: the default (AUTO) may try BR/EDR first
+        // against a dual-mode peer such as a Linux laptop with classic
+        // Bluetooth on. Measured dials to one took 9-10 s, and every second
+        // one failed with the peer refusing notifications.
+        val gatt = device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
         synchronized(gattLock) {
             connectedGatts[address] = gatt
             gattSessions[address] = session
@@ -997,7 +1001,12 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
 
     fun startAdvertising(
         serviceUuid: String, characteristicUuids: Array<String>, readable: BooleanArray, writable: BooleanArray,
-        notifiable: BooleanArray, initialValues: Array<ByteArray>,
+        notifiable: BooleanArray,
+        // `GattCharacteristicSpec::encrypted`: require an encrypted link to
+        // read, write or subscribe. The connecting central's OS pairs on
+        // demand when it meets the insufficient-encryption error.
+        encrypted: BooleanArray,
+        initialValues: Array<ByteArray>,
         // Same parallel-array flattening `onPeerDiscovered` uses on the read
         // side, mirrored here for the write side: a `java.util.HashMap`
         // across JNI costs several reflective calls per entry, and the Rust
@@ -1338,7 +1347,11 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             var permissions = 0
             if (readable[i]) {
                 properties = properties or BluetoothGattCharacteristic.PROPERTY_READ
-                permissions = permissions or BluetoothGattCharacteristic.PERMISSION_READ
+                permissions = permissions or if (encrypted[i]) {
+                    BluetoothGattCharacteristic.PERMISSION_READ_ENCRYPTED
+                } else {
+                    BluetoothGattCharacteristic.PERMISSION_READ
+                }
             }
             if (writable[i]) {
                 // Both modes, matching linux.rs (`write` and
@@ -1349,7 +1362,11 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 properties = properties or
                     BluetoothGattCharacteristic.PROPERTY_WRITE or
                     BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE
-                permissions = permissions or BluetoothGattCharacteristic.PERMISSION_WRITE
+                permissions = permissions or if (encrypted[i]) {
+                    BluetoothGattCharacteristic.PERMISSION_WRITE_ENCRYPTED
+                } else {
+                    BluetoothGattCharacteristic.PERMISSION_WRITE
+                }
             }
             if (notifiable[i]) {
                 properties = properties or BluetoothGattCharacteristic.PROPERTY_NOTIFY
@@ -1360,9 +1377,15 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             @Suppress("DEPRECATION")
             characteristic.value = initialValues[i]
             if (notifiable[i]) {
+                // Encrypted CCCD writes too, so subscribing is gated as well.
                 val cccd = BluetoothGattDescriptor(
                     CLIENT_CHARACTERISTIC_CONFIG_UUID,
-                    BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE
+                    if (encrypted[i]) {
+                        BluetoothGattDescriptor.PERMISSION_READ_ENCRYPTED or
+                            BluetoothGattDescriptor.PERMISSION_WRITE_ENCRYPTED
+                    } else {
+                        BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE
+                    }
                 )
                 characteristic.addDescriptor(cccd)
             }
@@ -1536,8 +1559,9 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     /// a mismatch, which is the only signal a consumer vendoring an
     /// out-of-date copy of this file will get. v2: added `onRadioState` /
     /// `isRadioEnabled` / this method (ADR-0005). v3: added
-    /// `requestConnectionPriority`.
-    fun bridgeAbiVersion(): Int = 3
+    /// `requestConnectionPriority`. v4: added `startAdvertising`'s
+    /// `encrypted` array.
+    fun bridgeAbiVersion(): Int = 4
 
     /// Whether the adapter is present and switched on. Rust's
     /// `Backend::radio_status()` calls this once at startup, so a `PeerLink`
