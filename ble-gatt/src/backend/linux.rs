@@ -455,7 +455,9 @@ pub struct LinuxBackend {
     notify_writers: Arc<AsyncMutex<HashMap<CharacteristicUuid, Vec<CharacteristicWriter>>>>,
     events_tx: broadcast::Sender<GattEvent>,
     app_handle: AsyncMutex<Option<ApplicationHandle>>,
-    adv_handle: AsyncMutex<Option<bluer::adv::AdvertisementHandle>>,
+    /// Shared with the task `advertise` spawns to re-arm the advertisement
+    /// after a central disconnects — see `rearm_advertisement`.
+    adv_handle: Arc<AsyncMutex<Option<bluer::adv::AdvertisementHandle>>>,
     /// Aborts the notify-session watchers started by `advertise`, *and* the
     /// per-peer disconnect watchers they spawn — those were previously
     /// detached, so `stop_advertising` could not cancel them.
@@ -611,7 +613,7 @@ impl LinuxBackend {
             notify_writers: Arc::new(AsyncMutex::new(HashMap::new())),
             events_tx,
             app_handle: AsyncMutex::new(None),
-            adv_handle: AsyncMutex::new(None),
+            adv_handle: Arc::new(AsyncMutex::new(None)),
             server_watch: Arc::new(StdMutex::new(Vec::new())),
             dialed: Arc::new(StdMutex::new(HashMap::new())),
             pending_cleanup: Arc::new(StdMutex::new(HashSet::new())),
@@ -863,6 +865,55 @@ fn spawn_peripheral_disconnect_watch(
             session: Some(session),
         });
     })
+}
+
+/// Re-register the advertisement each time a served central disconnects,
+/// for as long as `this_generation` is current.
+///
+/// Real-hardware evidence (Fedora BlueZ, Pixel 6 Pro scanning): once a
+/// peripheral-role link ends, the advertisement stops reaching the air
+/// while `bluetoothctl show` still reports the instance active. The phone
+/// heard nothing for 4.5 minutes of normal scanning, and heard it again the
+/// moment the advertisement was registered anew. So the backend re-arms it
+/// itself rather than leave every app to re-serve.
+///
+/// Driven by the peripheral-role `Disconnected` events this backend already
+/// emits. Those with no session come from `stop_advertising`, which
+/// invalidates the generation anyway. A central that connects and leaves
+/// without ever being admitted (no write, subscription or encrypted read)
+/// produces no event, so it does not re-arm.
+async fn rearm_advertisement(
+    mut events: broadcast::Receiver<GattEvent>, adapter: Adapter, adv: Advertisement,
+    adv_handle: Arc<AsyncMutex<Option<bluer::adv::AdvertisementHandle>>>,
+    advertise_lock: Arc<AsyncMutex<()>>, advertise_generation: Arc<StdMutex<u64>>,
+    this_generation: u64,
+) {
+    loop {
+        match events.recv().await {
+            Ok(GattEvent::Disconnected { local_role: Role::Peripheral, session: Some(_), .. }) => {}
+            Ok(_) => continue,
+            // A missed event may have been a disconnect; re-arming costs
+            // nothing if it was not.
+            Err(broadcast::error::RecvError::Lagged(_)) => {}
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+        // Serialised against `advertise` and `stop_advertising`, which
+        // install and clear the handle under the same lock.
+        let _serialise = advertise_lock.lock().await;
+        if *advertise_generation.lock().unwrap() != this_generation {
+            return;
+        }
+        // Register the replacement before dropping the old handle, the order
+        // `advertise` replaces one with: it is the sequence real hardware
+        // already showed to work.
+        match adapter.advertise(adv.clone()).await {
+            Ok(handle) => {
+                *adv_handle.lock().await = Some(handle);
+                log::info!("advertise: re-armed after a central disconnected, generation={this_generation}");
+            }
+            Err(err) => log::warn!("advertise: re-arming after a central disconnected failed: {err}"),
+        }
+    }
 }
 
 /// What an encrypted characteristic's read handler needs to admit a central
@@ -1855,7 +1906,7 @@ impl Backend for LinuxBackend {
                 .collect(),
             ..Default::default()
         };
-        let adv_handle = self.adapter.advertise(adv).await.map_err(|err| {
+        let adv_handle = self.adapter.advertise(adv.clone()).await.map_err(|err| {
             log::warn!("advertise: BlueZ rejected the advertisement: {err}");
             BleError::Gatt(err.to_string())
         })?;
@@ -1863,6 +1914,15 @@ impl Backend for LinuxBackend {
 
         *self.app_handle.lock().await = Some(app_handle);
         *self.adv_handle.lock().await = Some(adv_handle);
+        notify_sessions.push(tokio::spawn(rearm_advertisement(
+            self.events_tx.subscribe(),
+            self.adapter.clone(),
+            adv,
+            self.adv_handle.clone(),
+            self.advertise_lock.clone(),
+            advertise_generation.clone(),
+            this_generation,
+        )));
 
         // The previous generation's watchers were already aborted before any
         // of this generation's tasks were spawned — see the drain near the

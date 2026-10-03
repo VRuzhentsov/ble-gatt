@@ -14,8 +14,20 @@
     <!-- API 31+: the runtime-requestable Bluetooth permission triad. This
          module declares them; requesting the runtime grant from the user
          is the consuming app's responsibility, not this bridge's — see
-         BleGattBridge.kt's doc comment. -->
-    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+         BleGattBridge.kt's doc comment.
+
+         `neverForLocation` on BLUETOOTH_SCAN is required, not optional:
+         without it (and with no location permission, which this module
+         does not declare on API 31+) a scan starts without error and
+         silently delivers zero results — measured on a Pixel 6 Pro. The
+         bridge never derives location from scans. The flag makes Android
+         filter out some beacon advertisements (e.g. iBeacon), which a
+         service-UUID scan never wanted; an app that does need location from
+         scans must override this declaration and request a location
+         permission itself. -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
 
