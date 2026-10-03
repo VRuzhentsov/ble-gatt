@@ -647,7 +647,11 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 }
             }
         }
-        val gatt = device.connectGatt(context, false, callback)
+        // TRANSPORT_LE explicitly: the default (AUTO) may try BR/EDR first
+        // against a dual-mode peer such as a Linux laptop with classic
+        // Bluetooth on. Measured dials to one took 9-10 s, and every second
+        // one failed with the peer refusing notifications.
+        val gatt = device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
         synchronized(gattLock) {
             connectedGatts[address] = gatt
             gattSessions[address] = session

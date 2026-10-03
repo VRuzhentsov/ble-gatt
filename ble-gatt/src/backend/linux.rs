@@ -867,6 +867,76 @@ fn spawn_peripheral_disconnect_watch(
     })
 }
 
+/// How long `scan` keeps watching a device that BlueZ added without the
+/// wanted service UUID, for its properties to fill in.
+///
+/// Real-hardware evidence (Fedora BlueZ, Pixel peer): BlueZ often adds a
+/// device before the advertisement's UUIDs reach its properties. Checking
+/// only at `DeviceAdded` dropped such a peer until the *next* discovery
+/// session re-reported it with full data. 7 of 10 sightings landed 0-4 s
+/// after a scan restart, and finding the peer took 32-100 s. Bounded so a
+/// device that never advertises the service does not hold a watcher for the
+/// rest of the scan.
+const SCAN_PROPERTY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Wait up to `SCAN_PROPERTY_WAIT` for `device`'s UUIDs to come to include
+/// `target`, returning them once they do.
+async fn await_service_uuid(device: &bluer::Device, target: bluer::Uuid) -> Option<HashSet<bluer::Uuid>> {
+    let address = device.address();
+    let mut changes = device.events().await.ok()?;
+    // Re-read after subscribing: UUIDs that arrived between the first read
+    // and the subscription would otherwise never produce a change event.
+    let uuids = device.uuids().await.ok().flatten().unwrap_or_default();
+    if uuids.contains(&target) {
+        return Some(uuids);
+    }
+    let found = tokio::time::timeout(SCAN_PROPERTY_WAIT, async {
+        while let Some(event) = changes.next().await {
+            if let bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::Uuids(uuids)) = event {
+                if uuids.contains(&target) {
+                    return Some(uuids);
+                }
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten();
+    match &found {
+        Some(_) => log::debug!("scan: {address} gained the wanted service after it was added"),
+        None => log::trace!("scan: ignoring {address} — never advertised the wanted service"),
+    }
+    found
+}
+
+/// Read the rest of a matching device's properties into a `DiscoveredPeer`.
+async fn describe_discovered(device: &bluer::Device, uuids: HashSet<bluer::Uuid>) -> DiscoveredPeer {
+    let address = device.address();
+    let name = device.name().await.ok().flatten();
+    let manufacturer_data =
+        device.manufacturer_data().await.ok().flatten().unwrap_or_default().into_iter().collect();
+    let service_data = device
+        .service_data()
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(uuid, data)| (ServiceUuid(uuid), data))
+        .collect();
+    let rssi = device.rssi().await.ok().flatten();
+    log::info!("scan: discovered {address} name={name:?} rssi={rssi:?}");
+    DiscoveredPeer {
+        address: PeerAddress(address.to_string()),
+        name,
+        services: uuids.into_iter().map(ServiceUuid).collect(),
+        manufacturer_data,
+        service_data,
+        rssi,
+    }
+}
+
 /// Re-register the advertisement each time a served central disconnects,
 /// for as long as `this_generation` is current.
 ///
@@ -1371,51 +1441,28 @@ impl Backend for LinuxBackend {
         ));
         let target = service.0;
 
-        let discovered = events.filter_map(move |event| {
+        // `flat_map_unordered` with no limit, because a device whose
+        // properties are still filling in is watched for up to
+        // `SCAN_PROPERTY_WAIT`, and a bounded pool would stall every other
+        // device behind those waits.
+        let discovered = events.flat_map_unordered(None, move |event| {
             let _scan_guard = &scan_guard;
             let adapter = adapter.clone();
-            async move {
+            futures::stream::once(async move {
                 let AdapterEvent::DeviceAdded(address) = event else {
                     return None;
                 };
                 let device = adapter.device(address).ok()?;
                 let uuids = device.uuids().await.ok().flatten().unwrap_or_default();
-                if !uuids.contains(&target) {
-                    log::trace!(
-                        "scan: ignoring {address} — advertises {} service(s), none matching",
-                        uuids.len()
-                    );
-                    return None;
-                }
-                let name = device.name().await.ok().flatten();
-                let manufacturer_data = device
-                    .manufacturer_data()
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect();
-                let service_data = device
-                    .service_data()
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|(uuid, data)| (ServiceUuid(uuid), data))
-                    .collect();
-                let rssi = device.rssi().await.ok().flatten();
-                log::info!("scan: discovered {address} name={name:?} rssi={rssi:?}");
-                Some(Ok(DiscoveredPeer {
-                    address: PeerAddress(address.to_string()),
-                    name,
-                    services: uuids.into_iter().map(ServiceUuid).collect(),
-                    manufacturer_data,
-                    service_data,
-                    rssi,
-                }))
-            }
+                let uuids = if uuids.contains(&target) {
+                    uuids
+                } else {
+                    await_service_uuid(&device, target).await?
+                };
+                Some(Ok(describe_discovered(&device, uuids).await))
+            })
+            .filter_map(std::future::ready)
+            .boxed()
         });
         Ok(Box::pin(discovered))
     }
