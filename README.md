@@ -25,9 +25,6 @@ supported — and staying out of the way is deliberate, so that consumers
 talking to third-party device firmware (which will never speak your
 protocol) can use the raw GATT API directly. See ADR-0003.
 
-Other BLE libraries, in every language, and what this repo borrows from them:
-[docs/alternatives.md](docs/alternatives.md).
-
 Design decisions live in `docs/adr/`:
 [0001](docs/adr/0001-ble-gatt-tauri-plugin-split-and-scope.md) — why this
 split, why GATT-only, why hand-rolled instead of an existing crate.
