@@ -49,29 +49,9 @@ swap the radio at runtime (the cross-process mock broker depends on this).
 Every layer receives its dependencies as traits from its caller instead of
 constructing them.
 
-**D4 — One port per role.** The single `Backend` trait is split into
-`Central`, `Peripheral` and `Advertiser` ports, plus `Environment` (D7).
-One role can then be mocked alone, and a platform that cannot advertise
-still offers the central role. `platform()` keeps building all of them for
-the current OS in one call.
-
-**D5 — Work can be scoped to a connection.** On top of the explicit link
-handles, a connection offers a scope: tasks spawned in it are cancelled
-when the link drops. Callers no longer have to notice the disconnect to stop
-their own tasks. (Kable's `connect()` returns such a scope, and Nordic's
-`profile()` is similar.)
-
-**D6 — Radio resources are RAII handles.** Advertising, a GATT server, a scan
-and a connection are returned as handles that stop the resource when
-dropped, so an early return cannot leave the radio running. (This is how
-`bluer` does it.)
-
-**D7 — An `Environment` object.** One object answers whether Bluetooth is on,
-which permissions are granted and what this device can do, and streams
-changes to those answers. A mock `Environment` lets tests cover states such
-as "Android 12 without the scan permission" without a device. (This follows
-Nordic's `Environment`.) Asking the user for permissions stays in
-`tauri-plugin-ble-gatt`.
+**D4–D7 — Open.** Role ports, connection scopes, handles and an
+`Environment`-style object are still being discussed; the options are
+recorded in the pull request and will be written here once chosen.
 
 **D8 — Power policy is advice, as in bitchat.** A resolver turns inputs
 (foreground or background, battery level, charging, peers nearby) into a
@@ -102,11 +82,9 @@ a hardware-in-the-loop rig later.**
    today, then drop Fini's vendored Kotlin and its own context bridging.
 2. **Restructure the core into the layer modules** (`platform/`, `roles/`,
    `link/`, `transport/`, `power/`), moving code without changing behaviour.
-3. **Split the `Backend` trait into role ports** and add `Environment`
-   (D4, D7).
-4. **RAII handles and connection scopes** (D5, D6).
-5. **Power profiles** (D8).
-6. **Windows backend** (WinRT), then Apple.
+3. **D4–D7**, once decided.
+4. **Power profiles** (D8).
+5. **Windows backend** (WinRT), then Apple.
 
 Each step is its own change, keeps the existing tests green, and updates
 `docs/architecture.md` where the map moves.

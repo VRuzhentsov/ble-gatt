@@ -55,10 +55,7 @@ ble-gatt/src/
     apple/           (planned)
     mock/
   roles/             L1  public role API; holds injected platform ports
-    central.rs
-    peripheral.rs
-    advertiser.rs
-    environment.rs
+                         (how roles are split: ADR-0007 D4-D7, open)
   link/              L2  connection lifecycle, op queue, connection scope
   transport/         L3  datagram channel, peer identity, peer finding
   power/             Policy  profiles and the resolver
@@ -92,9 +89,8 @@ back.
 - is covered by the shared behaviour tests that run against the mock, plus
   hardware checks listed in `docs/hardware-verification.md`.
 
-**Lifetimes.** Anything that keeps the radio busy (advertising, a GATT
-server, a scan, a connection) is returned as a handle that stops it when
-dropped.
+**Lifetimes.** How resources that keep the radio busy are stopped is open
+(ADR-0007 D6).
 
 **Errors and events.** Errors are typed per layer. State changes are
 streams that any number of subscribers can follow.
