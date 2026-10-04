@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed. The layer map is in [`docs/architecture.md`](../architecture.md).
+Accepted. The layer map is in [`docs/architecture.md`](../architecture.md).
 Restructuring the code to match is planned work (see Plan).
 
 ## Context
@@ -59,8 +59,22 @@ Windows `BluetoothLEAdvertisementWatcher` / `GattServiceProvider` /
 then maps one to one onto its platform, an application uses and mocks only
 the roles it needs, and a device that cannot advertise still scans.
 
-**D5 — Open.** How work tied to a connection is stopped when the connection
-drops.
+**D5 — A connection publishes its state; cancellation is derived from it.**
+Each connection publishes its state (connecting, connected, disconnected) on
+a `tokio::sync::watch` channel: any number of subscribers, each seeing the
+current state as soon as it subscribes. This is the pub/sub style used across
+`ble-gatt` and Fini, and the same model as Kable's and Nordic's
+`StateFlow<State>`. As a convenience on top of that subscription, a
+connection also hands out a `tokio_util::sync::CancellationToken` that fires
+when it disconnects, so a task can be tied to the connection in one line
+(`token.run_until_cancelled(task)`).
+
+```rust
+let link = central.connect(addr).await?;
+let mut state = link.state();                      // watch::Receiver<LinkState>
+tokio::spawn(link.cancelled().run_until_cancelled(read_loop()));
+state.wait_for(|s| s.is_disconnected()).await;
+```
 
 **D6 — Radio resources are handles that stop on drop.** Advertising, a GATT
 server and a scan are returned as handles; dropping one stops it, so an
@@ -105,8 +119,8 @@ a hardware-in-the-loop rig later.**
    today, then drop Fini's vendored Kotlin and its own context bridging.
 2. **Restructure the core into the layer modules** (`platform/`, `roles/`,
    `link/`, `transport/`, `power/`), moving code without changing behaviour.
-3. **Role objects, the `Adapter` and handles** (D4, D6, D7), and D5 once
-   decided.
+3. **Role objects, the `Adapter`, handles and published connection state**
+   (D4–D7).
 4. **Power profiles** (D8).
 5. **Windows backend** (WinRT), then Apple.
 

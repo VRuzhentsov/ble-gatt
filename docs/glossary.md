@@ -153,6 +153,17 @@ A value that represents something running (a scan, an advertisement, a
 connection) and stops it when the value is dropped. *Also called:* guard,
 RAII handle.
 
+### RAII
+"Resource acquisition is initialization": a Rust (and C++) idiom where
+owning a value means owning a resource, and dropping the value releases it.
+A `MutexGuard` unlocking when it goes out of scope is the everyday example.
+
+### Adapter
+This library's object for the device's [Bluetooth adapter](#bluetooth-adapter):
+whether it is on, events when that changes, and what the hardware can do.
+Roles are created from it (ADR-0007 D7). *Also called:* `Adapter` in bluest
+and btleplug, `BluetoothAdapter` on Android.
+
 ### Mock radio
 A software stand-in for Bluetooth used in tests: in one process
 (`MockNetwork`), or shared by several processes through the *mock broker*
@@ -162,6 +173,33 @@ A software stand-in for Bluetooth used in tests: in one process
 Advice on how hard to work the radio (how long to scan, how long to pause,
 how many connections), worked out from the device's situation: battery,
 charging, foreground or background.
+
+### Layer number
+L0 to L5 in [`architecture.md`](architecture.md). These are this library's
+own layers, **not** the OSI model's: here L2 is one BLE connection, while
+OSI's layer 2 (data link) is what this library's L3 datagram channel does.
+Fini's `DataLink` is named after the OSI layer.
+
+### Pub/sub (publish/subscribe)
+One side *publishes* events or state; any number of *subscribers* receive
+them and react on their own, without the publisher knowing who they are.
+The style used across `ble-gatt` and Fini for state and events.
+
+### Watch channel
+`tokio::sync::watch`: pub/sub for a *value that changes*, such as whether the
+adapter is on or a connection's state. It keeps the latest value, so a new
+subscriber sees the current state at once. Kotlin's `StateFlow` is the same
+idea.
+
+### Broadcast stream
+Pub/sub for a *sequence of events* (`tokio::sync::broadcast` behind a
+stream), where every subscriber receives every event published after it
+subscribed.
+
+### Cancellation token
+`tokio_util::sync::CancellationToken`: a one-shot signal that tasks can wait
+on or be stopped by. A connection hands one out that fires when it
+disconnects.
 
 ### Adapter crate
 A crate that connects `ble-gatt` to something outside it, such as iroh

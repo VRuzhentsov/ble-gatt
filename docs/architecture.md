@@ -10,6 +10,11 @@ network stack such as iroh plugged in from outside, never wired in.
 
 ## Layers
 
+Layer numbers are this library's own. They are not the OSI model's: here L2
+is one BLE connection, while OSI's layer 2 (data link) is closer to this
+library's L3 datagram channel. Fini's `DataLink` is named after the OSI layer
+(Fini `docs/glossary.md`).
+
 | Layer | Job | Owns | Never does |
 |---|---|---|---|
 | **L0 Platform** | Talk to one operating system's Bluetooth API | BlueZ (via `bluer`), Android (JNI + Kotlin), Windows (WinRT), Apple (CoreBluetooth), mock radio | Policy, retries, protocol framing |
@@ -96,7 +101,10 @@ back.
 server, a scan) is returned as a handle that stops it when dropped, as
 `bluer` does (ADR-0007 D6).
 
-**Errors and events.** Errors are typed per layer. State changes are
-streams that any number of subscribers can follow.
+**Errors and events: pub/sub.** Errors are typed per layer. State is
+published, never polled: a value that changes (adapter on or off, a
+connection's state) is a `tokio::sync::watch` channel, and a sequence of
+events is a broadcast stream; any number of subscribers can follow either
+(ADR-0007 D5).
 
 **Runtime.** Async, Tokio only.
