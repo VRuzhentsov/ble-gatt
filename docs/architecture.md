@@ -13,7 +13,7 @@ network stack such as iroh plugged in from outside, never wired in.
 | Layer | Job | Owns | Never does |
 |---|---|---|---|
 | **L0 Platform** | Talk to one operating system's Bluetooth API | BlueZ (via `bluer`), Android (JNI + Kotlin), Windows (WinRT), Apple (CoreBluetooth), mock radio | Policy, retries, protocol framing |
-| **L1 Roles** | The BLE roles as a uniform API | `Central` (scan, connect, read, write, subscribe), `Peripheral` (GATT server, requests, notify), `Advertiser`, `Environment` (adapter power, permissions, capabilities) | Deciding when to scan or connect |
+| **L1 Roles** | The BLE roles as a uniform API | `Central` (scan, connect, read, write, subscribe), `Peripheral` (GATT server, requests, notify), `Advertiser`, `Adapter` (power state, events, capabilities) | Deciding when to scan or connect |
 | **L2 Link** | Keep a connection to one peer healthy | Connection state machine, one operation queue per device with timeouts, connection-scoped tasks, MTU and connection priority | Knowing who the peer is |
 | **L3 Transport** | Move messages between peers | Datagram channel (fragmentation, reassembly), peer identity in the advertisement, finding a known peer, deduplicating crossing connections | Encryption, routing, any specific network stack |
 | **Policy** | Advise how hard the radio should work | Power profiles: inputs (foreground or background, battery level, charging, peers nearby) resolve to a schedule (scan on and off times, connection limit) | Switching hardware on or off itself |
@@ -55,7 +55,10 @@ ble-gatt/src/
     apple/           (planned)
     mock/
   roles/             L1  public role API; holds injected platform ports
-                         (how roles are split: ADR-0007 D4-D7, open)
+    adapter.rs           the device's Bluetooth adapter: on/off, events, capabilities
+    central.rs
+    peripheral.rs
+    advertiser.rs
   link/              L2  connection lifecycle, op queue, connection scope
   transport/         L3  datagram channel, peer identity, peer finding
   power/             Policy  profiles and the resolver
@@ -79,7 +82,7 @@ back.
 
 - implements the same port traits, with the same behaviour, so callers
   cannot tell platforms apart;
-- reports what it cannot do through `Environment` capabilities or a typed
+- reports what it cannot do through `Adapter` capabilities or a typed
   `Unsupported` error, never by silently doing nothing;
 - keeps platform quirks (Android's one-operation-at-a-time GATT, BlueZ
   caching, Windows permission prompts) inside the module, documented next to
@@ -89,8 +92,9 @@ back.
 - is covered by the shared behaviour tests that run against the mock, plus
   hardware checks listed in `docs/hardware-verification.md`.
 
-**Lifetimes.** How resources that keep the radio busy are stopped is open
-(ADR-0007 D6).
+**Lifetimes.** Anything that keeps the radio busy (advertising, a GATT
+server, a scan) is returned as a handle that stops it when dropped, as
+`bluer` does (ADR-0007 D6).
 
 **Errors and events.** Errors are typed per layer. State changes are
 streams that any number of subscribers can follow.

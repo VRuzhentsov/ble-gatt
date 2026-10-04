@@ -49,9 +49,32 @@ swap the radio at runtime (the cross-process mock broker depends on this).
 Every layer receives its dependencies as traits from its caller instead of
 constructing them.
 
-**D4–D7 — Open.** Role ports, connection scopes, handles and an
-`Environment`-style object are still being discussed; the options are
-recorded in the pull request and will be written here once chosen.
+**D4 — One object per role.** The single `Backend` trait is split into
+`Central`, `Peripheral` and `Advertiser`, the way every platform splits them
+(Android `BluetoothLeScanner` / `BluetoothGattServer` /
+`BluetoothLeAdvertiser`; Apple `CBCentralManager` / `CBPeripheralManager`;
+Windows `BluetoothLEAdvertisementWatcher` / `GattServiceProvider` /
+`BluetoothLEAdvertisementPublisher`; BlueZ `Adapter1` / `GattManager1` /
+`LEAdvertisingManager1`), and as `blew` and Nordic's library do. A backend
+then maps one to one onto its platform, an application uses and mocks only
+the roles it needs, and a device that cannot advertise still scans.
+
+**D5 — Open.** How work tied to a connection is stopped when the connection
+drops.
+
+**D6 — Radio resources are handles that stop on drop.** Advertising, a GATT
+server and a scan are returned as handles; dropping one stops it, so an
+early return cannot leave the radio running. This follows `bluer`, which
+already returns `AdvertisementHandle` and `ApplicationHandle` on Linux, and
+matches how `ble-gatt`'s scan stream already stops when dropped. Stopping
+happens in the background, since `Drop` cannot wait for the platform.
+
+**D7 — An `Adapter` object.** One object stands for the device's Bluetooth
+adapter: whether it is on, events when that changes, and what the hardware
+can do. Roles are created from it. This follows `bluest`
+(`Adapter::default()`, `wait_available()`, `events()`), btleplug, Android's
+`BluetoothAdapter` and BlueZ's `Adapter1`. Asking the user for permissions is
+Android-specific and stays in `tauri-plugin-ble-gatt`.
 
 **D8 — Power policy is advice, as in bitchat.** A resolver turns inputs
 (foreground or background, battery level, charging, peers nearby) into a
@@ -82,7 +105,8 @@ a hardware-in-the-loop rig later.**
    today, then drop Fini's vendored Kotlin and its own context bridging.
 2. **Restructure the core into the layer modules** (`platform/`, `roles/`,
    `link/`, `transport/`, `power/`), moving code without changing behaviour.
-3. **D4–D7**, once decided.
+3. **Role objects, the `Adapter` and handles** (D4, D6, D7), and D5 once
+   decided.
 4. **Power profiles** (D8).
 5. **Windows backend** (WinRT), then Apple.
 
