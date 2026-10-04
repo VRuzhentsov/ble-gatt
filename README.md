@@ -8,7 +8,7 @@ for async/channels, [`thiserror`](https://github.com/dtolnay/thiserror) and
 [`async-trait`](https://github.com/dtolnay/async-trait) for the trait
 surface.
 
-This repo is a Cargo workspace with two published crates:
+This repo is a Cargo workspace with three crates:
 
 - **`ble-gatt`** — the core library. Scan/advertise, GATT client
   read/write/subscribe, GATT server characteristics, connection lifecycle as
@@ -18,6 +18,10 @@ This repo is a Cargo workspace with two published crates:
 - **`tauri-plugin-ble-gatt`** — a thin [Tauri](https://tauri.app) plugin
   wrapper around `ble-gatt`, following Tauri's own `tauri-plugin-*` naming
   convention for its mobile-plugin tooling.
+- **`ble-gatt-iroh`** — an [iroh](https://github.com/n0-computer/iroh)
+  custom transport that carries QUIC over `ble-gatt`'s GATT datagram
+  channel. The caller decides when the radio scans and advertises. See
+  ADR-0006.
 
 This library **carries bytes; it does not encrypt them.** Layering your own
 session protocol or end-to-end encryption on top is expected and

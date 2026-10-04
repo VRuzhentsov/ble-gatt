@@ -17,3 +17,5 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
       - name: cargo test
         run: cargo test -p ble-gatt
+      - name: cargo test (ble-gatt-iroh)
+        run: cargo test -p ble-gatt-iroh
