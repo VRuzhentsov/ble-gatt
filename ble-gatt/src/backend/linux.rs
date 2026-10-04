@@ -1183,7 +1183,9 @@ impl Drop for LinuxConnectGuard {
 
 /// What a scan learned about one device at one moment.
 enum ScannedPeer {
-    /// Its services are known and do not include the target.
+    /// The services BlueZ knows so far do not include the target. More may
+    /// still arrive (a scan response can carry the target UUID after the
+    /// first advertisement listed others).
     NotTarget,
     /// Matches, with manufacturer data.
     Complete(DiscoveredPeer),
@@ -1407,7 +1409,6 @@ impl Backend for LinuxBackend {
                     continue;
                 }
                 match read_scanned_peer(&adapter, address, target).await {
-                    ScannedPeer::NotTarget => {}
                     ScannedPeer::Complete(peer) => {
                         reported.lock().unwrap().insert(address, true);
                         if tx.send(Ok(peer)).await.is_err() {
@@ -1430,8 +1431,9 @@ impl Backend for LinuxBackend {
                             true,
                         ));
                     }
-                    // Nothing known about its services yet: wait for them.
-                    ScannedPeer::Unknown => {
+                    // Nothing known about its services yet, or not the target
+                    // among those known so far: wait for the rest.
+                    ScannedPeer::Unknown | ScannedPeer::NotTarget => {
                         reported.lock().unwrap().insert(address, false);
                         tokio::spawn(watch_for_completion(
                             adapter.clone(),
