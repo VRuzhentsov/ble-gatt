@@ -1260,19 +1260,26 @@ async fn read_scanned_peer(adapter: &Adapter, address: bluer::Address, target: u
 /// Watches one device's property changes for up to `SCAN_COMPLETION_WINDOW`
 /// and reports it as soon as it is complete -- the services known and the
 /// target among them, with manufacturer data.
+///
+/// A match without manufacturer data is reported too, once, the moment its
+/// services show the target (`match_sent` says whether the caller already
+/// did): an advertiser that never sends manufacturer data -- the default for
+/// `GattServiceSpec::new` -- would otherwise never be reported at all.
+///
+/// With every slot taken the device is not watched, and it is left out of
+/// `reported` so its next `DeviceAdded` in this scan tries again.
 async fn watch_for_completion(
     adapter: Adapter,
     address: bluer::Address,
     target: uuid::Uuid,
     reported: Arc<StdMutex<HashMap<bluer::Address, bool>>>,
     tx: tokio::sync::mpsc::Sender<Result<DiscoveredPeer>>,
+    mut match_sent: bool,
 ) {
-    use std::sync::atomic::Ordering;
-    if scan_watchers().fetch_add(1, Ordering::SeqCst) >= SCAN_MAX_WATCHERS {
-        scan_watchers().fetch_sub(1, Ordering::SeqCst);
+    let Some(_slot) = WatcherSlot::take() else {
+        reported.lock().unwrap().remove(&address);
         return;
-    }
-    let _slot = WatcherSlot;
+    };
     let Ok(device) = adapter.device(address) else {
         return;
     };
@@ -1283,10 +1290,19 @@ async fn watch_for_completion(
     loop {
         // Read first: the data may have arrived between the event that put
         // this device here and the subscription above.
-        if let ScannedPeer::Complete(peer) = read_scanned_peer(&adapter, address, target).await {
-            reported.lock().unwrap().insert(address, true);
-            let _ = tx.send(Ok(peer)).await;
-            return;
+        match read_scanned_peer(&adapter, address, target).await {
+            ScannedPeer::Complete(peer) => {
+                reported.lock().unwrap().insert(address, true);
+                let _ = tx.send(Ok(peer)).await;
+                return;
+            }
+            ScannedPeer::NoManufacturerData(peer) if !match_sent => {
+                match_sent = true;
+                if tx.send(Ok(peer)).await.is_err() {
+                    return;
+                }
+            }
+            _ => {}
         }
         tokio::select! {
             change = changes.next() => {
@@ -1300,8 +1316,19 @@ async fn watch_for_completion(
     }
 }
 
-/// Releases a watcher slot when dropped.
+/// One of the `SCAN_MAX_WATCHERS` slots, released when dropped.
 struct WatcherSlot;
+
+impl WatcherSlot {
+    fn take() -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        if scan_watchers().fetch_add(1, Ordering::SeqCst) >= SCAN_MAX_WATCHERS {
+            scan_watchers().fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(Self)
+    }
+}
 
 impl Drop for WatcherSlot {
     fn drop(&mut self) {
@@ -1400,6 +1427,7 @@ impl Backend for LinuxBackend {
                             target,
                             reported.clone(),
                             tx.clone(),
+                            true,
                         ));
                     }
                     // Nothing known about its services yet: wait for them.
@@ -1411,6 +1439,7 @@ impl Backend for LinuxBackend {
                             target,
                             reported.clone(),
                             tx.clone(),
+                            false,
                         ));
                     }
                 }
