@@ -1,197 +1,148 @@
 # Alternatives and prior art
 
-An inventory of other BLE libraries, so we know what already exists, what to
-borrow, and what this repo is for. ADR-0001 records the narrower Rust-only
-survey behind the decision to write `ble-gatt`. This file is wider: every
-language, plus apps and frameworks that solve the same problem.
+An inventory of other BLE libraries that run on Android. It records what
+already exists, what to borrow, and what this repo is for. ADR-0001 records
+the narrower Rust-only survey behind the decision to write `ble-gatt`. This
+file is wider: every language, plus apps that solve the same problem.
 
-**Inclusion rule:** 100+ GitHub stars. A few projects below that are listed
-separately, because they compete directly.
+**Inclusion rules:**
+- **Android is required.** Fini, the app this library is built for, ships on
+  Android, so a library without an Android backend is no alternative.
+  Notable libraries that fail this rule are named at the end, so nobody has to
+  re-check them.
+- **100+ GitHub stars.** A few projects below that are listed separately,
+  because they compete directly.
 
 **Snapshot:** star counts read from the GitHub API on 2026-10-04. They will
 drift.
 
-**Role columns:**
-- **C** = central (scan, connect, GATT client).
-- **P** = peripheral (advertise, GATT server).
+**Columns:**
+- **Roles: C** = central (scan, connect, GATT client).
+- **Roles: P** = peripheral (advertise, GATT server). For a multi-platform
+  library, **P** means peripheral works on Android, not only on some other
+  platform.
 - **?** = not confirmed from the project's own docs. Check before relying on it.
+- **Other platforms:** platforms supported besides Android. A dash (—) means
+  Android only.
 
 ## Where `ble-gatt` sits
 
-Very few libraries do both roles across platforms with a permissive licence,
-in any language. Most are central-only: they talk *to* a device and are never
-a device themselves. The peripheral role is where the gap is, especially on
-Android from Rust. The closest neighbours are:
+Of the 28 libraries and plugins below, 21 are central-only. They talk *to* a
+device and are never a device themselves. Six can also be a peripheral on
+Android (Golden Gate's phone-side role is unconfirmed):
 
-- **Same idea, other language:**
-  - `tinygo-org/bluetooth` (Go).
-  - Shiny (.NET).
-  - Nordic's Android/Kotlin libraries (Android only).
-  - BLESSED (Android only).
-  - BluetoothKit and BlueCap (Apple only).
-- **Same idea, Rust, one platform:** `bluer`. It is Linux only, and it is
-  `ble-gatt`'s own Linux backend.
-- **Same goal, as an app rather than a library:** bitchat, Berty, and Google's
-  archived Golden Gate. They show that device-to-device messaging over BLE
-  needs a framing and session layer above raw GATT. That is what this repo's
-  datagram and peer-link tiers are.
+- **Android only:** Nordic's Android-BLE-Library and Kotlin-BLE-Library,
+  BLESSED, and kshoji's HID peripheral. Kotlin/Java, with no desktop
+  counterpart.
+- **Android plus other platforms:** Shiny (.NET) and
+  cordova-plugin-bluetoothle. Both live inside a larger app framework.
 
-## Rust
+No Rust library here does the peripheral role on Android, and none pairs it
+with a desktop backend. The one Rust crate that does is AGPL-licensed (see
+"Below 100 stars").
 
-| Project | Stars | Roles | Platforms | Notes |
-|---|---:|---|---|---|
-| [deviceplug/btleplug](https://github.com/deviceplug/btleplug) | 1177 | C | Win, macOS, iOS, Linux, Android | Host-side by design; the de facto Rust BLE client. |
-| [bluez/bluer](https://github.com/bluez/bluer) | 450 | C + P | Linux | Official BlueZ bindings; our Linux backend. Also L2CAP, RFCOMM, mesh. |
-| [embassy-rs/trouble](https://github.com/embassy-rs/trouble) | 450 | C + P | Bare metal | BLE host stack for microcontrollers. |
-| [embassy-rs/nrf-softdevice](https://github.com/embassy-rs/nrf-softdevice) | 341 | C + P | nRF52 | Embedded only. |
-| [MnlPhlp/tauri-plugin-blec](https://github.com/MnlPhlp/tauri-plugin-blec) | 228 | C | Tauri desktop + mobile | btleplug wrapped as a Tauri plugin. |
-| [alexmoon/bluest](https://github.com/alexmoon/bluest) | 151 | C | Win, macOS, iOS, Linux | README says peripheral is out of scope. |
-| [spieglt/FlyingCarpet](https://github.com/spieglt/FlyingCarpet) | 5330 | (app) | Android, iOS, Linux, macOS, Win | Tauri app; uses BLE to negotiate a Wi-Fi transfer. Prior art for Tauri + BLE on mobile. |
+The closest match to `ble-gatt`'s goal is an app, not a library. bitchat
+connects every device as both central and peripheral and runs its own
+framing above GATT. That framing layer is what this repo's datagram and
+peer-link tiers provide.
 
-## C / C++
+## Libraries
 
-| Project | Stars | Roles | Platforms | Notes |
-|---|---:|---|---|---|
-| [zephyrproject-rtos/zephyr](https://github.com/zephyrproject-rtos/zephyr) | 16683 | C + P | Embedded RTOS | Full BLE stack inside an RTOS. |
-| [bluekitchen/btstack](https://github.com/bluekitchen/btstack) | 2144 | C + P | Embedded, desktop via HCI | Dual-mode stack. |
-| [simpleble/simpleble](https://github.com/simpleble/simpleble) | 1137 | C | Win, macOS, iOS, Linux, Android | C++ core with Python and Rust bindings. Check its licence before use. |
-| [h2zero/NimBLE-Arduino](https://github.com/h2zero/NimBLE-Arduino) | 1127 | C + P | ESP32, nRF5x | |
-| [apache/mynewt-nimble](https://github.com/apache/mynewt-nimble) | 893 | C + P | Embedded | NimBLE host and controller. |
-| [labapart/gattlib](https://github.com/labapart/gattlib) | 516 | C | Linux | GATT client over BlueZ. |
-| [sj15712795029/bluetooth_stack](https://github.com/sj15712795029/bluetooth_stack) | 485 | C + P | STM32, Linux | Dual-mode stack. |
-| [Google-Health-API/golden-gate](https://github.com/Google-Health-API/golden-gate) | 313 | C + P | Android, iOS, embedded | **Archived.** IP stack (CoAP/DTLS) over BLE for wearables. Closest prior art to our datagram tier. |
-| [intel-iot-devkit/tinyb](https://github.com/intel-iot-devkit/tinyb) | 270 | C | Linux | **Archived.** BlueZ D-Bus, C++/Java. |
-| [nettlep/gobbledegook](https://github.com/nettlep/gobbledegook) | 177 | P | Linux | Standalone BlueZ GATT server. |
-| [TorstenRobitzki/bluetoe](https://github.com/TorstenRobitzki/bluetoe) | 144 | P | Embedded | C++ GATT server framework. |
-
-## Go
-
-| Project | Stars | Roles | Platforms | Notes |
-|---|---:|---|---|---|
-| [paypal/gatt](https://github.com/paypal/gatt) | 1165 | C + P | Linux, macOS | Unmaintained for years. |
-| [tinygo-org/bluetooth](https://github.com/tinygo-org/bluetooth) | 1013 | C + P | Linux, macOS, Win, bare metal | Peripheral availability varies by OS. Closest "both roles, one API" analogue outside Rust. |
-| [muka/go-bluetooth](https://github.com/muka/go-bluetooth) | 674 | C + P | Linux | **Archived.** BlueZ D-Bus. |
-
-## Python
-
-| Project | Stars | Roles | Platforms | Notes |
-|---|---:|---|---|---|
-| [hbldh/bleak](https://github.com/hbldh/bleak) | 2536 | C | Win, macOS, Linux (Android via p4a) | The standard Python BLE client; asyncio. |
-| [IanHarvey/bluepy](https://github.com/IanHarvey/bluepy) | 1633 | C | Linux | |
-| [google/bumble](https://github.com/google/bumble) | 563 | C + P | Any OS, needs an HCI controller | Full host stack in Python; also a test tool. |
-| [peplin/pygatt](https://github.com/peplin/pygatt) | 531 | C | Linux, BGAPI | **Archived.** |
-| [ukBaz/python-bluezero](https://github.com/ukBaz/python-bluezero) | 422 | C + P | Linux | BlueZ wrapper. |
-| [adafruit/Adafruit_Python_BluefruitLE](https://github.com/adafruit/Adafruit_Python_BluefruitLE) | 394 | C | Linux, macOS | **Archived.** |
-| [kevincar/bless](https://github.com/kevincar/bless) | 195 | P | Win, macOS, Linux | Peripheral companion to bleak. |
-
-## JavaScript / TypeScript
-
-| Project | Stars | Roles | Platforms | Notes |
-|---|---:|---|---|---|
-| [noble/noble](https://github.com/noble/noble) | 3454 | C | Node: Linux, macOS, Win | **Archived** (community forks continue). |
-| [noble/bleno](https://github.com/noble/bleno) | 2139 | P | Node: Linux, macOS | **Archived.** Peripheral half of noble. |
-| [capacitor-community/bluetooth-le](https://github.com/capacitor-community/bluetooth-le) | 359 | C | Web, Android, iOS | |
-| [chrvadala/node-ble](https://github.com/chrvadala/node-ble) | 345 | C | Linux | Pure JS over BlueZ D-Bus. |
-| [securing/gattacker](https://github.com/securing/gattacker) | 852 | C + P | Node | Security / MITM tool, not a general library. |
-
-## React Native / Cordova
-
-| Project | Stars | Roles | Platforms | Notes |
-|---|---:|---|---|---|
-| [dotintent/react-native-ble-plx](https://github.com/dotintent/react-native-ble-plx) | 3441 | C | Android, iOS | |
-| [innoveit/react-native-ble-manager](https://github.com/innoveit/react-native-ble-manager) | 2333 | C | Android, iOS | |
-| [don/cordova-plugin-ble-central](https://github.com/don/cordova-plugin-ble-central) | 953 | C | Android, iOS | |
-| [randdusing/cordova-plugin-bluetoothle](https://github.com/randdusing/cordova-plugin-bluetoothle) | 804 | C + P | Android, iOS | Has peripheral (server) calls. |
-
-## Flutter / Dart
-
-| Project | Stars | Roles | Platforms | Notes |
-|---|---:|---|---|---|
-| [pauldemarco/flutter_blue](https://github.com/pauldemarco/flutter_blue) | 2427 | C | Android, iOS | Abandoned; succeeded by flutter_blue_plus. |
-| [chipweinberger/flutter_blue_plus](https://github.com/chipweinberger/flutter_blue_plus) | 1005 | C | Android, iOS, macOS, Web, Linux, Win | |
-| [PhilipsHue/flutter_reactive_ble](https://github.com/PhilipsHue/flutter_reactive_ble) | 737 | C | Android, iOS | |
-| [dotintent/FlutterBleLib](https://github.com/dotintent/FlutterBleLib) | 546 | C | Android, iOS | Can simulate peripherals for tests; compare our `MockBackend`. |
-
-## Android (Java / Kotlin)
-
-| Project | Stars | Roles | Platforms | Notes |
-|---|---:|---|---|---|
-| [Jasonchenlijian/FastBle](https://github.com/Jasonchenlijian/FastBle) | 5505 | C | Android | |
-| [dariuszseweryn/RxAndroidBle](https://github.com/dariuszseweryn/RxAndroidBle) | 3540 | C | Android | RxJava; well known for documenting Android BLE pitfalls. |
-| [nordicsemi/Android-BLE-Library](https://github.com/nordicsemi/Android-BLE-Library) | 2415 | C + P | Android | Request queue, server manager. Worth reading for our Kotlin bridge. |
-| [nordicsemi/Android-Scanner-Compat-Library](https://github.com/nordicsemi/Android-Scanner-Compat-Library) | 796 | C (scan) | Android | |
-| [weliem/blessed-android](https://github.com/weliem/blessed-android) | 595 | C + P | Android | Has a peripheral manager. |
-| [nordicsemi/Kotlin-BLE-Library](https://github.com/nordicsemi/Kotlin-BLE-Library) | 529 | C + P | Android | Coroutines successor to the above. |
-| [Beepiz/BleGattCoroutines](https://github.com/Beepiz/BleGattCoroutines) | 476 | C | Android | |
-| [kshoji/BLE-HID-Peripheral-for-Android](https://github.com/kshoji/BLE-HID-Peripheral-for-Android) | 258 | P | Android | HID-only peripheral. |
-| [haodynasty/AndroidBleManager](https://github.com/haodynasty/AndroidBleManager) | 244 | C | Android | |
-
-## Kotlin Multiplatform
-
-| Project | Stars | Roles | Platforms | Notes |
-|---|---:|---|---|---|
-| [JuulLabs/kable](https://github.com/JuulLabs/kable) | 1197 | C | Android, Apple, JS | Coroutine API; good reference for API shape. |
-| [Reedyuk/blue-falcon](https://github.com/Reedyuk/blue-falcon) | 488 | C | iOS, Android, macOS, Win, JS | |
-
-## Apple (Swift / Objective-C)
-
-| Project | Stars | Roles | Platforms | Notes |
-|---|---:|---|---|---|
-| [coolnameismy/BabyBluetooth](https://github.com/coolnameismy/BabyBluetooth) | 4742 | C (P ?) | iOS, macOS | |
-| [rhummelmose/BluetoothKit](https://github.com/rhummelmose/BluetoothKit) | 2300 | C + P | iOS, macOS | Built for device-to-device data transfer, the same goal as our tiers 2–3, but Apple only. |
-| [Polidea/RxBluetoothKit](https://github.com/Polidea/RxBluetoothKit) | 1435 | C (P ?) | iOS, macOS | |
-| [steamclock/bluejay](https://github.com/steamclock/bluejay) | 1127 | C | iOS | |
-| [troystribling/BlueCap](https://github.com/troystribling/BlueCap) | 716 | C + P | iOS | |
-| [manolofdez/AsyncBluetooth](https://github.com/manolofdez/AsyncBluetooth) | 202 | C | iOS, macOS | async/await over CoreBluetooth. |
-
-## .NET
-
-| Project | Stars | Roles | Platforms | Notes |
-|---|---:|---|---|---|
-| [shinyorg/shiny](https://github.com/shinyorg/shiny) | 1583 | C + P | iOS, macOS, Android, Win, Linux | BLE client plus "hosting" (peripheral) in a larger framework. |
-| [inthehand/32feet](https://github.com/inthehand/32feet) | 990 | C | Win, Android, iOS, macOS | |
-| [dotnet-bluetooth-le/dotnet-bluetooth-le](https://github.com/dotnet-bluetooth-le/dotnet-bluetooth-le) | 957 | C | Android, iOS, macOS, Win | Plugin.BLE. |
-
-## Java (desktop) / Elixir
-
-| Project | Stars | Roles | Platforms | Notes |
-|---|---:|---|---|---|
-| [sputnikdev/bluetooth-manager](https://github.com/sputnikdev/bluetooth-manager) | 112 | C | Linux (via TinyB) | |
-| [blue-heron/blue_heron](https://github.com/blue-heron/blue_heron) | 118 | C (P ?) | Linux / Nerves via HCI | Elixir. |
+| Project | Language | Stars | Roles | Other platforms | Notes |
+|---|---|---:|---|---|---|
+| [Jasonchenlijian/FastBle](https://github.com/Jasonchenlijian/FastBle) | Java | 5505 | C | — | |
+| [dariuszseweryn/RxAndroidBle](https://github.com/dariuszseweryn/RxAndroidBle) | Java | 3540 | C | — | RxJava; well known for documenting Android BLE pitfalls. |
+| [dotintent/react-native-ble-plx](https://github.com/dotintent/react-native-ble-plx) | Java / JS | 3441 | C | iOS | React Native. |
+| [hbldh/bleak](https://github.com/hbldh/bleak) | Python | 2536 | C | Windows, macOS, Linux | The standard Python BLE client. Android through python-for-android. |
+| [pauldemarco/flutter_blue](https://github.com/pauldemarco/flutter_blue) | Dart | 2427 | C | iOS | Abandoned; succeeded by flutter_blue_plus. |
+| [nordicsemi/Android-BLE-Library](https://github.com/nordicsemi/Android-BLE-Library) | Java | 2415 | C + P | — | Request queue and server manager. Worth reading for our Kotlin bridge. |
+| [innoveit/react-native-ble-manager](https://github.com/innoveit/react-native-ble-manager) | Java / JS | 2333 | C | iOS | React Native. |
+| [shinyorg/shiny](https://github.com/shinyorg/shiny) | C# | 1583 | C + P | iOS, macOS, Windows | .NET framework; BLE client plus "hosting" (peripheral). |
+| [JuulLabs/kable](https://github.com/JuulLabs/kable) | Kotlin | 1197 | C | iOS, macOS, JavaScript (Web Bluetooth) | Kotlin Multiplatform; a good reference for API shape. |
+| [deviceplug/btleplug](https://github.com/deviceplug/btleplug) | Rust | 1177 | C | Windows, macOS, iOS, Linux | Host-side by design; the de facto Rust BLE client. |
+| [simpleble/simpleble](https://github.com/simpleble/simpleble) | C++ | 1137 | C | Windows, macOS, iOS, Linux | Python and Rust bindings. Check its licence before use. |
+| [chipweinberger/flutter_blue_plus](https://github.com/chipweinberger/flutter_blue_plus) | Dart | 1005 | C | iOS, macOS, Web, Linux, Windows | |
+| [inthehand/32feet](https://github.com/inthehand/32feet) | C# | 990 | C | Windows, iOS, macOS | .NET. |
+| [dotnet-bluetooth-le/dotnet-bluetooth-le](https://github.com/dotnet-bluetooth-le/dotnet-bluetooth-le) | C# | 957 | C | iOS, macOS, Windows | Plugin.BLE for Xamarin/MAUI. |
+| [don/cordova-plugin-ble-central](https://github.com/don/cordova-plugin-ble-central) | Java / JS | 953 | C | iOS | Cordova. |
+| [randdusing/cordova-plugin-bluetoothle](https://github.com/randdusing/cordova-plugin-bluetoothle) | Obj-C / Java / JS | 804 | C + P | iOS | Cordova; has peripheral (server) calls. |
+| [nordicsemi/Android-Scanner-Compat-Library](https://github.com/nordicsemi/Android-Scanner-Compat-Library) | Java | 796 | C (scan only) | — | |
+| [PhilipsHue/flutter_reactive_ble](https://github.com/PhilipsHue/flutter_reactive_ble) | Dart | 737 | C | iOS | |
+| [weliem/blessed-android](https://github.com/weliem/blessed-android) | Java | 595 | C + P | — | Has a peripheral manager. |
+| [dotintent/FlutterBleLib](https://github.com/dotintent/FlutterBleLib) | Dart | 546 | C | iOS | Can simulate peripherals for tests; compare our `MockBackend`. |
+| [nordicsemi/Kotlin-BLE-Library](https://github.com/nordicsemi/Kotlin-BLE-Library) | Kotlin | 529 | C + P | — | Coroutines successor to Android-BLE-Library. |
+| [Reedyuk/blue-falcon](https://github.com/Reedyuk/blue-falcon) | Kotlin | 488 | C | iOS, macOS, Windows, JavaScript | Kotlin Multiplatform. |
+| [Beepiz/BleGattCoroutines](https://github.com/Beepiz/BleGattCoroutines) | Kotlin | 476 | C | — | |
+| [capacitor-community/bluetooth-le](https://github.com/capacitor-community/bluetooth-le) | TypeScript | 359 | C | iOS, Web | Capacitor. |
+| [Google-Health-API/golden-gate](https://github.com/Google-Health-API/golden-gate) | C | 313 | C + P ? | iOS, embedded (nRF, ESP32 …) | **Archived.** IP stack (CoAP/DTLS) over BLE for wearables. On phones it acts as central; peripheral is the device side. Closest prior art to our datagram tier. |
+| [kshoji/BLE-HID-Peripheral-for-Android](https://github.com/kshoji/BLE-HID-Peripheral-for-Android) | Java | 258 | P | — | HID profile only. |
+| [haodynasty/AndroidBleManager](https://github.com/haodynasty/AndroidBleManager) | Java | 244 | C | — | |
+| [MnlPhlp/tauri-plugin-blec](https://github.com/MnlPhlp/tauri-plugin-blec) | Rust | 228 | C | iOS, Windows, macOS, Linux | btleplug wrapped as a Tauri plugin. |
 
 ## Apps that message over BLE
 
 These are not libraries, but each one solved the problem `ble-gatt`'s upper
-tiers address: two ordinary devices talking to each other over BLE, both
-acting as central and peripheral.
+tiers address: two ordinary devices talking to each other with no
+infrastructure.
 
-| Project | Stars | Language | Notes |
-|---|---:|---|---|
-| [permissionlesstech/bitchat](https://github.com/permissionlesstech/bitchat) | 36341 | Swift | BLE mesh chat on iOS and macOS: fragmentation, relay, E2E crypto on top of GATT. |
-| [permissionlesstech/bitchat-android](https://github.com/permissionlesstech/bitchat-android) | 7678 | Kotlin | Android counterpart, wire-compatible with the Swift app. |
-| [berty/berty](https://github.com/berty/berty) | 9311 | TypeScript / Go | P2P messenger with a BLE proximity transport under libp2p. |
-| [briar/briar](https://github.com/briar/briar) | 699 | Java | Offline messenger; uses classic Bluetooth (RFCOMM), not BLE GATT. |
+| Project | Language | Stars | Roles | Other platforms | Notes |
+|---|---|---:|---|---|---|
+| [permissionlesstech/bitchat-android](https://github.com/permissionlesstech/bitchat-android) | Kotlin | 7678 | C + P | iOS, macOS (via [the Swift app](https://github.com/permissionlesstech/bitchat), 36341★) | BLE mesh chat: fragmentation, relay and E2E crypto on top of GATT. The two apps are wire-compatible. |
+| [berty/berty](https://github.com/berty/berty) | TypeScript / Go | 9311 | C + P ? | iOS, desktop | P2P messenger with a BLE proximity transport under libp2p. |
+| [spieglt/FlyingCarpet](https://github.com/spieglt/FlyingCarpet) | Rust | 5330 | C + P ? | iOS, Linux, macOS, Windows | Tauri app; uses BLE to negotiate a Wi-Fi transfer. Prior art for Tauri + BLE on mobile. |
+| [briar/briar](https://github.com/briar/briar) | Java | 699 | — | Desktop (separate app) | Offline messenger; uses classic Bluetooth (RFCOMM), not BLE GATT. |
 
 ## Below 100 stars but directly comparable
 
-| Project | Stars | Why it's here |
-|---|---:|---|
-| [rohitsangwan01/ble-peripheral-rust](https://github.com/rohitsangwan01/ble-peripheral-rust) | 62 | Rust peripheral role, cross-platform; no Android backend (see ADR-0001). |
-| [weliem/blessed-bluez](https://github.com/weliem/blessed-bluez) | 98 | BLESSED for Java on BlueZ. |
-| [juliansteenbakker/flutter_ble_peripheral](https://github.com/juliansteenbakker/flutter_ble_peripheral) | 91 | Flutter advertising-only peripheral. |
-| `blew` / `tauri-plugin-blew` | — | The one Rust crate covering both roles on Android, but AGPL-3.0. Ruled out in ADR-0001. |
+| Project | Language | Stars | Roles | Other platforms | Why it's here |
+|---|---|---:|---|---|---|
+| [juliansteenbakker/flutter_ble_peripheral](https://github.com/juliansteenbakker/flutter_ble_peripheral) | Dart | 91 | P (advertising only) | iOS | Flutter peripheral, but no GATT server. |
+| [himelbrand/react-native-ble-peripheral](https://github.com/himelbrand/react-native-ble-peripheral) | Java / JS | 71 | P | — | React Native peripheral simulator. |
+| `blew` / `tauri-plugin-blew` | Rust | — | C + P | ? | The one Rust crate covering both roles on Android, but AGPL-3.0. Ruled out in ADR-0001. |
+
+## Excluded: no Android support
+
+These have 100+ stars but fail the Android rule. They are still useful
+reading:
+
+- **Rust:**
+  - `bluez/bluer` (Linux). This is `ble-gatt`'s own Linux backend.
+  - `alexmoon/bluest`. Android was "planned" when ADR-0001 was written.
+  - `embassy-rs/trouble` and `embassy-rs/nrf-softdevice` (embedded).
+- **Go:**
+  - `tinygo-org/bluetooth`, which does both roles on Linux, macOS, Windows and
+    bare metal.
+  - `paypal/gatt` and `muka/go-bluetooth`.
+- **Python:**
+  - `bluepy`, `bless` (peripheral), `python-bluezero`.
+  - `google/bumble` (a host stack).
+  - `pygatt` and Adafruit's BluefruitLE (both archived).
+- **JavaScript:** `noble` and `bleno` (archived), `node-ble`, `gattacker`.
+- **Apple only:**
+  - BluetoothKit, which does both roles for device-to-device transfer and is
+    the Apple counterpart to our tiers 2–3.
+  - BabyBluetooth, RxBluetoothKit, bluejay, BlueCap, AsyncBluetooth.
+- **C/C++ stacks and embedded:**
+  - zephyr, btstack, NimBLE (`mynewt-nimble`, NimBLE-Arduino).
+  - gattlib, tinyb (archived), gobbledegook, bluetoe.
+- **Other:** `sputnikdev/bluetooth-manager` (Java on Linux), `blue_heron`
+  (Elixir).
 
 ## What to borrow
 
-- **Windows and Apple backends (M2, M3):** read btleplug's and bluest's WinRT
-  and CoreBluetooth code before writing ours. Both are permissively licensed
-  and mature on the central side.
+- **Windows and Apple backends (M2, M3):** read btleplug's WinRT and
+  CoreBluetooth code before writing ours. bluest is a second reference even
+  without Android. Both are permissively licensed and mature on the central
+  side.
 - **Android bridge robustness:** Nordic's Android-BLE-Library and
   RxAndroidBle document many Android GATT quirks: operation queueing, status
   133, bonding, MTU. Check ours against their lists.
+- **Android peripheral role:** Nordic's server manager and BLESSED's
+  peripheral manager are the two mature open implementations to compare our
+  Kotlin GATT server against.
 - **Framing and sessions:** bitchat's fragmentation and relay, and Golden
   Gate's IP-over-BLE, are the two serious public designs above GATT. Compare
   them with our datagram tier.
-- **Testing without radios:** bumble (a host stack that can be pointed at a
-  virtual controller) and FlutterBleLib's simulated peripherals do what our
-  `MockBackend` does. bumble might let CI exercise the real BlueZ backend.
+- **Testing without radios:** FlutterBleLib's simulated peripherals do what
+  our `MockBackend` does. Google's bumble (a host stack that can be pointed at
+  a virtual controller) might let CI exercise the real BlueZ backend.
