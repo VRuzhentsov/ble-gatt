@@ -250,6 +250,10 @@ impl BleGattTransport {
 
 /// Moves packets between one datagram channel and iroh until either side
 /// ends.
+///
+/// Sending runs in its own task. A peripheral's notifications are small, so
+/// one QUIC packet can take a hundred of them; receiving must not wait for
+/// that, or each side's acknowledgements stall behind its own sends.
 async fn run_link(
     inner: Arc<Inner>,
     peer: PeerAddress,
@@ -258,6 +262,17 @@ async fn run_link(
     link: mpsc::Sender<Vec<u8>>,
 ) {
     log::debug!("link to {} up", peer.0);
+    let (to_send, mut sending) = mpsc::channel::<Vec<u8>>(LINK_QUEUE_DEPTH);
+    let sender = channel.sender();
+    let send_peer = peer.clone();
+    let mut send_task = tokio::spawn(async move {
+        while let Some(packet) = sending.recv().await {
+            if let Err(err) = sender.send(packet).await {
+                log::debug!("link to {}: send failed: {err}", send_peer.0);
+                break;
+            }
+        }
+    });
     let idle = tokio::time::sleep(inner.link_idle_timeout);
     tokio::pin!(idle);
     loop {
@@ -266,11 +281,12 @@ async fn run_link(
                 log::debug!("link to {}: idle, closing", peer.0);
                 break;
             }
+            _ = &mut send_task => break,
             packet = outbound.recv() => {
                 idle.as_mut().reset(tokio::time::Instant::now() + inner.link_idle_timeout);
                 let Some(packet) = packet else { break };
-                if let Err(err) = channel.send(packet).await {
-                    log::debug!("link to {}: send failed: {err}", peer.0);
+                // Like a full socket buffer: drop, QUIC recovers.
+                if let Err(mpsc::error::TrySendError::Closed(_)) = to_send.try_send(packet) {
                     break;
                 }
             }
@@ -292,6 +308,7 @@ async fn run_link(
             },
         }
     }
+    send_task.abort();
     let _ = channel.close().await;
     remove_link(&inner, &peer, &link);
     log::debug!("link to {} down", peer.0);

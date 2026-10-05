@@ -63,6 +63,9 @@ impl Drop for RemoteClient {
 impl RemoteClient {
     pub(crate) async fn dial(endpoint: impl ToSocketAddrs) -> Result<Self> {
         let stream = TcpStream::connect(endpoint).await.map_err(|e| BleError::Transport(e.to_string()))?;
+        // See the broker's `handle_connection`: small request/response
+        // frames, so no Nagle.
+        let _ = stream.set_nodelay(true);
         let (read_half, write_half) = tokio::io::split(stream);
         let (outbox_tx, outbox_rx) = mpsc::unbounded_channel::<Envelope>();
 

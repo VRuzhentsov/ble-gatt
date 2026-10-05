@@ -92,7 +92,7 @@ pub mod fragment;
 pub mod reassembly;
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 /// A reported gap in the inbound stream, plus the means to wake a receiver
@@ -332,7 +332,7 @@ enum Sink {
 pub struct DatagramChannel {
     peer: PeerAddress,
     characteristic: CharacteristicUuid,
-    sink: Mutex<Sink>,
+    sink: Arc<Mutex<Sink>>,
     inbound: ReceiverStream<Result<Vec<u8>>>,
     /// Tells `serve` this channel is gone, so it can free the single-central
     /// slot and drop the peer.
@@ -356,7 +356,7 @@ pub struct DatagramChannel {
     /// Rolling message id. 32-bit so it cannot wrap back onto an id whose
     /// message is still being reassembled — see `fragment`'s header docs for
     /// why 16 bits was not merely tight but unsound.
-    next_msg_id: u32,
+    next_msg_id: Arc<AtomicU32>,
     max_message_len: usize,
     /// Fixed at construction from the negotiated MTU. BLE does not
     /// renegotiate mid-session in practice, so this is not refreshed.
@@ -395,19 +395,39 @@ impl Drop for DatagramChannel {
         // already open. `Drop` cannot await, so the connection is handed to
         // a detached task — the same pattern `PendingConnection` already
         // uses for a setup abandoned mid-flight.
-        if let Sink::Connection { connection, .. } = self.sink.get_mut() {
-            if let Some(mut connection) = connection.take() {
-                let peer = self.peer.clone();
+        // Taken now when the sink is free. A `DatagramSender` mid-send
+        // holds it; then a task waits for it rather than leaving the
+        // connection open.
+        let peer = self.peer.clone();
+        let connection = match self.sink.try_lock() {
+            Ok(mut sink) => match &mut *sink {
+                Sink::Connection { connection, .. } => connection.take(),
+                Sink::Notify { .. } => None,
+            },
+            Err(_) => {
+                let sink = self.sink.clone();
                 tokio::spawn(async move {
-                    log::info!(
-                        "drop: disconnecting {} — channel dropped without close()",
-                        peer.0
-                    );
-                    if let Err(err) = connection.disconnect().await {
-                        log::warn!("drop: could not disconnect {}: {err}", peer.0);
+                    let connection = match &mut *sink.lock().await {
+                        Sink::Connection { connection, .. } => connection.take(),
+                        Sink::Notify { .. } => None,
+                    };
+                    if let Some(mut connection) = connection {
+                        let _ = connection.disconnect().await;
                     }
                 });
+                None
             }
+        };
+        if let Some(mut connection) = connection {
+            tokio::spawn(async move {
+                log::info!(
+                    "drop: disconnecting {} — channel dropped without close()",
+                    peer.0
+                );
+                if let Err(err) = connection.disconnect().await {
+                    log::warn!("drop: could not disconnect {}: {err}", peer.0);
+                }
+            });
         }
     }
 }
@@ -447,7 +467,7 @@ impl DatagramChannel {
     /// request, so a channel accepted by `serve` returns
     /// [`BleError::Unsupported`].
     pub async fn request_connection_priority(&mut self, priority: ConnectionPriority) -> Result<()> {
-        match self.sink.get_mut() {
+        match &mut *self.sink.lock().await {
             Sink::Connection { connection: Some(connection), .. } => {
                 connection.request_connection_priority(priority).await
             }
@@ -459,7 +479,104 @@ impl DatagramChannel {
         }
     }
 
+    /// Sends one message. While this runs the channel cannot also
+    /// `recv`; a caller that must keep receiving during a slow send (a
+    /// peripheral's notifications are small, so a large message takes many
+    /// of them) sends through [`Self::sender`] instead.
     pub async fn send(&mut self, payload: Vec<u8>) -> Result<()> {
+        self.sender().send(payload).await
+    }
+
+    /// A handle that sends on this channel independently of `recv`. Sends
+    /// from all handles share one message-id sequence and are serialised.
+    /// Once the channel is closed, sends fail.
+    pub fn sender(&self) -> DatagramSender {
+        DatagramSender {
+            peer: self.peer.clone(),
+            characteristic: self.characteristic,
+            sink: self.sink.clone(),
+            session: self.session,
+            next_msg_id: self.next_msg_id.clone(),
+            max_message_len: self.max_message_len,
+            fragment_budget: self.fragment_budget,
+        }
+    }
+
+    /// Next complete message, or `None` once the channel is closed — which
+    /// includes the peer vanishing without warning, not just an orderly
+    /// `close()`. Without that, a caller mid-conversation would block
+    /// forever on a dead link.
+    pub async fn recv(&mut self) -> Option<Result<Vec<u8>>> {
+        loop {
+            // Checked ahead of the queue so the report is prompt. It is
+            // deliberately out of order with respect to messages still
+            // buffered: "you have lost data" is more useful now than after
+            // draining everything that survived.
+            if self.overflow.take() {
+                log::warn!("recv: inbound overflow from {} — a message was lost", self.peer.0);
+                return Some(Err(BleError::Gatt(format!(
+                    "inbound overflow from {}: fragments were dropped and at least one \
+                     message is lost",
+                    self.peer.0
+                ))));
+            }
+            // Waiting on both is what makes a gap reachable by a receiver
+            // that is *already* parked here. Registering the notification
+            // before polling the queue means a gap raised in between is not
+            // lost — it fires this arm immediately and the loop re-checks.
+            let notified = self.overflow.notify.notified();
+            tokio::select! {
+                item = self.inbound.next() => {
+                    match &item {
+                        Some(Ok(message)) => log::debug!(
+                            "recv: {} bytes from {}", message.len(), self.peer.0
+                        ),
+                        Some(Err(err)) => {
+                            log::warn!("recv: error from {}: {err}", self.peer.0)
+                        }
+                        None => log::info!("recv: channel to {} closed", self.peer.0),
+                    }
+                    return item;
+                }
+                _ = notified => continue,
+            }
+        }
+    }
+
+    pub async fn close(&mut self) -> Result<()> {
+        let mut sink = self.sink.lock().await;
+        match &mut *sink {
+            // Takes the connection rather than borrowing it, so a second
+            // `close()` — or a later `Drop` — sees `None` and does not
+            // repeat the disconnect on a connection this call already tore
+            // down.
+            Sink::Connection { connection, .. } => match connection.take() {
+                Some(mut connection) => connection.disconnect().await,
+                None => Ok(()),
+            },
+            // The peripheral does not own the link; a central disconnecting
+            // is what ends it. Stopping advertising here would tear down
+            // every other peer's channel too.
+            Sink::Notify { .. } => Ok(()),
+        }
+    }
+}
+
+/// Sends on a [`DatagramChannel`] without holding it, from
+/// [`DatagramChannel::sender`].
+#[derive(Clone)]
+pub struct DatagramSender {
+    peer: PeerAddress,
+    characteristic: CharacteristicUuid,
+    sink: Arc<Mutex<Sink>>,
+    session: Option<u64>,
+    next_msg_id: Arc<AtomicU32>,
+    max_message_len: usize,
+    fragment_budget: usize,
+}
+
+impl DatagramSender {
+    pub async fn send(&self, payload: Vec<u8>) -> Result<()> {
         if payload.len() > self.max_message_len {
             log::warn!(
                 "send: refusing {} bytes to {} — over the {}-byte channel limit",
@@ -473,8 +590,7 @@ impl DatagramChannel {
                 self.max_message_len
             )));
         }
-        let msg_id = self.next_msg_id;
-        self.next_msg_id = self.next_msg_id.wrapping_add(1);
+        let msg_id = self.next_msg_id.fetch_add(1, Ordering::Relaxed);
 
         let fragments = split(msg_id, &payload, self.fragment_budget)?;
         log::debug!(
@@ -545,65 +661,6 @@ impl DatagramChannel {
         }
         log::trace!("send: msg_id={msg_id} fully written to {}", self.peer.0);
         Ok(())
-    }
-
-    /// Next complete message, or `None` once the channel is closed — which
-    /// includes the peer vanishing without warning, not just an orderly
-    /// `close()`. Without that, a caller mid-conversation would block
-    /// forever on a dead link.
-    pub async fn recv(&mut self) -> Option<Result<Vec<u8>>> {
-        loop {
-            // Checked ahead of the queue so the report is prompt. It is
-            // deliberately out of order with respect to messages still
-            // buffered: "you have lost data" is more useful now than after
-            // draining everything that survived.
-            if self.overflow.take() {
-                log::warn!("recv: inbound overflow from {} — a message was lost", self.peer.0);
-                return Some(Err(BleError::Gatt(format!(
-                    "inbound overflow from {}: fragments were dropped and at least one \
-                     message is lost",
-                    self.peer.0
-                ))));
-            }
-            // Waiting on both is what makes a gap reachable by a receiver
-            // that is *already* parked here. Registering the notification
-            // before polling the queue means a gap raised in between is not
-            // lost — it fires this arm immediately and the loop re-checks.
-            let notified = self.overflow.notify.notified();
-            tokio::select! {
-                item = self.inbound.next() => {
-                    match &item {
-                        Some(Ok(message)) => log::debug!(
-                            "recv: {} bytes from {}", message.len(), self.peer.0
-                        ),
-                        Some(Err(err)) => {
-                            log::warn!("recv: error from {}: {err}", self.peer.0)
-                        }
-                        None => log::info!("recv: channel to {} closed", self.peer.0),
-                    }
-                    return item;
-                }
-                _ = notified => continue,
-            }
-        }
-    }
-
-    pub async fn close(&mut self) -> Result<()> {
-        let mut sink = self.sink.lock().await;
-        match &mut *sink {
-            // Takes the connection rather than borrowing it, so a second
-            // `close()` — or a later `Drop` — sees `None` and does not
-            // repeat the disconnect on a connection this call already tore
-            // down.
-            Sink::Connection { connection, .. } => match connection.take() {
-                Some(mut connection) => connection.disconnect().await,
-                None => Ok(()),
-            },
-            // The peripheral does not own the link; a central disconnecting
-            // is what ends it. Stopping advertising here would tear down
-            // every other peer's channel too.
-            Sink::Notify { .. } => Ok(()),
-        }
     }
 }
 
@@ -881,10 +938,10 @@ pub async fn connect(
     Ok(DatagramChannel {
         peer: peer.clone(),
         characteristic: config.characteristic,
-        sink: Mutex::new(Sink::Connection {
+        sink: Arc::new(Mutex::new(Sink::Connection {
             connection: Some(connection),
             write_type: config.write_type,
-        }),
+        })),
         inbound: ReceiverStream::new(rx),
         // Central channels are not held in anyone's slot, so nothing needs
         // telling when this one goes away.
@@ -893,7 +950,7 @@ pub async fn connect(
         // Set when the backend reports it dropped notifications — the
         // central-side equivalent of `serve`'s fragment-queue overflow.
         overflow,
-        next_msg_id: 0,
+        next_msg_id: Arc::default(),
         max_message_len: effective_max_message_len(config.max_message_len, budget),
         fragment_budget: budget,
         tasks: vec![reassembly, watcher],
@@ -1148,15 +1205,15 @@ pub async fn serve(
                     let channel = DatagramChannel {
                         peer: peer.clone(),
                         characteristic: config.characteristic,
-                        sink: Mutex::new(Sink::Notify {
+                        sink: Arc::new(Mutex::new(Sink::Notify {
                             backend: backend.clone(),
                             active: active.clone(),
-                        }),
+                        })),
                         inbound: ReceiverStream::new(msg_rx),
                         release: Some((release_tx.clone(), generation)),
                         session: backend_session,
                         overflow: overflow.clone(),
-                        next_msg_id: 0,
+                        next_msg_id: Arc::default(),
                         max_message_len: effective_max_message_len(
                             config.max_message_len,
                             peripheral_budget,
