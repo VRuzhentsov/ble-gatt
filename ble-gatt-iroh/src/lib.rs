@@ -92,6 +92,15 @@ pub fn peer_address(addr: &CustomAddr) -> Option<PeerAddress> {
     String::from_utf8(addr.data().to_vec()).ok().map(PeerAddress)
 }
 
+/// Whether `packet` can be the first datagram a dialler sends over a new
+/// channel: a QUIC Initial, which has a long header (top bit set). An
+/// application sharing one GATT service between QUIC and its own messages
+/// can route a new channel by its first datagram, provided its own first
+/// byte never has the top bit set (UTF-8 JSON, for one, cannot start so).
+pub fn is_quic_initial(packet: &[u8]) -> bool {
+    packet.first().is_some_and(|byte| byte & 0x80 != 0)
+}
+
 /// Builder for [`BleGattTransport`].
 #[derive(Default)]
 pub struct BleGattTransportBuilder {
@@ -175,6 +184,15 @@ impl BleGattTransport {
             .expect("poisoned")
             .insert(peer.clone(), tx.clone());
         tokio::spawn(run_link(self.inner.clone(), peer, channel, rx, tx));
+    }
+
+    /// Like [`attach`](Self::attach), for a channel whose first datagram
+    /// the caller already read, typically to tell QUIC from its own traffic
+    /// with [`is_quic_initial`]. `first` is handed to iroh before anything
+    /// else from the channel.
+    pub fn attach_after(&self, channel: DatagramChannel, first: Vec<u8>) {
+        let _ = self.inner.inbound_tx.try_send((channel.peer(), first));
+        self.attach(channel);
     }
 
     /// Records where `endpoint` can be reached, for iroh's address lookup.

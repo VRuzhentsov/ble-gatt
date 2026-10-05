@@ -142,3 +142,52 @@ async fn quic_dials_by_key_through_the_address_lookup() {
         .expect("echo in time");
     assert_eq!(reply, payload);
 }
+
+/// An application that shares the datagram service with its own messages
+/// reads each new channel's first datagram to route it, then hands QUIC
+/// channels over with `attach_after`; the connection still completes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_channel_routed_by_its_first_datagram_still_carries_quic() {
+    let network = MockNetwork::new();
+    let listener_address = PeerAddress("AA:00:00:00:00:04".to_string());
+
+    let listener_transport = BleGattTransport::builder().build();
+    let incoming = datagram::serve(backend(&network, &listener_address.0), &config())
+        .await
+        .expect("serve");
+    let attach_to = listener_transport.clone();
+    tokio::spawn(async move {
+        let mut incoming = incoming;
+        while let Some(mut channel) = incoming.next().await {
+            let first = channel.recv().await.expect("a first datagram").expect("not a gap");
+            assert!(ble_gatt_iroh::is_quic_initial(&first), "a dialler opens with a QUIC Initial");
+            attach_to.attach_after(channel, first);
+        }
+    });
+    let listener_key = SecretKey::generate();
+    let listener_id = listener_key.public();
+    let listener = endpoint(listener_key, &listener_transport).await;
+    let _router = Router::builder(listener).accept(ECHO_ALPN, Echo).spawn();
+
+    let dialer_transport = BleGattTransport::builder()
+        .dialer(dial_with(backend(&network, "AA:00:00:00:00:03"), config()))
+        .build();
+    dialer_transport.set_peer_address(listener_id, listener_address);
+    let dialer = endpoint(SecretKey::generate(), &dialer_transport).await;
+
+    let connection = tokio::time::timeout(TIMEOUT, dialer.connect(listener_id, ECHO_ALPN))
+        .await
+        .expect("connect in time")
+        .expect("connect");
+    let reply = tokio::time::timeout(TIMEOUT, echo(&connection, b"routed"))
+        .await
+        .expect("echo in time");
+    assert_eq!(reply, b"routed");
+}
+
+#[test]
+fn json_never_looks_like_a_quic_initial() {
+    assert!(!ble_gatt_iroh::is_quic_initial(br#"{"v":1}"#));
+    assert!(!ble_gatt_iroh::is_quic_initial(b""));
+    assert!(ble_gatt_iroh::is_quic_initial(&[0xC3, 0, 0, 0, 1]));
+}
