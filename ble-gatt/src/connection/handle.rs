@@ -17,7 +17,10 @@ use crate::entities::models::{
 use crate::hal::{BoxStream, GattConnection};
 
 pub struct Connection {
-    inner: Box<dyn GattConnection>,
+    /// Taken only by `Drop`, to disconnect in the background.
+    inner: Option<Box<dyn GattConnection>>,
+    /// Cleared by `disconnect()`, so `Drop` does not disconnect twice.
+    open: bool,
     state_tx: watch::Sender<ConnectionState>,
     cancel: CancellationToken,
     watcher: JoinHandle<()>,
@@ -38,7 +41,8 @@ impl Connection {
             cancel.clone(),
         ));
         Self {
-            inner,
+            inner: Some(inner),
+            open: true,
             state_tx,
             cancel,
             watcher,
@@ -59,47 +63,48 @@ impl Connection {
     }
 
     pub fn peer(&self) -> PeerAddress {
-        self.inner.peer()
+        self.conn().peer()
     }
 
     pub fn session(&self) -> Option<u64> {
-        self.inner.session()
+        self.conn().session()
     }
 
     pub fn att_mtu(&self) -> u16 {
-        self.inner.att_mtu()
+        self.conn().att_mtu()
     }
 
     pub fn max_write_len(&self) -> usize {
-        self.inner.max_write_len()
+        self.conn().max_write_len()
     }
 
     pub async fn read(&mut self, characteristic: CharacteristicUuid) -> Result<Vec<u8>> {
-        self.inner.read(characteristic).await
+        self.conn_mut().read(characteristic).await
     }
 
     pub async fn write(&mut self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
-        self.inner.write(characteristic, value).await
+        self.conn_mut().write(characteristic, value).await
     }
 
     pub async fn write_with_type(
         &mut self, characteristic: CharacteristicUuid, value: Vec<u8>, write_type: WriteType,
     ) -> Result<()> {
-        self.inner.write_with_type(characteristic, value, write_type).await
+        self.conn_mut().write_with_type(characteristic, value, write_type).await
     }
 
     pub async fn subscribe(&mut self, characteristic: CharacteristicUuid) -> Result<BoxStream<Result<Vec<u8>>>> {
-        self.inner.subscribe(characteristic).await
+        self.conn_mut().subscribe(characteristic).await
     }
 
     pub async fn request_connection_priority(&mut self, priority: ConnectionPriority) -> Result<()> {
-        self.inner.request_connection_priority(priority).await
+        self.conn_mut().request_connection_priority(priority).await
     }
 
     /// Disconnects and publishes `Disconnected`, whatever the platform
     /// answered.
     pub async fn disconnect(&mut self) -> Result<()> {
-        let result = self.inner.disconnect().await;
+        let result = self.conn_mut().disconnect().await;
+        self.open = false;
         end(&self.state_tx, &self.cancel);
         result
     }
@@ -108,7 +113,15 @@ impl Connection {
     /// profile's `DatagramChannel`). State keeps being published until this
     /// `Connection` is dropped.
     pub fn gatt(&mut self) -> &mut dyn GattConnection {
-        self.inner.as_mut()
+        self.conn_mut()
+    }
+
+    fn conn(&self) -> &dyn GattConnection {
+        self.inner.as_deref().expect("only Drop takes the connection")
+    }
+
+    fn conn_mut(&mut self) -> &mut dyn GattConnection {
+        self.inner.as_deref_mut().expect("only Drop takes the connection")
     }
 }
 
@@ -116,6 +129,21 @@ impl Drop for Connection {
     fn drop(&mut self) {
         self.watcher.abort();
         end(&self.state_tx, &self.cancel);
+        // No driver disconnects on its own drop; on Android the
+        // `BluetoothGatt` stays open and the next connect to the peer is
+        // refused as already open. `Drop` cannot await, so a task does it,
+        // as `DatagramChannel`'s `Drop` does.
+        let Some(mut inner) = self.inner.take().filter(|_| self.open) else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
+            if let Err(err) = inner.disconnect().await {
+                log::warn!("drop: could not disconnect {}: {err}", inner.peer().0);
+            }
+        });
     }
 }
 

@@ -103,6 +103,55 @@ async fn dropping_a_connection_cancels_its_token() {
 }
 
 #[tokio::test]
+async fn dropping_a_connection_disconnects_it() {
+    let network = MockNetwork::new();
+    let _server = Adapter::new(device(&network, "peripheral") as Arc<dyn Backend>)
+        .await
+        .peripheral()
+        .serve(service())
+        .await
+        .unwrap();
+    let connection = Adapter::new(device(&network, "central") as Arc<dyn Backend>)
+        .await
+        .central()
+        .connect(&PeerAddress("peripheral".into()))
+        .await
+        .unwrap();
+
+    drop(connection);
+    timeout(WAIT, async {
+        while network.disconnected_peers().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a dropped connection disconnects its driver");
+    assert_eq!(network.disconnected_peers(), vec![PeerAddress("peripheral".into())]);
+}
+
+#[tokio::test]
+async fn an_explicit_disconnect_is_not_repeated_on_drop() {
+    let network = MockNetwork::new();
+    let _server = Adapter::new(device(&network, "peripheral") as Arc<dyn Backend>)
+        .await
+        .peripheral()
+        .serve(service())
+        .await
+        .unwrap();
+    let mut connection = Adapter::new(device(&network, "central") as Arc<dyn Backend>)
+        .await
+        .central()
+        .connect(&PeerAddress("peripheral".into()))
+        .await
+        .unwrap();
+
+    connection.disconnect().await.unwrap();
+    drop(connection);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(network.disconnected_peers().len(), 1);
+}
+
+#[tokio::test]
 async fn dropping_the_server_handle_stops_advertising() {
     let network = MockNetwork::new();
     let peripheral_backend = device(&network, "peripheral");
