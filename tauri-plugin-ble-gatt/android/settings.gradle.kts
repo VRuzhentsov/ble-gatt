@@ -18,3 +18,6 @@ pluginManagement {
 }
 
 rootProject.name = "ble-gatt-android"
+
+include(":tauri-android")
+project(":tauri-android").projectDir = file("./.tauri/tauri-api")

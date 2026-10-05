@@ -15,9 +15,34 @@ This repo is a Cargo workspace with two published crates:
   an event stream, and a radio-free `MockBackend` for CI-safe protocol
   tests. Depends on nothing Tauri-specific — usable from any Tokio-based
   Rust program (a CLI, a daemon, another GUI framework).
-- **`tauri-plugin-ble-gatt`** — a thin [Tauri](https://tauri.app) plugin
-  wrapper around `ble-gatt`, following Tauri's own `tauri-plugin-*` naming
-  convention for its mobile-plugin tooling.
+- **`tauri-plugin-ble-gatt`** — the [Tauri](https://tauri.app) integration:
+  ships the Android Kotlin bridge (an application never copies it), builds
+  the platform backend on first use, asks for Android's Bluetooth runtime
+  permissions through Tauri's permission mechanism, and exposes both a Rust
+  API and JavaScript commands.
+
+### Using the plugin from a Rust application
+
+```rust
+use tauri_plugin_ble_gatt::BleGattExt;
+
+tauri::Builder::default()
+    .plugin(tauri_plugin_ble_gatt::init())
+    // or, to supply a backend yourself (a mock radio in tests):
+    // .plugin(tauri_plugin_ble_gatt::Builder::new().backend(backend).build())
+    .setup(|app| {
+        let backend = app.ble_gatt().backend(); // Arc<dyn ble_gatt::Backend>
+        Ok(())
+    });
+
+// From a blocking task, never the main thread:
+let state = app.ble_gatt().request_permissions()?; // PermissionState::Granted, ...
+```
+
+On Android, an application that also calls Java through `ndk-context`
+calls `tauri_plugin_ble_gatt::android_context::ensure()` first instead of
+initializing `ndk-context` itself; it may only be initialized once per
+process.
 
 This library **carries bytes; it does not encrypt them.** Layering your own
 session protocol or end-to-end encryption on top is expected and
