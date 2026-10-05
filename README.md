@@ -8,7 +8,7 @@ for async/channels, [`thiserror`](https://github.com/dtolnay/thiserror) and
 [`async-trait`](https://github.com/dtolnay/async-trait) for the trait
 surface.
 
-This repo is a Cargo workspace with two published crates:
+This repo is a Cargo workspace with three crates:
 
 - **`ble-gatt`** — the core library. Scan/advertise, GATT client
   read/write/subscribe, GATT server characteristics, connection lifecycle as
@@ -20,6 +20,10 @@ This repo is a Cargo workspace with two published crates:
   the platform backend on first use, asks for Android's Bluetooth runtime
   permissions through Tauri's permission mechanism, and exposes both a Rust
   API and JavaScript commands.
+- **`ble-gatt-iroh`** — an [iroh](https://github.com/n0-computer/iroh)
+  custom transport that carries QUIC over `ble-gatt`'s GATT datagram
+  channel. The caller decides when the radio scans and advertises. See
+  ADR-0006.
 
 ### Using the plugin from a Rust application
 

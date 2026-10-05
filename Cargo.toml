@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["ble-gatt", "tauri-plugin-ble-gatt"]
+members = ["ble-gatt", "ble-gatt-iroh", "tauri-plugin-ble-gatt"]
 
 [workspace.package]
 version = "0.1.0"

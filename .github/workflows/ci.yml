@@ -28,3 +28,5 @@ jobs:
         run: |
           rustup target add aarch64-linux-android
           cargo check --target aarch64-linux-android -p tauri-plugin-ble-gatt
+      - name: cargo test (ble-gatt-iroh)
+        run: cargo test -p ble-gatt-iroh
