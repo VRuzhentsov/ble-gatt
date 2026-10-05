@@ -39,6 +39,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use ble_gatt::backend::Backend;
 use ble_gatt::datagram::{DatagramChannel, DatagramConfig};
@@ -59,6 +60,11 @@ const LINK_QUEUE_DEPTH: usize = 64;
 
 /// Packets received from all peers and not yet taken by iroh.
 const INBOUND_QUEUE_DEPTH: usize = 256;
+
+/// How long a channel may carry nothing before it is closed. A live QUIC
+/// connection sends keep-alives far more often than this, so only a channel
+/// whose connection has ended goes idle, and closing it frees the radio.
+pub const DEFAULT_LINK_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A packet received from a peer.
 type Inbound = (PeerAddress, Vec<u8>);
@@ -106,6 +112,7 @@ pub fn is_quic_initial(packet: &[u8]) -> bool {
 pub struct BleGattTransportBuilder {
     dialer: Option<Dialer>,
     local_address: Option<PeerAddress>,
+    link_idle_timeout: Option<Duration>,
 }
 
 impl BleGattTransportBuilder {
@@ -123,6 +130,13 @@ impl BleGattTransportBuilder {
         self
     }
 
+    /// How long a channel may carry nothing before it is closed; default
+    /// [`DEFAULT_LINK_IDLE_TIMEOUT`].
+    pub fn link_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.link_idle_timeout = Some(timeout);
+        self
+    }
+
     pub fn build(self) -> BleGattTransport {
         let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE_DEPTH);
         let local = self.local_address.iter().map(custom_addr).collect();
@@ -134,6 +148,7 @@ impl BleGattTransportBuilder {
                 inbound_rx: Mutex::new(Some(inbound_rx)),
                 dialer: self.dialer,
                 local: n0_watcher::Watchable::new(local),
+                link_idle_timeout: self.link_idle_timeout.unwrap_or(DEFAULT_LINK_IDLE_TIMEOUT),
             }),
         }
     }
@@ -156,6 +171,7 @@ struct Inner {
     inbound_rx: Mutex<Option<mpsc::Receiver<Inbound>>>,
     dialer: Option<Dialer>,
     local: n0_watcher::Watchable<Vec<CustomAddr>>,
+    link_idle_timeout: Duration,
 }
 
 impl fmt::Debug for BleGattTransport {
@@ -175,7 +191,10 @@ impl BleGattTransport {
     /// Carries iroh traffic over `channel`, an open datagram channel in either
     /// role. A channel already attached for the same peer is replaced and
     /// closed.
-    pub fn attach(&self, channel: DatagramChannel) {
+    ///
+    /// The returned handle completes when the channel closes: the peer went
+    /// away, or it carried nothing for the idle timeout.
+    pub fn attach(&self, channel: DatagramChannel) -> tokio::task::JoinHandle<()> {
         let peer = channel.peer();
         let (tx, rx) = mpsc::channel(LINK_QUEUE_DEPTH);
         self.inner
@@ -183,16 +202,16 @@ impl BleGattTransport {
             .lock()
             .expect("poisoned")
             .insert(peer.clone(), tx.clone());
-        tokio::spawn(run_link(self.inner.clone(), peer, channel, rx, tx));
+        tokio::spawn(run_link(self.inner.clone(), peer, channel, rx, tx))
     }
 
     /// Like [`attach`](Self::attach), for a channel whose first datagram
     /// the caller already read, typically to tell QUIC from its own traffic
     /// with [`is_quic_initial`]. `first` is handed to iroh before anything
     /// else from the channel.
-    pub fn attach_after(&self, channel: DatagramChannel, first: Vec<u8>) {
+    pub fn attach_after(&self, channel: DatagramChannel, first: Vec<u8>) -> tokio::task::JoinHandle<()> {
         let _ = self.inner.inbound_tx.try_send((channel.peer(), first));
-        self.attach(channel);
+        self.attach(channel)
     }
 
     /// Records where `endpoint` can be reached, for iroh's address lookup.
@@ -239,9 +258,16 @@ async fn run_link(
     link: mpsc::Sender<Vec<u8>>,
 ) {
     log::debug!("link to {} up", peer.0);
+    let idle = tokio::time::sleep(inner.link_idle_timeout);
+    tokio::pin!(idle);
     loop {
         tokio::select! {
+            () = &mut idle => {
+                log::debug!("link to {}: idle, closing", peer.0);
+                break;
+            }
             packet = outbound.recv() => {
+                idle.as_mut().reset(tokio::time::Instant::now() + inner.link_idle_timeout);
                 let Some(packet) = packet else { break };
                 if let Err(err) = channel.send(packet).await {
                     log::debug!("link to {}: send failed: {err}", peer.0);
@@ -252,6 +278,7 @@ async fn run_link(
             // when this arm completes.
             message = channel.recv() => match message {
                 Some(Ok(packet)) => {
+                    idle.as_mut().reset(tokio::time::Instant::now() + inner.link_idle_timeout);
                     // Like a full socket buffer: drop, QUIC recovers.
                     if let Err(mpsc::error::TrySendError::Closed(_)) =
                         inner.inbound_tx.try_send((peer.clone(), packet))

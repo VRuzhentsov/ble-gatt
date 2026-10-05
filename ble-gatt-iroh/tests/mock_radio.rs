@@ -191,3 +191,31 @@ fn json_never_looks_like_a_quic_initial() {
     assert!(!ble_gatt_iroh::is_quic_initial(b""));
     assert!(ble_gatt_iroh::is_quic_initial(&[0xC3, 0, 0, 0, 1]));
 }
+
+/// A channel that carries nothing for the idle timeout is closed, and the
+/// handle `attach` returned completes, so an application knows the central
+/// has gone and the radio is free.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_channel_is_closed() {
+    let network = MockNetwork::new();
+    let listener_address = PeerAddress("AA:00:00:00:00:06".to_string());
+    let transport = BleGattTransport::builder()
+        .link_idle_timeout(Duration::from_millis(200))
+        .build();
+    let mut incoming = datagram::serve(backend(&network, &listener_address.0), &config())
+        .await
+        .expect("serve");
+    let _client = datagram::connect(backend(&network, "AA:00:00:00:00:05"), &listener_address, &config())
+        .await
+        .expect("connect");
+    let channel = tokio::time::timeout(TIMEOUT, incoming.next())
+        .await
+        .expect("accepted in time")
+        .expect("a channel");
+    let link = transport.attach(channel);
+    tokio::time::timeout(Duration::from_secs(5), link)
+        .await
+        .expect("the idle link closes")
+        .expect("the link task ends cleanly");
+    assert!(transport.linked_peers().is_empty());
+}
