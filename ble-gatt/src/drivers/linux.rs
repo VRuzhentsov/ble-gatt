@@ -74,9 +74,9 @@ const DISCOVERY_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
-use crate::backend::{Backend, BoxStream, GattConnection};
-use crate::error::{BleError, Result};
-use crate::models::{
+use crate::hal::{Backend, BoxStream, GattConnection};
+use crate::entities::error::{BleError, Result};
+use crate::entities::models::{
     CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress,
     Role, ServiceUuid, WriteType,
 };
@@ -573,9 +573,9 @@ impl LinuxBackend {
                         event
                     {
                         let status = if powered {
-                            crate::models::RadioStatus::On
+                            crate::entities::models::RadioStatus::On
                         } else {
-                            crate::models::RadioStatus::Off
+                            crate::entities::models::RadioStatus::Off
                         };
                         log::info!("radio: adapter powered={powered}");
                         let _ = events_tx.send(GattEvent::RadioChanged { status });
@@ -1669,7 +1669,7 @@ impl Backend for LinuxBackend {
             dial_lock: self.dial_lock.clone(),
             peer: peer.clone(),
             device,
-            att_mtu: AtomicU16::new(crate::backend::DEFAULT_ATT_MTU),
+            att_mtu: AtomicU16::new(crate::hal::DEFAULT_ATT_MTU),
         }))
     }
 
@@ -2027,11 +2027,11 @@ impl Backend for LinuxBackend {
         )
     }
 
-    async fn radio_status(&self) -> crate::models::RadioStatus {
+    async fn radio_status(&self) -> crate::entities::models::RadioStatus {
         if self.adapter.is_powered().await.unwrap_or(false) {
-            crate::models::RadioStatus::On
+            crate::entities::models::RadioStatus::On
         } else {
-            crate::models::RadioStatus::Off
+            crate::entities::models::RadioStatus::Off
         }
     }
 }
@@ -2188,7 +2188,7 @@ impl GattConnection for LinuxGattConnection {
             log::warn!(
                 "subscribe: {} did not publish an MTU; staying at the {}-byte default",
                 self.peer.0,
-                crate::backend::DEFAULT_ATT_MTU
+                crate::hal::DEFAULT_ATT_MTU
             );
         }
         let notify_stream = target.notify().await.map_err(|err| {

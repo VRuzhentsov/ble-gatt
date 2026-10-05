@@ -1,6 +1,6 @@
 //! The datagram tier: an ordered, opaque-bytes channel to a peer.
 //!
-//! Raw GATT (`crate::backend`) is characteristic-oriented and caps every
+//! Raw GATT (`crate::hal`) is characteristic-oriented and caps every
 //! write at the negotiated MTU. This module turns that into a message pipe —
 //! hand it a `Vec<u8>` of any size, get exactly that `Vec<u8>` out the other
 //! end — by fragmenting against the live connection's `max_write_len()` and
@@ -11,7 +11,7 @@
 //! framing of its own. Layering encryption on top is the expected use; see
 //! `docs/adr/0003`. Consumers that instead need to speak a *third party's*
 //! GATT protocol (vendor sensor firmware with its own framing) should use
-//! `crate::backend` directly and ignore this module entirely.
+//! `crate::hal` directly and ignore this module entirely.
 //!
 //! ## Wire shape
 //!
@@ -133,11 +133,11 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
-use crate::backend::{Backend, BoxStream, GattConnection};
-use crate::datagram::fragment::{split, FragmentHeader, FRAGMENT_HEADER_LEN, MAX_FRAGMENTS};
-use crate::datagram::reassembly::{Accept, Reassembler, ReassemblyLimits};
-use crate::error::{BleError, Result};
-use crate::models::{
+use crate::hal::{Backend, BoxStream, GattConnection};
+use crate::profile::datagram::fragment::{split, FragmentHeader, FRAGMENT_HEADER_LEN, MAX_FRAGMENTS};
+use crate::profile::datagram::reassembly::{Accept, Reassembler, ReassemblyLimits};
+use crate::entities::error::{BleError, Result};
+use crate::entities::models::{
     CharacteristicUuid, ConnectionPriority, GattCharacteristicSpec, GattEvent, GattServiceSpec,
     PeerAddress, Role, ServiceUuid, WriteType,
 };
@@ -1011,8 +1011,8 @@ pub async fn serve(
     // it budgets against the spec-minimum. Conservative on purpose:
     // undersized fragments always fit, oversized ones would be truncated by
     // the stack with no error.
-    let peripheral_budget = crate::backend::DEFAULT_ATT_MTU as usize
-        - crate::backend::ATT_HEADER_LEN
+    let peripheral_budget = crate::hal::DEFAULT_ATT_MTU as usize
+        - crate::hal::ATT_HEADER_LEN
         - FRAGMENT_HEADER_LEN;
 
     tokio::spawn(async move {

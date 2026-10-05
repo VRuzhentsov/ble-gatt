@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 const KOTLIN_DIR: &str = "android/src/main/kotlin/dev/blegatt";
-const DRIVER: &str = "../ble-gatt/src/backend/android.rs";
+const DRIVER: &str = "../ble-gatt/src/drivers/android.rs";
 const JNI_EXPORT_PREFIX: &str = "Java_dev_blegatt_NativeKt_";
 
 /// Methods Rust calls on standard Java classes, not on the bridge.

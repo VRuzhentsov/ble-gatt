@@ -1,28 +1,17 @@
-//! The `Backend` port: one implementation per platform. Every backend
-//! speaks the same generic GATT vocabulary (`crate::models`) — callers never
-//! see platform types (no `bluer::Device`, no JNI handles) crossing this
+//! The ports every driver implements (layer: Use Cases; see
+//! `docs/architecture.md`). Named after Rust's `embedded-hal`: traits here,
+//! one implementation per platform in `crate::drivers`. Every driver speaks
+//! the same generic GATT vocabulary (`crate::entities`); callers never see
+//! platform types (no `bluer::Device`, no JNI handles) crossing this
 //! boundary.
-
-#[cfg(target_os = "android")]
-pub mod android;
-
-#[cfg(target_os = "linux")]
-pub mod linux;
-
-pub(crate) mod link_state;
-
-pub mod mock;
-
-#[cfg(target_os = "windows")]
-pub mod windows;
 
 use std::pin::Pin;
 
 use async_trait::async_trait;
 use tokio_stream::Stream;
 
-use crate::error::Result;
-use crate::models::{
+use crate::entities::error::Result;
+use crate::entities::models::{
     CapabilityReport, CharacteristicUuid, ConnectionPriority, DiscoveredPeer, GattEvent, GattServiceSpec,
     PeerAddress, ServiceUuid, WriteType,
 };
@@ -102,8 +91,8 @@ pub trait GattConnection: Send {
     /// [`BleError::Unsupported`] where the platform has no such control
     /// (Linux: BlueZ exposes none over D-Bus) — the default here.
     ///
-    /// [`ConnectionPriority::LowPower`]: crate::models::ConnectionPriority::LowPower
-    /// [`ConnectionPriority::High`]: crate::models::ConnectionPriority::High
+    /// [`ConnectionPriority::LowPower`]: crate::entities::models::ConnectionPriority::LowPower
+    /// [`ConnectionPriority::High`]: crate::entities::models::ConnectionPriority::High
     /// [`BleError::Unsupported`]: crate::BleError::Unsupported
     async fn request_connection_priority(&mut self, priority: ConnectionPriority) -> Result<()> {
         let _ = priority;
@@ -223,23 +212,7 @@ pub trait Backend: Send + Sync {
     /// consumer needs before the first transition arrives (a `PeerLink`
     /// created while Bluetooth is already off must not assume `On`).
     /// Defaults to `On` for backends with no notion of a togglable radio.
-    async fn radio_status(&self) -> crate::models::RadioStatus {
-        crate::models::RadioStatus::On
-    }
-}
-
-/// Construct the backend for the platform this binary runs on. Used by
-/// `PeerLink::new`; a consumer using the `Backend` trait directly picks its
-/// own constructor (`linux::LinuxBackend::new`, `android::AndroidBackend::new`,
-/// or `mock::MockBackend::new`).
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub async fn platform() -> Result<std::sync::Arc<dyn Backend>> {
-    #[cfg(target_os = "linux")]
-    {
-        Ok(std::sync::Arc::new(linux::LinuxBackend::new().await?))
-    }
-    #[cfg(target_os = "android")]
-    {
-        Ok(std::sync::Arc::new(android::AndroidBackend::new().await?))
+    async fn radio_status(&self) -> crate::entities::models::RadioStatus {
+        crate::entities::models::RadioStatus::On
     }
 }

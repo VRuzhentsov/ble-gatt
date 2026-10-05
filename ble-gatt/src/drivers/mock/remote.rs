@@ -12,9 +12,9 @@ use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
-use crate::backend::BoxStream;
-use crate::error::{BleError, Result};
-use crate::models::{
+use crate::hal::BoxStream;
+use crate::entities::error::{BleError, Result};
+use crate::entities::models::{
     CharacteristicUuid, DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress, ServiceUuid,
     WriteType,
 };

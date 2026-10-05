@@ -8,8 +8,8 @@
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::error::{BleError, Result};
-use crate::models::{
+use crate::entities::error::{BleError, Result};
+use crate::entities::models::{
     CharacteristicUuid, DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress, ServiceUuid,
     WriteType,
 };

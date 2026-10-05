@@ -77,14 +77,23 @@ peripheral mode reports that honestly instead of failing opaquely later.
 ## Architecture
 
 ```
-Backend trait (async, Tokio)
-├── linux.rs    BlueZ via bluer — central + peripheral         (M1)
-├── android.rs  raw jni + ndk-context JNI bridge                (M1)
-├── windows.rs  reserved                                        (M2)
-└── mock/       in-process, radio-free — CI-safe protocol tests;
-                optionally a cross-process broker behind the
-                `mock-broker` feature — see ADR-0004
+ble-gatt/src/
+├── entities/     Entities: types, events, errors
+├── hal/          Use Cases: the Backend / GattConnection ports (async, Tokio)
+├── connection/   Use Cases: one connection's state machine, PeerLink
+├── profile/      Use Cases: the datagram profile (fragmentation, reassembly)
+└── drivers/      Frameworks & Drivers: one Backend per platform
+    ├── linux.rs    BlueZ via bluer — central + peripheral       (M1)
+    ├── android.rs  raw jni + ndk-context JNI bridge              (M1)
+    ├── windows.rs  reserved                                      (M2)
+    └── mock/       in-process, radio-free — CI-safe protocol tests;
+                    optionally a cross-process broker behind the
+                    `mock-broker` feature — see ADR-0004
 ```
+
+Layers are named after Clean Architecture and modules after the Bluetooth
+specification (ADR-0007). The old paths (`ble_gatt::backend::…`,
+`ble_gatt::datagram`, `ble_gatt::peer_link`) still resolve.
 
 Every backend speaks the same generic GATT vocabulary
 (`ServiceUuid`/`CharacteristicUuid`/`GattEvent`/`GattServiceSpec`/...) —

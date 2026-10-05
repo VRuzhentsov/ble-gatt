@@ -24,7 +24,7 @@
 //! is not a duplicate and nothing looks wrong. Only making reuse
 //! unreachable does, and at 2^32 ids it is.
 
-use crate::error::{BleError, Result};
+use crate::entities::error::{BleError, Result};
 
 /// Size of the fragment header in bytes. Subtract from a connection's
 /// `max_write_len()` to get the per-fragment payload budget.

@@ -24,13 +24,13 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
-use crate::backend::link_state::{
+use crate::connection::link_state::{
     CentralEvent, CentralLink, PeripheralEvent, PeripheralLink, RadioEvent, RadioState,
 };
-use crate::backend::{Backend, BoxStream};
-use crate::datagram::{self, DatagramChannel, DatagramConfig};
-use crate::error::{BleError, Result};
-use crate::models::{ConnectionPriority, GattEvent, PeerAddress, RadioStatus, Role};
+use crate::hal::{Backend, BoxStream};
+use crate::profile::datagram::{self, DatagramChannel, DatagramConfig};
+use crate::entities::error::{BleError, Result};
+use crate::entities::models::{ConnectionPriority, GattEvent, PeerAddress, RadioStatus, Role};
 
 const EVENT_CHANNEL_CAPACITY: usize = 128;
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
@@ -733,7 +733,7 @@ impl Driver {
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
-            crate::backend::platform().await.ok()
+            crate::drivers::platform().await.ok()
         }
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {

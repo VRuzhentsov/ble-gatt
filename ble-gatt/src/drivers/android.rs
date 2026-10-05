@@ -71,9 +71,9 @@ const ADVERTISE_ERROR_STOPPED: i32 = 102;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
-use crate::backend::{Backend, BoxStream, GattConnection};
-use crate::error::{BleError, Result};
-use crate::models::{
+use crate::hal::{Backend, BoxStream, GattConnection};
+use crate::entities::error::{BleError, Result};
+use crate::entities::models::{
     CapabilityReport, CharacteristicUuid, ConnectionPriority, DiscoveredPeer, GattEvent, GattServiceSpec,
     PeerAddress, RadioStatus, Role, ServiceUuid, WriteType,
 };
@@ -1115,7 +1115,7 @@ impl GattConnection for AndroidGattConnection {
             .unwrap()
             .get(&self.address)
             .copied()
-            .unwrap_or(crate::backend::DEFAULT_ATT_MTU)
+            .unwrap_or(crate::hal::DEFAULT_ATT_MTU)
     }
 
     async fn read(&mut self, characteristic: CharacteristicUuid) -> Result<Vec<u8>> {

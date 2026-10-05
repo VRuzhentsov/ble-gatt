@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use crate::datagram::fragment::FragmentHeader;
+use crate::profile::datagram::fragment::FragmentHeader;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReassemblyLimits {

@@ -14,8 +14,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
-use crate::error::{BleError, Result};
-use crate::models::{GattEvent, PeerAddress};
+use crate::entities::error::{BleError, Result};
+use crate::entities::models::{GattEvent, PeerAddress};
 
 use super::local::LocalRadio;
 use super::wire::{read_frame, write_frame, Envelope, Frame, Push, Request, Response};
