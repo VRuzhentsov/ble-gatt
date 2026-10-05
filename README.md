@@ -54,6 +54,10 @@ supported — and staying out of the way is deliberate, so that consumers
 talking to third-party device firmware (which will never speak your
 protocol) can use the raw GATT API directly. See ADR-0003.
 
+The layer map (what each layer and module is responsible for, and how
+platform modules are designed) is in
+[`docs/architecture.md`](docs/architecture.md).
+
 Design decisions live in `docs/adr/`:
 [0001](docs/adr/0001-ble-gatt-tauri-plugin-split-and-scope.md) — why this
 split, why GATT-only, why hand-rolled instead of an existing crate.
