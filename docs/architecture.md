@@ -8,68 +8,81 @@ The aim is a reusable, cross-platform BLE library for Rust applications:
 the same API on Linux, Android, Windows and, later, Apple platforms, with a
 network stack such as iroh plugged in from outside, never wired in.
 
+## Naming rule
+
+Nothing here is a home-grown scheme:
+
+- **Layers** are named after [Clean Architecture](https://blog.cleancoder.com/uncle-bob/2012/08/13/the-clean-architecture.html)
+  (Robert C. Martin): Entities, Use Cases, Interface Adapters, Frameworks &
+  Drivers.
+- **Modules inside a layer** are named after the Bluetooth Core
+  Specification (GAP roles, connection, GATT profile) and, for the platform
+  interface, after Rust's [`embedded-hal`](https://docs.rs/embedded-hal)
+  (a HAL of traits, implemented by drivers).
+- **`L` followed by a number always means an OSI layer** (L2 = data link).
+  It is never used for this library's layers. See
+  [How the layers map onto OSI](#how-the-layers-map-onto-osi).
+
 ## Layers
 
-Layer numbers are this library's own. They are not the OSI model's: here L2
-is one BLE connection, while OSI's layer 2 (data link) is closer to this
-library's L3 datagram channel. Fini's `DataLink` is named after the OSI layer
-(Fini `docs/glossary.md`). Where each layer sits on the OSI model is in
-[How the layers map onto OSI](#how-the-layers-map-onto-osi).
+Clean Architecture's dependency rule applies: source code depends only
+inwards. Entities depend on nothing; Use Cases depend on Entities and declare
+the interfaces (ports) they need; Drivers and Interface Adapters depend on
+Use Cases and implement or call those interfaces.
 
-| Layer | Job | Owns | Never does |
+| Layer (Clean Architecture) | Job | Modules or crates | Never does |
 |---|---|---|---|
-| **L0 Platform** | Talk to one operating system's Bluetooth API | BlueZ (via `bluer`), Android (JNI + Kotlin), Windows (WinRT), Apple (CoreBluetooth), mock radio | Policy, retries, protocol framing |
-| **L1 Roles** | The BLE roles as a uniform API | `Central` (scan, connect, read, write, subscribe), `Peripheral` (GATT server, requests, notify), `Advertiser`, `Adapter` (power state, events, capabilities) | Deciding when to scan or connect |
-| **L2 Link** | Keep a connection to one peer healthy | Connection state machine, one operation queue per device with timeouts, connection-scoped tasks, MTU and connection priority | Knowing who the peer is |
-| **L3 Transport** | Move messages between peers | Datagram channel (fragmentation, reassembly), peer identity in the advertisement, finding a known peer, deduplicating crossing connections | Encryption, routing, any specific network stack |
-| **Policy** | Advise how hard the radio should work | Power profiles: inputs (foreground or background, battery level, charging, peers nearby) resolve to a schedule (scan on and off times, connection limit) | Switching hardware on or off itself |
-| **L4 Adapters** | Connect the library to the outside world | `ble-gatt-iroh` (iroh custom transport), `tauri-plugin-ble-gatt` (Tauri host integration) | Anything the core needs to work |
-| **L5 Application** | Product logic | Which network stack to use, sessions, sync, routing, store-and-forward, UI | (lives outside this repository) |
+| **Entities** | Data types and rules that hold everywhere | `entities/`: `PeerAddress`, peer identity, connection states, errors, the fragment format | Any I/O, any platform call |
+| **Use Cases** | What the library does | `hal/` (the port traits drivers implement), `roles/` (`Adapter`, `Central`, `Peripheral`, `Advertiser`), `connection/` (one connection's lifecycle), `profile/` (the datagram profile: message channel, peer identity in the advertisement, finding a known peer), `power/` (power profiles) | Call an operating system directly; know about iroh, Tauri or any application |
+| **Interface Adapters** | Connect the library to a specific outside system | Crates `ble-gatt-iroh` (iroh custom transport) and `tauri-plugin-ble-gatt` (Tauri host integration) | Anything the core needs to work |
+| **Frameworks & Drivers** | Talk to one operating system's Bluetooth API | `drivers/`: Linux (BlueZ via `bluer`), Android (JNI + Kotlin), Windows (WinRT), Apple (CoreBluetooth), mock radio | Policy, retries, protocol framing |
+| *(outside)* Application | Product logic | Which network stack to use, sessions, sync, routing, UI | (lives outside this repository) |
 
-Dependencies point downwards only: a layer uses the layer below through its
-public interface and knows nothing about the layers above. L4 adapters
-depend on the core; the core never depends on an adapter.
+### The Use Cases modules
+
+| Module | Job | Name taken from |
+|---|---|---|
+| `hal/` | Traits a driver implements: scanning, connecting, GATT client and server operations, advertising | `embedded-hal` (traits) and its drivers |
+| `roles/` | The BLE roles as a uniform API, created from the `Adapter` object | GAP roles in the Bluetooth Core Specification; Nordic's `client` / `server` / `advertiser` |
+| `connection/` | Keep a connection to one peer healthy: state machine, one operation queue per device with timeouts, connection-scoped tasks, MTU and connection priority | GAP connection procedures; Kable's and Nordic's `connect()` |
+| `profile/` | The datagram profile: whole messages over a connection (fragmentation, reassembly), peer identity in the advertisement, finding a known peer, deduplicating crossing connections | GATT-based profile in the Bluetooth Core Specification; Nordic's `profile()` |
+| `power/` | Advise how hard the radio should work: inputs (foreground or background, battery level, charging, peers nearby) resolve to a schedule (scan on and off times, connection limit) | bitchat's `PowerManager` |
 
 ## How the layers map onto OSI
 
 The two schemes answer different questions. The OSI model says what a
-protocol does to the bytes on their way between devices. This library's
-layers say how its code is split and which part depends on which. Some of
-our layers are code structure with no OSI counterpart, and several of them
-fall inside the same OSI layer.
+protocol does to the bytes on their way between devices. Clean Architecture
+says how code is split and which part depends on which. All of this
+library's protocol work falls inside OSI layer 2.
 
-| OSI layer | What it does | Who does it, with `ble-gatt` and iroh (as in Fini) | `ble-gatt` layers |
+| OSI layer | What it does | Who does it, with `ble-gatt` and iroh (as in Fini) | `ble-gatt` part |
 |---|---|---|---|
-| 1 Physical | Radio signal | Bluetooth chip | — |
-| 2 Data link | Frames between two devices in range | The operating system's Bluetooth stack (BLE link layer, L2CAP, ATT/GATT); on top of it, `ble-gatt` reaches GATT and turns it into a message channel between two peers | L0 Platform, L1 Roles, L2 Link, L3 Transport |
-| 3 Network | Addressing and choosing a path | iroh: a peer is addressed by its public key, and iroh picks Bluetooth or IP | L4 `ble-gatt-iroh` connects L3 to it |
-| 4 Transport | Reliable delivery, streams | QUIC inside iroh | — |
-| 5–7 Session, presentation, application | Sessions, message format, product logic | The application (for Fini: its ALPN, `PeerFrame`, sync) | L5 Application |
-| — | Not a protocol layer | Power profiles (Policy), the Tauri integration (L4 `tauri-plugin-ble-gatt`) | Policy, L4 |
+| L1 Physical | Radio signal | Bluetooth chip | — |
+| L2 Data link | Frames between two devices in range | The operating system's Bluetooth stack (BLE link layer, L2CAP, ATT/GATT); on top of it, `ble-gatt` turns GATT into a message channel between two peers | Drivers, `roles/`, `connection/`, `profile/` |
+| L3 Network | Addressing and choosing a path | iroh: a peer is addressed by its public key, and iroh picks Bluetooth or IP | `ble-gatt-iroh` connects `profile/` to it |
+| L4 Transport | Reliable delivery, streams | QUIC inside iroh | — |
+| L5–L7 Session, presentation, application | Sessions, message format, product logic | The application (for Fini: its ALPN, `PeerFrame`, sync) | — |
+| — | Not a protocol layer | Power profiles, the Tauri integration | `power/`, `tauri-plugin-ble-gatt` |
 
-Two consequences for naming:
-
-- The word *transport* means different things here and in iroh. This
-  library's L3 Transport is OSI layer 2 work (one hop, whole messages); iroh's
-  custom *transport* and QUIC are OSI layers 3 and 4.
-- Fini's `DataLink` (OSI layer 2) corresponds to this library's L3, not L2.
+Fini's `DataLink` is named after OSI L2 and corresponds to this library's
+`profile/` (Fini `docs/glossary.md`).
 
 ## Who owns which layer
 
 | Layer | Owner |
 |---|---|
-| L0–L3 and Policy | `ble-gatt` (this repository, core crate) |
-| L4 iroh adapter | `ble-gatt-iroh` (this repository). All iroh coupling lives here and nowhere else. A different network stack gets its own adapter crate next to it. |
-| L4 Tauri adapter | `tauri-plugin-ble-gatt` (this repository) |
-| L5 | The application. Fini decides that Fini uses iroh (Fini ADR-0009); `ble-gatt` takes no such decision. |
+| Entities, Use Cases, Frameworks & Drivers | `ble-gatt` (this repository, core crate) |
+| Interface Adapter for iroh | `ble-gatt-iroh` (this repository). All iroh coupling lives here and nowhere else. A different network stack gets its own adapter crate next to it. |
+| Interface Adapter for Tauri | `tauri-plugin-ble-gatt` (this repository) |
+| Application | The application. Fini decides that Fini uses iroh (Fini ADR-0009); `ble-gatt` takes no such decision. |
 
 ## Crates
 
 | Crate | Layers | Depends on |
 |---|---|---|
-| `ble-gatt` | L0, L1, L2, L3, Policy | platform SDKs only |
-| `ble-gatt-iroh` | L4 | `ble-gatt`, `iroh` |
-| `tauri-plugin-ble-gatt` | L4 | `ble-gatt`, `tauri` |
+| `ble-gatt` | Entities, Use Cases, Frameworks & Drivers | platform SDKs only |
+| `ble-gatt-iroh` | Interface Adapters | `ble-gatt`, `iroh` |
+| `tauri-plugin-ble-gatt` | Interface Adapters | `ble-gatt`, `tauri` |
 
 ## Module map of the core crate
 
@@ -78,39 +91,46 @@ The target layout. Moving today's modules into it is planned work
 
 ```
 ble-gatt/src/
-  platform/          L0  one sub-module per OS, all implementing the same ports
+  entities/          Entities      types, errors, fragment format
+  hal/               Use Cases     port traits the drivers implement
+  roles/             Use Cases     public role API; holds injected drivers
+    adapter.rs                     the device's Bluetooth adapter: on/off, events, capabilities
+    central.rs
+    peripheral.rs
+    advertiser.rs
+  connection/        Use Cases     connection lifecycle, op queue, connection scope
+  profile/           Use Cases     datagram profile, peer identity, finding peers
+  power/             Use Cases     power profiles and the resolver
+  drivers/           Frameworks & Drivers   one sub-module per OS, all implementing hal/
     linux/
     android/
     windows/         (planned)
     apple/           (planned)
     mock/
-  roles/             L1  public role API; holds injected platform ports
-    adapter.rs           the device's Bluetooth adapter: on/off, events, capabilities
-    central.rs
-    peripheral.rs
-    advertiser.rs
-  link/              L2  connection lifecycle, op queue, connection scope
-  transport/         L3  datagram channel, peer identity, peer finding
-  power/             Policy  profiles and the resolver
-  models.rs, error.rs
 ```
 
-Today's modules map onto it as: `backend/{linux,android,mock}` → `platform/`,
-`backend/link_state.rs` and `peer_link.rs` → `link/`, `datagram/` →
-`transport/`.
+Today's modules map onto it as:
+
+| Today | Target |
+|---|---|
+| `backend/{linux,android,mock}` | `drivers/` |
+| the `Backend` trait | `hal/` |
+| `backend/link_state.rs`, `peer_link.rs` | `connection/` |
+| `datagram/` | `profile/` |
+| `models.rs`, `error.rs` | `entities/` |
 
 ## Designing a module
 
-**Dependency injection.** Each layer defines its dependencies as traits
-(ports) and receives implementations from the caller. L1 holds
-`Arc<dyn …Port>` values supplied at construction; tests supply mocks. A
-convenience constructor (`platform()`) builds the real ports for the current
-OS, but nothing below L4 creates its own dependencies behind the caller's
-back.
+**Dependency injection.** Use Cases declare their dependencies as traits in
+`hal/` and receive implementations from the caller. `roles/` holds
+`Arc<dyn …>` values supplied at construction; tests supply mocks. A
+convenience constructor (`platform()`) builds the real drivers for the
+current OS, but nothing in the core creates its own dependencies behind the
+caller's back.
 
-**One layer, several platforms (L0).** Every platform module:
+**One interface, several platforms (drivers).** Every driver:
 
-- implements the same port traits, with the same behaviour, so callers
+- implements the same `hal/` traits, with the same behaviour, so callers
   cannot tell platforms apart;
 - reports what it cannot do through `Adapter` capabilities or a typed
   `Unsupported` error, never by silently doing nothing;

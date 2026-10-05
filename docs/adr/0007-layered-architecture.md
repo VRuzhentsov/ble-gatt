@@ -25,23 +25,24 @@ taken from the copyleft or source-available ones (`blew`,
 
 ## Decisions
 
-**D1 — The library goes up to the transport layer, plus power policy.**
-Roles, links, datagram channels, peer identity and power profiles are in
-the library. Routing, store-and-forward, sessions and encryption are
+**D1 — The library goes up to the datagram profile, plus power policy.**
+Roles, connections, the datagram profile (message channel, peer identity)
+and power profiles are in the library. Routing, store-and-forward, sessions and encryption are
 application concerns; iroh provides some of them.
 
 **D2 — Separate crates per role in the stack.**
 
-- `ble-gatt` is the core: layers L0 to L3 and power policy.
+- `ble-gatt` is the core: Entities, Use Cases (including power policy) and
+  the platform drivers.
 - `ble-gatt-iroh` is the iroh adapter. All coupling to iroh lives in that
   crate; if a better alternative to iroh appears, it gets its own adapter
   crate and the core does not change.
 - `tauri-plugin-ble-gatt` integrates the library into Tauri apps such as
   Fini.
 
-The core's modules follow the layer map in `docs/architecture.md`, which
-also states what each layer is responsible for and how modules on one layer
-are designed across platforms.
+The core's modules follow the layer map in `docs/architecture.md` (D13),
+which also states what each layer is responsible for and how modules on one
+layer are designed across platforms.
 
 **D3 — Platform backends are trait objects, supplied by dependency
 injection.** `dyn` ports are kept, because they let a test or an e2e lane
@@ -112,13 +113,29 @@ a hardware-in-the-loop rig later.**
 
 **D12 — Tokio only.**
 
+**D13 — Layers are named after Clean Architecture, modules after the
+Bluetooth specification.** No home-grown layer scheme:
+
+- Layers follow Clean Architecture (Robert C. Martin): Entities, Use Cases,
+  Interface Adapters, Frameworks & Drivers, with its dependency rule (code
+  depends only inwards).
+- Modules inside the core are named after the Bluetooth Core Specification
+  (`roles/` for the GAP roles, `connection/`, `profile/` for the datagram
+  GATT profile) and after Rust's `embedded-hal` (`hal/` traits implemented by
+  `drivers/`).
+- `L` with a number always means an OSI layer, in this repository and in
+  Fini. An earlier draft numbered this library's layers L0 to L5; that
+  clashed with OSI (its "L2 Link" and "L3 Transport" were both OSI L2 work,
+  and "transport" means OSI L4 in iroh and QUIC), so it was dropped.
+
 ## Plan
 
 1. **Fini uses `tauri-plugin-ble-gatt`** (D9). Make sure the plugin's Android
    bridge, `ndk-context` setup and permission handling cover what Fini does
    today, then drop Fini's vendored Kotlin and its own context bridging.
-2. **Restructure the core into the layer modules** (`platform/`, `roles/`,
-   `link/`, `transport/`, `power/`), moving code without changing behaviour.
+2. **Restructure the core into the layer modules** (`entities/`, `hal/`,
+   `roles/`, `connection/`, `profile/`, `power/`, `drivers/`; D13), moving
+   code without changing behaviour.
 3. **Role objects, the `Adapter`, handles and published connection state**
    (D4–D7).
 4. **Power profiles** (D8).

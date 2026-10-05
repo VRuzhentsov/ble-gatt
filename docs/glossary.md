@@ -115,7 +115,20 @@ its advertisement.
 
 ### Link
 This library's handle on one connection, which tracks whether it is
-connecting, connected or gone (`PeerLink`, ADR-0005).
+connecting, connected or gone (`PeerLink`, ADR-0005). The code still uses
+the word; the module it moves into is `connection/` (ADR-0007 D13). *Not the
+same as* OSI L2 (data link) or the BLE link layer.
+
+### GAP (Generic Access Profile)
+The part of the Bluetooth Core Specification that defines the roles
+(central, peripheral, broadcaster, observer) and how devices find and
+connect to each other. The `roles/` module is named after it.
+
+### Profile
+In the Bluetooth specification, a set of GATT services and the rules for
+using them for one purpose. This library's datagram channel is such a
+profile; it lives in `profile/`. *Not the same as* a
+[power profile](#power-profile).
 
 ### Datagram channel
 A message channel over a connection: whole messages in, whole messages out,
@@ -129,19 +142,41 @@ pieces back into the message.
 ## Code structure
 
 ### Layer
-One level of the library with one job, L0 to L5; see
+One level of the library with one job, named after
+[Clean Architecture](#clean-architecture); see
 [`architecture.md`](architecture.md).
+
+### Clean Architecture
+Robert C. Martin's way of splitting code into rings, each depending only on
+the rings inside it: **Entities** (data types and rules that hold
+everywhere), **Use Cases** (what the software does), **Interface Adapters**
+(connecting to a specific outside system) and **Frameworks & Drivers**
+(external APIs). This library's layers use these names.
+
+### Dependency rule
+Clean Architecture's rule that code depends only inwards: Use Cases never
+call a driver directly, they call a trait the driver implements.
+
+### HAL (hardware abstraction layer)
+A set of traits that hide the differences between platforms; each platform
+supplies a driver that implements them. Named after Rust's `embedded-hal`.
+In this library: the `hal/` module.
+
+### Driver
+The code that implements the `hal/` traits for one platform, or the mock
+(`drivers/`). Layer: Frameworks & Drivers. *Also called:* backend (the
+code's current word), platform implementation, executor (Nordic).
 
 ### Platform
 One operating system's Bluetooth API: Linux (BlueZ), Android, Windows, Apple.
 
 ### Backend
-The code that implements this library's interfaces for one platform, or the
-mock. *Also called:* platform implementation, driver, executor (Nordic).
+The current code's word for a [driver](#driver).
 
 ### Port
-An interface (a Rust trait) a layer defines for what it needs from the layer
-below, so that any implementation, real or mock, can be plugged in.
+An interface (a Rust trait) a layer defines for what it needs from outside,
+so that any implementation, real or mock, can be plugged in. The ports
+drivers implement live in `hal/`.
 
 ### Dependency injection
 Passing a component the implementations it needs (its ports) from outside,
@@ -174,18 +209,13 @@ Advice on how hard to work the radio (how long to scan, how long to pause,
 how many connections), worked out from the device's situation: battery,
 charging, foreground or background.
 
-### Layer number
-L0 to L5 in [`architecture.md`](architecture.md). These are this library's
-own layers, **not** the OSI model's: here L2 is one BLE connection, while
-OSI's layer 2 (data link) is what this library's L3 datagram channel does.
-Fini's `DataLink` is named after the OSI layer. The full mapping is in
-[`architecture.md`](architecture.md#how-the-layers-map-onto-osi).
-
 ### OSI model
 The standard seven-layer model of network protocols: 1 physical, 2 data link,
 3 network, 4 transport, 5 session, 6 presentation, 7 application. Each layer
-says what a protocol does to the bytes. Used here only to compare against;
-this library's [layer numbers](#layer-number) are its own.
+says what a protocol does to the bytes. **`L` with a number always means an
+OSI layer** (L2 = data link), never one of this library's layers. Where this
+library sits on it: [`architecture.md`](architecture.md#how-the-layers-map-onto-osi).
+Fini's `DataLink` is named after OSI L2.
 
 ### Pub/sub (publish/subscribe)
 One side *publishes* events or state; any number of *subscribers* receive
@@ -210,5 +240,6 @@ disconnects.
 
 ### Adapter crate
 A crate that connects `ble-gatt` to something outside it, such as iroh
-(`ble-gatt-iroh`) or Tauri (`tauri-plugin-ble-gatt`). Layer L4. Not to be
+(`ble-gatt-iroh`) or Tauri (`tauri-plugin-ble-gatt`). Layer: Interface
+Adapters. Not to be
 confused with a [Bluetooth adapter](#bluetooth-adapter).
