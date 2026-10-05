@@ -9,13 +9,14 @@
 //! | Module | Layer |
 //! |---|---|
 //! | `entities` | Entities |
-//! | `hal`, `roles`, `connection`, `profile` | Use Cases |
+//! | `hal`, `roles`, `connection`, `profile`, `power` | Use Cases |
 //! | `drivers` | Frameworks & Drivers |
 
 pub mod connection;
 pub mod drivers;
 pub mod entities;
 pub mod hal;
+pub mod power;
 pub mod profile;
 pub mod roles;
 

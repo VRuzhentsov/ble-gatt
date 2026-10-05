@@ -107,6 +107,13 @@ tokio::spawn(conn.cancelled().run_until_cancelled_owned(read_loop()));
 state.wait_for(|s| s.is_disconnected()).await?;
 ```
 
+### Power profiles
+
+`power::PowerAdvisor` turns the device's situation (foreground, battery,
+charging, peers nearby) into advice: scan on/off times, a connection limit
+and a connection priority, published on a `watch` channel. It never touches
+the radio; the application applies it (ADR-0007 D8).
+
 Layers are named after Clean Architecture and modules after the Bluetooth
 specification (ADR-0007). The old paths (`ble_gatt::backend::…`,
 `ble_gatt::datagram`, `ble_gatt::peer_link`) still resolve.
