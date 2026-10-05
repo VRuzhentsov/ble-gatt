@@ -157,6 +157,27 @@ pub enum GattEvent {
     RadioChanged { status: RadioStatus },
 }
 
+/// One connection's state, published by `connection::Connection::state`
+/// (ADR-0007 D5). A `Connection` exists only once connected, so there is no
+/// "connecting" state here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionState {
+    Connected,
+    /// The peer went away, the radio stopped, or this side disconnected.
+    /// Final: a new connection is a new `Connection`.
+    Disconnected,
+}
+
+impl ConnectionState {
+    pub fn is_connected(self) -> bool {
+        self == Self::Connected
+    }
+
+    pub fn is_disconnected(self) -> bool {
+        self == Self::Disconnected
+    }
+}
+
 /// Whether the platform BLE radio is usable. See
 /// [`GattEvent::RadioChanged`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

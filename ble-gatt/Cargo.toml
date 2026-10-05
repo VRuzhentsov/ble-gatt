@@ -12,6 +12,7 @@ log.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
+tokio-util.workspace = true
 uuid.workspace = true
 # Optional, only compiled in behind `mock-broker` — see docs/adr/0004.
 serde = { version = "1", features = ["derive"], optional = true }

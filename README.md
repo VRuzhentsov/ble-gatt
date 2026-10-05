@@ -91,6 +91,22 @@ ble-gatt/src/
                     `mock-broker` feature — see ADR-0004
 ```
 
+### Roles, published state, handles
+
+```rust
+use ble_gatt::{Adapter, RadioStatus};
+
+let adapter = Adapter::platform().await?;      // or Adapter::new(backend) to inject one
+adapter.wait_available().await;                 // adapter.status(): watch::Receiver<RadioStatus>
+
+let server = adapter.peripheral().serve(spec).await?; // advertising stops when `server` drops
+
+let mut conn = adapter.central().connect(&peer).await?;
+let mut state = conn.state();                   // watch::Receiver<ConnectionState>
+tokio::spawn(conn.cancelled().run_until_cancelled_owned(read_loop()));
+state.wait_for(|s| s.is_disconnected()).await?;
+```
+
 Layers are named after Clean Architecture and modules after the Bluetooth
 specification (ADR-0007). The old paths (`ble_gatt::backend::…`,
 `ble_gatt::datagram`, `ble_gatt::peer_link`) still resolve.

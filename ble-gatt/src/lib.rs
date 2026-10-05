@@ -9,7 +9,7 @@
 //! | Module | Layer |
 //! |---|---|
 //! | `entities` | Entities |
-//! | `hal`, `connection`, `profile` | Use Cases |
+//! | `hal`, `roles`, `connection`, `profile` | Use Cases |
 //! | `drivers` | Frameworks & Drivers |
 
 pub mod connection;
@@ -17,6 +17,7 @@ pub mod drivers;
 pub mod entities;
 pub mod hal;
 pub mod profile;
+pub mod roles;
 
 pub use connection::peer_link;
 pub use entities::{error, models};
@@ -40,11 +41,13 @@ pub mod backend {
 
 pub use entities::error::{BleError, Result};
 pub use entities::models::{
-    CapabilityReport, CharacteristicUuid, ConnectionPriority, DiscoveredPeer, GattCharacteristicSpec, GattEvent,
+    CapabilityReport, CharacteristicUuid, ConnectionPriority, ConnectionState, DiscoveredPeer, GattCharacteristicSpec, GattEvent,
     GattServiceSpec, PeerAddress, RadioStatus, Role, ServiceUuid, WriteType,
 };
 pub use connection::peer_link::{
     LinkId, LinkRole, MaxLinks, PeerChannel, PeerLink, PeerLinkConfig, PeerLinkEvent, PeerStatus,
     RetryBudget,
 };
+pub use connection::Connection;
 pub use hal::{Backend, BoxStream, GattConnection};
+pub use roles::{Adapter, Central, Peripheral, ServerHandle};
