@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["ble-gatt", "tauri-plugin-ble-gatt"]
+members = ["ble-gatt", "ble-gatt-iroh", "tauri-plugin-ble-gatt"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,4 +14,5 @@ log = "0.4"
 thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = "0.7"
 uuid = { version = "1", features = ["v4"] }

@@ -13,7 +13,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # bluer (the Linux backend) links against libdbus at build time.
-      - name: Install libdbus dev headers
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+      # bluer links against libdbus; Tauri (the plugin) against WebKitGTK.
+      - name: Install system libraries
+        run: >-
+          sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+          libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
       - name: cargo test
         run: cargo test -p ble-gatt
+      - name: cargo test (Tauri plugin, includes the JNI name check)
+        run: cargo test -p tauri-plugin-ble-gatt
+      # The Android driver and the plugin's Android code compile only for
+      # Android; check them without an NDK (no linking).
+      - name: cargo check (Android)
+        run: |
+          rustup target add aarch64-linux-android
+          cargo check --target aarch64-linux-android -p tauri-plugin-ble-gatt
+      - name: cargo test (ble-gatt-iroh)
+        run: cargo test -p ble-gatt-iroh

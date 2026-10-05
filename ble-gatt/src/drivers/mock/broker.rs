@@ -14,8 +14,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
-use crate::error::{BleError, Result};
-use crate::models::{GattEvent, PeerAddress};
+use crate::entities::error::{BleError, Result};
+use crate::entities::models::{GattEvent, PeerAddress};
 
 use super::local::LocalRadio;
 use super::wire::{read_frame, write_frame, Envelope, Frame, Push, Request, Response};
@@ -42,6 +42,9 @@ pub(super) async fn serve(listener: TcpListener) -> Result<()> {
 }
 
 async fn handle_connection(socket: TcpStream, radio: Arc<LocalRadio>) {
+    // Every request waits on its response; Nagle's algorithm with delayed
+    // ACKs would hold each small frame back tens of milliseconds.
+    let _ = socket.set_nodelay(true);
     let (mut read_half, write_half) = tokio::io::split(socket);
     let (outbox_tx, mut outbox_rx) = mpsc::unbounded_channel::<Envelope>();
     let conn = Arc::new(ConnHandle {

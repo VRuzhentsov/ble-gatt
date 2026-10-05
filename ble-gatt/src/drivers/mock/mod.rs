@@ -26,9 +26,9 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
-use crate::backend::{Backend, BoxStream, GattConnection};
-use crate::error::{BleError, Result};
-use crate::models::{
+use crate::hal::{Backend, BoxStream, GattConnection};
+use crate::entities::error::{BleError, Result};
+use crate::entities::models::{
     CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress,
     ServiceUuid, WriteType,
 };
@@ -304,7 +304,7 @@ impl MockBackend {
     /// events a real radio loss produces — a test wanting those uses
     /// `simulate_peer_loss` per peer. `PeerLink` tears its own links down
     /// off the `RadioChanged` alone.
-    pub fn simulate_radio(&self, status: crate::models::RadioStatus) {
+    pub fn simulate_radio(&self, status: crate::entities::models::RadioStatus) {
         let _ = self.events_tx.send(GattEvent::RadioChanged { status });
     }
 

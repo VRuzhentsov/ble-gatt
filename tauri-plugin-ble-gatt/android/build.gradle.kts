@@ -57,3 +57,11 @@ android {
         disable += "MissingPermission"
     }
 }
+
+dependencies {
+    // Tauri's Android API (`app.tauri.plugin.Plugin`), for BleGattPlugin.
+    // Included by the generated Tauri app as `:tauri-android`; for a
+    // standalone build, settings.gradle.kts points it at the copy
+    // `tauri-plugin`'s build script unpacks into `.tauri/tauri-api`.
+    implementation(project(":tauri-android"))
+}

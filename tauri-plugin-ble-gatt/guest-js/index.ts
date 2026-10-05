@@ -78,7 +78,9 @@ export type GattEvent =
    * connection state derived from this stream should be treated as stale
    * and re-read rather than trusted.
    */
-  | { type: "lagged"; dropped: number };
+  | { type: "lagged"; dropped: number }
+  /** The Bluetooth radio became usable (`on`) or stopped being usable. */
+  | { type: "radioChanged"; status: "on" | "off" | "unsupported" };
 
 export async function capabilities(): Promise<Capabilities> {
   return invoke("plugin:ble-gatt|ble_capabilities");

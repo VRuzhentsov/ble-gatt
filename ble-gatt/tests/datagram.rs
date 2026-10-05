@@ -1193,3 +1193,37 @@ async fn advertised_manufacturer_data_reaches_a_scanner_through_serve() {
 
     assert_eq!(peer.manufacturer_data.get(&0xABCD), Some(&vec![0x01]));
 }
+
+/// A `sender` sends while the channel itself is parked in `recv`: both
+/// directions move at once, and a closed channel stops the sender.
+#[tokio::test]
+async fn a_sender_sends_while_the_channel_receives() {
+    let config = config();
+    let (mut central, mut peripheral, _c, _p) = connected_pair(&config).await;
+
+    let sender = peripheral.sender();
+    let large: Vec<u8> = (0..600).map(|i| (i % 251) as u8).collect();
+    let sending = {
+        let large = large.clone();
+        tokio::spawn(async move { sender.send(large).await })
+    };
+    central.send(b"meanwhile".to_vec()).await.expect("central send");
+    let got = tokio::time::timeout(Duration::from_secs(2), peripheral.recv())
+        .await
+        .expect("the central's message should arrive during the send")
+        .expect("channel open")
+        .expect("no error");
+    assert_eq!(got, b"meanwhile");
+
+    sending.await.expect("sender task").expect("sender send");
+    let got_large = tokio::time::timeout(Duration::from_secs(2), central.recv())
+        .await
+        .expect("the large message should arrive")
+        .expect("channel open")
+        .expect("no error");
+    assert_eq!(got_large, large);
+
+    let sender = central.sender();
+    central.close().await.expect("close");
+    assert!(sender.send(b"late".to_vec()).await.is_err(), "a closed channel refuses sends");
+}

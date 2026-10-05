@@ -1,7 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
+    <!-- Not required: a library must not narrow which devices may install
+         the app. An app that cannot work without BLE declares required="true"
+         itself; the manifest merger lets a "true" anywhere win, so a "true"
+         here would hide every app using this plugin from devices without
+         BLE (TVs, for instance) on Google Play. -->
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
 
     <!-- API 30 and below: legacy Bluetooth + coarse/fine location (BLE scan
          results were treated as location data prior to API 31). -->

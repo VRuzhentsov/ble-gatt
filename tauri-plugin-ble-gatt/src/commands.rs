@@ -141,6 +141,19 @@ pub enum GattEventDto {
     /// stream cannot know its view is still accurate otherwise.
     #[serde(rename_all = "camelCase")]
     Lagged { dropped: u64 },
+    /// The Bluetooth radio became usable or stopped being usable:
+    /// `"on"`, `"off"` or `"unsupported"`.
+    #[serde(rename_all = "camelCase")]
+    RadioChanged { status: String },
+}
+
+fn radio_status_name(status: ble_gatt::RadioStatus) -> String {
+    match status {
+        ble_gatt::RadioStatus::On => "on",
+        ble_gatt::RadioStatus::Off => "off",
+        ble_gatt::RadioStatus::Unsupported => "unsupported",
+    }
+    .to_string()
 }
 
 /// Which role *this* device played. JS needs it for the same reason Rust
@@ -184,6 +197,9 @@ impl From<GattEvent> for GattEventDto {
                 value,
             },
             GattEvent::Lagged { dropped } => Self::Lagged { dropped },
+            GattEvent::RadioChanged { status } => Self::RadioChanged {
+                status: radio_status_name(status),
+            },
         }
     }
 }
