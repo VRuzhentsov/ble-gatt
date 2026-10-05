@@ -219,3 +219,35 @@ async fn an_idle_channel_is_closed() {
         .expect("the link task ends cleanly");
     assert!(transport.linked_peers().is_empty());
 }
+
+/// Both directions busy at once: the echo writes back while the dialer is
+/// still writing, so each side's link sends and receives at the same time.
+/// A link that stops reading while a send is in flight can wedge here.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_large_echo_moves_both_ways_at_once() {
+    let pair = pair().await;
+    let address = EndpointAddr::from_parts(
+        pair.listener_id,
+        [TransportAddr::Custom(custom_addr(&pair.listener_address))],
+    );
+    let connection = tokio::time::timeout(TIMEOUT, pair.dialer.connect(address, ECHO_ALPN))
+        .await
+        .expect("connect in time")
+        .expect("connect");
+
+    let payload: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+    let (mut send, mut recv) = connection.open_bi().await.expect("open stream");
+    let writing = {
+        let payload = payload.clone();
+        tokio::spawn(async move {
+            send.write_all(&payload).await.expect("write");
+            send.finish().expect("finish");
+        })
+    };
+    let reply = tokio::time::timeout(TIMEOUT, recv.read_to_end(payload.len() + 1))
+        .await
+        .expect("echo in time")
+        .expect("read echo");
+    writing.await.expect("writer");
+    assert_eq!(reply, payload);
+}
