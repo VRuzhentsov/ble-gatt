@@ -178,7 +178,14 @@ charging, foreground or background.
 L0 to L5 in [`architecture.md`](architecture.md). These are this library's
 own layers, **not** the OSI model's: here L2 is one BLE connection, while
 OSI's layer 2 (data link) is what this library's L3 datagram channel does.
-Fini's `DataLink` is named after the OSI layer.
+Fini's `DataLink` is named after the OSI layer. The full mapping is in
+[`architecture.md`](architecture.md#how-the-layers-map-onto-osi).
+
+### OSI model
+The standard seven-layer model of network protocols: 1 physical, 2 data link,
+3 network, 4 transport, 5 session, 6 presentation, 7 application. Each layer
+says what a protocol does to the bytes. Used here only to compare against;
+this library's [layer numbers](#layer-number) are its own.
 
 ### Pub/sub (publish/subscribe)
 One side *publishes* events or state; any number of *subscribers* receive

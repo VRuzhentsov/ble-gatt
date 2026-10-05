@@ -13,7 +13,8 @@ network stack such as iroh plugged in from outside, never wired in.
 Layer numbers are this library's own. They are not the OSI model's: here L2
 is one BLE connection, while OSI's layer 2 (data link) is closer to this
 library's L3 datagram channel. Fini's `DataLink` is named after the OSI layer
-(Fini `docs/glossary.md`).
+(Fini `docs/glossary.md`). Where each layer sits on the OSI model is in
+[How the layers map onto OSI](#how-the-layers-map-onto-osi).
 
 | Layer | Job | Owns | Never does |
 |---|---|---|---|
@@ -28,6 +29,30 @@ library's L3 datagram channel. Fini's `DataLink` is named after the OSI layer
 Dependencies point downwards only: a layer uses the layer below through its
 public interface and knows nothing about the layers above. L4 adapters
 depend on the core; the core never depends on an adapter.
+
+## How the layers map onto OSI
+
+The two schemes answer different questions. The OSI model says what a
+protocol does to the bytes on their way between devices. This library's
+layers say how its code is split and which part depends on which. Some of
+our layers are code structure with no OSI counterpart, and several of them
+fall inside the same OSI layer.
+
+| OSI layer | What it does | Who does it, with `ble-gatt` and iroh (as in Fini) | `ble-gatt` layers |
+|---|---|---|---|
+| 1 Physical | Radio signal | Bluetooth chip | — |
+| 2 Data link | Frames between two devices in range | The operating system's Bluetooth stack (BLE link layer, L2CAP, ATT/GATT); on top of it, `ble-gatt` reaches GATT and turns it into a message channel between two peers | L0 Platform, L1 Roles, L2 Link, L3 Transport |
+| 3 Network | Addressing and choosing a path | iroh: a peer is addressed by its public key, and iroh picks Bluetooth or IP | L4 `ble-gatt-iroh` connects L3 to it |
+| 4 Transport | Reliable delivery, streams | QUIC inside iroh | — |
+| 5–7 Session, presentation, application | Sessions, message format, product logic | The application (for Fini: its ALPN, `PeerFrame`, sync) | L5 Application |
+| — | Not a protocol layer | Power profiles (Policy), the Tauri integration (L4 `tauri-plugin-ble-gatt`) | Policy, L4 |
+
+Two consequences for naming:
+
+- The word *transport* means different things here and in iroh. This
+  library's L3 Transport is OSI layer 2 work (one hop, whole messages); iroh's
+  custom *transport* and QUIC are OSI layers 3 and 4.
+- Fini's `DataLink` (OSI layer 2) corresponds to this library's L3, not L2.
 
 ## Who owns which layer
 
