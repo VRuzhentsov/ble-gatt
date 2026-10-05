@@ -58,6 +58,9 @@ The layer map (what each layer and module is responsible for, and how
 platform modules are designed) is in
 [`docs/architecture.md`](docs/architecture.md).
 
+Other BLE libraries, in every language, and what this repo borrows from them:
+[docs/alternatives.md](docs/alternatives.md).
+
 Design decisions live in `docs/adr/`:
 [0001](docs/adr/0001-ble-gatt-tauri-plugin-split-and-scope.md) — why this
 split, why GATT-only, why hand-rolled instead of an existing crate.
