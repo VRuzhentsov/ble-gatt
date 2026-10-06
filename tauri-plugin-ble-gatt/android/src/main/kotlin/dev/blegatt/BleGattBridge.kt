@@ -12,6 +12,7 @@ import android.bluetooth.BluetoothGattServerCallback
 import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.le.AdvertiseCallback
 import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertiseSettings
@@ -23,6 +24,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
@@ -887,33 +889,47 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         if (attempt == 0) {
             rearmPriorityFallback(address, gatt)
         }
-        characteristic.writeType = if (withoutResponse) {
+        val writeType = if (withoutResponse) {
             BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
         } else {
             BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
         }
-        characteristic.value = value
-        if (!gatt.writeCharacteristic(characteristic)) {
-            if (attempt < GATT_BUSY_MAX_RETRIES) {
-                Log.w(
-                    TAG,
-                    "writeCharacteristic rejected by the stack, retrying " +
-                        "(${attempt + 1}/$GATT_BUSY_MAX_RETRIES): $address/$characteristicUuid",
-                )
-                val retry = Runnable {
-                    attemptWrite(address, characteristicUuid, value, withoutResponse, requestId, session, attempt + 1)
-                }
-                pendingRetries[requestId] = retry
-                retryHandler.postDelayed(retry, gattBusyRetryDelayMs(attempt + 1))
-            } else {
-                Log.w(
-                    TAG,
-                    "writeCharacteristic rejected by the stack after $attempt retries: " +
-                        "$address/$characteristicUuid (${radioContentionSnapshot()})",
-                )
-                synchronized(queue) { queue.remove(requestId) }
-                onCharacteristicWriteResult(nativeHandle, requestId, address, characteristicUuid, false)
+        // API 33+: the overload that returns a `BluetoothStatusCodes` value.
+        // The deprecated boolean form folds every refusal (busy, not
+        // connected, not allowed, missing permission) into `false`, which
+        // left a field report with nothing to go on but "rejected by the
+        // stack". Only a busy stack is worth retrying; any other code is
+        // final and is reported at once.
+        val status = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            gatt.writeCharacteristic(characteristic, value, writeType)
+        } else {
+            characteristic.writeType = writeType
+            characteristic.value = value
+            if (gatt.writeCharacteristic(characteristic)) BluetoothStatusCodes.SUCCESS else WRITE_REFUSED_LEGACY
+        }
+        if (status == BluetoothStatusCodes.SUCCESS) return
+        val retryable = status == WRITE_REFUSED_LEGACY ||
+            (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                status == BluetoothStatusCodes.ERROR_GATT_WRITE_REQUEST_BUSY)
+        if (retryable && attempt < GATT_BUSY_MAX_RETRIES) {
+            Log.w(
+                TAG,
+                "writeCharacteristic rejected by the stack (${writeStatusName(status)}), retrying " +
+                    "(${attempt + 1}/$GATT_BUSY_MAX_RETRIES): $address/$characteristicUuid",
+            )
+            val retry = Runnable {
+                attemptWrite(address, characteristicUuid, value, withoutResponse, requestId, session, attempt + 1)
             }
+            pendingRetries[requestId] = retry
+            retryHandler.postDelayed(retry, gattBusyRetryDelayMs(attempt + 1))
+        } else {
+            Log.w(
+                TAG,
+                "writeCharacteristic rejected by the stack (${writeStatusName(status)}) after $attempt retries: " +
+                    "$address/$characteristicUuid (${radioContentionSnapshot()})",
+            )
+            synchronized(queue) { queue.remove(requestId) }
+            onCharacteristicWriteResult(nativeHandle, requestId, address, characteristicUuid, false)
         }
     }
 
@@ -1842,6 +1858,27 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         /// doubles each time, capped, so it's cheap to retry a genuinely
         /// brief stall quickly without spending the whole budget on retries
         /// fired too early to have any chance during a sustained one.
+        /// Stands in for the deprecated boolean `writeCharacteristic`'s
+        /// `false` below API 33, where the reason is not available. Not a
+        /// `BluetoothStatusCodes` value.
+        private const val WRITE_REFUSED_LEGACY = -1
+
+        /// `BluetoothStatusCodes` values `writeCharacteristic` returns, by
+        /// name, for the log. The raw number is kept for anything else.
+        private fun writeStatusName(status: Int): String = when (status) {
+            WRITE_REFUSED_LEGACY -> "refused (reason unavailable below API 33)"
+            BluetoothStatusCodes.ERROR_BLUETOOTH_NOT_ENABLED -> "ERROR_BLUETOOTH_NOT_ENABLED"
+            BluetoothStatusCodes.ERROR_BLUETOOTH_NOT_ALLOWED -> "ERROR_BLUETOOTH_NOT_ALLOWED"
+            BluetoothStatusCodes.ERROR_DEVICE_NOT_BONDED -> "ERROR_DEVICE_NOT_BONDED"
+            BluetoothStatusCodes.ERROR_MISSING_BLUETOOTH_CONNECT_PERMISSION ->
+                "ERROR_MISSING_BLUETOOTH_CONNECT_PERMISSION"
+            BluetoothStatusCodes.ERROR_PROFILE_SERVICE_NOT_BOUND -> "ERROR_PROFILE_SERVICE_NOT_BOUND"
+            BluetoothStatusCodes.ERROR_GATT_WRITE_NOT_ALLOWED -> "ERROR_GATT_WRITE_NOT_ALLOWED"
+            BluetoothStatusCodes.ERROR_GATT_WRITE_REQUEST_BUSY -> "ERROR_GATT_WRITE_REQUEST_BUSY"
+            BluetoothStatusCodes.ERROR_UNKNOWN -> "ERROR_UNKNOWN"
+            else -> "status $status"
+        }
+
         private fun gattBusyRetryDelayMs(attempt: Int): Long =
             (GATT_BUSY_RETRY_BASE_DELAY_MS shl (attempt - 1)).coerceAtMost(GATT_BUSY_RETRY_MAX_DELAY_MS)
     }
