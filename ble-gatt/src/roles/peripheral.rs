@@ -53,11 +53,15 @@ pub struct ServerHandle {
 
 impl ServerHandle {
     /// Stops serving and advertising, and waits until the platform did.
+    /// The handle stays armed until then, so a `stop` cancelled midway
+    /// still stops the server from `Drop`.
     pub async fn stop(mut self) -> Result<()> {
-        match self.backend.take() {
-            Some(backend) => backend.stop_advertising().await,
-            None => Ok(()),
-        }
+        let Some(backend) = self.backend.clone() else {
+            return Ok(());
+        };
+        let result = backend.stop_advertising().await;
+        self.backend = None;
+        result
     }
 }
 

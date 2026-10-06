@@ -220,6 +220,47 @@ async fn an_idle_channel_is_closed() {
     assert!(transport.linked_peers().is_empty());
 }
 
+/// A server-side channel from `client` on its own mock radio. Returns the
+/// client's end too, which must stay alive for the channel to stay open.
+async fn accepted_channel(client: &str) -> (datagram::DatagramChannel, datagram::DatagramChannel) {
+    let network = MockNetwork::new();
+    let listener_address = PeerAddress("AA:00:00:00:00:10".to_string());
+    let mut incoming = datagram::serve(backend(&network, &listener_address.0), &config())
+        .await
+        .expect("serve");
+    let client = datagram::connect(backend(&network, client), &listener_address, &config())
+        .await
+        .expect("connect");
+    let channel = tokio::time::timeout(TIMEOUT, incoming.next())
+        .await
+        .expect("accepted in time")
+        .expect("a channel");
+    (channel, client)
+}
+
+/// A second channel attached for the same peer replaces the first, and the
+/// first one ends rather than lingering until its idle timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replaced_channel_is_closed() {
+    let peer = PeerAddress("AA:00:00:00:00:07".to_string());
+    let transport = BleGattTransport::builder()
+        .link_idle_timeout(Duration::from_secs(60))
+        .build();
+    let (first, _first_client) = accepted_channel(&peer.0).await;
+    let (second, _second_client) = accepted_channel(&peer.0).await;
+    assert_eq!(first.peer(), peer);
+    assert_eq!(second.peer(), peer);
+
+    let first_link = transport.attach(first);
+    let _second_link = transport.attach(second);
+
+    tokio::time::timeout(Duration::from_secs(5), first_link)
+        .await
+        .expect("the replaced link closes")
+        .expect("the link task ends cleanly");
+    assert_eq!(transport.linked_peers(), vec![peer]);
+}
+
 /// Both directions busy at once: the echo writes back while the dialer is
 /// still writing, so each side's link sends and receives at the same time.
 /// A link that stops reading while a send is in flight can wedge here.

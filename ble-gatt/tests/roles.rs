@@ -54,6 +54,18 @@ async fn adapter_publishes_the_radio_status() {
     timeout(WAIT, adapter.wait_available()).await.unwrap();
 }
 
+/// The status stays right when the event that changed it was lost.
+#[tokio::test]
+async fn adapter_reads_the_radio_again_after_missed_events() {
+    let network = MockNetwork::new();
+    let backend = device(&network, "a");
+    let adapter = Adapter::new(backend.clone() as Arc<dyn Backend>).await;
+    let mut status = adapter.status();
+
+    backend.simulate_missed_radio_change(RadioStatus::Off);
+    timeout(WAIT, status.wait_for(|s| *s == RadioStatus::Off)).await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn a_connection_publishes_disconnected_when_the_peer_goes_away() {
     let network = MockNetwork::new();

@@ -197,12 +197,11 @@ impl BleGattTransport {
     pub fn attach(&self, channel: DatagramChannel) -> tokio::task::JoinHandle<()> {
         let peer = channel.peer();
         let (tx, rx) = mpsc::channel(LINK_QUEUE_DEPTH);
-        self.inner
-            .links
-            .lock()
-            .expect("poisoned")
-            .insert(peer.clone(), tx.clone());
-        tokio::spawn(run_link(self.inner.clone(), peer, channel, rx, tx))
+        let link = tx.downgrade();
+        // The map holds the only strong sender: replacing it closes the old
+        // link's queue, and that link then ends.
+        self.inner.links.lock().expect("poisoned").insert(peer.clone(), tx);
+        tokio::spawn(run_link(self.inner.clone(), peer, channel, rx, link))
     }
 
     /// Like [`attach`](Self::attach), for a channel whose first datagram
@@ -259,7 +258,7 @@ async fn run_link(
     peer: PeerAddress,
     mut channel: DatagramChannel,
     mut outbound: mpsc::Receiver<Vec<u8>>,
-    link: mpsc::Sender<Vec<u8>>,
+    link: mpsc::WeakSender<Vec<u8>>,
 ) {
     log::debug!("link to {} up", peer.0);
     let (to_send, mut sending) = mpsc::channel::<Vec<u8>>(LINK_QUEUE_DEPTH);
@@ -315,10 +314,13 @@ async fn run_link(
 }
 
 /// Removes `peer`'s link only if it is still `link`: a replacement attached
-/// meanwhile stays.
-fn remove_link(inner: &Inner, peer: &PeerAddress, link: &mpsc::Sender<Vec<u8>>) {
+/// meanwhile stays. A link already replaced has no strong sender left.
+fn remove_link(inner: &Inner, peer: &PeerAddress, link: &mpsc::WeakSender<Vec<u8>>) {
+    let Some(link) = link.upgrade() else {
+        return;
+    };
     let mut links = inner.links.lock().expect("poisoned");
-    if links.get(peer).is_some_and(|current| current.same_channel(link)) {
+    if links.get(peer).is_some_and(|current| current.same_channel(&link)) {
         links.remove(peer);
     }
 }
@@ -461,17 +463,18 @@ impl Sender {
         // handshake does not have to wait for a retransmission.
         let (tx, rx) = mpsc::channel(LINK_QUEUE_DEPTH);
         let _ = tx.try_send(packet);
-        links.insert(peer.clone(), tx.clone());
+        let link = tx.downgrade();
+        links.insert(peer.clone(), tx);
         drop(links);
         let inner = self.inner.clone();
         let peer = peer.clone();
         tokio::spawn(async move {
             log::debug!("dialling {}", peer.0);
             match dialer(peer.clone()).await {
-                Ok(channel) => run_link(inner, peer, channel, rx, tx).await,
+                Ok(channel) => run_link(inner, peer, channel, rx, link).await,
                 Err(err) => {
                     log::debug!("dial to {} failed: {err}", peer.0);
-                    remove_link(&inner, &peer, &tx);
+                    remove_link(&inner, &peer, &link);
                 }
             }
         });

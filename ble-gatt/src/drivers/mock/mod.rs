@@ -274,6 +274,8 @@ pub struct MockBackend {
     network: Arc<MockNetwork>,
     capabilities: CapabilityReport,
     events_tx: broadcast::Sender<GattEvent>,
+    /// The last status `simulate_radio` set, for `radio_status`.
+    radio: std::sync::Mutex<crate::entities::models::RadioStatus>,
 }
 
 impl MockBackend {
@@ -283,7 +285,13 @@ impl MockBackend {
     pub fn new(address: PeerAddress, network: Arc<MockNetwork>, capabilities: CapabilityReport) -> Self {
         let (events_tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         network.register_events_sender(address.clone(), events_tx.clone());
-        Self { address, network, capabilities, events_tx }
+        Self {
+            address,
+            network,
+            capabilities,
+            events_tx,
+            radio: std::sync::Mutex::new(crate::entities::models::RadioStatus::On),
+        }
     }
 
     /// Simulate the peer dropping the link without warning — out of range,
@@ -304,7 +312,16 @@ impl MockBackend {
     /// events a real radio loss produces — a test wanting those uses
     /// `simulate_peer_loss` per peer. `PeerLink` tears its own links down
     /// off the `RadioChanged` alone.
+    /// Change the radio's status, but lose the `RadioChanged` event: the
+    /// subscriber sees only `GattEvent::Lagged`, as a slow subscriber of a
+    /// real backend would.
+    pub fn simulate_missed_radio_change(&self, status: crate::entities::models::RadioStatus) {
+        *self.radio.lock().unwrap() = status;
+        let _ = self.events_tx.send(GattEvent::Lagged { dropped: 1 });
+    }
+
     pub fn simulate_radio(&self, status: crate::entities::models::RadioStatus) {
+        *self.radio.lock().unwrap() = status;
         let _ = self.events_tx.send(GattEvent::RadioChanged { status });
     }
 
@@ -319,6 +336,10 @@ impl MockBackend {
 impl Backend for MockBackend {
     async fn capabilities(&self) -> CapabilityReport {
         self.capabilities
+    }
+
+    async fn radio_status(&self) -> crate::entities::models::RadioStatus {
+        *self.radio.lock().unwrap()
     }
 
     async fn scan(&self, service: ServiceUuid) -> Result<BoxStream<Result<DiscoveredPeer>>> {

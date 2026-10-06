@@ -173,6 +173,9 @@ fn ends_connection(event: &GattEvent, peer: &PeerAddress, session: Option<u64>) 
                 }
         }
         GattEvent::RadioChanged { status } => *status != RadioStatus::On,
+        // The dropped events may have held this connection's disconnect;
+        // treat it as gone, as the datagram profile's lifecycle watcher does.
+        GattEvent::Lagged { .. } => true,
         _ => false,
     }
 }
@@ -221,5 +224,12 @@ mod tests {
         let on = GattEvent::RadioChanged { status: RadioStatus::On };
         assert!(ends_connection(&off, &peer, None));
         assert!(!ends_connection(&on, &peer, None));
+    }
+
+    /// Lost events may have held this connection's disconnect.
+    #[test]
+    fn missed_events_end_it() {
+        let peer = PeerAddress("AA".into());
+        assert!(ends_connection(&GattEvent::Lagged { dropped: 3 }, &peer, Some(1)));
     }
 }

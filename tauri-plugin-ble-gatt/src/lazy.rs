@@ -18,7 +18,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ble_gatt::{
     Backend, BleError, BoxStream, CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattConnection,
-    GattEvent, GattServiceSpec, PeerAddress, Result, ServiceUuid,
+    GattEvent, GattServiceSpec, PeerAddress, RadioStatus, Result, ServiceUuid,
 };
 use tokio::sync::{broadcast, OnceCell};
 use tokio_stream::wrappers::BroadcastStream;
@@ -121,6 +121,18 @@ impl Backend for LazyBackend {
         self.inner().await?.disconnect_peer(peer, session).await
     }
 
+    async fn radio_status(&self) -> RadioStatus {
+        match self.inner().await {
+            Ok(backend) => backend.radio_status().await,
+            // Not cached: a later call tries again, so `Off` (temporary)
+            // rather than `Unsupported`.
+            Err(err) => {
+                log::warn!("backend construction failed: {err}");
+                RadioStatus::Off
+            }
+        }
+    }
+
     fn events(&self) -> BoxStream<GattEvent> {
         // Always a live subscription, whether or not the backend exists yet.
         let rx = self.events_tx.subscribe();
@@ -160,5 +172,29 @@ mod tests {
         assert!(lazy.stop_advertising().await.is_ok());
         assert!(lazy.stop_advertising().await.is_ok());
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    /// The radio status is the built backend's, not the trait's `On`; a
+    /// build that fails (Bluetooth off on Linux) reads as `Off`.
+    #[tokio::test]
+    async fn radio_status_comes_from_the_backend() {
+        let network = MockNetwork::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = attempts.clone();
+        let lazy = LazyBackend::new(move || {
+            let attempt = counter.fetch_add(1, Ordering::SeqCst);
+            let network = network.clone();
+            async move {
+                if attempt == 0 {
+                    return Err(BleError::AdapterUnavailable("off".into()));
+                }
+                let backend = MockBackend::new(PeerAddress("AA".into()), network, CapabilityReport::default());
+                backend.simulate_radio(RadioStatus::Unsupported);
+                Ok(Arc::new(backend) as Arc<dyn Backend>)
+            }
+        });
+
+        assert_eq!(lazy.radio_status().await, RadioStatus::Off);
+        assert_eq!(lazy.radio_status().await, RadioStatus::Unsupported);
     }
 }

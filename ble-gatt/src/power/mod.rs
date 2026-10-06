@@ -184,13 +184,18 @@ impl PowerAdvisor {
     }
 
     /// Changes the inputs and republishes the profile if it changed.
+    /// Concurrent updates are serialized: the profile is published while
+    /// the inputs are still locked, so the last update's profile is the
+    /// one that stays.
     pub fn update(&self, change: impl FnOnce(&mut PowerInputs)) {
-        self.inputs.send_modify(change);
-        let profile = self.policy.resolve(&self.inputs.borrow());
-        self.profile.send_if_modified(|current| {
-            let changed = *current != profile;
-            *current = profile;
-            changed
+        self.inputs.send_modify(|inputs| {
+            change(inputs);
+            let profile = self.policy.resolve(inputs);
+            self.profile.send_if_modified(|current| {
+                let changed = *current != profile;
+                *current = profile;
+                changed
+            });
         });
     }
 

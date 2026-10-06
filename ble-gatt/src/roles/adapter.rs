@@ -37,7 +37,7 @@ impl Adapter {
         // the two is not lost.
         let events = backend.events();
         let (status_tx, status) = watch::channel(backend.radio_status().await);
-        let watcher = tokio::spawn(publish_status(events, status_tx));
+        let watcher = tokio::spawn(publish_status(backend.clone(), events, status_tx));
         Self {
             inner: Arc::new(Inner {
                 backend,
@@ -91,14 +91,20 @@ impl Adapter {
     }
 }
 
-async fn publish_status(mut events: BoxStream<GattEvent>, status_tx: watch::Sender<RadioStatus>) {
+async fn publish_status(
+    backend: Arc<dyn Backend>, mut events: BoxStream<GattEvent>, status_tx: watch::Sender<RadioStatus>,
+) {
     while let Some(event) = events.next().await {
-        if let GattEvent::RadioChanged { status } = event {
-            status_tx.send_if_modified(|current| {
-                let changed = *current != status;
-                *current = status;
-                changed
-            });
-        }
+        let status = match event {
+            GattEvent::RadioChanged { status } => status,
+            // The dropped events may have held the only radio change: ask.
+            GattEvent::Lagged { .. } => backend.radio_status().await,
+            _ => continue,
+        };
+        status_tx.send_if_modified(|current| {
+            let changed = *current != status;
+            *current = status;
+            changed
+        });
     }
 }
