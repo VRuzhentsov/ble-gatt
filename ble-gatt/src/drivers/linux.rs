@@ -584,6 +584,50 @@ impl LinuxBackend {
             });
         }
 
+        // Watch for bluetoothd itself disappearing and coming back — a
+        // crash or a package upgrade restarting the service — not just the
+        // adapter's own `Powered` property above. Once bluetoothd exits
+        // there is no process left to emit `Powered(false)`, so the watcher
+        // above's D-Bus subscription just goes silent; nothing today ever
+        // reports the radio unusable for that case, and nothing re-registers
+        // the GATT application and advertisement BlueZ forgot when it died.
+        // `org.freedesktop.DBus.NameOwnerChanged` for `org.bluez` is the one
+        // signal the session bus itself still emits, since it is the bus
+        // daemon — not bluetoothd — that notices the connection close.
+        //
+        // Reported as `RadioChanged` rather than a new event: from a
+        // consumer's point of view "bluetoothd is gone" and "the adapter
+        // powered off" mean the same thing, nothing BLE works until it comes
+        // back, and `Peripheral::serve` already reacts to `RadioStatus::On`
+        // by re-registering.
+        {
+            let events_tx = events_tx.clone();
+            let conn = discovery.conn.clone();
+            tokio::spawn(async move {
+                let rule =
+                    dbus::message::MatchRule::new_signal("org.freedesktop.DBus", "NameOwnerChanged");
+                let Ok(matched) = conn.add_match(rule).await else {
+                    log::warn!(
+                        "bluez watch: could not subscribe to NameOwnerChanged; restart recovery is disabled"
+                    );
+                    return;
+                };
+                let (_token, mut stream) = matched.msg_stream();
+                while let Some(msg) = stream.next().await {
+                    let (name, _old_owner, new_owner) = msg.get3::<&str, &str, &str>();
+                    if name != Some("org.bluez") {
+                        continue;
+                    }
+                    let status = match new_owner {
+                        Some(owner) if !owner.is_empty() => crate::entities::models::RadioStatus::On,
+                        _ => crate::entities::models::RadioStatus::Off,
+                    };
+                    log::info!("bluez watch: org.bluez owner changed, reporting radio {status:?}");
+                    let _ = events_tx.send(GattEvent::RadioChanged { status });
+                }
+            });
+        }
+
         Ok(Self {
             _session: session,
             adapter,
@@ -690,6 +734,11 @@ async fn watch_notify_sessions(
         let session = {
             let current = advertise_generation.lock().unwrap();
             if *current != this_generation {
+                log::warn!(
+                    "notify session: dropping a subscribe from {} for stale generation {this_generation} \
+                     (current {current})",
+                    peer.0
+                );
                 return;
             }
 
@@ -1667,6 +1716,8 @@ impl Backend for LinuxBackend {
             session: dial_generation,
             dialed: self.dialed.clone(),
             dial_lock: self.dial_lock.clone(),
+            served_peers: self.served_peers.clone(),
+            events_tx: self.events_tx.clone(),
             peer: peer.clone(),
             device,
             att_mtu: AtomicU16::new(crate::hal::DEFAULT_ATT_MTU),
@@ -1690,14 +1741,18 @@ impl Backend for LinuxBackend {
         }
         let values = self.values.clone();
         let next_session = self.next_session.clone();
-        // Claimed before anything is registered, so every handler built
-        // below is stamped with the generation it belongs to.
+        // Reserved (not yet published) before anything is registered, so
+        // every handler built below is stamped with the generation it
+        // belongs to. Deliberately *not* written into `advertise_generation`
+        // here: doing so immediately would mark the *outgoing* generation's
+        // still-live handlers stale before its BlueZ objects are actually
+        // replaced below, silently dropping any write or subscribe that
+        // lands on them in that window — hardware-confirmed to happen on a
+        // re-advertise. Published only once the new application and
+        // advertisement are installed, by which point the outgoing
+        // generation's BlueZ objects are already being replaced anyway.
         let advertise_generation = self.advertise_generation.clone();
-        let this_generation = {
-            let mut current = advertise_generation.lock().unwrap();
-            *current += 1;
-            *current
-        };
+        let this_generation = *advertise_generation.lock().unwrap() + 1;
         let server_watch = self.server_watch.clone();
         let notify_writers = self.notify_writers.clone();
         let mut notify_sessions = Vec::new();
@@ -1772,6 +1827,11 @@ impl Backend for LinuxBackend {
                             // check onward this is indivisible.
                             let current = advertise_generation.lock().unwrap();
                             if *current != this_generation {
+                                log::warn!(
+                                    "write: dropping a write from {} for stale generation \
+                                     {this_generation} (current {current})",
+                                    peer.0
+                                );
                                 return ReqResult::Ok(());
                             }
 
@@ -1904,10 +1964,17 @@ impl Backend for LinuxBackend {
             log::warn!("advertise: BlueZ rejected the advertisement: {err}");
             BleError::Gatt(err.to_string())
         })?;
-        log::info!("advertise: registered, generation={this_generation}");
 
+        // Install the new BlueZ objects and publish the generation together,
+        // immediately after both registrations succeeded — see the doc
+        // comment on `this_generation`'s reservation above. Published last:
+        // a failed registration above leaves the outgoing generation (and
+        // its still-live BlueZ objects) valid rather than burning a
+        // generation number for a re-advertise that never took effect.
         *self.app_handle.lock().await = Some(app_handle);
         *self.adv_handle.lock().await = Some(adv_handle);
+        *advertise_generation.lock().unwrap() = this_generation;
+        log::info!("advertise: registered, generation={this_generation}");
 
         // The previous generation's watchers were already aborted before any
         // of this generation's tasks were spawned — see the drain near the
@@ -2046,6 +2113,16 @@ struct LinuxGattConnection {
     dialed: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
     /// See `LinuxBackend::dial_lock`.
     dial_lock: Arc<AsyncMutex<()>>,
+    /// Peripheral-role sessions currently being served, shared with
+    /// `LinuxBackend`. BlueZ keeps one ACL per remote address — disconnecting
+    /// it from the central role tears down a peripheral-role session on the
+    /// same peer too, since both sides of `GattConnection`/`Backend` address
+    /// the same `bluer::Device`. Checked by `disconnect()` before it would
+    /// otherwise kill a link the peripheral role still needs.
+    served_peers: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
+    /// So `disconnect()` can report the central-role link as lost without
+    /// actually tearing down the ACL — see its doc comment.
+    events_tx: broadcast::Sender<GattEvent>,
     peer: PeerAddress,
     device: bluer::Device,
     /// Negotiated ATT MTU, refreshed from BlueZ whenever a characteristic
@@ -2213,6 +2290,26 @@ impl GattConnection for LinuxGattConnection {
         // window.
         let _dial = self.dial_lock.lock().await;
         self.ensure_current()?;
+
+        // BlueZ keeps exactly one ACL per remote address. If the same peer
+        // also holds a live peripheral-role session right now (it dialled
+        // us while we were dialling it, or just never disconnected after),
+        // `Device::disconnect()` tears down that shared link too — dropping
+        // a central-role channel this call's caller is done with would
+        // silently kill an inbound session a completely different consumer
+        // is still relying on. Hardware-confirmed: closing a central probe
+        // link ended the phone's own inbound connection on the same ACL a
+        // moment later, losing an in-flight reply.
+        //
+        // Reporting the central-role link as lost rather than leaving it
+        // silently stuck: the caller asked to disconnect, and from its own
+        // point of view this *is* gone — it just doesn't get to take the
+        // shared radio link down with it.
+        if self.served_peers.lock().unwrap().contains_key(&self.peer) {
+            report_central_loss(&self.events_tx, &self.dialed, &self.peer, self.session);
+            return Ok(());
+        }
+
         self.device.disconnect().await.map_err(|err| BleError::Gatt(err.to_string()))
     }
 }

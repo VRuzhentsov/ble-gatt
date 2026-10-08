@@ -1,13 +1,15 @@
 //! The role objects (ADR-0007 D4–D7) on the mock radio: published adapter
 //! and connection state, and handles that stop what they started.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use ble_gatt::backend::mock::{MockBackend, MockNetwork};
 use ble_gatt::{
-    Adapter, Backend, CapabilityReport, CharacteristicUuid, ConnectionState, GattCharacteristicSpec,
-    GattServiceSpec, PeerAddress, RadioStatus, ServiceUuid,
+    Adapter, Backend, BoxStream, CapabilityReport, CharacteristicUuid, ConnectionState, DiscoveredPeer,
+    GattCharacteristicSpec, GattConnection, GattEvent, GattServiceSpec, PeerAddress, RadioStatus,
+    ServiceUuid,
 };
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
@@ -179,4 +181,91 @@ async fn dropping_the_server_handle_stops_advertising() {
         !matches!(timeout(Duration::from_millis(300), scan.next()).await, Ok(Some(_))),
         "the peripheral is still advertising after its handle was dropped"
     );
+}
+
+/// Counts `advertise` calls while delegating everything else, so a test can
+/// observe `Peripheral::serve`'s radio-recovery behavior (re-registering on
+/// `RadioChanged::On`) without the mock backend needing to model BlueZ
+/// forgetting its GATT app on a radio loss, which it doesn't.
+struct CountingBackend {
+    inner: Arc<dyn Backend>,
+    advertise_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Backend for CountingBackend {
+    async fn capabilities(&self) -> CapabilityReport {
+        self.inner.capabilities().await
+    }
+
+    async fn scan(&self, service: ServiceUuid) -> ble_gatt::Result<BoxStream<ble_gatt::Result<DiscoveredPeer>>> {
+        self.inner.scan(service).await
+    }
+
+    async fn connect(&self, peer: &PeerAddress) -> ble_gatt::Result<Box<dyn GattConnection>> {
+        self.inner.connect(peer).await
+    }
+
+    async fn advertise(&self, service: GattServiceSpec) -> ble_gatt::Result<()> {
+        self.advertise_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.advertise(service).await
+    }
+
+    async fn stop_advertising(&self) -> ble_gatt::Result<()> {
+        self.inner.stop_advertising().await
+    }
+
+    async fn notify(&self, characteristic: CharacteristicUuid, value: Vec<u8>) -> ble_gatt::Result<()> {
+        self.inner.notify(characteristic, value).await
+    }
+
+    async fn notify_peer(
+        &self, peer: &PeerAddress, session: Option<u64>, characteristic: CharacteristicUuid,
+        value: Vec<u8>,
+    ) -> ble_gatt::Result<()> {
+        self.inner.notify_peer(peer, session, characteristic, value).await
+    }
+
+    async fn disconnect_peer(&self, peer: &PeerAddress, session: Option<u64>) -> ble_gatt::Result<()> {
+        self.inner.disconnect_peer(peer, session).await
+    }
+
+    fn events(&self) -> BoxStream<GattEvent> {
+        self.inner.events()
+    }
+
+    async fn radio_status(&self) -> RadioStatus {
+        self.inner.radio_status().await
+    }
+}
+
+#[tokio::test]
+async fn a_radio_recovery_re_registers_the_service() {
+    let network = MockNetwork::new();
+    let peripheral_backend = device(&network, "peripheral");
+    let advertise_calls = Arc::new(AtomicUsize::new(0));
+    let counting = Arc::new(CountingBackend {
+        inner: peripheral_backend.clone() as Arc<dyn Backend>,
+        advertise_calls: advertise_calls.clone(),
+    });
+
+    let _server = Adapter::new(counting as Arc<dyn Backend>).await.peripheral().serve(service()).await.unwrap();
+    assert_eq!(advertise_calls.load(Ordering::SeqCst), 1, "serve's own initial advertise");
+
+    peripheral_backend.simulate_radio(RadioStatus::Off);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        advertise_calls.load(Ordering::SeqCst),
+        1,
+        "a radio loss alone must not trigger a re-advertise"
+    );
+
+    peripheral_backend.simulate_radio(RadioStatus::On);
+    timeout(WAIT, async {
+        while advertise_calls.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a radio recovery re-registers the service");
 }
