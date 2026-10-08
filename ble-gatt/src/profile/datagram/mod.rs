@@ -139,7 +139,7 @@ use crate::profile::datagram::reassembly::{Accept, Reassembler, ReassemblyLimits
 use crate::entities::error::{BleError, Result};
 use crate::entities::models::{
     CharacteristicUuid, ConnectionPriority, GattCharacteristicSpec, GattEvent, GattServiceSpec,
-    PeerAddress, Role, ServiceUuid, WriteType,
+    PeerAddress, RadioStatus, Role, ServiceUuid, WriteType,
 };
 
 pub const DEFAULT_MAX_MESSAGE_LEN: usize = 1024 * 1024;
@@ -1064,11 +1064,11 @@ pub async fn serve(
     let (channels_tx, channels_rx) = mpsc::channel(config.accept_queue_depth);
     let (release_tx, mut release_rx) = mpsc::unbounded_channel::<(PeerAddress, u64)>();
     let config = config.clone();
-    // The peripheral has no `GattConnection` to ask for a negotiated MTU, so
-    // it budgets against the spec-minimum. Conservative on purpose:
+    // Fallback when the backend cannot report a peer's notification size
+    // (`Backend::notify_max_len`): the spec-minimum. Conservative on purpose:
     // undersized fragments always fit, oversized ones would be truncated by
     // the stack with no error.
-    let peripheral_budget = crate::hal::DEFAULT_ATT_MTU as usize
+    let default_peripheral_budget = crate::hal::DEFAULT_ATT_MTU as usize
         - crate::hal::ATT_HEADER_LEN
         - FRAGMENT_HEADER_LEN;
 
@@ -1190,6 +1190,16 @@ pub async fn serve(
                     }
                     let generation = next_generation;
                     next_generation += 1;
+                    // A central usually subscribes before its first write, so
+                    // the backend can normally size notifications to this
+                    // peer's real MTU by now — 537 bytes as 2 notifications
+                    // instead of 45 at the spec-minimum.
+                    let peripheral_budget = backend
+                        .notify_max_len(&peer, backend_session)
+                        .await
+                        .and_then(|len| len.checked_sub(FRAGMENT_HEADER_LEN))
+                        .filter(|budget| *budget > 0)
+                        .unwrap_or(default_peripheral_budget);
                     let active = Arc::new(AtomicBool::new(true));
                     let (frag_tx, frag_rx) = mpsc::channel(config.fragment_queue_depth);
                     let (msg_tx, msg_rx) = mpsc::channel(config.inbound_queue_depth);
@@ -1423,13 +1433,34 @@ pub async fn serve(
                         return;
                     }
                 }
+                // A radio loss ends every served session. Per-peer
+                // `Disconnected` events cannot be relied on here: when
+                // bluetoothd itself dies, nothing is left to emit them, and a
+                // peer kept in `inbound` would refuse every central after
+                // recovery.
+                GattEvent::RadioChanged { status: RadioStatus::Off | RadioStatus::Unsupported } => {
+                    for (peer, served) in inbound.drain() {
+                        log::info!("serve: radio lost; ending session with central {}", peer.0);
+                        served.active.store(false, Ordering::SeqCst);
+                    }
+                    if accept_closed {
+                        return;
+                    }
+                }
+                // The platform forgot the GATT application and advertisement
+                // along with the radio (an adapter power-cycle, or a
+                // bluetoothd restart), and nothing else re-registers them.
+                GattEvent::RadioChanged { status: RadioStatus::On } => {
+                    if accept_closed {
+                        continue;
+                    }
+                    log::info!("serve: radio back; re-advertising service {}", config.service.0);
+                    if let Err(err) = backend.advertise(config.service_spec()).await {
+                        log::warn!("serve: re-advertising after radio recovery failed: {err}");
+                    }
+                }
                 // Central-role lifecycle belongs to `connect`, not here.
-                // `RadioChanged` is for `PeerLink` / a whole-connectivity
-                // consumer; the per-peer `Disconnected` events a radio loss
-                // also produces are what `serve` acts on.
-                GattEvent::Connected { .. }
-                | GattEvent::Disconnected { .. }
-                | GattEvent::RadioChanged { .. } => {}
+                GattEvent::Connected { .. } | GattEvent::Disconnected { .. } => {}
             }
         }
     });

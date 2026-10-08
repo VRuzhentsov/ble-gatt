@@ -52,6 +52,11 @@ const NOTIFY_SESSION_POLL: std::time::Duration = std::time::Duration::from_milli
 /// backend also serves) still fails promptly rather than stalling every
 /// `notify`/`notify_peer` caller for this long.
 const NOTIFY_WRITER_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long to wait, after bluetoothd reappears on the bus, for its adapter
+/// to report powered before giving up on reporting the radio back `On`.
+const BLUEZ_RESTART_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const BLUEZ_RESTART_READY_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 const NOTIFY_WRITER_ACQUIRE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// How long `connect()` waits for this backend's own discovery to stop
@@ -603,6 +608,7 @@ impl LinuxBackend {
         {
             let events_tx = events_tx.clone();
             let conn = discovery.conn.clone();
+            let adapter = adapter.clone();
             tokio::spawn(async move {
                 let rule =
                     dbus::message::MatchRule::new_signal("org.freedesktop.DBus", "NameOwnerChanged");
@@ -618,12 +624,33 @@ impl LinuxBackend {
                     if name != Some("org.bluez") {
                         continue;
                     }
-                    let status = match new_owner {
-                        Some(owner) if !owner.is_empty() => crate::entities::models::RadioStatus::On,
-                        _ => crate::entities::models::RadioStatus::Off,
-                    };
-                    log::info!("bluez watch: org.bluez owner changed, reporting radio {status:?}");
-                    let _ = events_tx.send(GattEvent::RadioChanged { status });
+                    if new_owner.is_none_or(|owner| owner.is_empty()) {
+                        log::warn!("bluez watch: bluetoothd left the bus, reporting radio Off");
+                        let _ = events_tx.send(GattEvent::RadioChanged {
+                            status: crate::entities::models::RadioStatus::Off,
+                        });
+                        continue;
+                    }
+                    // bluetoothd claims its bus name before it has exported
+                    // and powered the adapter, and `On` tells consumers to
+                    // re-register right away — so wait until it is usable.
+                    let ready = tokio::time::timeout(BLUEZ_RESTART_READY_TIMEOUT, async {
+                        while !adapter.is_powered().await.unwrap_or(false) {
+                            tokio::time::sleep(BLUEZ_RESTART_READY_POLL).await;
+                        }
+                    })
+                    .await;
+                    if ready.is_err() {
+                        log::warn!(
+                            "bluez watch: bluetoothd is back but the adapter is not powered after \
+                             {BLUEZ_RESTART_READY_TIMEOUT:?}; leaving radio Off"
+                        );
+                        continue;
+                    }
+                    log::info!("bluez watch: bluetoothd is back and the adapter is powered, reporting radio On");
+                    let _ = events_tx.send(GattEvent::RadioChanged {
+                        status: crate::entities::models::RadioStatus::On,
+                    });
                 }
             });
         }
@@ -2100,6 +2127,24 @@ impl Backend for LinuxBackend {
         } else {
             crate::entities::models::RadioStatus::Off
         }
+    }
+
+    async fn notify_max_len(&self, peer: &PeerAddress, session: Option<u64>) -> Option<usize> {
+        // Same lock order as `notify_matching`: writers first, then the
+        // session check, so the writer found belongs to the session asked for.
+        let writers = self.notify_writers.lock().await;
+        if let Some(session) = session {
+            if self.served_peers.lock().unwrap().get(peer) != Some(&session) {
+                return None;
+            }
+        }
+        // `CharacteristicWriter::mtu()` is already the usable value size
+        // (bluer subtracts its BlueZ truncation workaround), not the raw MTU.
+        writers
+            .values()
+            .flatten()
+            .find(|w| !w.is_closed().unwrap_or(true) && w.device_address().to_string() == peer.0)
+            .map(|w| w.mtu().min(crate::hal::MAX_ATT_ATTRIBUTE_LEN))
     }
 }
 
