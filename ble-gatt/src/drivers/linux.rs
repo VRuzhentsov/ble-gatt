@@ -1220,6 +1220,17 @@ impl Drop for LinuxConnectGuard {
                         );
                         break;
                     }
+                    // BlueZ removed the device object (it does for a stale
+                    // private address it no longer sees). A device that no
+                    // longer exists has no link left to clean up; retrying
+                    // kept the address quarantined for minutes on hardware.
+                    Ok(Ok(Err(err))) if err.kind == bluer::ErrorKind::NotFound => {
+                        log::info!(
+                            "connect: {} cleanup disconnect found the device already removed; treating as clean",
+                            peer.0
+                        );
+                        break;
+                    }
                     Ok(Ok(Err(err))) => {
                         log::warn!(
                             "connect: {} cleanup disconnect attempt failed ({err}), retrying in \

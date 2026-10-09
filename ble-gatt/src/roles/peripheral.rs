@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use futures::stream::StreamExt;
+use tokio_stream::StreamExt;
 
 use crate::entities::error::Result;
 use crate::entities::models::{CharacteristicUuid, GattEvent, GattServiceSpec, PeerAddress, RadioStatus};
