@@ -1310,6 +1310,17 @@ async fn read_scanned_peer(adapter: &Adapter, address: bluer::Address, target: u
         );
         return ScannedPeer::NotTarget;
     }
+    // BlueZ keeps device objects for addresses it heard in earlier scans and
+    // hands them to every new scan; it sets RSSI only once this discovery
+    // actually hears the device. Reporting a device without RSSI sent callers
+    // to addresses a phone had already rotated away from (Android picks a new
+    // private address each time it restarts advertising): 21 of 24 reports in
+    // one hardware session, each costing a 20s dial timeout. Treated as not yet
+    // known, so the completion watcher reports it once it is really heard.
+    let Some(rssi) = device.rssi().await.ok().flatten() else {
+        log::debug!("scan: {address} is cached but not heard in this scan yet");
+        return ScannedPeer::Unknown;
+    };
     let name = device.name().await.ok().flatten();
     let manufacturer_data: std::collections::BTreeMap<u16, Vec<u8>> = device
         .manufacturer_data()
@@ -1328,9 +1339,12 @@ async fn read_scanned_peer(adapter: &Adapter, address: bluer::Address, target: u
         .into_iter()
         .map(|(uuid, data)| (ServiceUuid(uuid), data))
         .collect();
-    let rssi = device.rssi().await.ok().flatten();
-    log::info!("scan: discovered {address} name={name:?} rssi={rssi:?}");
     let complete = !manufacturer_data.is_empty();
+    log::info!(
+        "scan: discovered {address} name={name:?} rssi={rssi} manufacturer_data={}",
+        if complete { "yes" } else { "not yet" }
+    );
+    let rssi = Some(rssi);
     let peer = DiscoveredPeer {
         address: PeerAddress(address.to_string()),
         name,

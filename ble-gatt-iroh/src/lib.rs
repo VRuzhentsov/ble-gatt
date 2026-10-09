@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 
 use ble_gatt::backend::Backend;
 use ble_gatt::datagram::{DatagramChannel, DatagramConfig};
-use ble_gatt::{PeerAddress, Role};
+use ble_gatt::{ConnectionPriority, PeerAddress, Role};
 use iroh::address_lookup::{self, AddressLookup, EndpointData, EndpointInfo, Item};
 use iroh::endpoint::transports::{CustomEndpoint, CustomSender, CustomTransport, RecvInfo, Transmit};
 use iroh_base::{CustomAddr, EndpointId, TransportAddr};
@@ -84,11 +84,24 @@ pub type DialFuture = Pin<Box<dyn Future<Output = ble_gatt::Result<DatagramChann
 pub type Dialer = Arc<dyn Fn(PeerAddress) -> DialFuture + Send + Sync>;
 
 /// A [`Dialer`] that opens channels with [`ble_gatt::datagram::connect`].
+///
+/// Each new link asks for [`ConnectionPriority::High`]: QUIC needs many
+/// connection events, and on the default interval a busy radio (an AX210
+/// also serving Wi-Fi or audio) missed enough of them for the link to hit its
+/// supervision timeout within seconds. The request is best-effort; Linux has
+/// no such control, and the channel is used either way. Links close when idle,
+/// so the higher power draw lasts only while there is traffic.
 pub fn dial_with(backend: Arc<dyn Backend>, config: DatagramConfig) -> Dialer {
     Arc::new(move |peer: PeerAddress| {
         let backend = backend.clone();
         let config = config.clone();
-        Box::pin(async move { ble_gatt::datagram::connect(backend, &peer, &config).await })
+        Box::pin(async move {
+            let mut channel = ble_gatt::datagram::connect(backend, &peer, &config).await?;
+            if let Err(err) = channel.request_connection_priority(ConnectionPriority::High).await {
+                log::debug!("link to {}: high connection priority not applied: {err}", peer.0);
+            }
+            Ok(channel)
+        })
     })
 }
 
