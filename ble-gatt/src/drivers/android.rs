@@ -971,6 +971,23 @@ impl Backend for AndroidBackend {
         }))
     }
 
+    async fn notify_max_len(&self, peer: &PeerAddress, session: Option<u64>) -> Option<usize> {
+        if let Some(session) = session {
+            if self.inner.server_sessions.lock().unwrap().get(&peer.0) != Some(&session) {
+                return None;
+            }
+        }
+        // Filled by `onMtuChanged` from either role's callback: one ATT
+        // bearer per link, so a central's MTU exchange on our server lands
+        // in the same per-address entry.
+        let mtu = *self.inner.att_mtus.lock().unwrap().get(&peer.0)?;
+        Some(
+            (mtu as usize)
+                .saturating_sub(crate::hal::ATT_HEADER_LEN)
+                .min(crate::hal::MAX_ATT_ATTRIBUTE_LEN),
+        )
+    }
+
     async fn radio_status(&self) -> RadioStatus {
         let enabled = (|| -> Result<bool> {
             let mut env = self.inner.env()?;

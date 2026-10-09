@@ -28,6 +28,15 @@ pub const DEFAULT_ATT_MTU: u16 = 23;
 /// `GattConnection::max_write_len`.
 pub const ATT_HEADER_LEN: usize = 3;
 
+/// Largest attribute value the ATT protocol permits in a single PDU
+/// (Bluetooth Core spec, Vol 3, Part F, 3.2.9), independent of MTU. An ATT
+/// MTU above 515 makes `att_mtu - ATT_HEADER_LEN` exceed this, and a write
+/// of that size is rejected outright — on Android as a client-side
+/// `IllegalArgumentException`, before any ATT traffic — rather than
+/// negotiated down. `max_write_len` clamps to this so no platform's cap
+/// requires its own knowledge of the ATT limit.
+pub const MAX_ATT_ATTRIBUTE_LEN: usize = 512;
+
 /// One live GATT client connection to a remote peripheral (central role).
 #[async_trait]
 pub trait GattConnection: Send {
@@ -46,11 +55,14 @@ pub trait GattConnection: Send {
     fn att_mtu(&self) -> u16;
 
     /// Largest payload that fits in a single write/notify on this
-    /// connection (`att_mtu` minus [`ATT_HEADER_LEN`]). Chunk bulk transfers
-    /// against *this*, not a hardcoded constant — the value is only known
-    /// after MTU negotiation and differs per peer and per platform.
+    /// connection (`att_mtu` minus [`ATT_HEADER_LEN`], capped at
+    /// [`MAX_ATT_ATTRIBUTE_LEN`]). Chunk bulk transfers against *this*, not
+    /// a hardcoded constant — the value is only known after MTU negotiation
+    /// and differs per peer and per platform.
     fn max_write_len(&self) -> usize {
-        (self.att_mtu() as usize).saturating_sub(ATT_HEADER_LEN)
+        (self.att_mtu() as usize)
+            .saturating_sub(ATT_HEADER_LEN)
+            .min(MAX_ATT_ATTRIBUTE_LEN)
     }
 
     async fn read(&mut self, characteristic: CharacteristicUuid) -> Result<Vec<u8>>;
@@ -182,6 +194,15 @@ pub trait Backend: Send + Sync {
     /// `None` disconnects whatever currently holds the address, which is
     /// only correct when the caller has no session to be stale about.
     async fn disconnect_peer(&self, peer: &PeerAddress, session: Option<u64>) -> Result<()>;
+
+    /// Largest value a single notification to `peer` can carry, once the
+    /// platform knows it (Linux: the MTU BlueZ returns with `AcquireNotify`).
+    /// `None` where the backend cannot tell, or before the peer subscribed —
+    /// callers then budget against [`DEFAULT_ATT_MTU`].
+    async fn notify_max_len(&self, peer: &PeerAddress, session: Option<u64>) -> Option<usize> {
+        let _ = (peer, session);
+        None
+    }
 
     // --- Lifecycle ---
 

@@ -39,11 +39,11 @@ use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ble_gatt::backend::Backend;
 use ble_gatt::datagram::{DatagramChannel, DatagramConfig};
-use ble_gatt::PeerAddress;
+use ble_gatt::{ConnectionPriority, PeerAddress, Role};
 use iroh::address_lookup::{self, AddressLookup, EndpointData, EndpointInfo, Item};
 use iroh::endpoint::transports::{CustomEndpoint, CustomSender, CustomTransport, RecvInfo, Transmit};
 use iroh_base::{CustomAddr, EndpointId, TransportAddr};
@@ -66,6 +66,13 @@ const INBOUND_QUEUE_DEPTH: usize = 256;
 /// whose connection has ended goes idle, and closing it frees the radio.
 pub const DEFAULT_LINK_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// After a link the peer dialled (we were the peripheral) ends, how long this
+/// side leaves reconnecting to the peer instead of dialling it too. Both sides
+/// re-dialling at once crossed on hardware: two links to one peer, each
+/// tearing the other down. The dialler re-dials within a second or two (a
+/// dial times out at 20s), so this only has to outlast one dial attempt.
+const REDIAL_YIELD: Duration = Duration::from_secs(30);
+
 /// A packet received from a peer.
 type Inbound = (PeerAddress, Vec<u8>);
 
@@ -77,11 +84,24 @@ pub type DialFuture = Pin<Box<dyn Future<Output = ble_gatt::Result<DatagramChann
 pub type Dialer = Arc<dyn Fn(PeerAddress) -> DialFuture + Send + Sync>;
 
 /// A [`Dialer`] that opens channels with [`ble_gatt::datagram::connect`].
+///
+/// Each new link asks for [`ConnectionPriority::High`]: QUIC needs many
+/// connection events, and on the default interval a busy radio (an AX210
+/// also serving Wi-Fi or audio) missed enough of them for the link to hit its
+/// supervision timeout within seconds. The request is best-effort; Linux has
+/// no such control, and the channel is used either way. Links close when idle,
+/// so the higher power draw lasts only while there is traffic.
 pub fn dial_with(backend: Arc<dyn Backend>, config: DatagramConfig) -> Dialer {
     Arc::new(move |peer: PeerAddress| {
         let backend = backend.clone();
         let config = config.clone();
-        Box::pin(async move { ble_gatt::datagram::connect(backend, &peer, &config).await })
+        Box::pin(async move {
+            let mut channel = ble_gatt::datagram::connect(backend, &peer, &config).await?;
+            if let Err(err) = channel.request_connection_priority(ConnectionPriority::High).await {
+                log::debug!("link to {}: high connection priority not applied: {err}", peer.0);
+            }
+            Ok(channel)
+        })
     })
 }
 
@@ -146,6 +166,7 @@ impl BleGattTransportBuilder {
                 peers: Mutex::new(HashMap::new()),
                 inbound_tx,
                 inbound_rx: Mutex::new(Some(inbound_rx)),
+                answered: Mutex::new(HashMap::new()),
                 dialer: self.dialer,
                 local: n0_watcher::Watchable::new(local),
                 link_idle_timeout: self.link_idle_timeout.unwrap_or(DEFAULT_LINK_IDLE_TIMEOUT),
@@ -169,6 +190,8 @@ struct Inner {
     inbound_tx: mpsc::Sender<Inbound>,
     /// Taken by the one endpoint that binds this transport.
     inbound_rx: Mutex<Option<mpsc::Receiver<Inbound>>>,
+    /// When a link the peer dialled ended, per peer; see [`REDIAL_YIELD`].
+    answered: Mutex<HashMap<PeerAddress, Instant>>,
     dialer: Option<Dialer>,
     local: n0_watcher::Watchable<Vec<CustomAddr>>,
     link_idle_timeout: Duration,
@@ -197,6 +220,7 @@ impl BleGattTransport {
     pub fn attach(&self, channel: DatagramChannel) -> tokio::task::JoinHandle<()> {
         let peer = channel.peer();
         let (tx, rx) = mpsc::channel(LINK_QUEUE_DEPTH);
+        self.inner.answered.lock().expect("poisoned").remove(&peer);
         self.inner
             .links
             .lock()
@@ -262,6 +286,7 @@ async fn run_link(
     link: mpsc::Sender<Vec<u8>>,
 ) {
     log::debug!("link to {} up", peer.0);
+    let role = channel.local_role();
     let (to_send, mut sending) = mpsc::channel::<Vec<u8>>(LINK_QUEUE_DEPTH);
     let sender = channel.sender();
     let send_peer = peer.clone();
@@ -310,6 +335,9 @@ async fn run_link(
     }
     send_task.abort();
     let _ = channel.close().await;
+    if role == Role::Peripheral {
+        inner.answered.lock().expect("poisoned").insert(peer.clone(), Instant::now());
+    }
     remove_link(&inner, &peer, &link);
     log::debug!("link to {} down", peer.0);
 }
@@ -451,6 +479,15 @@ impl Sender {
             },
             None => packet,
         };
+        // The peer dialled the link that just ended, so it re-dials; dialling
+        // it too would cross. Dropping the packet reads to QUIC as loss, and
+        // it resends once the peer's new link is attached.
+        if let Some(ended) = self.inner.answered.lock().expect("poisoned").get(peer) {
+            if ended.elapsed() < REDIAL_YIELD {
+                log::debug!("not dialling {}: waiting for it to dial back", peer.0);
+                return Ok(());
+            }
+        }
         let Some(dialer) = self.inner.dialer.clone() else {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
