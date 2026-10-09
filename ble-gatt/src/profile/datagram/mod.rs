@@ -437,6 +437,17 @@ impl DatagramChannel {
         self.peer.clone()
     }
 
+    /// Which side of the link this end is: `Central` for a channel from
+    /// [`connect`] (we dialled), `Peripheral` for one from [`serve`] (the peer
+    /// dialled us). Only served channels hold a slot to release.
+    pub fn local_role(&self) -> Role {
+        if self.release.is_some() {
+            Role::Peripheral
+        } else {
+            Role::Central
+        }
+    }
+
     /// The backend session this channel is bound to, when the backend can
     /// distinguish successive connections to the same address.
     pub fn session(&self) -> Option<u64> {
