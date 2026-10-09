@@ -53,11 +53,6 @@ const NOTIFY_SESSION_POLL: std::time::Duration = std::time::Duration::from_milli
 /// `notify`/`notify_peer` caller for this long.
 const NOTIFY_WRITER_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// How long a central-role `disconnect()` waits before actually dropping
-/// the shared ACL — long enough for a peer that answers a probe by dialling
-/// back (seen on hardware ~1s later) to show up as a served session first.
-const SHARED_ACL_DISCONNECT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// How long to wait, after bluetoothd reappears on the bus, for its adapter
 /// to report powered before giving up on reporting the radio back `On`.
 const BLUEZ_RESTART_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -2341,40 +2336,26 @@ impl GattConnection for LinuxGattConnection {
         let _dial = self.dial_lock.lock().await;
         self.ensure_current()?;
 
-        // BlueZ keeps exactly one ACL per remote address, shared with any
-        // peripheral-role session the same peer opens to us, and
-        // `Device1.Disconnect` kills that ACL about 2s *after* the call
-        // returns (BlueZ's own disconnect timer). So no check made before
-        // the call can protect an inbound session: hardware showed the peer
-        // dialling us 1s after a probe channel closed, riding the doomed
-        // ACL, and dying with it a second later mid-reply (reason 0x13).
+        // BlueZ keeps exactly one ACL per remote address. If the same peer
+        // also holds a live peripheral-role session right now (it dialled
+        // us while we were dialling it, or just never disconnected after),
+        // `Device::disconnect()` tears down that shared link too — dropping
+        // a central-role channel this call's caller is done with would
+        // silently kill an inbound session a completely different consumer
+        // is still relying on. Hardware-confirmed: closing a central probe
+        // link ended the phone's own inbound connection on the same ACL a
+        // moment later, losing an in-flight reply.
         //
-        // So the central link is reported lost right away — from the
-        // caller's point of view it is gone — and the platform disconnect
-        // is deferred, then skipped if by then the peer is served by us or
-        // a newer dial owns the address.
-        report_central_loss(&self.events_tx, &self.dialed, &self.peer, self.session);
-        let device = self.device.clone();
-        let dial_lock = self.dial_lock.clone();
-        let served_peers = self.served_peers.clone();
-        let dialed = self.dialed.clone();
-        let peer = self.peer.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(SHARED_ACL_DISCONNECT_GRACE).await;
-            let _dial = dial_lock.lock().await;
-            if served_peers.lock().unwrap().contains_key(&peer) {
-                log::info!("disconnect: keeping the link to {} — it is serving a peripheral session", peer.0);
-                return;
-            }
-            if dialed.lock().unwrap().contains_key(&peer) {
-                log::info!("disconnect: keeping the link to {} — a newer dial owns it", peer.0);
-                return;
-            }
-            if let Err(err) = device.disconnect().await {
-                log::warn!("disconnect: deferred disconnect of {} failed: {err}", peer.0);
-            }
-        });
-        Ok(())
+        // Reporting the central-role link as lost rather than leaving it
+        // silently stuck: the caller asked to disconnect, and from its own
+        // point of view this *is* gone — it just doesn't get to take the
+        // shared radio link down with it.
+        if self.served_peers.lock().unwrap().contains_key(&self.peer) {
+            report_central_loss(&self.events_tx, &self.dialed, &self.peer, self.session);
+            return Ok(());
+        }
+
+        self.device.disconnect().await.map_err(|err| BleError::Gatt(err.to_string()))
     }
 }
 
