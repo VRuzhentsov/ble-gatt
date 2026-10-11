@@ -85,6 +85,12 @@ The largest single message a connection carries at once, agreed by both sides
 after connecting (23 bytes at minimum, often a few hundred). Anything larger
 is split into fragments.
 
+### Attribute value
+The bytes carried by one read, write or notification of a characteristic.
+Bluetooth caps it at 512 bytes, whatever the MTU. With an MTU of 517 the
+largest message would be 514 bytes, so the 512-byte cap applies first, and
+Android refuses a longer write outright (`MAX_ATT_ATTRIBUTE_LEN`).
+
 ### Connection priority
 A request to the phone's Bluetooth stack to trade battery for speed on one
 connection (shorter connection interval). Android only.

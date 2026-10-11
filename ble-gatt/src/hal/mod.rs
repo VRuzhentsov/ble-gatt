@@ -28,7 +28,8 @@ pub const DEFAULT_ATT_MTU: u16 = 23;
 /// `GattConnection::max_write_len`.
 pub const ATT_HEADER_LEN: usize = 3;
 
-/// Largest attribute value the ATT protocol permits in a single PDU
+/// Largest attribute value (see `docs/glossary.md`: the bytes of one read,
+/// write or notification) the ATT protocol permits in a single PDU
 /// (Bluetooth Core spec, Vol 3, Part F, 3.2.9), independent of MTU. An ATT
 /// MTU above 515 makes `att_mtu - ATT_HEADER_LEN` exceed this, and a write
 /// of that size is rejected outright — on Android as a client-side

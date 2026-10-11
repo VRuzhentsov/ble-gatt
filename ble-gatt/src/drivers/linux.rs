@@ -53,6 +53,12 @@ const NOTIFY_SESSION_POLL: std::time::Duration = std::time::Duration::from_milli
 /// `notify`/`notify_peer` caller for this long.
 const NOTIFY_WRITER_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// How often a GATT handler that BlueZ called before `advertise` published
+/// its generation checks again, and how many times a write waits (2s) before
+/// it is treated as stale.
+const GENERATION_PUBLISH_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+const GENERATION_PUBLISH_MAX_POLLS: usize = 200;
+
 /// How long to wait, after bluetoothd reappears on the bus, for its adapter
 /// to report powered before giving up on reporting the radio back `On`.
 const BLUEZ_RESTART_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -546,6 +552,36 @@ pub struct LinuxBackend {
     discovery: Arc<DiscoveryBus>,
 }
 
+impl LinuxBackend {
+    /// Announces every served central as gone, then forgets it and its notify
+    /// sessions. For when the registration serving them ends (stop, or a
+    /// replacement `advertise`), whose disconnect watchers are aborted.
+    ///
+    /// Announcing first matters: silently clearing left `datagram::serve`
+    /// holding those peers with their channels live, so the next server
+    /// refused the real central as an interloper. And forgetting matters: a
+    /// stale `served_peers` entry makes `watch_notify_sessions` skip the
+    /// peer's next subscription, so it is never given a session or a
+    /// disconnect watcher again.
+    async fn release_served_peers(&self, why: &str) {
+        let mut writers = self.notify_writers.lock().await;
+        let served: Vec<PeerAddress> = self.served_peers.lock().unwrap().drain().map(|(peer, _)| peer).collect();
+        self.announce_released(served, why);
+        writers.clear();
+    }
+
+    fn announce_released(&self, served: Vec<PeerAddress>, why: &str) {
+        for peer in served {
+            log::info!("advertise: releasing served central {} on {why}", peer.0);
+            let _ = self.events_tx.send(GattEvent::Disconnected {
+                peer,
+                local_role: Role::Peripheral,
+                session: None,
+            });
+        }
+    }
+}
+
 /// Reports bluetoothd itself leaving and rejoining the bus — a crash or a
 /// package upgrade restarting it — as `RadioChanged` `Off`/`On`. Once
 /// bluetoothd exits no process is left to emit `Powered(false)`, so the
@@ -757,7 +793,21 @@ async fn watch_notify_sessions(
         // The async lock on `writers` is taken *first*, so that from the
         // generation check onward there is no await and every effect below
         // is indivisible with it.
-        let mut writers_guard = writers.lock().await;
+        // A subscription can reach this generation's handlers in the instant
+        // between BlueZ serving the application and `advertise` publishing
+        // the generation. That is "not yet current", not stale: wait for the
+        // publish instead of returning, which would end this watcher and
+        // ignore every later subscription. `advertise` publishes while
+        // holding `writers`, so once the generation is current here it
+        // cannot change before the check below.
+        let mut writers_guard = loop {
+            let guard = writers.lock().await;
+            if *advertise_generation.lock().unwrap() >= this_generation {
+                break guard;
+            }
+            drop(guard);
+            tokio::time::sleep(GENERATION_PUBLISH_POLL).await;
+        };
         let session = {
             let current = advertise_generation.lock().unwrap();
             if *current != this_generation {
@@ -1676,6 +1726,7 @@ impl Backend for LinuxBackend {
             dialed: self.dialed.clone(),
             dial_lock: self.dial_lock.clone(),
             served_peers: self.served_peers.clone(),
+            notify_writers: self.notify_writers.clone(),
             events_tx: self.events_tx.clone(),
             peer: peer.clone(),
             device,
@@ -1707,9 +1758,8 @@ impl Backend for LinuxBackend {
         // still-live handlers stale before its BlueZ objects are actually
         // replaced below, silently dropping any write or subscribe that
         // lands on them in that window — hardware-confirmed to happen on a
-        // re-advertise. Published only once the new application and
-        // advertisement are installed, by which point the outgoing
-        // generation's BlueZ objects are already being replaced anyway.
+        // re-advertise. Published the moment BlueZ serves the new
+        // application (below), together with replacing the old one.
         let advertise_generation = self.advertise_generation.clone();
         let this_generation = *advertise_generation.lock().unwrap() + 1;
         let server_watch = self.server_watch.clone();
@@ -1784,6 +1834,16 @@ impl Backend for LinuxBackend {
                             // `server_watch` is a sync mutex precisely so
                             // there is no await anywhere in here: from the
                             // check onward this is indivisible.
+                            // Not yet published (see `watch_notify_sessions`):
+                            // wait briefly rather than drop a write that is
+                            // current. The generation only moves forward, so
+                            // after this the check below sees current or stale.
+                            for _ in 0..GENERATION_PUBLISH_MAX_POLLS {
+                                if *advertise_generation.lock().unwrap() >= this_generation {
+                                    break;
+                                }
+                                tokio::time::sleep(GENERATION_PUBLISH_POLL).await;
+                            }
                             let current = advertise_generation.lock().unwrap();
                             if *current != this_generation {
                                 log::warn!(
@@ -1907,6 +1967,30 @@ impl Backend for LinuxBackend {
             log::warn!("advertise: BlueZ rejected the GATT application: {err}");
             BleError::Gatt(err.to_string())
         })?;
+        // Switch over the moment BlueZ serves the new application: from now
+        // on it dispatches writes and subscriptions to the new handlers, so
+        // they must be current even while the advertisement below is still
+        // being registered. Replacing the handle also unregisters the old
+        // application, so no request reaches handlers that now refuse it.
+        //
+        // The old generation's centrals are released in the same step: their
+        // disconnect watchers were aborted above, so a `served_peers` entry
+        // left behind would make the next subscription from that address be
+        // skipped for good. The admission lock (`notify_writers`) and the
+        // generation lock are held across publish and drain, so a new
+        // session is admitted either before (and released with the old) or
+        // after (and kept), never lost in between.
+        {
+            let mut writers = self.notify_writers.lock().await;
+            *self.app_handle.lock().await = Some(app_handle);
+            let released: Vec<PeerAddress> = {
+                let mut current = advertise_generation.lock().unwrap();
+                *current = this_generation;
+                self.served_peers.lock().unwrap().drain().map(|(peer, _)| peer).collect()
+            };
+            self.announce_released(released, "re-advertise");
+            writers.clear();
+        }
 
         let adv = Advertisement {
             service_uuids: [service.uuid.0].into_iter().collect(),
@@ -1924,15 +2008,7 @@ impl Backend for LinuxBackend {
             BleError::Gatt(err.to_string())
         })?;
 
-        // Install the new BlueZ objects and publish the generation together,
-        // immediately after both registrations succeeded — see the doc
-        // comment on `this_generation`'s reservation above. Published last:
-        // a failed registration above leaves the outgoing generation (and
-        // its still-live BlueZ objects) valid rather than burning a
-        // generation number for a re-advertise that never took effect.
-        *self.app_handle.lock().await = Some(app_handle);
         *self.adv_handle.lock().await = Some(adv_handle);
-        *advertise_generation.lock().unwrap() = this_generation;
         log::info!("advertise: registered, generation={this_generation}");
 
         // The previous generation's watchers were already aborted before any
@@ -1964,25 +2040,9 @@ impl Backend for LinuxBackend {
         for watch in self.server_watch.lock().unwrap().drain(..) {
             watch.abort();
         }
-        // Announce the departure of every central we were serving *before*
-        // forgetting them. Silently clearing the set left `datagram::serve`
-        // holding those peers in its single-central map with their channels
-        // still live, so a later `advertise` had the old task disconnecting
-        // the new server's central as an interloper — locking the new
-        // `serve` out until the stale peer happened to drop physically.
-        let served: Vec<PeerAddress> =
-            self.served_peers.lock().unwrap().drain().map(|(peer, _)| peer).collect();
-        for peer in served {
-            log::info!("advertise: releasing served central {} on stop", peer.0);
-            let _ = self.events_tx.send(GattEvent::Disconnected {
-                peer,
-                local_role: Role::Peripheral,
-                session: None,
-            });
-        }
+        self.release_served_peers("stop").await;
         *self.app_handle.lock().await = None;
         *self.adv_handle.lock().await = None;
-        self.notify_writers.lock().await.clear();
         Ok(())
     }
 
@@ -2097,6 +2157,10 @@ struct LinuxGattConnection {
     /// the same `bluer::Device`. Checked by `disconnect()` before it would
     /// otherwise kill a link the peripheral role still needs.
     served_peers: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
+    /// Peripheral-role session admission lock (see `watch_notify_sessions`),
+    /// held by `disconnect()` across its `served_peers` check and the platform
+    /// call, as `disconnect_peer` does.
+    notify_writers: Arc<AsyncMutex<HashMap<CharacteristicUuid, Vec<CharacteristicWriter>>>>,
     /// So `disconnect()` can report the central-role link as lost without
     /// actually tearing down the ACL — see its doc comment.
     events_tx: broadcast::Sender<GattEvent>,
@@ -2282,6 +2346,12 @@ impl GattConnection for LinuxGattConnection {
         // silently stuck: the caller asked to disconnect, and from its own
         // point of view this *is* gone — it just doesn't get to take the
         // shared radio link down with it.
+        //
+        // The admission lock is held from this check through the platform
+        // call, so a peer cannot be admitted as served in between and then
+        // lose its session to the disconnect. BlueZ itself still drops the
+        // ACL ~2s after the call, which no lock here can cover.
+        let _admission = self.notify_writers.lock().await;
         if self.served_peers.lock().unwrap().contains_key(&self.peer) {
             report_central_loss(&self.events_tx, &self.dialed, &self.peer, self.session);
             return Ok(());
