@@ -67,7 +67,9 @@ const INBOUND_QUEUE_DEPTH: usize = 256;
 pub const DEFAULT_LINK_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// After a link the peer dialled (we were the peripheral) ends, how long this
-/// side leaves reconnecting to the peer instead of dialling it too. Both sides
+/// side leaves reconnecting to the peer instead of dialling it too — for an
+/// address the caller set with `set_peer_address`; an address only ever seen
+/// as the source of the peer's connection is not dialled at all. Both sides
 /// re-dialling at once crossed on hardware: two links to one peer, each
 /// tearing the other down. The dialler re-dials within a second or two (a
 /// dial times out at 20s), so this only has to outlast one dial attempt.
@@ -190,7 +192,9 @@ struct Inner {
     inbound_tx: mpsc::Sender<Inbound>,
     /// Taken by the one endpoint that binds this transport.
     inbound_rx: Mutex<Option<mpsc::Receiver<Inbound>>>,
-    /// When a link the peer dialled ended, per peer; see [`REDIAL_YIELD`].
+    /// Addresses whose last link was one the peer dialled, with when it
+    /// ended; see [`REDIAL_YIELD`] and `Sender::send`. Cleared when we dial
+    /// the address successfully.
     answered: Mutex<HashMap<PeerAddress, Instant>>,
     dialer: Option<Dialer>,
     local: n0_watcher::Watchable<Vec<CustomAddr>>,
@@ -479,10 +483,22 @@ impl Sender {
             },
             None => packet,
         };
-        // The peer dialled the link that just ended, so it re-dials; dialling
-        // it too would cross. Dropping the packet reads to QUIC as loss, and
-        // it resends once the peer's new link is attached.
-        if let Some(ended) = self.inner.answered.lock().expect("poisoned").get(peer) {
+        // The last link with this address was one the peer dialled. Dropping
+        // the packet reads to QUIC as loss, and it resends once a link exists.
+        let answered = self.inner.answered.lock().expect("poisoned").get(peer).copied();
+        if let Some(ended) = answered {
+            // Seen only as the source of the peer's own connection: iroh
+            // remembers it as a path, but a phone dials from a private
+            // address it never accepts connections on and soon drops, so
+            // dialling it hung 20s on hardware while the address the caller
+            // set went unused. Only an address the caller set is dialled.
+            let set_by_caller = self.inner.peers.lock().expect("poisoned").values().any(|address| address == peer);
+            if !set_by_caller {
+                log::debug!("not dialling {}: only known as the source of its own connection", peer.0);
+                return Ok(());
+            }
+            // An address the caller set: the peer re-dials after a drop, and
+            // dialling it too would cross. Wait for it, for a while.
             if ended.elapsed() < REDIAL_YIELD {
                 log::debug!("not dialling {}: waiting for it to dial back", peer.0);
                 return Ok(());
@@ -505,7 +521,11 @@ impl Sender {
         tokio::spawn(async move {
             log::debug!("dialling {}", peer.0);
             match dialer(peer.clone()).await {
-                Ok(channel) => run_link(inner, peer, channel, rx, tx).await,
+                Ok(channel) => {
+                    // Reachable by dialling after all: no longer inbound-only.
+                    inner.answered.lock().expect("poisoned").remove(&peer);
+                    run_link(inner, peer, channel, rx, tx).await
+                }
                 Err(err) => {
                     log::debug!("dial to {} failed: {err}", peer.0);
                     remove_link(&inner, &peer, &tx);

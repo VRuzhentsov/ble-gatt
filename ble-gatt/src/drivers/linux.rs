@@ -100,7 +100,9 @@ const EVENT_CHANNEL_CAPACITY: usize = 64;
 /// Real-hardware evidence: with no bound at all, a `Connect` call to an
 /// unresponsive/out-of-range peer can hang effectively forever — not just
 /// past a caller's own external timeout, since `dial_lock` is held across
-/// the whole call and every subsequent dial (and, evidence suggests, the
+/// the whole call and every subsequent dial to that address (and, when the
+/// lock was still backend-wide, every other peer's operations; and,
+/// evidence suggests, the
 /// shared D-Bus connection's own capacity for outstanding calls) piles up
 /// behind it rather than that one dial simply failing slowly. A caller-side
 /// `tokio::time::timeout` around the whole `connect()` future does not fix
@@ -115,8 +117,8 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 /// itself hit the same D-Bus timeout the stuck `Connect` was already
 /// sitting on ("cleanup disconnect ... failed: ... D-Bus error ...
 /// Timeout waiting for reply") — an unbounded cleanup call holding the same
-/// `dial_lock` is just as capable of starving every other dial as the
-/// original stuck connect was. Shorter than `CONNECT_TIMEOUT`: this is a
+/// `dial_lock` is just as capable of starving later dials to the address as
+/// the original stuck connect was. Shorter than `CONNECT_TIMEOUT`: this is a
 /// best-effort cancellation signal, not an operation worth waiting as long
 /// for.
 const CLEANUP_DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -490,15 +492,16 @@ pub struct LinuxBackend {
     /// setup would then install its own handles regardless, leaving the
     /// service advertising after stop had returned.
     advertise_lock: Arc<AsyncMutex<()>>,
-    /// Serialises every GATT operation against dial and teardown.
+    /// Serialises every GATT operation against dial and teardown, per peer
+    /// address.
     ///
     /// `bluer`'s `Device` is address-backed, so checking ownership and then
     /// awaiting `disconnect()` leaves a window in which a reconnect installs
     /// a new dial — and the in-flight call then drops *that* link. A plain
     /// mutex around the check cannot help, because the platform call is
     /// asynchronous; the two operations have to exclude each other for their
-    /// whole duration.
-    dial_lock: Arc<AsyncMutex<()>>,
+    /// whole duration. See [`DialLocks`] for why it is per address.
+    dial_lock: DialLocks,
     /// Which advertisement is current. The GATT application's own handlers
     /// are not registered in `server_watch` and cannot be aborted, so
     /// dropping the application handle does not stop a handler that is
@@ -579,6 +582,30 @@ impl LinuxBackend {
                 session: None,
             });
         }
+    }
+}
+
+/// One dial/teardown lock per peer address (see `LinuxBackend::dial_lock`).
+///
+/// The race the lock closes is per address: `Device` resolves by address, so
+/// only operations on the *same* address can drop each other's link. A
+/// single backend-wide lock also made every other peer wait behind a slow
+/// dial: on hardware, a 20s Connect to a stale address held a live link's
+/// write for those 20s, and the QUIC handshake on that link timed out.
+///
+/// Entries no one holds or waits on are dropped on the next `lock`, so
+/// rotating private addresses do not grow the map without bound.
+#[derive(Clone, Default)]
+struct DialLocks(Arc<StdMutex<HashMap<PeerAddress, Arc<AsyncMutex<()>>>>>);
+
+impl DialLocks {
+    async fn lock(&self, peer: &PeerAddress) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.0.lock().unwrap();
+            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+            locks.entry(peer.clone()).or_default().clone()
+        };
+        lock.lock_owned().await
     }
 }
 
@@ -697,7 +724,7 @@ impl LinuxBackend {
             values: Arc::new(StdMutex::new(HashMap::new())),
             served_peers: Arc::new(StdMutex::new(HashMap::new())),
             next_session: Arc::new(AtomicU64::new(1)),
-            dial_lock: Arc::new(AsyncMutex::new(())),
+            dial_lock: DialLocks::default(),
             advertise_lock: Arc::new(AsyncMutex::new(())),
             advertise_generation: Arc::new(StdMutex::new(1)),
             notify_writers: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -1086,7 +1113,7 @@ struct LinuxConnectGuard {
     adapter: Adapter,
     address: bluer::Address,
     dialed: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
-    dial_lock: Arc<AsyncMutex<()>>,
+    dial_lock: DialLocks,
     pending_cleanup: Arc<StdMutex<HashSet<PeerAddress>>>,
     /// Reserved by `connect()` before `device.connect()` was ever issued —
     /// see `MAX_CONCURRENT_CLEANUP_DISCONNECTS`'s doc comment. `Some` for
@@ -1214,13 +1241,12 @@ impl Drop for LinuxConnectGuard {
                     // fresh attempt, not around waiting on one already
                     // running — that D-Bus call proceeds independently of
                     // this lock once issued, and the address is already
-                    // quarantined regardless, so holding a backend-wide
-                    // lock for another `CLEANUP_DISCONNECT_TIMEOUT` just to
-                    // poll an existing task needlessly blocked every other
-                    // peer's dial/read/write for that whole span, repeated
-                    // on every timeout, and multiple stuck peers could
-                    // compound the delay past any caller's own timeout.
-                    let _dial = dial_lock.lock().await;
+                    // quarantined regardless, so holding the lock (then
+                    // backend-wide, now this address's own) for another
+                    // `CLEANUP_DISCONNECT_TIMEOUT` just to poll an existing
+                    // task needlessly blocked other operations for that
+                    // whole span, repeated on every timeout.
+                    let _dial = dial_lock.lock(&peer).await;
                     // A newer dial claiming this address while quarantined
                     // should be structurally impossible now — connect()'s
                     // own quarantine checks (before and after acquiring
@@ -1558,7 +1584,7 @@ impl Backend for LinuxBackend {
         //
         // Held across the platform call, so a concurrent `disconnect` on an
         // older handle cannot land midway and drop this link.
-        let _dial = self.dial_lock.lock().await;
+        let _dial = self.dial_lock.lock(peer).await;
         // Re-checked now that `dial_lock` is actually held: the check above
         // only sees state as of *before* this call queued for the lock.
         // Real-hardware evidence (Codex review): a cancelled attempt's
@@ -2079,7 +2105,7 @@ impl Backend for LinuxBackend {
         // for the reason `dial_lock` already was: `Device` resolves by
         // address, so validating and then awaiting would let either kind of
         // reconnect land in the gap and have this call drop the replacement.
-        let _dial = self.dial_lock.lock().await;
+        let _dial = self.dial_lock.lock(peer).await;
         let _writers = self.notify_writers.lock().await;
         if let Some(session) = session {
             if self.served_peers.lock().unwrap().get(peer) != Some(&session) {
@@ -2149,7 +2175,7 @@ struct LinuxGattConnection {
     /// connection that replaced it.
     dialed: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
     /// See `LinuxBackend::dial_lock`.
-    dial_lock: Arc<AsyncMutex<()>>,
+    dial_lock: DialLocks,
     /// Peripheral-role sessions currently being served, shared with
     /// `LinuxBackend`. BlueZ keeps one ACL per remote address — disconnecting
     /// it from the central role tears down a peripheral-role session on the
@@ -2227,7 +2253,7 @@ impl GattConnection for LinuxGattConnection {
     }
 
     async fn read(&mut self, characteristic: CharacteristicUuid) -> Result<Vec<u8>> {
-        let _dial = self.dial_lock.lock().await;
+        let _dial = self.dial_lock.lock(&self.peer).await;
         self.ensure_current()?;
         let target = self.find_characteristic(characteristic).await?;
         if let Ok(mtu) = target.mtu().await {
@@ -2262,7 +2288,7 @@ impl GattConnection for LinuxGattConnection {
         };
         // A single attempt — no internal retry; see `read`'s matching
         // comment and `is_transient_gatt_error`'s doc comment.
-        let _dial = self.dial_lock.lock().await;
+        let _dial = self.dial_lock.lock(&self.peer).await;
         self.ensure_current()?;
         let target = self.find_characteristic(characteristic).await?;
         // Cache the negotiated MTU opportunistically: BlueZ only publishes a
@@ -2288,7 +2314,7 @@ impl GattConnection for LinuxGattConnection {
     async fn subscribe(
         &mut self, characteristic: CharacteristicUuid,
     ) -> Result<BoxStream<Result<Vec<u8>>>> {
-        let _dial = self.dial_lock.lock().await;
+        let _dial = self.dial_lock.lock(&self.peer).await;
         self.ensure_current()?;
         let target = self.find_characteristic(characteristic).await?;
         // Refresh here too. `datagram::connect` only subscribes before it
@@ -2329,7 +2355,7 @@ impl GattConnection for LinuxGattConnection {
         // call, so a reconnect cannot slip in between them. Checking and
         // then awaiting was still a check-then-act, just with a smaller
         // window.
-        let _dial = self.dial_lock.lock().await;
+        let _dial = self.dial_lock.lock(&self.peer).await;
         self.ensure_current()?;
 
         // BlueZ keeps exactly one ACL per remote address. If the same peer
