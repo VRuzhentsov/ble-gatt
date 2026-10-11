@@ -306,13 +306,18 @@ impl DiscoveryBus {
         proxy.method_call::<(), _, _, _>("org.bluez.Adapter1", method, args).await.map_err(bluer::Error::from)
     }
 
-    /// `SetDiscoveryFilter` + `StartDiscovery`, with the same default filter
-    /// `bluer` sent (any UUID, interleaved LE/BR-EDR scan).
+    /// `SetDiscoveryFilter` + `StartDiscovery`: any UUID, LE only.
+    ///
+    /// LE only because a scan here only ever looks for GATT services, which
+    /// BR/EDR inquiry never finds. `"auto"` (what `bluer` sent) interleaves
+    /// that inquiry with the LE scan, and inquiry takes radio time from
+    /// every live connection on the adapter, including the LE link a scan
+    /// runs alongside.
     async fn start_discovery(&self) -> bluer::Result<()> {
         use dbus::arg::{RefArg, Variant};
         let mut filter: HashMap<&str, Variant<Box<dyn RefArg>>> = HashMap::new();
         filter.insert("UUIDs", Variant(Box::new(Vec::<String>::new())));
-        filter.insert("Transport", Variant(Box::new("auto".to_string())));
+        filter.insert("Transport", Variant(Box::new("le".to_string())));
         self.call("SetDiscoveryFilter", (filter,)).await?;
         self.call("StartDiscovery", ()).await
     }
