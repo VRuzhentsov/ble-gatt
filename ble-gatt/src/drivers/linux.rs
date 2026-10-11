@@ -54,7 +54,7 @@ const NOTIFY_SESSION_POLL: std::time::Duration = std::time::Duration::from_milli
 const NOTIFY_WRITER_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// How often a GATT handler that BlueZ called before `advertise` published
-/// its generation checks again, and how many times a write waits (2s) before
+/// its generation checks again, and how many times a handler waits (2s) before
 /// it is treated as stale.
 const GENERATION_PUBLISH_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 const GENERATION_PUBLISH_MAX_POLLS: usize = 200;
@@ -513,6 +513,11 @@ pub struct LinuxBackend {
     /// `broadcast::Sender::send` does not block, so holding this across the
     /// send is safe.
     advertise_generation: Arc<StdMutex<u64>>,
+    /// Source of every value `advertise_generation` ever takes. Reserving
+    /// `current + 1` let a cancelled `advertise` and the next one share a
+    /// number, so the abandoned call's handlers would count as current in the
+    /// replacement server. Strictly increasing, so no number is reused.
+    generation_counter: Arc<AtomicU64>,
     /// Addresses this backend dialled itself, in the central role. BlueZ
     /// reports one `Connected` property per device regardless of who
     /// initiated, so without this an outbound connection would be
@@ -556,6 +561,11 @@ pub struct LinuxBackend {
 }
 
 impl LinuxBackend {
+    /// A generation number never handed out before; see `generation_counter`.
+    fn next_generation(&self) -> u64 {
+        self.generation_counter.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
     /// Announces every served central as gone, then forgets it and its notify
     /// sessions. For when the registration serving them ends (stop, or a
     /// replacement `advertise`), whose disconnect watchers are aborted.
@@ -727,6 +737,7 @@ impl LinuxBackend {
             dial_lock: DialLocks::default(),
             advertise_lock: Arc::new(AsyncMutex::new(())),
             advertise_generation: Arc::new(StdMutex::new(1)),
+            generation_counter: Arc::new(AtomicU64::new(1)),
             notify_writers: Arc::new(AsyncMutex::new(HashMap::new())),
             events_tx,
             app_handle: AsyncMutex::new(None),
@@ -827,12 +838,18 @@ async fn watch_notify_sessions(
         // ignore every later subscription. `advertise` publishes while
         // holding `writers`, so once the generation is current here it
         // cannot change before the check below.
+        // Bounded: an `advertise` cancelled between serving and publishing
+        // never publishes, and this watcher must not wait for it forever.
+        // Generations are never reused, so once a later one is published
+        // this one reads as stale below and the watcher ends.
+        let mut polls = 0;
         let mut writers_guard = loop {
             let guard = writers.lock().await;
-            if *advertise_generation.lock().unwrap() >= this_generation {
+            if *advertise_generation.lock().unwrap() >= this_generation || polls >= GENERATION_PUBLISH_MAX_POLLS {
                 break guard;
             }
             drop(guard);
+            polls += 1;
             tokio::time::sleep(GENERATION_PUBLISH_POLL).await;
         };
         let session = {
@@ -1787,7 +1804,7 @@ impl Backend for LinuxBackend {
         // re-advertise. Published the moment BlueZ serves the new
         // application (below), together with replacing the old one.
         let advertise_generation = self.advertise_generation.clone();
-        let this_generation = *advertise_generation.lock().unwrap() + 1;
+        let this_generation = self.next_generation();
         let server_watch = self.server_watch.clone();
         let notify_writers = self.notify_writers.clone();
         let mut notify_sessions = Vec::new();
@@ -2062,7 +2079,7 @@ impl Backend for LinuxBackend {
         // Taking the same lock the handlers publish under means an
         // in-progress publication completes before this, or is rejected —
         // never interleaved.
-        *self.advertise_generation.lock().unwrap() += 1;
+        *self.advertise_generation.lock().unwrap() = self.next_generation();
         for watch in self.server_watch.lock().unwrap().drain(..) {
             watch.abort();
         }

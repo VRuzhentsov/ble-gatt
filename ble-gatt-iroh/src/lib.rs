@@ -339,10 +339,19 @@ async fn run_link(
     }
     send_task.abort();
     let _ = channel.close().await;
-    if role == Role::Peripheral {
-        inner.answered.lock().expect("poisoned").insert(peer.clone(), Instant::now());
+    // Only while this link still owns the peer: an old inbound link ending
+    // after a newer one was attached would otherwise mark the peer as having
+    // dialled us, and the yield would then hold back dials the newer link's
+    // side is entitled to make.
+    {
+        let mut links = inner.links.lock().expect("poisoned");
+        if links.get(&peer).is_some_and(|current| current.same_channel(&link)) {
+            if role == Role::Peripheral {
+                inner.answered.lock().expect("poisoned").insert(peer.clone(), Instant::now());
+            }
+            links.remove(&peer);
+        }
     }
-    remove_link(&inner, &peer, &link);
     log::debug!("link to {} down", peer.0);
 }
 
