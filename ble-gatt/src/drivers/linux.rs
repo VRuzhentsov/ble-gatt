@@ -1887,6 +1887,16 @@ impl Backend for LinuxBackend {
                                 }
                                 tokio::time::sleep(GENERATION_PUBLISH_POLL).await;
                             }
+                            // The peripheral admission lock, as
+                            // `watch_notify_sessions` takes it: a write can
+                            // admit a peer to `served_peers` too, and a
+                            // central-role `disconnect()` holds this lock
+                            // across its served-session check and the
+                            // platform call. Without it a write could admit
+                            // the peer in between and lose the session to
+                            // that disconnect. Taken before the generation
+                            // check, so everything below stays await-free.
+                            let _admission = notify_writers.lock().await;
                             let current = advertise_generation.lock().unwrap();
                             if *current != this_generation {
                                 log::warn!(
@@ -1937,7 +1947,7 @@ impl Backend for LinuxBackend {
                                     peer.clone(),
                                     events_tx.clone(),
                                     served_peers,
-                                    notify_writers,
+                                    notify_writers.clone(),
                                     session,
                                 );
                                 server_watch.lock().unwrap().push(handle.abort_handle());
