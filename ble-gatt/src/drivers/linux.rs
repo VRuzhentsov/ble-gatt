@@ -541,6 +541,65 @@ pub struct LinuxBackend {
     discovery: Arc<DiscoveryBus>,
 }
 
+/// Reports bluetoothd itself leaving and rejoining the bus — a crash or a
+/// package upgrade restarting it — as `RadioChanged` `Off`/`On`. Once
+/// bluetoothd exits no process is left to emit `Powered(false)`, so the
+/// adapter-property watcher goes silent, and nothing re-registered the GATT
+/// application and advertisement BlueZ forgot. `NameOwnerChanged` for
+/// `org.bluez` is emitted by the bus daemon itself, so it still arrives.
+///
+/// `RadioChanged` rather than a new event: for a consumer, "bluetoothd is
+/// gone" and "the adapter powered off" mean the same, and `datagram::serve`
+/// and `Peripheral::serve` already re-register on `RadioStatus::On`.
+///
+/// Returns once the subscription is in place, so no restart is missed
+/// between this call and the watch starting.
+async fn spawn_bluez_restart_watch(
+    conn: Arc<dbus::nonblock::SyncConnection>, adapter: Adapter, events_tx: broadcast::Sender<GattEvent>,
+) {
+    let rule = dbus::message::MatchRule::new_signal("org.freedesktop.DBus", "NameOwnerChanged");
+    let Ok(matched) = conn.add_match(rule).await else {
+        log::warn!("bluez watch: could not subscribe to NameOwnerChanged; restart recovery is disabled");
+        return;
+    };
+    tokio::spawn(async move {
+        let (_token, mut stream) = matched.msg_stream();
+        while let Some(msg) = stream.next().await {
+            let (name, _old_owner, new_owner) = msg.get3::<&str, &str, &str>();
+            if name != Some("org.bluez") {
+                continue;
+            }
+            if new_owner.is_none_or(|owner| owner.is_empty()) {
+                log::warn!("bluez watch: bluetoothd left the bus, reporting radio Off");
+                let _ = events_tx.send(GattEvent::RadioChanged {
+                    status: crate::entities::models::RadioStatus::Off,
+                });
+                continue;
+            }
+            // bluetoothd claims its bus name before it has exported and
+            // powered the adapter, and `On` tells consumers to re-register
+            // right away — so wait until it is usable.
+            let ready = tokio::time::timeout(BLUEZ_RESTART_READY_TIMEOUT, async {
+                while !adapter.is_powered().await.unwrap_or(false) {
+                    tokio::time::sleep(BLUEZ_RESTART_READY_POLL).await;
+                }
+            })
+            .await;
+            if ready.is_err() {
+                log::warn!(
+                    "bluez watch: bluetoothd is back but the adapter is not powered after \
+                     {BLUEZ_RESTART_READY_TIMEOUT:?}; leaving radio Off"
+                );
+                continue;
+            }
+            log::info!("bluez watch: bluetoothd is back and the adapter is powered, reporting radio On");
+            let _ = events_tx.send(GattEvent::RadioChanged {
+                status: crate::entities::models::RadioStatus::On,
+            });
+        }
+    });
+}
+
 impl LinuxBackend {
     pub async fn new() -> Result<Self> {
         let session = Session::new()
@@ -589,71 +648,7 @@ impl LinuxBackend {
             });
         }
 
-        // Watch for bluetoothd itself disappearing and coming back — a
-        // crash or a package upgrade restarting the service — not just the
-        // adapter's own `Powered` property above. Once bluetoothd exits
-        // there is no process left to emit `Powered(false)`, so the watcher
-        // above's D-Bus subscription just goes silent; nothing today ever
-        // reports the radio unusable for that case, and nothing re-registers
-        // the GATT application and advertisement BlueZ forgot when it died.
-        // `org.freedesktop.DBus.NameOwnerChanged` for `org.bluez` is the one
-        // signal the session bus itself still emits, since it is the bus
-        // daemon — not bluetoothd — that notices the connection close.
-        //
-        // Reported as `RadioChanged` rather than a new event: from a
-        // consumer's point of view "bluetoothd is gone" and "the adapter
-        // powered off" mean the same thing, nothing BLE works until it comes
-        // back, and `Peripheral::serve` already reacts to `RadioStatus::On`
-        // by re-registering.
-        {
-            let events_tx = events_tx.clone();
-            let conn = discovery.conn.clone();
-            let adapter = adapter.clone();
-            tokio::spawn(async move {
-                let rule =
-                    dbus::message::MatchRule::new_signal("org.freedesktop.DBus", "NameOwnerChanged");
-                let Ok(matched) = conn.add_match(rule).await else {
-                    log::warn!(
-                        "bluez watch: could not subscribe to NameOwnerChanged; restart recovery is disabled"
-                    );
-                    return;
-                };
-                let (_token, mut stream) = matched.msg_stream();
-                while let Some(msg) = stream.next().await {
-                    let (name, _old_owner, new_owner) = msg.get3::<&str, &str, &str>();
-                    if name != Some("org.bluez") {
-                        continue;
-                    }
-                    if new_owner.is_none_or(|owner| owner.is_empty()) {
-                        log::warn!("bluez watch: bluetoothd left the bus, reporting radio Off");
-                        let _ = events_tx.send(GattEvent::RadioChanged {
-                            status: crate::entities::models::RadioStatus::Off,
-                        });
-                        continue;
-                    }
-                    // bluetoothd claims its bus name before it has exported
-                    // and powered the adapter, and `On` tells consumers to
-                    // re-register right away — so wait until it is usable.
-                    let ready = tokio::time::timeout(BLUEZ_RESTART_READY_TIMEOUT, async {
-                        while !adapter.is_powered().await.unwrap_or(false) {
-                            tokio::time::sleep(BLUEZ_RESTART_READY_POLL).await;
-                        }
-                    })
-                    .await;
-                    if ready.is_err() {
-                        log::warn!(
-                            "bluez watch: bluetoothd is back but the adapter is not powered after \
-                             {BLUEZ_RESTART_READY_TIMEOUT:?}; leaving radio Off"
-                        );
-                        continue;
-                    }
-                    log::info!("bluez watch: bluetoothd is back and the adapter is powered, reporting radio On");
-                    let _ = events_tx.send(GattEvent::RadioChanged {
-                        status: crate::entities::models::RadioStatus::On,
-                    });
-                }
-            });
-        }
+        spawn_bluez_restart_watch(discovery.conn.clone(), adapter.clone(), events_tx.clone()).await;
 
         Ok(Self {
             _session: session,
@@ -2329,6 +2324,7 @@ mod tests {
         /// Held inside the `StartDiscovery` handler before it replies, so a
         /// test can cancel the caller after BlueZ has accepted the call.
         start_delay: std::time::Duration,
+        powered: bool,
     }
 
     type Fake = Arc<StdMutex<FakeAdapter>>;
@@ -2350,7 +2346,7 @@ mod tests {
     /// Starts a private bus, points this process's *system* bus at it, and
     /// serves `FakeAdapter` as `org.bluez` `/org/bluez/hci0` on it. `None`
     /// when no `dbus-daemon` is installed.
-    async fn fake_bluez() -> Option<(PrivateBus, Fake)> {
+    async fn fake_bluez() -> Option<(PrivateBus, Fake, Arc<dbus::nonblock::SyncConnection>)> {
         use std::io::BufRead;
         let mut child = std::process::Command::new("dbus-daemon")
             .args(["--session", "--nofork", "--print-address"])
@@ -2376,6 +2372,7 @@ mod tests {
         )));
         let iface = cr.register("org.bluez.Adapter1", |b: &mut dbus_crossroads::IfaceBuilder<Fake>| {
             b.property::<bool, _>("Discovering").get(|_, fake| Ok(!fake.lock().unwrap().clients.is_empty()));
+            b.property::<bool, _>("Powered").get(|_, fake| Ok(fake.lock().unwrap().powered));
             b.method("SetDiscoveryFilter", ("filter",), (), |_, _, (_filter,): (dbus::arg::PropMap,)| Ok(()));
             // Async so `start_delay` holds only this reply, not a runtime
             // thread.
@@ -2410,6 +2407,7 @@ mod tests {
             });
         });
         cr.insert("/org/bluez/hci0", &[iface], fake.clone());
+        let bluez = conn.clone();
         conn.start_receive(
             dbus::message::MatchRule::new_method_call(),
             Box::new(move |msg, conn| {
@@ -2417,7 +2415,7 @@ mod tests {
                 true
             }),
         );
-        Some((bus, fake))
+        Some((bus, fake, bluez))
     }
 
     /// The real-hardware wedge, end to end against the fake. A failed
@@ -2430,7 +2428,7 @@ mod tests {
     /// mid-start must leave the stop owed. Also covers refcounted sharing.
     #[tokio::test(flavor = "multi_thread")]
     async fn discovery_recovers_from_a_failed_stop() {
-        let Some((_bus, fake)) = fake_bluez().await else {
+        let Some((_bus, fake, bluez)) = fake_bluez().await else {
             eprintln!("dbus-daemon not installed; skipping");
             return;
         };
@@ -2483,6 +2481,33 @@ mod tests {
         assert!(discovery.state.lock().unwrap().idle_running(), "the stop must be owed");
         discovery.stop_if_idle("test").await;
         assert!(fake.lock().unwrap().clients.is_empty(), "discovery must be stopped before a dial");
+
+        // bluetoothd restarting: `org.bluez` leaves the bus, then comes back.
+        // `Off` must be reported, and `On` only once the adapter is powered.
+        let (events_tx, mut events) = broadcast::channel(8);
+        spawn_bluez_restart_watch(discovery.conn.clone(), adapter.clone(), events_tx).await;
+        let next = |events: &mut broadcast::Receiver<GattEvent>, wait_ms| {
+            let wait = std::time::Duration::from_millis(wait_ms);
+            let mut events = events.resubscribe();
+            async move { tokio::time::timeout(wait, events.recv()).await.ok().and_then(|e| e.ok()) }
+        };
+        let off = next(&mut events, 2000);
+        bluez.release_name("org.bluez").await.unwrap();
+        assert!(
+            matches!(off.await, Some(GattEvent::RadioChanged { status: crate::entities::models::RadioStatus::Off })),
+            "bluetoothd leaving the bus must report the radio Off"
+        );
+
+        let early = next(&mut events, 800);
+        bluez.request_name("org.bluez", false, true, false).await.unwrap();
+        assert!(early.await.is_none(), "On must wait until the restarted adapter is powered");
+
+        let on = next(&mut events, 3000);
+        fake.lock().unwrap().powered = true;
+        assert!(
+            matches!(on.await, Some(GattEvent::RadioChanged { status: crate::entities::models::RadioStatus::On })),
+            "bluetoothd back with a powered adapter must report the radio On"
+        );
     }
 
     #[test]
