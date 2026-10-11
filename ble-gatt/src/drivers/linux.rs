@@ -1282,18 +1282,10 @@ enum ScannedPeer {
     Unknown,
 }
 
-/// How long a device that is not yet complete is watched for the rest of its
-/// properties.
-const SCAN_COMPLETION_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// At most this many devices are watched at once, so a room full of beacons
-/// cannot turn one scan into a flood of D-Bus match rules.
-const SCAN_MAX_WATCHERS: usize = 16;
-
-fn scan_watchers() -> &'static std::sync::atomic::AtomicUsize {
-    static WATCHERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    &WATCHERS
-}
+/// How often a scan re-reads the devices it has not fully reported yet. Reads
+/// are property gets on BlueZ's cached objects, not radio work, and a device
+/// that does not advertise the target costs one `UUIDs` read per tick.
+const SCAN_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 async fn read_scanned_peer(adapter: &Adapter, address: bluer::Address, target: uuid::Uuid) -> ScannedPeer {
     let Ok(device) = adapter.device(address) else {
@@ -1360,85 +1352,6 @@ async fn read_scanned_peer(adapter: &Adapter, address: bluer::Address, target: u
     }
 }
 
-/// Watches one device's property changes for up to `SCAN_COMPLETION_WINDOW`
-/// and reports it as soon as it is complete -- the services known and the
-/// target among them, with manufacturer data.
-///
-/// A match without manufacturer data is reported too, once, the moment its
-/// services show the target (`match_sent` says whether the caller already
-/// did): an advertiser that never sends manufacturer data -- the default for
-/// `GattServiceSpec::new` -- would otherwise never be reported at all.
-///
-/// With every slot taken the device is not watched, and it is left out of
-/// `reported` so its next `DeviceAdded` in this scan tries again.
-async fn watch_for_completion(
-    adapter: Adapter,
-    address: bluer::Address,
-    target: uuid::Uuid,
-    reported: Arc<StdMutex<HashMap<bluer::Address, bool>>>,
-    tx: tokio::sync::mpsc::Sender<Result<DiscoveredPeer>>,
-    mut match_sent: bool,
-) {
-    let Some(_slot) = WatcherSlot::take() else {
-        reported.lock().unwrap().remove(&address);
-        return;
-    };
-    let Ok(device) = adapter.device(address) else {
-        return;
-    };
-    let Ok(mut changes) = device.events().await else {
-        return;
-    };
-    let deadline = tokio::time::Instant::now() + SCAN_COMPLETION_WINDOW;
-    loop {
-        // Read first: the data may have arrived between the event that put
-        // this device here and the subscription above.
-        match read_scanned_peer(&adapter, address, target).await {
-            ScannedPeer::Complete(peer) => {
-                reported.lock().unwrap().insert(address, true);
-                let _ = tx.send(Ok(peer)).await;
-                return;
-            }
-            ScannedPeer::NoManufacturerData(peer) if !match_sent => {
-                match_sent = true;
-                if tx.send(Ok(peer)).await.is_err() {
-                    return;
-                }
-            }
-            _ => {}
-        }
-        tokio::select! {
-            change = changes.next() => {
-                if change.is_none() {
-                    return;
-                }
-            }
-            () = tokio::time::sleep_until(deadline) => return,
-            () = tx.closed() => return,
-        }
-    }
-}
-
-/// One of the `SCAN_MAX_WATCHERS` slots, released when dropped.
-struct WatcherSlot;
-
-impl WatcherSlot {
-    fn take() -> Option<Self> {
-        use std::sync::atomic::Ordering;
-        if scan_watchers().fetch_add(1, Ordering::SeqCst) >= SCAN_MAX_WATCHERS {
-            scan_watchers().fetch_sub(1, Ordering::SeqCst);
-            return None;
-        }
-        Some(Self)
-    }
-}
-
-impl Drop for WatcherSlot {
-    fn drop(&mut self) {
-        scan_watchers().fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
 #[async_trait]
 impl Backend for LinuxBackend {
     async fn capabilities(&self) -> CapabilityReport {
@@ -1483,67 +1396,61 @@ impl Backend for LinuxBackend {
         // when the caller drops the returned stream (the channel closes),
         // which is what stops discovery.
         //
-        // BlueZ reports a device the moment the first advertisement is heard,
-        // often before its service UUIDs or manufacturer data are filled in.
-        // Evaluating only that moment dropped a nearby peer until the *next*
-        // discovery session began and BlueZ re-reported it from its cache --
-        // tens of seconds for two devices side by side. So a device that is
-        // not yet complete is watched for a few seconds and reported the
-        // moment it is.
+        // BlueZ announces a device once (`DeviceAdded`, or the known list at
+        // start), often before its services, RSSI or manufacturer data are
+        // filled in, and never again for an object it already has. So every
+        // device not yet fully reported stays pending for the whole scan and
+        // is re-read on each tick, rather than only at its announcement or
+        // for a fixed window after it. A window of 5s missed a phone BlueZ
+        // heard 6s into a 30s scan, three scans in a row on hardware.
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<DiscoveredPeer>>(32);
         tokio::spawn(async move {
             let _scan_guard = scan_guard;
-            let reported: Arc<StdMutex<HashMap<bluer::Address, bool>>> = Arc::new(StdMutex::new(HashMap::new()));
+            // `true`: reported complete, done. `false`: a match was reported
+            // without manufacturer data; still watched for the data.
+            let mut reported: HashMap<bluer::Address, bool> = HashMap::new();
+            let mut pending: HashSet<bluer::Address> = HashSet::new();
             let mut events = Box::pin(events);
+            let mut tick = tokio::time::interval(SCAN_RECHECK_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                let event = tokio::select! {
-                    event = events.next() => event,
+                let due: Vec<bluer::Address> = tokio::select! {
+                    event = events.next() => match event {
+                        Some(AdapterEvent::DeviceAdded(address)) => {
+                            if reported.get(&address) == Some(&true) {
+                                continue;
+                            }
+                            pending.insert(address);
+                            vec![address]
+                        }
+                        Some(AdapterEvent::DeviceRemoved(address)) => {
+                            pending.remove(&address);
+                            continue;
+                        }
+                        Some(_) => continue,
+                        None => break,
+                    },
+                    _ = tick.tick() => pending.iter().copied().collect(),
                     () = tx.closed() => break,
                 };
-                let Some(AdapterEvent::DeviceAdded(address)) = event else {
-                    if event.is_none() {
-                        break;
-                    }
-                    continue;
-                };
-                if reported.lock().unwrap().contains_key(&address) {
-                    continue;
-                }
-                match read_scanned_peer(&adapter, address, target).await {
-                    ScannedPeer::Complete(peer) => {
-                        reported.lock().unwrap().insert(address, true);
-                        if tx.send(Ok(peer)).await.is_err() {
-                            break;
+                for address in due {
+                    let peer = match read_scanned_peer(&adapter, address, target).await {
+                        ScannedPeer::Complete(peer) => {
+                            reported.insert(address, true);
+                            pending.remove(&address);
+                            peer
                         }
-                    }
-                    // Matches, but no manufacturer data yet: reported now, as
-                    // before, and again when the data arrives.
-                    ScannedPeer::NoManufacturerData(peer) => {
-                        reported.lock().unwrap().insert(address, false);
-                        if tx.send(Ok(peer)).await.is_err() {
-                            break;
+                        // Reported once without manufacturer data, so an
+                        // advertiser that never sends any is still found, then
+                        // again once the data arrives.
+                        ScannedPeer::NoManufacturerData(peer) if !reported.contains_key(&address) => {
+                            reported.insert(address, false);
+                            peer
                         }
-                        tokio::spawn(watch_for_completion(
-                            adapter.clone(),
-                            address,
-                            target,
-                            reported.clone(),
-                            tx.clone(),
-                            true,
-                        ));
-                    }
-                    // Nothing known about its services yet, or not the target
-                    // among those known so far: wait for the rest.
-                    ScannedPeer::Unknown | ScannedPeer::NotTarget => {
-                        reported.lock().unwrap().insert(address, false);
-                        tokio::spawn(watch_for_completion(
-                            adapter.clone(),
-                            address,
-                            target,
-                            reported.clone(),
-                            tx.clone(),
-                            false,
-                        ));
+                        _ => continue,
+                    };
+                    if tx.send(Ok(peer)).await.is_err() {
+                        return;
                     }
                 }
             }
