@@ -971,6 +971,23 @@ impl Backend for AndroidBackend {
         }))
     }
 
+    async fn notify_max_len(&self, peer: &PeerAddress, session: Option<u64>) -> Option<usize> {
+        if let Some(session) = session {
+            if self.inner.server_sessions.lock().unwrap().get(&peer.0) != Some(&session) {
+                return None;
+            }
+        }
+        // Filled by `onMtuChanged` from either role's callback: one ATT
+        // bearer per link, so a central's MTU exchange on our server lands
+        // in the same per-address entry.
+        let mtu = *self.inner.att_mtus.lock().unwrap().get(&peer.0)?;
+        Some(
+            (mtu as usize)
+                .saturating_sub(crate::hal::ATT_HEADER_LEN)
+                .min(crate::hal::MAX_ATT_ATTRIBUTE_LEN),
+        )
+    }
+
     async fn radio_status(&self) -> RadioStatus {
         let enabled = (|| -> Result<bool> {
             let mut env = self.inner.env()?;
@@ -1643,7 +1660,16 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onDisconnected<'local>(
     log::info!("jni onDisconnected: {address} from_server={}", from_server != 0);
     let disconnected_session = if from_server != 0 {
         // Server-side peers carry the session minted when they subscribed.
-        inner.server_sessions.lock().unwrap().remove(&address)
+        let session = inner.server_sessions.lock().unwrap().remove(&address);
+        // The MTU belongs to the link, which both roles share. Kept while
+        // our own outbound connection to this address is still live;
+        // otherwise a later session from the address could inherit a larger
+        // MTU it never negotiated and get oversized fragments.
+        let client_live = inner.connections.lock().unwrap().get(&address).is_some_and(|state| state.live);
+        if !client_live {
+            inner.att_mtus.lock().unwrap().remove(&address);
+        }
+        session
     } else {
         inner
             .connections
@@ -1657,7 +1683,11 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onDisconnected<'local>(
     // client state here would kill reads, writes and subscriptions on a
     // still-live link.
     if from_server == 0 {
-        inner.att_mtus.lock().unwrap().remove(&address);
+        // Same rule from the other side: a central still attached to our
+        // server is on the same link and keeps its MTU.
+        if !inner.server_sessions.lock().unwrap().contains_key(&address) {
+            inner.att_mtus.lock().unwrap().remove(&address);
+        }
         let mut connections = inner.connections.lock().unwrap();
         if let Some(mut state) = connections.remove(&address) {
             state.live = false;

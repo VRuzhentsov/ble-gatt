@@ -121,6 +121,10 @@ impl Backend for LazyBackend {
         self.inner().await?.disconnect_peer(peer, session).await
     }
 
+    async fn notify_max_len(&self, peer: &PeerAddress, session: Option<u64>) -> Option<usize> {
+        self.inner().await.ok()?.notify_max_len(peer, session).await
+    }
+
     fn events(&self) -> BoxStream<GattEvent> {
         // Always a live subscription, whether or not the backend exists yet.
         let rx = self.events_tx.subscribe();

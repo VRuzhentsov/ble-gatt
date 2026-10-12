@@ -1119,6 +1119,19 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 }
             }
 
+            /// A central's MTU exchange on our server. There is one ATT bearer
+            /// per link, so this feeds the same per-address map the central
+            /// role uses — without it the peripheral side budgeted every
+            /// notification at the 23-byte default, splitting a 1200-byte
+            /// packet into 100 notifications.
+            override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
+                synchronized(this@BleGattBridge) {
+                    if (serverGeneration != generation) return
+                    Log.d(TAG, "server: ${device.address} negotiated mtu=$mtu")
+                    onMtuChanged(nativeHandle, device.address, mtu)
+                }
+            }
+
             override fun onCharacteristicReadRequest(
                 device: BluetoothDevice, requestId: Int, offset: Int, characteristic: BluetoothGattCharacteristic
             ) {
@@ -1185,9 +1198,12 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                     }
 
                     characteristic.value = value
+                    // An ATT Write Response carries no value; only Prepare
+                    // Write echoes it (above). Echoing a near-MTU value here
+                    // is a suspected cause of ATT 0x0e on 509-byte writes.
                     if (responseNeeded) {
                         gattServer?.sendResponse(
-                            device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value
+                            device, requestId, BluetoothGatt.GATT_SUCCESS, offset, null
                         )
                     }
                     // Minted here if this write is the first sign of the
