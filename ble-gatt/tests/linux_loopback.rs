@@ -18,13 +18,13 @@
 //!   non-blocking follow-up the plan already anticipated for real-hardware
 //!   verification.
 
-// `backend::linux` only exists on Linux, so without this gate the whole
+// `drivers::linux` only exists on Linux, so without this gate the whole
 // crate fails to build under `--all-targets` for the Android targets.
 #![cfg(target_os = "linux")]
 
 use std::time::Duration;
 
-use ble_gatt::backend::linux::LinuxBackend;
+use ble_gatt::drivers::linux::LinuxBackend;
 use ble_gatt::{Backend, CharacteristicUuid, GattCharacteristicSpec, GattServiceSpec, ServiceUuid};
 use uuid::Uuid;
 

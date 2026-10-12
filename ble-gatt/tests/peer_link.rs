@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ble_gatt::backend::mock::{MockBackend, MockNetwork};
+use ble_gatt::drivers::mock::{MockBackend, MockNetwork};
 use ble_gatt::datagram::DatagramConfig;
 use ble_gatt::{
     Backend, BleError, CapabilityReport, ConnectionPriority, GattCharacteristicSpec, GattServiceSpec,

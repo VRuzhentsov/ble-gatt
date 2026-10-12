@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use ble_gatt::backend::mock::{MockBackend, MockNetwork};
+use ble_gatt::drivers::mock::{MockBackend, MockNetwork};
 use ble_gatt::{
     Backend, CapabilityReport, CharacteristicUuid, GattCharacteristicSpec, GattEvent,
     GattServiceSpec, PeerAddress, ServiceUuid, WriteType,
@@ -279,10 +279,10 @@ async fn connection_reports_an_mtu_that_bounds_a_single_write() {
     // The point of exposing this at all: a caller chunking a bulk transfer
     // must derive the chunk size from the connection rather than hardcoding
     // one, since it is only known after negotiation and varies per peer.
-    assert!(connection.att_mtu() >= ble_gatt::backend::DEFAULT_ATT_MTU);
+    assert!(connection.att_mtu() >= ble_gatt::hal::DEFAULT_ATT_MTU);
     assert_eq!(
         connection.max_write_len(),
-        connection.att_mtu() as usize - ble_gatt::backend::ATT_HEADER_LEN
+        connection.att_mtu() as usize - ble_gatt::hal::ATT_HEADER_LEN
     );
 }
 

@@ -134,6 +134,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
 use crate::hal::{Backend, BoxStream, GattConnection};
+use crate::roles::Adapter;
 use crate::profile::datagram::fragment::{split, FragmentHeader, FRAGMENT_HEADER_LEN, MAX_FRAGMENTS};
 use crate::profile::datagram::reassembly::{Accept, Reassembler, ReassemblyLimits};
 use crate::entities::error::{BleError, Result};
@@ -866,6 +867,13 @@ impl Drop for PendingConnection {
 /// Central role: connect to `peer` and bring up a channel over `config`'s
 /// service.
 pub async fn connect(
+    adapter: &Adapter, peer: &PeerAddress, config: &DatagramConfig,
+) -> Result<DatagramChannel> {
+    connect_driver(adapter.backend(), peer, config).await
+}
+
+/// [`connect`] over a driver directly, for `PeerLink`, which holds one.
+pub(crate) async fn connect_driver(
     backend: Arc<dyn Backend>, peer: &PeerAddress, config: &DatagramConfig,
 ) -> Result<DatagramChannel> {
     config.validate()?;
@@ -1053,7 +1061,12 @@ fn spawn_link_loss_watch(
 /// this needs a per-peer notify on the `Backend` port: straightforward on
 /// Android (`notifyCharacteristicChanged` already takes a device),
 /// unresolved on BlueZ.
-pub async fn serve(
+pub async fn serve(adapter: &Adapter, config: &DatagramConfig) -> Result<BoxStream<DatagramChannel>> {
+    serve_driver(adapter.backend(), config).await
+}
+
+/// [`serve`] over a driver directly, for `PeerLink`, which holds one.
+pub(crate) async fn serve_driver(
     backend: Arc<dyn Backend>, config: &DatagramConfig,
 ) -> Result<BoxStream<DatagramChannel>> {
     config.validate()?;

@@ -140,7 +140,7 @@ impl Backend for LazyBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ble_gatt::backend::mock::{MockBackend, MockNetwork};
+    use ble_gatt::drivers::mock::{MockBackend, MockNetwork};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]

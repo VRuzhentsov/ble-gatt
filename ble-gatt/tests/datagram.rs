@@ -8,11 +8,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ble_gatt::backend::mock::{MockBackend, MockNetwork};
 use ble_gatt::datagram::{self, DatagramChannel, DatagramConfig};
-use ble_gatt::{Backend, CapabilityReport, CharacteristicUuid, PeerAddress, ServiceUuid};
+use ble_gatt::drivers::mock::{MockBackend, MockNetwork};
+use ble_gatt::{Adapter, Backend, CapabilityReport, CharacteristicUuid, PeerAddress, ServiceUuid};
 use tokio_stream::StreamExt;
 use uuid::Uuid;
+
+/// An adapter over a test's mock radio. The test keeps its own handle on
+/// the mock to drive it (drop links, power off).
+async fn adapter(backend: &Arc<MockBackend>) -> Adapter {
+    Adapter::new(backend.clone()).await
+}
 
 fn full_capabilities() -> CapabilityReport {
     CapabilityReport {
@@ -54,11 +60,11 @@ async fn connected_pair(
         full_capabilities(),
     ));
 
-    let mut incoming = datagram::serve(peripheral.clone(), config)
+    let mut incoming = datagram::serve(&adapter(&peripheral).await,config)
         .await
         .expect("serve should start");
 
-    let central_channel = datagram::connect(central.clone(), &peripheral_addr, config)
+    let central_channel = datagram::connect(&adapter(&central).await,&peripheral_addr, config)
         .await
         .expect("connect should succeed");
 
@@ -223,10 +229,10 @@ async fn losing_the_peer_closes_the_channel_instead_of_hanging_forever() {
         full_capabilities(),
     ));
 
-    let _incoming = datagram::serve(peripheral.clone(), &config)
+    let _incoming = datagram::serve(&adapter(&peripheral).await,&config)
         .await
         .expect("serve");
-    let mut central_channel = datagram::connect(central.clone(), &peripheral_addr, &config)
+    let mut central_channel = datagram::connect(&adapter(&central).await,&peripheral_addr, &config)
         .await
         .expect("connect");
 
@@ -276,11 +282,11 @@ async fn a_zero_queue_depth_is_rejected_rather_than_panicking() {
 
     let mut zero_inbound = config();
     zero_inbound.inbound_queue_depth = 0;
-    assert!(datagram::serve(backend.clone(), &zero_inbound).await.is_err());
+    assert!(datagram::serve(&adapter(&backend).await, &zero_inbound).await.is_err());
 
     let mut zero_fragments = config();
     zero_fragments.fragment_queue_depth = 0;
-    assert!(datagram::serve(backend, &zero_fragments).await.is_err());
+    assert!(datagram::serve(&adapter(&backend).await, &zero_fragments).await.is_err());
 }
 
 #[tokio::test]
@@ -308,13 +314,13 @@ async fn serving_and_dialling_on_one_backend_do_not_cross_over() {
         .advertise(config.service_spec())
         .await
         .expect("remote advertises");
-    let mut incoming = datagram::serve(both_roles.clone(), &config)
+    let mut incoming = datagram::serve(&adapter(&both_roles).await, &config)
         .await
         .expect("serve");
 
     // Dial out from the same backend that is serving.
     let _outbound = datagram::connect(
-        both_roles.clone(),
+        &adapter(&both_roles).await,
         &PeerAddress("remote-peripheral".to_string()),
         &config,
     )
@@ -347,10 +353,10 @@ async fn a_served_channel_stops_sending_once_its_peer_disconnects() {
         full_capabilities(),
     ));
 
-    let mut incoming = datagram::serve(peripheral.clone(), &config)
+    let mut incoming = datagram::serve(&adapter(&peripheral).await,&config)
         .await
         .expect("serve should start");
-    let central_channel = datagram::connect(central.clone(), &peripheral_addr, &config)
+    let central_channel = datagram::connect(&adapter(&central).await,&peripheral_addr, &config)
         .await
         .expect("connect should succeed");
     let mut served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
@@ -401,10 +407,10 @@ async fn stopping_the_server_releases_the_peer_it_was_serving() {
         full_capabilities(),
     ));
 
-    let mut incoming = datagram::serve(peripheral.clone(), &config)
+    let mut incoming = datagram::serve(&adapter(&peripheral).await,&config)
         .await
         .expect("serve should start");
-    let _first = datagram::connect(first_central.clone(), &peripheral_addr, &config)
+    let _first = datagram::connect(&adapter(&first_central).await,&peripheral_addr, &config)
         .await
         .expect("connect should succeed");
     let mut served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
@@ -421,7 +427,7 @@ async fn stopping_the_server_releases_the_peer_it_was_serving() {
     drop(incoming);
 
     // Restart and attach a different central.
-    let mut restarted = datagram::serve(peripheral.clone(), &config)
+    let mut restarted = datagram::serve(&adapter(&peripheral).await,&config)
         .await
         .expect("serve should restart");
     let second_central: Arc<MockBackend> = Arc::new(MockBackend::new(
@@ -429,7 +435,7 @@ async fn stopping_the_server_releases_the_peer_it_was_serving() {
         network.clone(),
         full_capabilities(),
     ));
-    let mut second = datagram::connect(second_central.clone(), &peripheral_addr, &config)
+    let mut second = datagram::connect(&adapter(&second_central).await,&peripheral_addr, &config)
         .await
         .expect("connect should succeed");
     let mut second_served = tokio::time::timeout(Duration::from_secs(2), restarted.next())
@@ -478,10 +484,10 @@ async fn inbound_overflow_is_reported_to_the_receiver_rather_than_lost_silently(
         full_capabilities(),
     ));
 
-    let mut incoming = datagram::serve(peripheral.clone(), &config)
+    let mut incoming = datagram::serve(&adapter(&peripheral).await,&config)
         .await
         .expect("serve should start");
-    let mut sender = datagram::connect(central.clone(), &peripheral_addr, &config)
+    let mut sender = datagram::connect(&adapter(&central).await,&peripheral_addr, &config)
         .await
         .expect("connect should succeed");
     let mut served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
@@ -541,10 +547,10 @@ async fn a_central_that_unsubscribes_frees_the_single_central_slot() {
         full_capabilities(),
     ));
 
-    let mut incoming = datagram::serve(peripheral.clone(), &config)
+    let mut incoming = datagram::serve(&adapter(&peripheral).await,&config)
         .await
         .expect("serve should start");
-    let _first_channel = datagram::connect(first.clone(), &peripheral_addr, &config)
+    let _first_channel = datagram::connect(&adapter(&first).await,&peripheral_addr, &config)
         .await
         .expect("connect should succeed");
     let mut served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
@@ -564,7 +570,7 @@ async fn a_central_that_unsubscribes_frees_the_single_central_slot() {
         network.clone(),
         full_capabilities(),
     ));
-    let mut second_channel = datagram::connect(second.clone(), &peripheral_addr, &config)
+    let mut second_channel = datagram::connect(&adapter(&second).await,&peripheral_addr, &config)
         .await
         .expect("connect should succeed");
     let mut second_served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
@@ -601,14 +607,14 @@ async fn a_server_can_greet_the_moment_it_is_handed_a_channel() {
         full_capabilities(),
     ));
 
-    let mut incoming = datagram::serve(peripheral.clone(), &config)
+    let mut incoming = datagram::serve(&adapter(&peripheral).await,&config)
         .await
         .expect("serve should start");
 
     // The central connects and then waits. It sends nothing — this is the
     // server-speaks-first shape that the whole announce-on-subscribe design
     // exists to support.
-    let mut client = datagram::connect(central.clone(), &peripheral_addr, &config)
+    let mut client = datagram::connect(&adapter(&central).await,&peripheral_addr, &config)
         .await
         .expect("connect should succeed");
 
@@ -651,10 +657,10 @@ async fn a_receiver_already_waiting_is_woken_when_inbound_data_is_lost() {
         full_capabilities(),
     ));
 
-    let mut incoming = datagram::serve(peripheral.clone(), &config)
+    let mut incoming = datagram::serve(&adapter(&peripheral).await,&config)
         .await
         .expect("serve should start");
-    let mut client = datagram::connect(central.clone(), &peripheral_addr, &config)
+    let mut client = datagram::connect(&adapter(&central).await,&peripheral_addr, &config)
         .await
         .expect("connect should succeed");
     let _served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
@@ -699,10 +705,10 @@ async fn dropping_a_served_channel_frees_the_slot_for_the_next_central() {
         full_capabilities(),
     ));
 
-    let mut incoming = datagram::serve(peripheral.clone(), &config)
+    let mut incoming = datagram::serve(&adapter(&peripheral).await,&config)
         .await
         .expect("serve should start");
-    let _first_client = datagram::connect(first.clone(), &peripheral_addr, &config)
+    let _first_client = datagram::connect(&adapter(&first).await,&peripheral_addr, &config)
         .await
         .expect("connect should succeed");
     let served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
@@ -721,7 +727,7 @@ async fn dropping_a_served_channel_frees_the_slot_for_the_next_central() {
         network.clone(),
         full_capabilities(),
     ));
-    let mut second_client = datagram::connect(second.clone(), &peripheral_addr, &config)
+    let mut second_client = datagram::connect(&adapter(&second).await,&peripheral_addr, &config)
         .await
         .expect("connect should succeed");
     let mut second_served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
@@ -759,10 +765,10 @@ async fn a_stale_channel_drop_does_not_evict_the_reconnected_peer() {
         full_capabilities(),
     ));
 
-    let mut incoming = datagram::serve(peripheral.clone(), &config)
+    let mut incoming = datagram::serve(&adapter(&peripheral).await,&config)
         .await
         .expect("serve should start");
-    let first_client = datagram::connect(first.clone(), &peripheral_addr, &config)
+    let first_client = datagram::connect(&adapter(&first).await,&peripheral_addr, &config)
         .await
         .expect("connect should succeed");
     let stale = tokio::time::timeout(Duration::from_secs(2), incoming.next())
@@ -781,7 +787,7 @@ async fn a_stale_channel_drop_does_not_evict_the_reconnected_peer() {
         network.clone(),
         full_capabilities(),
     ));
-    let mut second_client = datagram::connect(second.clone(), &peripheral_addr, &config)
+    let mut second_client = datagram::connect(&adapter(&second).await,&peripheral_addr, &config)
         .await
         .expect("reconnect should succeed");
     let mut reconnected = tokio::time::timeout(Duration::from_secs(2), incoming.next())
@@ -823,7 +829,7 @@ async fn a_release_survives_a_saturated_accept_queue() {
         full_capabilities(),
     ));
 
-    let mut incoming = datagram::serve(peripheral.clone(), &config)
+    let mut incoming = datagram::serve(&adapter(&peripheral).await,&config)
         .await
         .expect("serve should start");
 
@@ -837,7 +843,7 @@ async fn a_release_survives_a_saturated_accept_queue() {
         network.clone(),
         full_capabilities(),
     ));
-    let first_client = datagram::connect(first.clone(), &peripheral_addr, &config)
+    let first_client = datagram::connect(&adapter(&first).await,&peripheral_addr, &config)
         .await
         .expect("connect should succeed");
     let stale = tokio::time::timeout(Duration::from_secs(2), incoming.next())
@@ -854,7 +860,7 @@ async fn a_release_survives_a_saturated_accept_queue() {
         network.clone(),
         full_capabilities(),
     ));
-    let second_client = datagram::connect(second.clone(), &peripheral_addr, &config)
+    let second_client = datagram::connect(&adapter(&second).await,&peripheral_addr, &config)
         .await
         .expect("reconnect should succeed");
     let live = tokio::time::timeout(Duration::from_secs(2), incoming.next())
@@ -874,7 +880,7 @@ async fn a_release_survives_a_saturated_accept_queue() {
         network.clone(),
         full_capabilities(),
     ));
-    let _third_client = datagram::connect(third.clone(), &peripheral_addr, &config)
+    let _third_client = datagram::connect(&adapter(&third).await,&peripheral_addr, &config)
         .await
         .expect("connect should succeed");
     tokio::time::timeout(Duration::from_secs(2), incoming.next())
@@ -901,10 +907,10 @@ async fn a_lagged_lifecycle_stream_ends_the_served_session_rather_than_stranding
         full_capabilities(),
     ));
 
-    let mut incoming = datagram::serve(peripheral.clone(), &config)
+    let mut incoming = datagram::serve(&adapter(&peripheral).await,&config)
         .await
         .expect("serve should start");
-    let _first_client = datagram::connect(first.clone(), &peripheral_addr, &config)
+    let _first_client = datagram::connect(&adapter(&first).await,&peripheral_addr, &config)
         .await
         .expect("connect should succeed");
     let mut served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
@@ -932,7 +938,7 @@ async fn a_lagged_lifecycle_stream_ends_the_served_session_rather_than_stranding
         network.clone(),
         full_capabilities(),
     ));
-    let mut second_client = datagram::connect(second.clone(), &peripheral_addr, &config)
+    let mut second_client = datagram::connect(&adapter(&second).await,&peripheral_addr, &config)
         .await
         .expect("connect should succeed");
     let mut second_served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
@@ -978,7 +984,7 @@ async fn abandoning_connect_mid_setup_still_releases_the_connection() {
 
     let outcome = tokio::time::timeout(
         Duration::from_millis(200),
-        datagram::connect(central.clone(), &peripheral_addr, &config),
+        datagram::connect(&adapter(&central).await,&peripheral_addr, &config),
     )
     .await;
     assert!(outcome.is_err(), "the connect future should have been cancelled");
@@ -1023,7 +1029,7 @@ async fn dropping_a_central_channel_without_close_still_disconnects_it() {
         full_capabilities(),
     ));
 
-    let channel = datagram::connect(central.clone(), &peripheral_addr, &config)
+    let channel = datagram::connect(&adapter(&central).await,&peripheral_addr, &config)
         .await
         .expect("connect should succeed");
 
@@ -1068,10 +1074,10 @@ async fn a_central_parked_in_recv_is_released_when_lifecycle_events_lag() {
         full_capabilities(),
     ));
 
-    let mut incoming = datagram::serve(peripheral.clone(), &config)
+    let mut incoming = datagram::serve(&adapter(&peripheral).await,&config)
         .await
         .expect("serve should start");
-    let mut client = datagram::connect(central.clone(), &peripheral_addr, &config)
+    let mut client = datagram::connect(&adapter(&central).await,&peripheral_addr, &config)
         .await
         .expect("connect should succeed");
     let _served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
@@ -1116,12 +1122,12 @@ async fn a_loss_event_from_a_replaced_connection_does_not_kill_its_successor() {
         full_capabilities(),
     ));
 
-    let mut incoming = datagram::serve(peripheral.clone(), &config)
+    let mut incoming = datagram::serve(&adapter(&peripheral).await,&config)
         .await
         .expect("serve should start");
 
     // First connection, whose session id we capture, then abandon.
-    let first = datagram::connect(central.clone(), &peripheral_addr, &config)
+    let first = datagram::connect(&adapter(&central).await,&peripheral_addr, &config)
         .await
         .expect("connect should succeed");
     let stale_session = first.session().expect("mock supplies a session");
@@ -1137,7 +1143,7 @@ async fn a_loss_event_from_a_replaced_connection_does_not_kill_its_successor() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     // The same address reconnects and is served afresh.
-    let mut second = datagram::connect(central.clone(), &peripheral_addr, &config)
+    let mut second = datagram::connect(&adapter(&central).await,&peripheral_addr, &config)
         .await
         .expect("reconnect should succeed");
     let mut second_served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
@@ -1179,7 +1185,7 @@ async fn advertised_manufacturer_data_reaches_a_scanner_through_serve() {
     config.advertised_manufacturer_data.insert(0xABCDu16, vec![0x01]);
 
     let peripheral = MockBackend::new(peripheral_addr.clone(), network.clone(), full_capabilities());
-    let _incoming = datagram::serve(Arc::new(peripheral), &config)
+    let _incoming = datagram::serve(&adapter(&Arc::new(peripheral)).await, &config)
         .await
         .expect("serve should start");
 

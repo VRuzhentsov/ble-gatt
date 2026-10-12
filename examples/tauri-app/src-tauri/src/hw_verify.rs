@@ -21,12 +21,12 @@
 //! With the property unset the app behaves exactly as before, so this costs
 //! the normal example nothing.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use ble_gatt::backend::Backend;
 use ble_gatt::datagram::{self, DatagramConfig};
-use ble_gatt::{CharacteristicUuid, PeerAddress, ServiceUuid};
+use ble_gatt::{Adapter, CharacteristicUuid, PeerAddress, ServiceUuid};
+use tauri::{AppHandle, Runtime};
+use tauri_plugin_ble_gatt::BleGattExt;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
@@ -73,14 +73,15 @@ fn role() -> Option<String> {
 }
 
 /// Start the harness if a role is set. Returns immediately otherwise.
-pub fn spawn_if_configured(backend: Arc<dyn Backend>) {
+pub fn spawn_if_configured<R: Runtime>(app: AppHandle<R>) {
     let Some(role) = role() else {
         return;
     };
     tauri::async_runtime::spawn(async move {
+        let adapter = app.ble_gatt().adapter().await;
         let result = match role.as_str() {
-            "peripheral" => run_peripheral(backend).await,
-            "central" => run_central(backend).await,
+            "peripheral" => run_peripheral(&adapter).await,
+            "central" => run_central(&adapter).await,
             other => Err(format!("unknown role {other:?}")),
         };
         match result {
@@ -90,8 +91,8 @@ pub fn spawn_if_configured(backend: Arc<dyn Backend>) {
     });
 }
 
-async fn run_peripheral(backend: Arc<dyn Backend>) -> Result<(), String> {
-    let caps = backend.capabilities().await;
+async fn run_peripheral(adapter: &Adapter) -> Result<(), String> {
+    let caps = adapter.capabilities().await;
     mark(&format!(
         "INFO capabilities central={} peripheral={}",
         caps.central, caps.peripheral
@@ -101,7 +102,7 @@ async fn run_peripheral(backend: Arc<dyn Backend>) -> Result<(), String> {
     }
 
     let config = config();
-    let mut incoming = datagram::serve(backend, &config)
+    let mut incoming = datagram::serve(adapter, &config)
         .await
         .map_err(|err| format!("serve failed: {err}"))?;
     mark(&format!("INFO advertising service {SERVICE}"));
@@ -130,15 +131,16 @@ async fn run_peripheral(backend: Arc<dyn Backend>) -> Result<(), String> {
     Ok(())
 }
 
-async fn run_central(backend: Arc<dyn Backend>) -> Result<(), String> {
-    let caps = backend.capabilities().await;
+async fn run_central(adapter: &Adapter) -> Result<(), String> {
+    let caps = adapter.capabilities().await;
     mark(&format!(
         "INFO capabilities central={} peripheral={}",
         caps.central, caps.peripheral
     ));
 
     mark(&format!("INFO scanning for {SERVICE}"));
-    let mut found = backend
+    let mut found = adapter
+        .central()
         .scan(ServiceUuid(SERVICE))
         .await
         .map_err(|err| format!("scan failed to start: {err}"))?;
@@ -159,7 +161,7 @@ async fn run_central(backend: Arc<dyn Backend>) -> Result<(), String> {
     drop(found);
 
     let config = config();
-    let mut channel = datagram::connect(backend, &peer, &config)
+    let mut channel = datagram::connect(adapter, &peer, &config)
         .await
         .map_err(|err| format!("connect failed: {err}"))?;
     mark(&format!(

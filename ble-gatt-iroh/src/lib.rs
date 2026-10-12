@@ -20,7 +20,7 @@
 //!
 //! ```ignore
 //! let transport = BleGattTransport::builder()
-//!     .dialer(dial_with(backend.clone(), config.clone()))
+//!     .dialer(dial_with(adapter.clone(), config.clone()))
 //!     .build();
 //! let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
 //!     .clear_ip_transports()
@@ -41,9 +41,8 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use ble_gatt::backend::Backend;
 use ble_gatt::datagram::{DatagramChannel, DatagramConfig};
-use ble_gatt::{ConnectionPriority, PeerAddress, Role};
+use ble_gatt::{Adapter, ConnectionPriority, PeerAddress, Role};
 use iroh::address_lookup::{self, AddressLookup, EndpointData, EndpointInfo, Item};
 use iroh::endpoint::transports::{CustomEndpoint, CustomSender, CustomTransport, RecvInfo, Transmit};
 use iroh_base::{CustomAddr, EndpointId, TransportAddr};
@@ -93,12 +92,12 @@ pub type Dialer = Arc<dyn Fn(PeerAddress) -> DialFuture + Send + Sync>;
 /// supervision timeout within seconds. The request is best-effort; Linux has
 /// no such control, and the channel is used either way. Links close when idle,
 /// so the higher power draw lasts only while there is traffic.
-pub fn dial_with(backend: Arc<dyn Backend>, config: DatagramConfig) -> Dialer {
+pub fn dial_with(adapter: Adapter, config: DatagramConfig) -> Dialer {
     Arc::new(move |peer: PeerAddress| {
-        let backend = backend.clone();
+        let adapter = adapter.clone();
         let config = config.clone();
         Box::pin(async move {
-            let mut channel = ble_gatt::datagram::connect(backend, &peer, &config).await?;
+            let mut channel = ble_gatt::datagram::connect(&adapter, &peer, &config).await?;
             if let Err(err) = channel.request_connection_priority(ConnectionPriority::High).await {
                 log::debug!("link to {}: high connection priority not applied: {err}", peer.0);
             }
