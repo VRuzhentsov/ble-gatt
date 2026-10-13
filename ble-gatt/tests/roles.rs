@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use ble_gatt::backend::mock::{MockBackend, MockNetwork};
+use ble_gatt::drivers::mock::{MockBackend, MockNetwork};
 use ble_gatt::{
     Adapter, Backend, BoxStream, CapabilityReport, CharacteristicUuid, ConnectionState, DiscoveredPeer,
     GattCharacteristicSpec, GattConnection, GattEvent, GattServiceSpec, PeerAddress, RadioStatus,

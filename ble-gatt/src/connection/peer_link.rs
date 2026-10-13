@@ -670,7 +670,7 @@ impl Driver {
         let cfg = self.config.datagram.clone();
         let inbound_tx = inbound_tx.clone();
         tokio::spawn(async move {
-            match datagram::serve(backend, &cfg).await {
+            match datagram::serve_driver(backend, &cfg).await {
                 Ok(mut stream) => {
                     while let Some(channel) = stream.next().await {
                         if inbound_tx.send(channel).is_err() {
@@ -854,7 +854,7 @@ impl Driver {
             let peer2 = peer.clone();
             let session = next_session;
             let task = tokio::spawn(async move {
-                let result = datagram::connect(backend, &peer2, &cfg).await;
+                let result = datagram::connect_driver(backend, &peer2, &cfg).await;
                 let _ = conn_tx.send((peer2, session, result));
             });
             p.dial_task = Some(task.abort_handle());

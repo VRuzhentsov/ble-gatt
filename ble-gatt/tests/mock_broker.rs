@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use ble_gatt::backend::mock::{MockBackend, MockNetwork};
+use ble_gatt::drivers::mock::{MockBackend, MockNetwork};
 use ble_gatt::{
     Backend, CapabilityReport, CharacteristicUuid, GattCharacteristicSpec, GattEvent,
     GattServiceSpec, PeerAddress, ServiceUuid,

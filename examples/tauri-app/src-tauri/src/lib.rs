@@ -15,9 +15,7 @@ pub fn run() {
 
       // Runs only when `debug.blegatt.role` is set, so an ordinary launch
       // of the example is unaffected.
-      use tauri::Manager;
-      let state = app.state::<tauri_plugin_ble_gatt::commands::PluginState>();
-      hw_verify::spawn_if_configured(state.backend());
+      hw_verify::spawn_if_configured(app.handle().clone());
       Ok(())
     })
     .run(tauri::generate_context!())

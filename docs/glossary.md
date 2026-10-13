@@ -51,6 +51,19 @@ One of those broadcast packets: up to about 31 bytes carrying service UUIDs
 and small data (for example the manufacturer data where this library puts a
 peer's identity fingerprint). *Also called:* advertising data, adv.
 
+### Scan response
+A second packet of up to 31 bytes that an advertiser sends only when a
+scanner asks for it. Scanners ask during an *active* scan, which is how both
+Android and BlueZ scan. This library puts a peer's local name there, because
+the advertisement itself is full. *Also called:* SCAN_RSP.
+
+### Local name
+A short, human-readable name a peripheral advertises so a scanner can show
+it without connecting (`GattServiceSpec::local_name` → `DiscoveredPeer::name`).
+Linux sends it as BlueZ's `LocalName`; Android, which cannot set a name per
+advertisement, sends it as service data under the advertised service UUID.
+Both go in the scan response. Not the OS device name (`Pixel 6 Pro`).
+
 ### Scan
 A central listening for advertisements for a while. Scanning is the most
 battery-expensive thing BLE does on a phone.

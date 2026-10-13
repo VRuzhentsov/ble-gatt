@@ -5,10 +5,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ble_gatt::backend::mock::{MockBackend, MockNetwork};
-use ble_gatt::backend::Backend;
 use ble_gatt::datagram::{self, DatagramConfig};
-use ble_gatt::{CapabilityReport, CharacteristicUuid, PeerAddress, ServiceUuid};
+use ble_gatt::drivers::mock::{MockBackend, MockNetwork};
+use ble_gatt::{Adapter, CapabilityReport, CharacteristicUuid, PeerAddress, ServiceUuid};
 use ble_gatt_iroh::{custom_addr, dial_with, BleGattTransport};
 use iroh::endpoint::{presets, Connection};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
@@ -38,12 +37,13 @@ fn config() -> DatagramConfig {
     )
 }
 
-fn backend(network: &Arc<MockNetwork>, address: &str) -> Arc<dyn Backend> {
-    Arc::new(MockBackend::new(
+async fn adapter(network: &Arc<MockNetwork>, address: &str) -> Adapter {
+    Adapter::new(Arc::new(MockBackend::new(
         PeerAddress(address.to_string()),
         network.clone(),
         CapabilityReport { central: true, peripheral: true },
-    ))
+    )))
+    .await
 }
 
 async fn endpoint(secret_key: SecretKey, transport: &BleGattTransport) -> Endpoint {
@@ -72,7 +72,7 @@ async fn pair() -> Pair {
     let listener_address = PeerAddress("AA:00:00:00:00:02".to_string());
 
     let listener_transport = BleGattTransport::builder().build();
-    let incoming = datagram::serve(backend(&network, &listener_address.0), &config())
+    let incoming = datagram::serve(&adapter(&network, &listener_address.0).await, &config())
         .await
         .expect("serve");
     let attach_to = listener_transport.clone();
@@ -88,7 +88,7 @@ async fn pair() -> Pair {
     let router = Router::builder(listener).accept(ECHO_ALPN, Echo).spawn();
 
     let dialer_transport = BleGattTransport::builder()
-        .dialer(dial_with(backend(&network, "AA:00:00:00:00:01"), config()))
+        .dialer(dial_with(adapter(&network, "AA:00:00:00:00:01").await, config()))
         .build();
     dialer_transport.set_peer_address(listener_id, listener_address.clone());
     let dialer = endpoint(SecretKey::generate(), &dialer_transport).await;
@@ -152,7 +152,7 @@ async fn a_channel_routed_by_its_first_datagram_still_carries_quic() {
     let listener_address = PeerAddress("AA:00:00:00:00:04".to_string());
 
     let listener_transport = BleGattTransport::builder().build();
-    let incoming = datagram::serve(backend(&network, &listener_address.0), &config())
+    let incoming = datagram::serve(&adapter(&network, &listener_address.0).await, &config())
         .await
         .expect("serve");
     let attach_to = listener_transport.clone();
@@ -170,7 +170,7 @@ async fn a_channel_routed_by_its_first_datagram_still_carries_quic() {
     let _router = Router::builder(listener).accept(ECHO_ALPN, Echo).spawn();
 
     let dialer_transport = BleGattTransport::builder()
-        .dialer(dial_with(backend(&network, "AA:00:00:00:00:03"), config()))
+        .dialer(dial_with(adapter(&network, "AA:00:00:00:00:03").await, config()))
         .build();
     dialer_transport.set_peer_address(listener_id, listener_address);
     let dialer = endpoint(SecretKey::generate(), &dialer_transport).await;
@@ -202,10 +202,10 @@ async fn an_idle_channel_is_closed() {
     let transport = BleGattTransport::builder()
         .link_idle_timeout(Duration::from_millis(200))
         .build();
-    let mut incoming = datagram::serve(backend(&network, &listener_address.0), &config())
+    let mut incoming = datagram::serve(&adapter(&network, &listener_address.0).await, &config())
         .await
         .expect("serve");
-    let _client = datagram::connect(backend(&network, "AA:00:00:00:00:05"), &listener_address, &config())
+    let _client = datagram::connect(&adapter(&network, "AA:00:00:00:00:05").await, &listener_address, &config())
         .await
         .expect("connect");
     let channel = tokio::time::timeout(TIMEOUT, incoming.next())

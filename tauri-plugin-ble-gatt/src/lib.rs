@@ -7,7 +7,7 @@
 //!   one the application injects ([`Builder::backend`]);
 //! - Bluetooth runtime permissions through Tauri's own mobile-plugin
 //!   permission mechanism ([`BleGatt::request_permissions`]);
-//! - access from Rust: `app.ble_gatt().backend()` ([`BleGattExt`]), the same
+//! - access from Rust: `app.ble_gatt().adapter()` ([`BleGattExt`]), the same
 //!   pattern as `tauri-plugin-store`'s `StoreExt`;
 //! - `#[tauri::command]`s for JavaScript callers (`commands`).
 
@@ -20,8 +20,9 @@ mod lazy;
 use std::sync::Arc;
 
 pub use ble_gatt;
-use ble_gatt::Backend;
+use ble_gatt::{Adapter, Backend};
 pub use lazy::LazyBackend;
+use tokio::sync::OnceCell;
 use tauri::plugin::{PermissionState, PluginApi, TauriPlugin};
 use tauri::{AppHandle, Manager, Runtime};
 
@@ -95,6 +96,9 @@ impl Builder {
 /// The plugin's Rust API, reached with `app.ble_gatt()`.
 pub struct BleGatt<R: Runtime> {
     backend: Arc<dyn Backend>,
+    /// Built on the first `adapter()` call: `Adapter::new` is async and
+    /// spawns its status watcher, which plugin setup is no place to do.
+    adapter: OnceCell<Adapter>,
     #[cfg(target_os = "android")]
     mobile: tauri::plugin::PluginHandle<R>,
     #[cfg(not(target_os = "android"))]
@@ -107,6 +111,7 @@ impl<R: Runtime> BleGatt<R> {
     ) -> Result<Self, Error> {
         Ok(Self {
             backend,
+            adapter: OnceCell::new(),
             #[cfg(target_os = "android")]
             mobile: _api.register_android_plugin(PLUGIN_IDENTIFIER, "BleGattPlugin")?,
             #[cfg(not(target_os = "android"))]
@@ -114,10 +119,13 @@ impl<R: Runtime> BleGatt<R> {
         })
     }
 
-    /// The backend this plugin drives, for using the `ble-gatt` API
-    /// directly from Rust.
-    pub fn backend(&self) -> Arc<dyn Backend> {
-        self.backend.clone()
+    /// The adapter this plugin drives, for using the `ble-gatt` API
+    /// directly from Rust. Every call returns the same adapter.
+    pub async fn adapter(&self) -> Adapter {
+        self.adapter
+            .get_or_init(|| Adapter::new(self.backend.clone()))
+            .await
+            .clone()
     }
 
     /// Whether the app may use Bluetooth. On Android this covers the
@@ -180,7 +188,7 @@ impl<R: Runtime, T: Manager<R>> BleGattExt<R> for T {
 #[cfg(target_os = "linux")]
 fn default_backend() -> Option<Arc<dyn Backend>> {
     Some(Arc::new(LazyBackend::new(|| async {
-        let backend = ble_gatt::backend::linux::LinuxBackend::new().await?;
+        let backend = ble_gatt::drivers::linux::LinuxBackend::new().await?;
         Ok(Arc::new(backend) as Arc<dyn Backend>)
     })))
 }
@@ -189,7 +197,7 @@ fn default_backend() -> Option<Arc<dyn Backend>> {
 fn default_backend() -> Option<Arc<dyn Backend>> {
     Some(Arc::new(LazyBackend::new(|| async {
         android_context::ensure().map_err(ble_gatt::BleError::AdapterUnavailable)?;
-        let backend = ble_gatt::backend::android::AndroidBackend::new().await?;
+        let backend = ble_gatt::drivers::android::AndroidBackend::new().await?;
         Ok(Arc::new(backend) as Arc<dyn Backend>)
     })))
 }

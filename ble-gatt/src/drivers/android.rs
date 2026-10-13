@@ -74,8 +74,9 @@ use uuid::Uuid;
 use crate::hal::{Backend, BoxStream, GattConnection};
 use crate::entities::error::{BleError, Result};
 use crate::entities::models::{
-    CapabilityReport, CharacteristicUuid, ConnectionPriority, DiscoveredPeer, GattEvent, GattServiceSpec,
-    PeerAddress, RadioStatus, Role, ServiceUuid, WriteType,
+    advertised_name, truncate_name, CapabilityReport, CharacteristicUuid, ConnectionPriority, DiscoveredPeer,
+    GattEvent, GattServiceSpec, PeerAddress, RadioStatus, Role, ServiceUuid, WriteType,
+    NAME_SERVICE_DATA_MAX_LEN,
 };
 
 const BRIDGE_CLASS_BINARY_NAME: &str = "dev.blegatt.BleGattBridge";
@@ -150,6 +151,9 @@ struct ScanState {
     /// scan's platform session and clear its sender, leaving a scan that
     /// returned successfully with an immediately-closed result stream.
     generation: u64,
+    /// The service this scan looks for, under whose service data an
+    /// Android peer sends its name (`advertised_name`).
+    service: Option<ServiceUuid>,
 }
 
 struct Inner {
@@ -548,6 +552,7 @@ impl Backend for AndroidBackend {
         scan.tx = Some(tx);
         scan.error = None;
         scan.generation = generation;
+        scan.service = Some(service);
         drop(scan);
 
         Ok(Box::pin(ScanStream {
@@ -650,6 +655,7 @@ impl Backend for AndroidBackend {
     }
 
     async fn advertise(&self, service: GattServiceSpec) -> Result<()> {
+        service.validate()?;
         // Held across claiming the generation and issuing the platform call,
         // so an abandoned attempt's cleanup cannot interleave with a retry.
         // Released before awaiting the result, so a cancelled attempt's
@@ -743,12 +749,23 @@ impl Backend for AndroidBackend {
                 .map_err(|err| BleError::Gatt(err.to_string()))?;
         }
 
+        // Android cannot set a name per advertisement, so the name travels
+        // as service data under the service UUID in the scan response
+        // (`GattServiceSpec::local_name`). Null when there is none.
+        let scan_response_name = match service.local_name.as_deref() {
+            Some(name) if !name.is_empty() => JObject::from(
+                env.byte_array_from_slice(truncate_name(name, NAME_SERVICE_DATA_MAX_LEN).as_bytes())
+                    .map_err(|err| BleError::Gatt(err.to_string()))?,
+            ),
+            _ => JObject::null(),
+        };
+
         let (tx, rx) = oneshot::channel();
         *self.inner.advertise_tx.lock().unwrap() = Some(tx);
         self.inner.call_void(
             &mut env,
             "startAdvertising",
-            "(Ljava/lang/String;[Ljava/lang/String;[Z[Z[Z[[B[I[[B[Ljava/lang/String;[[B)V",
+            "(Ljava/lang/String;[Ljava/lang/String;[Z[Z[Z[[B[I[[B[Ljava/lang/String;[[B[B)V",
             &[
                 JValue::Object(&service_uuid),
                 JValue::Object(&char_uuids),
@@ -760,6 +777,7 @@ impl Backend for AndroidBackend {
                 JValue::Object(&manufacturer_value_array),
                 JValue::Object(&service_data_uuid_array),
                 JValue::Object(&service_data_value_array),
+                JValue::Object(&scan_response_name),
             ],
         )?;
         rx
@@ -1530,6 +1548,10 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onPeerDiscovered<'local>(
         // try_send on a bounded queue: this runs on a JVM callback thread
         // that must not block, and in a dense advertising environment the
         // radio can outpace any consumer indefinitely.
+        let name = match scan.service {
+            Some(service) => advertised_name(service, &service_data, name),
+            None => name,
+        };
         let peer = DiscoveredPeer {
             address: PeerAddress(address),
             name,

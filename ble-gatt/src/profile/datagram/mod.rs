@@ -134,6 +134,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
 use crate::hal::{Backend, BoxStream, GattConnection};
+use crate::roles::Adapter;
 use crate::profile::datagram::fragment::{split, FragmentHeader, FRAGMENT_HEADER_LEN, MAX_FRAGMENTS};
 use crate::profile::datagram::reassembly::{Accept, Reassembler, ReassemblyLimits};
 use crate::entities::error::{BleError, Result};
@@ -203,6 +204,10 @@ pub struct DatagramConfig {
     /// discoverability flag toggled on and off) re-advertises by ending the
     /// current `serve` stream and calling it again with an updated config.
     pub advertised_manufacturer_data: BTreeMap<u16, Vec<u8>>,
+    /// Becomes [`service_spec`](Self::service_spec)'s
+    /// `GattServiceSpec.local_name`: a short name scanners read from the
+    /// scan response without connecting. `None` by default.
+    pub advertised_local_name: Option<String>,
 }
 
 impl DatagramConfig {
@@ -218,6 +223,7 @@ impl DatagramConfig {
             fragment_queue_depth: DEFAULT_FRAGMENT_QUEUE_DEPTH,
             accept_queue_depth: DEFAULT_ACCEPT_QUEUE_DEPTH,
             advertised_manufacturer_data: BTreeMap::new(),
+            advertised_local_name: None,
         }
     }
 
@@ -266,6 +272,7 @@ impl DatagramConfig {
             }],
         );
         spec.manufacturer_data = self.advertised_manufacturer_data.clone();
+        spec.local_name = self.advertised_local_name.clone();
         spec
     }
 }
@@ -866,6 +873,13 @@ impl Drop for PendingConnection {
 /// Central role: connect to `peer` and bring up a channel over `config`'s
 /// service.
 pub async fn connect(
+    adapter: &Adapter, peer: &PeerAddress, config: &DatagramConfig,
+) -> Result<DatagramChannel> {
+    connect_driver(adapter.backend(), peer, config).await
+}
+
+/// [`connect`] over a driver directly, for `PeerLink`, which holds one.
+pub(crate) async fn connect_driver(
     backend: Arc<dyn Backend>, peer: &PeerAddress, config: &DatagramConfig,
 ) -> Result<DatagramChannel> {
     config.validate()?;
@@ -1053,7 +1067,12 @@ fn spawn_link_loss_watch(
 /// this needs a per-peer notify on the `Backend` port: straightforward on
 /// Android (`notifyCharacteristicChanged` already takes a device),
 /// unresolved on BlueZ.
-pub async fn serve(
+pub async fn serve(adapter: &Adapter, config: &DatagramConfig) -> Result<BoxStream<DatagramChannel>> {
+    serve_driver(adapter.backend(), config).await
+}
+
+/// [`serve`] over a driver directly, for `PeerLink`, which holds one.
+pub(crate) async fn serve_driver(
     backend: Arc<dyn Backend>, config: &DatagramConfig,
 ) -> Result<BoxStream<DatagramChannel>> {
     config.validate()?;

@@ -32,12 +32,12 @@ use tauri_plugin_ble_gatt::BleGattExt;
 
 tauri::Builder::default()
     .plugin(tauri_plugin_ble_gatt::init())
-    // or, to supply a backend yourself (a mock radio in tests):
-    // .plugin(tauri_plugin_ble_gatt::Builder::new().backend(backend).build())
-    .setup(|app| {
-        let backend = app.ble_gatt().backend(); // Arc<dyn ble_gatt::Backend>
-        Ok(())
-    });
+    // or, to supply a driver yourself (a mock radio in tests):
+    // .plugin(tauri_plugin_ble_gatt::Builder::new().backend(driver).build())
+    ;
+
+// From async code:
+let adapter = app.ble_gatt().adapter().await; // ble_gatt::Adapter
 
 // From a blocking task, never the main thread:
 let state = app.ble_gatt().request_permissions()?; // PermissionState::Granted, ...
@@ -69,7 +69,7 @@ exactly what is and isn't verified about it.
 [0003](docs/adr/0003-carrier-not-crypto-and-the-two-api-tiers.md) — carrier
 vs. crypto, the two API tiers, and the no-AGPL constraint.
 [0004](docs/adr/0004-mock-broker-for-cross-process-e2e.md) — the optional
-`mock-broker` feature letting `backend::mock` bridge two real OS processes
+`mock-broker` feature letting `drivers::mock` bridge two real OS processes
 over a socket instead of sharing an in-process `Arc`.
 
 ## Platform support
@@ -120,14 +120,17 @@ state.wait_for(|s| s.is_disconnected()).await?;
 
 ### Power profiles
 
-`power::PowerAdvisor` turns the device's situation (foreground, battery,
+`power::PowerProfiles` turns the device's situation (foreground, battery,
 charging, peers nearby) into advice: scan on/off times, a connection limit
 and a connection priority, published on a `watch` channel. It never touches
 the radio; the application applies it (ADR-0007 D8).
 
 Layers are named after Clean Architecture and modules after the Bluetooth
-specification (ADR-0007). The old paths (`ble_gatt::backend::…`,
-`ble_gatt::datagram`, `ble_gatt::peer_link`) still resolve.
+specification (ADR-0007). The short paths `ble_gatt::datagram` and
+`ble_gatt::peer_link` still resolve; `ble_gatt::backend::…` is gone (use
+`ble_gatt::drivers` and `ble_gatt::hal`). Application code takes an
+`Adapter` (`datagram::connect`/`serve`, `ble_gatt_iroh::dial_with`);
+`Backend` is the driver port underneath it.
 
 Every backend speaks the same generic GATT vocabulary
 (`ServiceUuid`/`CharacteristicUuid`/`GattEvent`/`GattServiceSpec`/...) —
