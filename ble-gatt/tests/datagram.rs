@@ -1200,6 +1200,46 @@ async fn advertised_manufacturer_data_reaches_a_scanner_through_serve() {
     assert_eq!(peer.manufacturer_data.get(&0xABCD), Some(&vec![0x01]));
 }
 
+/// `DatagramConfig::advertised_local_name` reaches a scanner as
+/// `DiscoveredPeer::name`, next to the manufacturer data, with no connection.
+#[tokio::test]
+async fn advertised_local_name_reaches_a_scanner_through_serve() {
+    let network = MockNetwork::new();
+    let mut config = config();
+    config.advertised_manufacturer_data.insert(0xABCDu16, vec![0x01]);
+    config.advertised_local_name = Some("Will's Pixel".to_string());
+
+    let peripheral = MockBackend::new(PeerAddress("peripheral-name".to_string()), network.clone(), full_capabilities());
+    let _incoming = datagram::serve(&adapter(&Arc::new(peripheral)).await, &config)
+        .await
+        .expect("serve should start");
+
+    let central = MockBackend::new(PeerAddress("central-name".to_string()), network.clone(), full_capabilities());
+    let mut discovered = central.scan(config.service).await.expect("scan should succeed");
+    let peer = discovered
+        .next()
+        .await
+        .expect("peripheral should be discovered")
+        .expect("discovery should not error");
+
+    assert_eq!(peer.name.as_deref(), Some("Will's Pixel"));
+    assert_eq!(peer.manufacturer_data.get(&0xABCD), Some(&vec![0x01]));
+}
+
+/// A name and service data under the advertised service would both travel
+/// as that service data, so advertising refuses the pair.
+#[tokio::test]
+async fn a_local_name_cannot_share_the_service_data_slot() {
+    let network = MockNetwork::new();
+    let config = config();
+    let mut spec = config.service_spec();
+    spec.local_name = Some("name".to_string());
+    spec.service_data.insert(config.service, vec![1]);
+
+    let peripheral = MockBackend::new(PeerAddress("peripheral-clash".to_string()), network, full_capabilities());
+    assert!(peripheral.advertise(spec).await.is_err());
+}
+
 /// A `sender` sends while the channel itself is parked in `recv`: both
 /// directions move at once, and a closed channel stops the sender.
 #[tokio::test]

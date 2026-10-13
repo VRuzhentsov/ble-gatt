@@ -304,7 +304,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             override fun onScanResult(callbackType: Int, result: ScanResult) {
                 val record = result.scanRecord
                 val uuids = record?.serviceUuids
-                Log.d(TAG, "onScanResult: ${result.device.address} name=${result.device.name} advertisedUuids=$uuids")
+                Log.d(TAG, "onScanResult: ${result.device.address} name=${record?.deviceName} advertisedUuids=$uuids")
                 if (uuids == null || !uuids.contains(ParcelUuid(target))) {
                     return
                 }
@@ -337,7 +337,11 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                     // costs nothing and is what Linux and the mock report.
                     (uuids ?: emptyList()).map { it.uuid.toString() }.toTypedArray(),
                     result.device.address,
-                    result.device.name,
+                    // The name in this advertisement and its scan response
+                    // (a Linux peer's LocalName), not `device.name`, which is
+                    // the name cached from an earlier connection. An Android
+                    // peer's name arrives as service data; Rust picks it.
+                    record.deviceName,
                     result.rssi,
                     manufacturerIds,
                     manufacturerValues as Array<ByteArray>,
@@ -1008,6 +1012,9 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         // side would have to walk it back out again either way.
         manufacturerIds: IntArray, manufacturerValues: Array<ByteArray>,
         serviceDataUuids: Array<String>, serviceDataValues: Array<ByteArray>,
+        // The short name, already truncated by Rust, sent as service data
+        // under serviceUuid in the scan response. Null for none.
+        scanResponseName: ByteArray?,
     ) {
         // Tear down any predecessor first. This bridge holds a single
         // `gattServer`/`advertiseCallback` pair, so starting without
@@ -1067,6 +1074,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                     beginAdvertising(
                         advertiser, serviceUuid, generation,
                         manufacturerIds, manufacturerValues, serviceDataUuids, serviceDataValues,
+                        scanResponseName,
                     )
                 }
             }
@@ -1403,6 +1411,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         generation: Long,
         manufacturerIds: IntArray, manufacturerValues: Array<ByteArray>,
         serviceDataUuids: Array<String>, serviceDataValues: Array<ByteArray>,
+        scanResponseName: ByteArray?,
     ) {
         val settings = AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
@@ -1422,6 +1431,18 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             dataBuilder.addServiceData(ParcelUuid(UUID.fromString(serviceDataUuids[i])), serviceDataValues[i])
         }
         val data = dataBuilder.build()
+        // The advertising packet is full (service UUID + manufacturer data),
+        // so the name goes in the scan response, which scanners request
+        // during an active scan. Android cannot set a custom local name per
+        // advertisement, hence service data under our own service UUID.
+        val scanResponse = if (scanResponseName != null && scanResponseName.isNotEmpty()) {
+            AdvertiseData.Builder()
+                .setIncludeDeviceName(false)
+                .addServiceData(ParcelUuid(UUID.fromString(serviceUuid)), scanResponseName)
+                .build()
+        } else {
+            null
+        }
         val callback = object : AdvertiseCallback() {
             override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
                 // A stop/restart can leave this callback running against a
@@ -1457,8 +1478,12 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             }
         }
         advertiseCallback = callback
-        Log.d(TAG, "startAdvertising: serviceUuid=$serviceUuid advertiser=${advertiser != null}")
-        advertiser.startAdvertising(settings, data, callback)
+        Log.d(TAG, "startAdvertising: serviceUuid=$serviceUuid advertiser=${advertiser != null} scanResponseName=${scanResponse != null}")
+        if (scanResponse != null) {
+            advertiser.startAdvertising(settings, data, scanResponse, callback)
+        } else {
+            advertiser.startAdvertising(settings, data, callback)
+        }
     }
 
     /// Close every open GATT and the server, so no Kotlin object is left

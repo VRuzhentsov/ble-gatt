@@ -204,6 +204,10 @@ pub struct DatagramConfig {
     /// discoverability flag toggled on and off) re-advertises by ending the
     /// current `serve` stream and calling it again with an updated config.
     pub advertised_manufacturer_data: BTreeMap<u16, Vec<u8>>,
+    /// Becomes [`service_spec`](Self::service_spec)'s
+    /// `GattServiceSpec.local_name`: a short name scanners read from the
+    /// scan response without connecting. `None` by default.
+    pub advertised_local_name: Option<String>,
 }
 
 impl DatagramConfig {
@@ -219,6 +223,7 @@ impl DatagramConfig {
             fragment_queue_depth: DEFAULT_FRAGMENT_QUEUE_DEPTH,
             accept_queue_depth: DEFAULT_ACCEPT_QUEUE_DEPTH,
             advertised_manufacturer_data: BTreeMap::new(),
+            advertised_local_name: None,
         }
     }
 
@@ -267,6 +272,7 @@ impl DatagramConfig {
             }],
         );
         spec.manufacturer_data = self.advertised_manufacturer_data.clone();
+        spec.local_name = self.advertised_local_name.clone();
         spec
     }
 }

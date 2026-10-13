@@ -88,8 +88,8 @@ use tokio::sync::{broadcast, Mutex as AsyncMutex};
 use crate::hal::{Backend, BoxStream, GattConnection};
 use crate::entities::error::{BleError, Result};
 use crate::entities::models::{
-    CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress,
-    Role, ServiceUuid, WriteType,
+    advertised_name, truncate_name, CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattEvent,
+    GattServiceSpec, PeerAddress, Role, ServiceUuid, WriteType, LOCAL_NAME_MAX_LEN,
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
@@ -1406,7 +1406,7 @@ async fn read_scanned_peer(adapter: &Adapter, address: bluer::Address, target: u
         log::debug!("scan: {address} is cached but not heard in this scan yet");
         return ScannedPeer::Unknown;
     };
-    let name = device.name().await.ok().flatten();
+    let platform_name = device.name().await.ok().flatten();
     let manufacturer_data: std::collections::BTreeMap<u16, Vec<u8>> = device
         .manufacturer_data()
         .await
@@ -1424,11 +1424,8 @@ async fn read_scanned_peer(adapter: &Adapter, address: bluer::Address, target: u
         .into_iter()
         .map(|(uuid, data)| (ServiceUuid(uuid), data))
         .collect();
+    let name = advertised_name(ServiceUuid(target), &service_data, platform_name);
     let complete = !manufacturer_data.is_empty();
-    log::info!(
-        "scan: discovered {address} name={name:?} rssi={rssi} manufacturer_data={}",
-        if complete { "yes" } else { "not yet" }
-    );
     let rssi = Some(rssi);
     let peer = DiscoveredPeer {
         address: PeerAddress(address.to_string()),
@@ -1496,12 +1493,18 @@ impl Backend for LinuxBackend {
         // is re-read on each tick, rather than only at its announcement or
         // for a fixed window after it. A window of 5s missed a phone BlueZ
         // heard 6s into a 30s scan, three scans in a row on hardware.
+        //
+        // A matched device stays watched after it is reported, too: its name
+        // arrives in the scan response, possibly after the first report, and
+        // BlueZ's name can change from a cached one to the advertised one. A
+        // device is reported again when it gains manufacturer data or its
+        // name changes.
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<DiscoveredPeer>>(32);
         tokio::spawn(async move {
             let _scan_guard = scan_guard;
-            // `true`: reported complete, done. `false`: a match was reported
-            // without manufacturer data; still watched for the data.
-            let mut reported: HashMap<bluer::Address, bool> = HashMap::new();
+            // What was last reported per device: whether it had manufacturer
+            // data, and its name.
+            let mut reported: HashMap<bluer::Address, (bool, Option<String>)> = HashMap::new();
             let mut pending: HashSet<bluer::Address> = HashSet::new();
             let mut events = Box::pin(events);
             let mut tick = tokio::time::interval(SCAN_RECHECK_INTERVAL);
@@ -1510,9 +1513,6 @@ impl Backend for LinuxBackend {
                 let due: Vec<bluer::Address> = tokio::select! {
                     event = events.next() => match event {
                         Some(AdapterEvent::DeviceAdded(address)) => {
-                            if reported.get(&address) == Some(&true) {
-                                continue;
-                            }
                             pending.insert(address);
                             vec![address]
                         }
@@ -1527,21 +1527,25 @@ impl Backend for LinuxBackend {
                     () = tx.closed() => break,
                 };
                 for address in due {
-                    let peer = match read_scanned_peer(&adapter, address, target).await {
-                        ScannedPeer::Complete(peer) => {
-                            reported.insert(address, true);
-                            pending.remove(&address);
-                            peer
-                        }
-                        // Reported once without manufacturer data, so an
-                        // advertiser that never sends any is still found, then
-                        // again once the data arrives.
-                        ScannedPeer::NoManufacturerData(peer) if !reported.contains_key(&address) => {
-                            reported.insert(address, false);
-                            peer
-                        }
+                    // Reported without manufacturer data too, so an advertiser
+                    // that never sends any is still found, then again once the
+                    // data arrives.
+                    let (peer, complete) = match read_scanned_peer(&adapter, address, target).await {
+                        ScannedPeer::Complete(peer) => (peer, true),
+                        ScannedPeer::NoManufacturerData(peer) => (peer, false),
                         _ => continue,
                     };
+                    let now = (complete, peer.name.clone());
+                    if reported.get(&address) == Some(&now) {
+                        continue;
+                    }
+                    log::info!(
+                        "scan: discovered {address} name={:?} rssi={:?} manufacturer_data={}",
+                        peer.name,
+                        peer.rssi,
+                        if complete { "yes" } else { "not yet" }
+                    );
+                    reported.insert(address, now);
                     if tx.send(Ok(peer)).await.is_err() {
                         return;
                     }
@@ -1783,6 +1787,7 @@ impl Backend for LinuxBackend {
             service.uuid.0,
             service.characteristics.len()
         );
+        service.validate()?;
         // Held for the whole setup, including both BlueZ registrations, so a
         // concurrent stop cannot interleave with installing the handles.
         let _serialise = self.advertise_lock.lock().await;
@@ -2054,6 +2059,12 @@ impl Backend for LinuxBackend {
                 .iter()
                 .map(|(uuid, value)| (uuid.0, value.clone()))
                 .collect(),
+            // BlueZ sends LocalName in the scan response. Truncated here so
+            // a long name is cut on a character boundary, not by BlueZ.
+            local_name: service
+                .local_name
+                .as_deref()
+                .map(|name| truncate_name(name, LOCAL_NAME_MAX_LEN).to_string()),
             ..Default::default()
         };
         let adv_handle = self.adapter.advertise(adv).await.map_err(|err| {

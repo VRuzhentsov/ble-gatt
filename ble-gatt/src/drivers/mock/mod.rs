@@ -347,6 +347,7 @@ impl Backend for MockBackend {
         if !self.capabilities.peripheral {
             return Err(BleError::PeripheralUnsupported);
         }
+        service.validate()?;
         self.network.advertise(&self.address, service).await
     }
 

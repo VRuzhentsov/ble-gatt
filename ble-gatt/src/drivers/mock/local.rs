@@ -222,7 +222,7 @@ impl LocalRadio {
             .filter(|(addr, state)| *addr != requester && state.service.uuid == service)
             .map(|(addr, state)| DiscoveredPeer {
                 address: addr.clone(),
-                name: None,
+                name: state.service.local_name.clone(),
                 services: vec![state.service.uuid],
                 manufacturer_data: state.manufacturer_data.clone(),
                 service_data: state.service_data.clone(),
