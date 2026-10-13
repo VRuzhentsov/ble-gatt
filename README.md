@@ -120,7 +120,7 @@ state.wait_for(|s| s.is_disconnected()).await?;
 
 ### Power profiles
 
-`power::PowerAdvisor` turns the device's situation (foreground, battery,
+`power::PowerProfiles` turns the device's situation (foreground, battery,
 charging, peers nearby) into advice: scan on/off times, a connection limit
 and a connection priority, published on a `watch` channel. It never touches
 the radio; the application applies it (ADR-0007 D8).
