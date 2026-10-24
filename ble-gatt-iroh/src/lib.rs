@@ -32,7 +32,7 @@
 //!
 //! [iroh]: https://docs.rs/iroh
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -165,6 +165,7 @@ impl BleGattTransportBuilder {
             inner: Arc::new(Inner {
                 links: Mutex::new(HashMap::new()),
                 peers: Mutex::new(HashMap::new()),
+                retired: Mutex::new(HashSet::new()),
                 inbound_tx,
                 inbound_rx: Mutex::new(Some(inbound_rx)),
                 answered: Mutex::new(HashMap::new()),
@@ -188,6 +189,9 @@ struct Inner {
     links: Mutex<HashMap<PeerAddress, mpsc::Sender<Vec<u8>>>>,
     /// Where each known endpoint can be reached, for address lookup.
     peers: Mutex<HashMap<EndpointId, PeerAddress>>,
+    /// Addresses `set_peer_address` replaced or `forget_peer` removed, and
+    /// not set again since: never dialled; see `Sender::send`.
+    retired: Mutex<HashSet<PeerAddress>>,
     inbound_tx: mpsc::Sender<Inbound>,
     /// Taken by the one endpoint that binds this transport.
     inbound_rx: Mutex<Option<mpsc::Receiver<Inbound>>>,
@@ -245,17 +249,33 @@ impl BleGattTransport {
     }
 
     /// Records where `endpoint` can be reached, for iroh's address lookup.
+    ///
+    /// The address it replaces is no longer dialled, though iroh may still
+    /// offer it as a path it used before: a phone's old advertising address
+    /// is gone, and on BlueZ a dial to it cancelled the dial to the current
+    /// one (`le-connection-abort-by-local`). An address never set here is
+    /// still dialled, so connecting by an explicit `EndpointAddr` works.
     pub fn set_peer_address(&self, endpoint: EndpointId, address: PeerAddress) {
-        self.inner
-            .peers
-            .lock()
-            .expect("poisoned")
-            .insert(endpoint, address);
+        let mut peers = self.inner.peers.lock().expect("poisoned");
+        let mut retired = self.inner.retired.lock().expect("poisoned");
+        retired.remove(&address);
+        if let Some(old) = peers.insert(endpoint, address) {
+            if !peers.values().any(|current| *current == old) {
+                retired.insert(old);
+            }
+        }
     }
 
-    /// Forgets where `endpoint` can be reached.
+    /// Forgets where `endpoint` can be reached. Its address is no longer
+    /// dialled, as with an address [`set_peer_address`](Self::set_peer_address)
+    /// replaced.
     pub fn forget_peer(&self, endpoint: &EndpointId) {
-        self.inner.peers.lock().expect("poisoned").remove(endpoint);
+        let mut peers = self.inner.peers.lock().expect("poisoned");
+        if let Some(old) = peers.remove(endpoint) {
+            if !peers.values().any(|current| *current == old) {
+                self.inner.retired.lock().expect("poisoned").insert(old);
+            }
+        }
     }
 
     /// Peers with a channel open or being dialled.
@@ -499,6 +519,12 @@ impl Sender {
             },
             None => packet,
         };
+        // An address the caller replaced; see `set_peer_address`. Dropped
+        // like any packet with no link: QUIC uses its other paths.
+        if self.inner.retired.lock().expect("poisoned").contains(peer) {
+            log::debug!("not dialling {}: replaced by set_peer_address", peer.0);
+            return Ok(());
+        }
         // The last link with this address was one the peer dialled. Dropping
         // the packet reads to QUIC as loss, and it resends once a link exists.
         let answered = self.inner.answered.lock().expect("poisoned").get(peer).copied();

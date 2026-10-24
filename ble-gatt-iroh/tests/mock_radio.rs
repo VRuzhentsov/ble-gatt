@@ -2,13 +2,13 @@
 //! mock radio: one serves datagram channels and attaches them, the other
 //! dials through the transport.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ble_gatt::datagram::{self, DatagramConfig};
 use ble_gatt::drivers::mock::{MockBackend, MockNetwork};
 use ble_gatt::{Adapter, CapabilityReport, CharacteristicUuid, PeerAddress, ServiceUuid};
-use ble_gatt_iroh::{custom_addr, dial_with, BleGattTransport};
+use ble_gatt_iroh::{custom_addr, dial_with, BleGattTransport, Dialer};
 use iroh::endpoint::{presets, Connection};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey, TransportAddr};
@@ -277,6 +277,58 @@ async fn an_idle_inbound_channel_does_not_hold_back_a_dial() {
         .expect("A dials without waiting for B to dial back")
         .expect("connect");
     assert_eq!(tokio::time::timeout(TIMEOUT, echo(&connection, b"a to b")).await.expect("echo in time"), b"a to b");
+}
+
+/// An address `set_peer_address` replaced is not dialled, even when iroh
+/// still offers it: a phone's old advertising address is gone, and on
+/// BlueZ a dial to it cancelled the dial to the current one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replaced_address_is_not_dialled() {
+    let network = MockNetwork::new();
+    let listener_address = PeerAddress("AA:00:00:00:00:0A".to_string());
+    let old_address = PeerAddress("AA:00:00:00:00:0B".to_string());
+
+    let listener_transport = BleGattTransport::builder().build();
+    let incoming = datagram::serve(&adapter(&network, &listener_address.0).await, &config())
+        .await
+        .expect("serve");
+    let attach_to = listener_transport.clone();
+    tokio::spawn(async move {
+        let mut incoming = incoming;
+        while let Some(channel) = incoming.next().await {
+            attach_to.attach(channel);
+        }
+    });
+    let listener_key = SecretKey::generate();
+    let listener_id = listener_key.public();
+    let listener = endpoint(listener_key, &listener_transport).await;
+    let _router = Router::builder(listener).accept(ECHO_ALPN, Echo).spawn();
+
+    let dialled = Arc::new(Mutex::new(Vec::new()));
+    let inner = dial_with(adapter(&network, "AA:00:00:00:00:09").await, config());
+    let record = dialled.clone();
+    let dialer: Dialer = Arc::new(move |peer: PeerAddress| {
+        record.lock().unwrap().push(peer.clone());
+        inner(peer)
+    });
+    let dialer_transport = BleGattTransport::builder().dialer(dialer).build();
+    dialer_transport.set_peer_address(listener_id, old_address.clone());
+    dialer_transport.set_peer_address(listener_id, listener_address.clone());
+    let dialer = endpoint(SecretKey::generate(), &dialer_transport).await;
+
+    let address = EndpointAddr::from_parts(
+        listener_id,
+        [
+            TransportAddr::Custom(custom_addr(&old_address)),
+            TransportAddr::Custom(custom_addr(&listener_address)),
+        ],
+    );
+    let connection = tokio::time::timeout(TIMEOUT, dialer.connect(address, ECHO_ALPN))
+        .await
+        .expect("connect in time")
+        .expect("connect");
+    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&connection, b"current")).await.expect("echo in time"), b"current");
+    assert!(!dialled.lock().unwrap().contains(&old_address), "dialled the replaced address");
 }
 
 /// Both directions busy at once: the echo writes back while the dialer is
