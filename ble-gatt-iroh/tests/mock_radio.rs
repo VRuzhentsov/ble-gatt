@@ -62,6 +62,7 @@ async fn endpoint(secret_key: SecretKey, transport: &BleGattTransport) -> Endpoi
 /// one, plus a dialer that reaches it.
 struct Pair {
     dialer: Endpoint,
+    dialer_transport: BleGattTransport,
     listener_id: iroh::EndpointId,
     listener_address: PeerAddress,
     _router: Router,
@@ -95,6 +96,7 @@ async fn pair() -> Pair {
 
     Pair {
         dialer,
+        dialer_transport,
         listener_id,
         listener_address,
         _router: router,
@@ -329,6 +331,58 @@ async fn a_replaced_address_is_not_dialled() {
         .expect("connect");
     assert_eq!(tokio::time::timeout(TIMEOUT, echo(&connection, b"current")).await.expect("echo in time"), b"current");
     assert!(!dialled.lock().unwrap().contains(&old_address), "dialled the replaced address");
+}
+
+/// `close_link` closes an attached channel long before the idle timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn close_link_closes_an_attached_channel() {
+    let network = MockNetwork::new();
+    let listener_address = PeerAddress("AA:00:00:00:00:0D".to_string());
+    let client_address = PeerAddress("AA:00:00:00:00:0C".to_string());
+    let transport = BleGattTransport::builder().build();
+    let mut incoming = datagram::serve(&adapter(&network, &listener_address.0).await, &config())
+        .await
+        .expect("serve");
+    let _client = datagram::connect(&adapter(&network, &client_address.0).await, &listener_address, &config())
+        .await
+        .expect("connect");
+    let channel = tokio::time::timeout(TIMEOUT, incoming.next())
+        .await
+        .expect("accepted in time")
+        .expect("a channel");
+    let link = transport.attach(channel);
+    transport.close_link(&client_address);
+    tokio::time::timeout(Duration::from_secs(5), link)
+        .await
+        .expect("the link closes before the idle timeout")
+        .expect("the link task ends cleanly");
+    assert!(transport.linked_peers().is_empty());
+}
+
+/// `close_links` reaches a channel to an address `set_peer_address` has
+/// since replaced: a phone's old address, still linked after the
+/// connection on it ended.
+#[tokio::test(flavor = "multi_thread")]
+async fn close_links_closes_a_channel_to_a_replaced_address() {
+    let pair = pair().await;
+    let connection = tokio::time::timeout(TIMEOUT, pair.dialer.connect(pair.listener_id, ECHO_ALPN))
+        .await
+        .expect("connect in time")
+        .expect("connect");
+    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&connection, b"old")).await.expect("echo in time"), b"old");
+    connection.close(0u32.into(), b"done");
+    assert_eq!(pair.dialer_transport.linked_peers(), vec![pair.listener_address.clone()]);
+
+    pair.dialer_transport
+        .set_peer_address(pair.listener_id, PeerAddress("AA:00:00:00:00:0E".to_string()));
+    pair.dialer_transport.close_links(&pair.listener_id);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !pair.dialer_transport.linked_peers().is_empty() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the link to the replaced address closes before the idle timeout");
 }
 
 /// Both directions busy at once: the echo writes back while the dialer is

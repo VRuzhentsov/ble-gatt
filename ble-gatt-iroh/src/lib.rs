@@ -32,7 +32,7 @@
 //!
 //! [iroh]: https://docs.rs/iroh
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -46,7 +46,7 @@ use ble_gatt::{Adapter, ConnectionPriority, PeerAddress, Role};
 use iroh::address_lookup::{self, AddressLookup, EndpointData, EndpointInfo, Item};
 use iroh::endpoint::transports::{CustomEndpoint, CustomSender, CustomTransport, RecvInfo, Transmit};
 use iroh_base::{CustomAddr, EndpointId, TransportAddr};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 /// The custom address id of this transport ("BLEG"). iroh keeps a registry of
 /// transport ids in its `TRANSPORTS.md`; this one is private to `ble-gatt`.
@@ -165,7 +165,8 @@ impl BleGattTransportBuilder {
             inner: Arc::new(Inner {
                 links: Mutex::new(HashMap::new()),
                 peers: Mutex::new(HashMap::new()),
-                retired: Mutex::new(HashSet::new()),
+                retired: Mutex::new(HashMap::new()),
+                closers: Mutex::new(HashMap::new()),
                 inbound_tx,
                 inbound_rx: Mutex::new(Some(inbound_rx)),
                 answered: Mutex::new(HashMap::new()),
@@ -190,8 +191,12 @@ struct Inner {
     /// Where each known endpoint can be reached, for address lookup.
     peers: Mutex<HashMap<EndpointId, PeerAddress>>,
     /// Addresses `set_peer_address` replaced or `forget_peer` removed, and
-    /// not set again since: never dialled; see `Sender::send`.
-    retired: Mutex<HashSet<PeerAddress>>,
+    /// not set again since, with the endpoint they were set for: never
+    /// dialled; see `Sender::send`.
+    retired: Mutex<HashMap<PeerAddress, EndpointId>>,
+    /// A close signal per running link, replaced ones included; see
+    /// [`BleGattTransport::close_link`].
+    closers: Mutex<HashMap<PeerAddress, Vec<Arc<Notify>>>>,
     inbound_tx: mpsc::Sender<Inbound>,
     /// Taken by the one endpoint that binds this transport.
     inbound_rx: Mutex<Option<mpsc::Receiver<Inbound>>>,
@@ -226,7 +231,8 @@ impl BleGattTransport {
     /// peer may still be sending on it.
     ///
     /// The returned handle completes when the channel closes: the peer went
-    /// away, or it carried nothing for the idle timeout.
+    /// away, it carried nothing for the idle timeout, or
+    /// [`close_link`](Self::close_link) closed it.
     pub fn attach(&self, channel: DatagramChannel) -> tokio::task::JoinHandle<()> {
         let peer = channel.peer();
         let (tx, rx) = mpsc::channel(LINK_QUEUE_DEPTH);
@@ -236,7 +242,42 @@ impl BleGattTransport {
             .lock()
             .expect("poisoned")
             .insert(peer.clone(), tx.clone());
-        tokio::spawn(run_link(self.inner.clone(), peer, channel, rx, tx))
+        let close = add_closer(&self.inner, &peer);
+        tokio::spawn(run_link(self.inner.clone(), peer, channel, rx, tx, close))
+    }
+
+    /// Closes every channel to `peer`, including one being dialled (it
+    /// closes once the dial completes) and one a newer channel replaced, as
+    /// if each had gone idle. For an application that knows it is done with
+    /// a peer before the idle timeout: on hardware, a lingering channel to a
+    /// phone's old address made BlueZ abort every dial to its new one
+    /// (`le-connection-abort-by-local`).
+    pub fn close_link(&self, peer: &PeerAddress) {
+        let closers = self.inner.closers.lock().expect("poisoned").get(peer).cloned();
+        for close in closers.into_iter().flatten() {
+            // Stores a permit when the link is not waiting yet.
+            close.notify_one();
+        }
+    }
+
+    /// [`close_link`](Self::close_link) for `endpoint`'s current address and
+    /// every address [`set_peer_address`](Self::set_peer_address) replaced
+    /// for it. A channel the peer dialled from an address never set here
+    /// is not reached: close it by its address.
+    pub fn close_links(&self, endpoint: &EndpointId) {
+        let mut addresses: Vec<PeerAddress> = self
+            .inner
+            .retired
+            .lock()
+            .expect("poisoned")
+            .iter()
+            .filter(|(_, owner)| *owner == endpoint)
+            .map(|(address, _)| address.clone())
+            .collect();
+        addresses.extend(self.inner.peers.lock().expect("poisoned").get(endpoint).cloned());
+        for address in &addresses {
+            self.close_link(address);
+        }
     }
 
     /// Like [`attach`](Self::attach), for a channel whose first datagram
@@ -261,7 +302,7 @@ impl BleGattTransport {
         retired.remove(&address);
         if let Some(old) = peers.insert(endpoint, address) {
             if !peers.values().any(|current| *current == old) {
-                retired.insert(old);
+                retired.insert(old, endpoint);
             }
         }
     }
@@ -273,7 +314,7 @@ impl BleGattTransport {
         let mut peers = self.inner.peers.lock().expect("poisoned");
         if let Some(old) = peers.remove(endpoint) {
             if !peers.values().any(|current| *current == old) {
-                self.inner.retired.lock().expect("poisoned").insert(old);
+                self.inner.retired.lock().expect("poisoned").insert(old, *endpoint);
             }
         }
     }
@@ -310,6 +351,7 @@ async fn run_link(
     mut channel: DatagramChannel,
     mut outbound: mpsc::Receiver<Vec<u8>>,
     link: mpsc::Sender<Vec<u8>>,
+    close: Arc<Notify>,
 ) {
     log::debug!("link to {} up", peer.0);
     let role = channel.local_role();
@@ -326,12 +368,18 @@ async fn run_link(
     });
     let idle = tokio::time::sleep(inner.link_idle_timeout);
     tokio::pin!(idle);
-    let mut went_idle = false;
+    // Closed by this side (idle or `close_link`), not dropped by the peer.
+    let mut closed_here = false;
     loop {
         tokio::select! {
             () = &mut idle => {
                 log::debug!("link to {}: idle, closing", peer.0);
-                went_idle = true;
+                closed_here = true;
+                break;
+            }
+            () = close.notified() => {
+                log::debug!("link to {}: closed by the application", peer.0);
+                closed_here = true;
                 break;
             }
             _ = &mut send_task => break,
@@ -362,24 +410,48 @@ async fn run_link(
         }
     }
     send_task.abort();
+    remove_closer(&inner, &peer, &close);
     let _ = channel.close().await;
     // Only while this link still owns the peer: an old inbound link ending
     // after a newer one was attached would otherwise mark the peer as having
     // dialled us, and the yield would then hold back dials the newer link's
-    // side is entitled to make. An idle close starts no yield: no QUIC
-    // connection is left to resend, so the peer will not dial back, and on
-    // hardware this side's next connect timed out waiting for it.
+    // side is entitled to make. A close by this side starts no yield: no
+    // QUIC connection is left to resend, so the peer will not dial back, and
+    // on hardware this side's next connect timed out waiting for it.
     {
         let mut links = inner.links.lock().expect("poisoned");
         if links.get(&peer).is_some_and(|current| current.same_channel(&link)) {
             if role == Role::Peripheral {
-                let dropped = (!went_idle).then(Instant::now);
+                let dropped = (!closed_here).then(Instant::now);
                 inner.answered.lock().expect("poisoned").insert(peer.clone(), dropped);
             }
             links.remove(&peer);
         }
     }
     log::debug!("link to {} down", peer.0);
+}
+
+/// Registers a close signal for a new link to `peer`.
+fn add_closer(inner: &Inner, peer: &PeerAddress) -> Arc<Notify> {
+    let close = Arc::new(Notify::new());
+    inner
+        .closers
+        .lock()
+        .expect("poisoned")
+        .entry(peer.clone())
+        .or_default()
+        .push(close.clone());
+    close
+}
+
+fn remove_closer(inner: &Inner, peer: &PeerAddress, close: &Arc<Notify>) {
+    let mut closers = inner.closers.lock().expect("poisoned");
+    if let Some(list) = closers.get_mut(peer) {
+        list.retain(|other| !Arc::ptr_eq(other, close));
+        if list.is_empty() {
+            closers.remove(peer);
+        }
+    }
 }
 
 /// Removes `peer`'s link only if it is still `link`: a replacement attached
@@ -521,7 +593,7 @@ impl Sender {
         };
         // An address the caller replaced; see `set_peer_address`. Dropped
         // like any packet with no link: QUIC uses its other paths.
-        if self.inner.retired.lock().expect("poisoned").contains(peer) {
+        if self.inner.retired.lock().expect("poisoned").contains_key(peer) {
             log::debug!("not dialling {}: replaced by set_peer_address", peer.0);
             return Ok(());
         }
@@ -558,6 +630,9 @@ impl Sender {
         let _ = tx.try_send(packet);
         links.insert(peer.clone(), tx.clone());
         drop(links);
+        // Registered before dialling, so `close_link` during the dial closes
+        // the channel as soon as it is up.
+        let close = add_closer(&self.inner, peer);
         let inner = self.inner.clone();
         let peer = peer.clone();
         tokio::spawn(async move {
@@ -566,10 +641,11 @@ impl Sender {
                 Ok(channel) => {
                     // Reachable by dialling after all: no longer inbound-only.
                     inner.answered.lock().expect("poisoned").remove(&peer);
-                    run_link(inner, peer, channel, rx, tx).await
+                    run_link(inner, peer, channel, rx, tx, close).await
                 }
                 Err(err) => {
                     log::debug!("dial to {} failed: {err}", peer.0);
+                    remove_closer(&inner, &peer, &close);
                     remove_link(&inner, &peer, &tx);
                 }
             }
