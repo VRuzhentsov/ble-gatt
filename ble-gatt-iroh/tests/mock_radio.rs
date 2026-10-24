@@ -220,6 +220,65 @@ async fn an_idle_channel_is_closed() {
     assert!(transport.linked_peers().is_empty());
 }
 
+/// A channel the peer dialled that then closes idle does not hold back this
+/// side's own dial: nobody re-dials after an idle close, so waiting for the
+/// peer to dial back would only time out the connect.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_inbound_channel_does_not_hold_back_a_dial() {
+    let network = MockNetwork::new();
+    let a_address = PeerAddress("AA:00:00:00:00:07".to_string());
+    let b_address = PeerAddress("AA:00:00:00:00:08".to_string());
+
+    // Each side serves, attaches what it accepts, and can dial.
+    let mut sides = Vec::new();
+    for (own, other) in [(&a_address, &b_address), (&b_address, &a_address)] {
+        let adapter = adapter(&network, &own.0).await;
+        let transport = BleGattTransport::builder()
+            .dialer(dial_with(adapter.clone(), config()))
+            .link_idle_timeout(Duration::from_millis(500))
+            .build();
+        let incoming = datagram::serve(&adapter, &config()).await.expect("serve");
+        let attach_to = transport.clone();
+        tokio::spawn(async move {
+            let mut incoming = incoming;
+            while let Some(channel) = incoming.next().await {
+                attach_to.attach(channel);
+            }
+        });
+        let key = SecretKey::generate();
+        let id = key.public();
+        let endpoint = endpoint(key, &transport).await;
+        let router = Router::builder(endpoint.clone()).accept(ECHO_ALPN, Echo).spawn();
+        sides.push((transport, endpoint, id, router, other.clone()));
+    }
+    let (a_transport, a_endpoint, a_id, _a_router, _) = &sides[0];
+    let (b_transport, b_endpoint, b_id, _b_router, _) = &sides[1];
+    a_transport.set_peer_address(*b_id, b_address.clone());
+    b_transport.set_peer_address(*a_id, a_address.clone());
+
+    // B dials A; A holds that channel as the peripheral.
+    let connection = tokio::time::timeout(TIMEOUT, b_endpoint.connect(*a_id, ECHO_ALPN))
+        .await
+        .expect("connect in time")
+        .expect("connect");
+    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&connection, b"b to a")).await.expect("echo in time"), b"b to a");
+    connection.close(0u32.into(), b"done");
+    tokio::time::timeout(TIMEOUT, async {
+        while !a_transport.linked_peers().is_empty() || !b_transport.linked_peers().is_empty() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("both links close idle");
+
+    // Well inside REDIAL_YIELD (30s): A dials B at once.
+    let connection = tokio::time::timeout(Duration::from_secs(10), a_endpoint.connect(*b_id, ECHO_ALPN))
+        .await
+        .expect("A dials without waiting for B to dial back")
+        .expect("connect");
+    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&connection, b"a to b")).await.expect("echo in time"), b"a to b");
+}
+
 /// Both directions busy at once: the echo writes back while the dialer is
 /// still writing, so each side's link sends and receives at the same time.
 /// A link that stops reading while a send is in flight can wedge here.

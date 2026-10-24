@@ -192,9 +192,10 @@ struct Inner {
     /// Taken by the one endpoint that binds this transport.
     inbound_rx: Mutex<Option<mpsc::Receiver<Inbound>>>,
     /// Addresses whose last link was one the peer dialled, with when it
-    /// ended; see [`REDIAL_YIELD`] and `Sender::send`. Cleared when we dial
-    /// the address successfully.
-    answered: Mutex<HashMap<PeerAddress, Instant>>,
+    /// dropped, or `None` if it closed idle (nobody re-dials then); see
+    /// [`REDIAL_YIELD`] and `Sender::send`. Cleared when we dial the address
+    /// successfully.
+    answered: Mutex<HashMap<PeerAddress, Option<Instant>>>,
     dialer: Option<Dialer>,
     local: n0_watcher::Watchable<Vec<CustomAddr>>,
     link_idle_timeout: Duration,
@@ -215,8 +216,10 @@ impl BleGattTransport {
     }
 
     /// Carries iroh traffic over `channel`, an open datagram channel in either
-    /// role. A channel already attached for the same peer is replaced and
-    /// closed.
+    /// role. iroh's packets for the peer go to the newest channel. One
+    /// already attached for it keeps delivering what it receives until it
+    /// closes idle or the peer drops it: when both sides dial at once, the
+    /// peer may still be sending on it.
     ///
     /// The returned handle completes when the channel closes: the peer went
     /// away, or it carried nothing for the idle timeout.
@@ -303,10 +306,12 @@ async fn run_link(
     });
     let idle = tokio::time::sleep(inner.link_idle_timeout);
     tokio::pin!(idle);
+    let mut went_idle = false;
     loop {
         tokio::select! {
             () = &mut idle => {
                 log::debug!("link to {}: idle, closing", peer.0);
+                went_idle = true;
                 break;
             }
             _ = &mut send_task => break,
@@ -341,12 +346,15 @@ async fn run_link(
     // Only while this link still owns the peer: an old inbound link ending
     // after a newer one was attached would otherwise mark the peer as having
     // dialled us, and the yield would then hold back dials the newer link's
-    // side is entitled to make.
+    // side is entitled to make. An idle close starts no yield: no QUIC
+    // connection is left to resend, so the peer will not dial back, and on
+    // hardware this side's next connect timed out waiting for it.
     {
         let mut links = inner.links.lock().expect("poisoned");
         if links.get(&peer).is_some_and(|current| current.same_channel(&link)) {
             if role == Role::Peripheral {
-                inner.answered.lock().expect("poisoned").insert(peer.clone(), Instant::now());
+                let dropped = (!went_idle).then(Instant::now);
+                inner.answered.lock().expect("poisoned").insert(peer.clone(), dropped);
             }
             links.remove(&peer);
         }
@@ -494,7 +502,7 @@ impl Sender {
         // The last link with this address was one the peer dialled. Dropping
         // the packet reads to QUIC as loss, and it resends once a link exists.
         let answered = self.inner.answered.lock().expect("poisoned").get(peer).copied();
-        if let Some(ended) = answered {
+        if let Some(dropped) = answered {
             // Seen only as the source of the peer's own connection: iroh
             // remembers it as a path, but a phone dials from a private
             // address it never accepts connections on and soon drops, so
@@ -507,7 +515,7 @@ impl Sender {
             }
             // An address the caller set: the peer re-dials after a drop, and
             // dialling it too would cross. Wait for it, for a while.
-            if ended.elapsed() < REDIAL_YIELD {
+            if dropped.is_some_and(|dropped| dropped.elapsed() < REDIAL_YIELD) {
                 log::debug!("not dialling {}: waiting for it to dial back", peer.0);
                 return Ok(());
             }
