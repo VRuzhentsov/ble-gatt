@@ -474,6 +474,10 @@ pub struct LinuxBackend {
     events_tx: broadcast::Sender<GattEvent>,
     app_handle: AsyncMutex<Option<ApplicationHandle>>,
     adv_handle: AsyncMutex<Option<bluer::adv::AdvertisementHandle>>,
+    /// The spec the live application and advertisement were built from, so
+    /// `update_advertisement` can tell whether a spec is for the served
+    /// service. `None` while nothing is fully registered.
+    served_service: StdMutex<Option<GattServiceSpec>>,
     /// Aborts the notify-session watchers started by `advertise`, *and* the
     /// per-peer disconnect watchers they spawn — those were previously
     /// detached, so `stop_advertising` could not cancel them.
@@ -592,6 +596,28 @@ impl LinuxBackend {
                 session: None,
             });
         }
+    }
+}
+
+/// The BlueZ advertisement for `service`, shared by `advertise` and
+/// `update_advertisement`.
+fn advertisement(service: &GattServiceSpec) -> Advertisement {
+    Advertisement {
+        service_uuids: [service.uuid.0].into_iter().collect(),
+        discoverable: Some(true),
+        manufacturer_data: service.manufacturer_data.clone(),
+        service_data: service
+            .service_data
+            .iter()
+            .map(|(uuid, value)| (uuid.0, value.clone()))
+            .collect(),
+        // BlueZ sends LocalName in the scan response. Truncated here so a
+        // long name is cut on a character boundary, not by BlueZ.
+        local_name: service
+            .local_name
+            .as_deref()
+            .map(|name| truncate_name(name, LOCAL_NAME_MAX_LEN).to_string()),
+        ..Default::default()
     }
 }
 
@@ -742,6 +768,7 @@ impl LinuxBackend {
             events_tx,
             app_handle: AsyncMutex::new(None),
             adv_handle: AsyncMutex::new(None),
+            served_service: StdMutex::new(None),
             server_watch: Arc::new(StdMutex::new(Vec::new())),
             dialed: Arc::new(StdMutex::new(HashMap::new())),
             pending_cleanup: Arc::new(StdMutex::new(HashSet::new())),
@@ -1791,6 +1818,8 @@ impl Backend for LinuxBackend {
         // Held for the whole setup, including both BlueZ registrations, so a
         // concurrent stop cannot interleave with installing the handles.
         let _serialise = self.advertise_lock.lock().await;
+        // Set again only once both registrations succeed.
+        *self.served_service.lock().unwrap() = None;
         // Abort the previous generation's watchers *before* spawning any of
         // this one's, so no task registered below can be mistaken for a
         // leftover and cancelled at the end of this call.
@@ -2050,29 +2079,13 @@ impl Backend for LinuxBackend {
             writers.clear();
         }
 
-        let adv = Advertisement {
-            service_uuids: [service.uuid.0].into_iter().collect(),
-            discoverable: Some(true),
-            manufacturer_data: service.manufacturer_data.clone(),
-            service_data: service
-                .service_data
-                .iter()
-                .map(|(uuid, value)| (uuid.0, value.clone()))
-                .collect(),
-            // BlueZ sends LocalName in the scan response. Truncated here so
-            // a long name is cut on a character boundary, not by BlueZ.
-            local_name: service
-                .local_name
-                .as_deref()
-                .map(|name| truncate_name(name, LOCAL_NAME_MAX_LEN).to_string()),
-            ..Default::default()
-        };
-        let adv_handle = self.adapter.advertise(adv).await.map_err(|err| {
+        let adv_handle = self.adapter.advertise(advertisement(&service)).await.map_err(|err| {
             log::warn!("advertise: BlueZ rejected the advertisement: {err}");
             BleError::Gatt(err.to_string())
         })?;
 
         *self.adv_handle.lock().await = Some(adv_handle);
+        *self.served_service.lock().unwrap() = Some(service);
         log::info!("advertise: registered, generation={this_generation}");
 
         // The previous generation's watchers were already aborted before any
@@ -2093,9 +2106,47 @@ impl Backend for LinuxBackend {
         Ok(())
     }
 
+    async fn update_advertisement(&self, service: GattServiceSpec) -> Result<()> {
+        service.validate()?;
+        let _serialise = self.advertise_lock.lock().await;
+        let serving = self
+            .served_service
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|served| served.same_service(&service));
+        if !serving {
+            return Err(BleError::Gatt(format!(
+                "update_advertisement: not serving service {} with these characteristics",
+                service.uuid.0
+            )));
+        }
+        // Only the LEAdvertisement1 object is replaced. The GATT application,
+        // its generation and every served central stay as they are.
+        // Registered before the old one is dropped, as `advertise` does.
+        let registered = self.adapter.advertise(advertisement(&service)).await;
+        let mut adv_handle = self.adv_handle.lock().await;
+        match registered {
+            Ok(handle) => {
+                *adv_handle = Some(handle);
+                *self.served_service.lock().unwrap() = Some(service);
+                log::info!("advertise: advertisement updated, GATT application kept");
+                Ok(())
+            }
+            Err(err) => {
+                // The old advertisement is withdrawn too, so the caller's
+                // refusal means "not advertising", as the trait says.
+                *adv_handle = None;
+                log::warn!("advertise: BlueZ rejected the updated advertisement: {err}");
+                Err(BleError::Gatt(err.to_string()))
+            }
+        }
+    }
+
     async fn stop_advertising(&self) -> Result<()> {
         log::info!("advertise: stopping");
         let _serialise = self.advertise_lock.lock().await;
+        *self.served_service.lock().unwrap() = None;
         // Invalidate first, so a handler already running publishes nothing.
         // Taking the same lock the handlers publish under means an
         // in-progress publication completes before this, or is rejected —

@@ -147,6 +147,30 @@ pub trait Backend: Send + Sync {
     /// first to change the served service.
     async fn advertise(&self, service: GattServiceSpec) -> Result<()>;
 
+    /// Replace the advertisement of the service `advertise` is serving,
+    /// leaving the GATT server, its connected centrals, their subscriptions
+    /// and their channels untouched. `advertise` replaces the server too,
+    /// which drops every central.
+    ///
+    /// `service` must describe the served service (same UUID and
+    /// characteristics); only its advertisement data
+    /// (`manufacturer_data`, `service_data`, `local_name`) is applied.
+    /// Errors when nothing is being advertised, the service differs, or the
+    /// platform refuses the new advertisement. After a refusal the server
+    /// keeps serving but nothing is advertised, so a caller that wants to be
+    /// discoverable falls back to `advertise`.
+    ///
+    /// Android and BlueZ both keep the two apart: `BluetoothLeAdvertiser`
+    /// next to `BluetoothGattServer`, and `LEAdvertisingManager1` next to
+    /// `GattManager1` (bluer returns an `AdvertisementHandle` and an
+    /// `ApplicationHandle`). Returns [`BleError::Unsupported`] by default.
+    ///
+    /// [`BleError::Unsupported`]: crate::BleError::Unsupported
+    async fn update_advertisement(&self, service: GattServiceSpec) -> Result<()> {
+        let _ = service;
+        Err(crate::BleError::Unsupported("updating the advertisement on this backend".into()))
+    }
+
     async fn stop_advertising(&self) -> Result<()>;
 
     /// Push a value to **every** central currently subscribed to

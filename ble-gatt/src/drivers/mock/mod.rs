@@ -194,6 +194,14 @@ impl MockNetwork {
         }
     }
 
+    async fn update_advertisement(&self, address: &PeerAddress, service: GattServiceSpec) -> Result<()> {
+        match &self.0 {
+            Radio::Local(r) => r.update_advertisement(address, service).await,
+            #[cfg(feature = "mock-broker")]
+            Radio::Remote(r) => r.update_advertisement(address, service).await,
+        }
+    }
+
     async fn stop_advertising(&self, address: &PeerAddress) -> Result<()> {
         match &self.0 {
             Radio::Local(r) => r.stop_advertising(address).await,
@@ -349,6 +357,11 @@ impl Backend for MockBackend {
         }
         service.validate()?;
         self.network.advertise(&self.address, service).await
+    }
+
+    async fn update_advertisement(&self, service: GattServiceSpec) -> Result<()> {
+        service.validate()?;
+        self.network.update_advertisement(&self.address, service).await
     }
 
     async fn stop_advertising(&self) -> Result<()> {

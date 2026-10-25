@@ -162,6 +162,12 @@ async fn dispatch(request: Request, radio: &Arc<LocalRadio>, conn: &Arc<ConnHand
             Ok(()) => Response::Unit,
             Err(e) => Response::Err(e),
         },
+        Request::UpdateAdvertisement { address, service } => {
+            match radio.update_advertisement(&address, service).await {
+                Ok(()) => Response::Unit,
+                Err(e) => Response::Err(e),
+            }
+        }
         Request::StopAdvertising { address } => match radio.stop_advertising(&address).await {
             Ok(()) => Response::Unit,
             Err(e) => Response::Err(e),

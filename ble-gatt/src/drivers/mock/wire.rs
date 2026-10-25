@@ -42,6 +42,7 @@ pub(super) enum Request {
     Scan { requester: PeerAddress, service: ServiceUuid },
     Connect { central: PeerAddress, peer: PeerAddress },
     Advertise { address: PeerAddress, service: GattServiceSpec },
+    UpdateAdvertisement { address: PeerAddress, service: GattServiceSpec },
     StopAdvertising { address: PeerAddress },
     Notify { address: PeerAddress, characteristic: CharacteristicUuid, value: Vec<u8> },
     NotifyPeer {

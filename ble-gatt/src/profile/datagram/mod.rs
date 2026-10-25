@@ -1071,6 +1071,22 @@ pub async fn serve(adapter: &Adapter, config: &DatagramConfig) -> Result<BoxStre
     serve_driver(adapter.backend(), config).await
 }
 
+/// Change what a running [`serve`] advertises (`config`'s manufacturer data
+/// and local name) and keep its GATT server. A central already connected
+/// keeps its link and its [`DatagramChannel`]; calling [`serve`] again
+/// replaces the server instead, which drops every central.
+///
+/// `config` must name the service and characteristic `serve` was started
+/// with. Errors when nothing is served, the service differs, or the platform
+/// refuses the advertisement; after a refusal nothing is advertised, and a
+/// caller that needs to be discoverable falls back to [`serve`]. See
+/// `Backend::update_advertisement`.
+pub async fn update_advertisement(adapter: &Adapter, config: &DatagramConfig) -> Result<()> {
+    config.validate()?;
+    log::info!("serve: updating the advertisement for {}", config.service.0);
+    adapter.backend().update_advertisement(config.service_spec()).await
+}
+
 /// [`serve`] over a driver directly, for `PeerLink`, which holds one.
 pub(crate) async fn serve_driver(
     backend: Arc<dyn Backend>, config: &DatagramConfig,

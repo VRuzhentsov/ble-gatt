@@ -99,6 +99,10 @@ impl Backend for LazyBackend {
         self.inner().await?.advertise(service).await
     }
 
+    async fn update_advertisement(&self, service: GattServiceSpec) -> Result<()> {
+        self.inner().await?.update_advertisement(service).await
+    }
+
     async fn stop_advertising(&self) -> Result<()> {
         self.inner().await?.stop_advertising().await
     }

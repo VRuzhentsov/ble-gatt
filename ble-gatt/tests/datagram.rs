@@ -1226,6 +1226,58 @@ async fn advertised_local_name_reaches_a_scanner_through_serve() {
     assert_eq!(peer.manufacturer_data.get(&0xABCD), Some(&vec![0x01]));
 }
 
+/// `update_advertisement` changes what scanners see and keeps the served
+/// central's channel working; `serve` again would have dropped it.
+#[tokio::test]
+async fn update_advertisement_keeps_the_served_channel() {
+    let mut config = config();
+    config.advertised_manufacturer_data.insert(0xABCDu16, vec![0x01]);
+    let (mut client, mut server, central, peripheral) = connected_pair(&config).await;
+
+    config.advertised_manufacturer_data.insert(0xABCDu16, vec![0x02]);
+    datagram::update_advertisement(&adapter(&peripheral).await, &config)
+        .await
+        .expect("the advertisement should update");
+
+    let mut discovered = central.scan(config.service).await.expect("scan should succeed");
+    let peer = discovered
+        .next()
+        .await
+        .expect("peripheral should be discovered")
+        .expect("discovery should not error");
+    assert_eq!(peer.manufacturer_data.get(&0xABCD), Some(&vec![0x02]));
+
+    client.send(b"to-server".to_vec()).await.expect("send to server");
+    let received = tokio::time::timeout(Duration::from_secs(2), server.recv())
+        .await
+        .expect("the server channel should still deliver")
+        .expect("channel should still be open")
+        .expect("no error");
+    assert_eq!(received, b"to-server");
+    server.send(b"to-client".to_vec()).await.expect("send to client");
+    let received = tokio::time::timeout(Duration::from_secs(2), client.recv())
+        .await
+        .expect("the client channel should still deliver")
+        .expect("channel should still be open")
+        .expect("no error");
+    assert_eq!(received, b"to-client");
+}
+
+/// `update_advertisement` only changes the advertisement of the served
+/// service: with nothing served, or a different service, it refuses.
+#[tokio::test]
+async fn update_advertisement_refuses_a_service_that_is_not_served() {
+    let network = MockNetwork::new();
+    let peripheral = Arc::new(MockBackend::new(PeerAddress("peripheral-update".to_string()), network, full_capabilities()));
+    let adapter = adapter(&peripheral).await;
+    let served = config();
+    assert!(datagram::update_advertisement(&adapter, &served).await.is_err());
+
+    let _incoming = datagram::serve(&adapter, &served).await.expect("serve should start");
+    assert!(datagram::update_advertisement(&adapter, &config()).await.is_err());
+    assert!(datagram::update_advertisement(&adapter, &served).await.is_ok());
+}
+
 /// A name and service data under the advertised service would both travel
 /// as that service data, so advertising refuses the pair.
 #[tokio::test]

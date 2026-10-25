@@ -204,6 +204,74 @@ struct Inner {
     /// its server in between — and the abandoned attempt's cleanup would
     /// then take the retry's sender and stop the retry's advertisement.
     advertise_lock: tokio::sync::Mutex<()>,
+    /// The spec the live server and advertisement were started from, so
+    /// `update_advertisement` can tell whether a spec is for the served
+    /// service. `None` until an advertise succeeds.
+    served_service: StdMutex<Option<GattServiceSpec>>,
+}
+
+/// A spec's advertisement data as `startAdvertising` and
+/// `updateAdvertising` take it.
+struct AdvertisementArgs<'local> {
+    manufacturer_ids: JIntArray<'local>,
+    manufacturer_values: JObjectArray<'local>,
+    service_data_uuids: JObjectArray<'local>,
+    service_data_values: JObjectArray<'local>,
+    scan_response_name: JObject<'local>,
+}
+
+impl<'local> AdvertisementArgs<'local> {
+    fn new(env: &mut JNIEnv<'local>, service: &GattServiceSpec) -> Result<Self> {
+        // Same parallel-array flattening `onPeerDiscovered` uses on the read
+        // side (see that callback's own comment): a `java.util.HashMap`
+        // across JNI costs several reflective calls per entry, so
+        // manufacturer/service advertisement data crosses as an id/UUID
+        // array plus a matching value array instead.
+        let ids: Vec<i32> = service.manufacturer_data.keys().map(|id| *id as i32).collect();
+        let manufacturer_ids = env
+            .new_int_array(ids.len() as i32)
+            .map_err(|err| BleError::Gatt(err.to_string()))?;
+        env.set_int_array_region(&manufacturer_ids, 0, &ids)
+            .map_err(|err| BleError::Gatt(err.to_string()))?;
+        let manufacturer_values = env
+            .new_object_array(ids.len() as i32, "[B", JObject::null())
+            .map_err(|err| BleError::Gatt(err.to_string()))?;
+        for (i, value) in service.manufacturer_data.values().enumerate() {
+            let jvalue = env.byte_array_from_slice(value).map_err(|err| BleError::Gatt(err.to_string()))?;
+            env.set_object_array_element(&manufacturer_values, i as i32, &jvalue)
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
+        }
+
+        let service_data_uuids = env
+            .new_object_array(service.service_data.len() as i32, "java/lang/String", JObject::null())
+            .map_err(|err| BleError::Gatt(err.to_string()))?;
+        let service_data_values = env
+            .new_object_array(service.service_data.len() as i32, "[B", JObject::null())
+            .map_err(|err| BleError::Gatt(err.to_string()))?;
+        for (i, (uuid, value)) in service.service_data.iter().enumerate() {
+            let uuid_str = env
+                .new_string(uuid.0.to_string())
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
+            env.set_object_array_element(&service_data_uuids, i as i32, &uuid_str)
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
+            let jvalue = env.byte_array_from_slice(value).map_err(|err| BleError::Gatt(err.to_string()))?;
+            env.set_object_array_element(&service_data_values, i as i32, &jvalue)
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
+        }
+
+        // Android cannot set a name per advertisement, so the name travels
+        // as service data under the service UUID in the scan response
+        // (`GattServiceSpec::local_name`). Null when there is none.
+        let scan_response_name = match service.local_name.as_deref() {
+            Some(name) if !name.is_empty() => JObject::from(
+                env.byte_array_from_slice(truncate_name(name, NAME_SERVICE_DATA_MAX_LEN).as_bytes())
+                    .map_err(|err| BleError::Gatt(err.to_string()))?,
+            ),
+            _ => JObject::null(),
+        };
+
+        Ok(Self { manufacturer_ids, manufacturer_values, service_data_uuids, service_data_values, scan_response_name })
+    }
 }
 
 impl Inner {
@@ -360,6 +428,7 @@ impl AndroidBackend {
             server_sessions: StdMutex::new(HashMap::new()),
             advertise_generation: AtomicU64::new(1),
             advertise_lock: tokio::sync::Mutex::new(()),
+            served_service: StdMutex::new(None),
         });
 
         // See the module doc comment: this pointer must stay valid for as
@@ -671,6 +740,8 @@ impl Backend for AndroidBackend {
         let serialise = self.inner.advertise_lock.lock().await;
         let advertise_generation =
             self.inner.advertise_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        // `startAdvertising` replaces the server; set again on success.
+        *self.inner.served_service.lock().unwrap() = None;
         // Scoped: `JNIEnv` is `!Send`, so it must be entirely out of scope
         // before the `.await` below, or the whole future stops being `Send`
         // and no longer satisfies the trait.
@@ -711,54 +782,7 @@ impl Backend for AndroidBackend {
                 .map_err(|err| BleError::Gatt(err.to_string()))?;
         }
 
-        // Same parallel-array flattening `onPeerDiscovered` uses on the read
-        // side (see that callback's own comment): a `java.util.HashMap`
-        // across JNI costs several reflective calls per entry, so
-        // manufacturer/service advertisement data crosses as an id/UUID
-        // array plus a matching value array instead.
-        let manufacturer_ids: Vec<i32> =
-            service.manufacturer_data.keys().map(|id| *id as i32).collect();
-        let manufacturer_id_array = env
-            .new_int_array(manufacturer_ids.len() as i32)
-            .map_err(|err| BleError::Gatt(err.to_string()))?;
-        env.set_int_array_region(&manufacturer_id_array, 0, &manufacturer_ids)
-            .map_err(|err| BleError::Gatt(err.to_string()))?;
-        let manufacturer_value_array = env
-            .new_object_array(manufacturer_ids.len() as i32, "[B", JObject::null())
-            .map_err(|err| BleError::Gatt(err.to_string()))?;
-        for (i, value) in service.manufacturer_data.values().enumerate() {
-            let jvalue = env.byte_array_from_slice(value).map_err(|err| BleError::Gatt(err.to_string()))?;
-            env.set_object_array_element(&manufacturer_value_array, i as i32, &jvalue)
-                .map_err(|err| BleError::Gatt(err.to_string()))?;
-        }
-
-        let service_data_uuid_array = env
-            .new_object_array(service.service_data.len() as i32, "java/lang/String", JObject::null())
-            .map_err(|err| BleError::Gatt(err.to_string()))?;
-        let service_data_value_array = env
-            .new_object_array(service.service_data.len() as i32, "[B", JObject::null())
-            .map_err(|err| BleError::Gatt(err.to_string()))?;
-        for (i, (uuid, value)) in service.service_data.iter().enumerate() {
-            let uuid_str = env
-                .new_string(uuid.0.to_string())
-                .map_err(|err| BleError::Gatt(err.to_string()))?;
-            env.set_object_array_element(&service_data_uuid_array, i as i32, &uuid_str)
-                .map_err(|err| BleError::Gatt(err.to_string()))?;
-            let jvalue = env.byte_array_from_slice(value).map_err(|err| BleError::Gatt(err.to_string()))?;
-            env.set_object_array_element(&service_data_value_array, i as i32, &jvalue)
-                .map_err(|err| BleError::Gatt(err.to_string()))?;
-        }
-
-        // Android cannot set a name per advertisement, so the name travels
-        // as service data under the service UUID in the scan response
-        // (`GattServiceSpec::local_name`). Null when there is none.
-        let scan_response_name = match service.local_name.as_deref() {
-            Some(name) if !name.is_empty() => JObject::from(
-                env.byte_array_from_slice(truncate_name(name, NAME_SERVICE_DATA_MAX_LEN).as_bytes())
-                    .map_err(|err| BleError::Gatt(err.to_string()))?,
-            ),
-            _ => JObject::null(),
-        };
+        let ad = AdvertisementArgs::new(&mut env, &service)?;
 
         let (tx, rx) = oneshot::channel();
         *self.inner.advertise_tx.lock().unwrap() = Some(tx);
@@ -773,11 +797,11 @@ impl Backend for AndroidBackend {
                 JValue::Object(&writable),
                 JValue::Object(&notifiable),
                 JValue::Object(&values),
-                JValue::Object(&manufacturer_id_array),
-                JValue::Object(&manufacturer_value_array),
-                JValue::Object(&service_data_uuid_array),
-                JValue::Object(&service_data_value_array),
-                JValue::Object(&scan_response_name),
+                JValue::Object(&ad.manufacturer_ids),
+                JValue::Object(&ad.manufacturer_values),
+                JValue::Object(&ad.service_data_uuids),
+                JValue::Object(&ad.service_data_values),
+                JValue::Object(&ad.scan_response_name),
             ],
         )?;
         rx
@@ -801,6 +825,12 @@ impl Backend for AndroidBackend {
         let outcome = match rx.await {
             Ok(Ok(())) => {
                 log::info!("advertise: started, generation={advertise_generation}");
+                // Only while this attempt is still current: a stop or a newer
+                // attempt that ran after this one's lock was released owns
+                // the server now.
+                if self.inner.advertise_generation.load(Ordering::SeqCst) == advertise_generation {
+                    *self.inner.served_service.lock().unwrap() = Some(service);
+                }
                 Ok(())
             }
             Ok(Err(code)) => {
@@ -826,6 +856,67 @@ impl Backend for AndroidBackend {
         outcome
     }
 
+    async fn update_advertisement(&self, service: GattServiceSpec) -> Result<()> {
+        service.validate()?;
+        // Held until the outcome arrives, so no advertise or stop can install
+        // its own waiter in between and receive this update's result.
+        let _serialise = self.inner.advertise_lock.lock().await;
+        let serving = self
+            .inner
+            .served_service
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|served| served.same_service(&service));
+        if !serving {
+            return Err(BleError::Gatt(format!(
+                "update_advertisement: not serving service {} with these characteristics",
+                service.uuid.0
+            )));
+        }
+        // Scoped: `JNIEnv` is `!Send` (see `advertise`).
+        let rx = {
+            let mut env = self.inner.env()?;
+            let service_uuid = env
+                .new_string(service.uuid.0.to_string())
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
+            let ad = AdvertisementArgs::new(&mut env, &service)?;
+            let (tx, rx) = oneshot::channel();
+            *self.inner.advertise_tx.lock().unwrap() = Some(tx);
+            self.inner.call_void(
+                &mut env,
+                "updateAdvertising",
+                "(Ljava/lang/String;[I[[B[Ljava/lang/String;[[B[B)V",
+                &[
+                    JValue::Object(&service_uuid),
+                    JValue::Object(&ad.manufacturer_ids),
+                    JValue::Object(&ad.manufacturer_values),
+                    JValue::Object(&ad.service_data_uuids),
+                    JValue::Object(&ad.service_data_values),
+                    JValue::Object(&ad.scan_response_name),
+                ],
+            )?;
+            rx
+        };
+        // No guard as in `advertise`: if this future is dropped, the server
+        // the caller already owns is still served, and at worst the new
+        // advertisement starts with nobody waiting for it.
+        match rx.await {
+            Ok(Ok(())) => {
+                log::info!("advertise: advertisement updated, GATT server kept");
+                *self.inner.served_service.lock().unwrap() = Some(service);
+                Ok(())
+            }
+            Ok(Err(code)) => {
+                log::warn!("advertise: Android refused the updated advertisement (error {code})");
+                Err(BleError::Gatt(format!(
+                    "Android refused the updated advertisement (AdvertiseCallback error {code})"
+                )))
+            }
+            Err(_) => Err(BleError::Gatt("advertisement update outcome was never reported".to_string())),
+        }
+    }
+
     async fn stop_advertising(&self) -> Result<()> {
         // Same lock `advertise` holds across its platform call. Without it a
         // stop could land between an attempt installing its sender and
@@ -835,6 +926,7 @@ impl Backend for AndroidBackend {
         // observed an outcome, its guard is disarmed and nothing cleans it
         // up.
         let _serialise = self.inner.advertise_lock.lock().await;
+        *self.inner.served_service.lock().unwrap() = None;
         // Resolve any advertise still waiting on Android's asynchronous
         // start result. Kotlin invalidates the server generation, so that
         // callback is deliberately ignored when it arrives — which means

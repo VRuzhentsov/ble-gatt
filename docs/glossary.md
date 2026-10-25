@@ -51,6 +51,12 @@ One of those broadcast packets: up to about 31 bytes carrying service UUIDs
 and small data (for example the manufacturer data where this library puts a
 peer's identity fingerprint). *Also called:* advertising data, adv.
 
+### Advertisement update
+Changing what a peripheral advertises while it keeps serving
+(`datagram::update_advertisement`). Only the advertisement is replaced; the
+GATT server, and every central connected to it with its subscription, stay.
+Advertising again with `serve` replaces the server and drops those centrals.
+
 ### Scan response
 A second packet of up to 31 bytes that an advertiser sends only when a
 scanner asks for it. Scanners ask during an *active* scan, which is how both

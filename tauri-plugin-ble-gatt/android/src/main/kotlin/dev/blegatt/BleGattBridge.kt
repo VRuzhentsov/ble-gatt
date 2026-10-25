@@ -1110,7 +1110,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                                 Log.d(TAG, "server: stale generation disconnect, ignoring")
                                 return
                             }
-                            Log.d(TAG, "server: central disconnected ${device.address}")
+                            Log.d(TAG, "server: central disconnected ${device.address} status=$status")
                             // Discard anything this peer had prepared but not
                             // executed. Left behind, a later connection from
                             // the same address could prepare the remaining
@@ -1406,12 +1406,48 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         // actually succeeded.
     }
 
+    /// Replace the advertisement and keep the GATT server, so connected
+    /// centrals keep their link, subscription and MTU. `startAdvertising`
+    /// opens a new server, which drops them.
+    ///
+    /// Reports through `onAdvertiseResult` like `startAdvertising`. A refusal
+    /// leaves the server serving with nothing advertised.
+    fun updateAdvertising(
+        serviceUuid: String,
+        manufacturerIds: IntArray, manufacturerValues: Array<ByteArray>,
+        serviceDataUuids: Array<String>, serviceDataValues: Array<ByteArray>,
+        scanResponseName: ByteArray?,
+    ) {
+        val advertiser = adapter?.bluetoothLeAdvertiser
+        val started = synchronized(this) {
+            if (advertiser == null || gattServer == null) {
+                false
+            } else {
+                advertiseCallback?.let { advertiser.stopAdvertising(it) }
+                advertiseCallback = null
+                beginAdvertising(
+                    advertiser, serviceUuid, serverGeneration,
+                    manufacturerIds, manufacturerValues, serviceDataUuids, serviceDataValues,
+                    scanResponseName, keepServerOnFailure = true,
+                )
+                true
+            }
+        }
+        if (!started) {
+            Log.w(TAG, "updateAdvertising: no server or advertiser")
+            onAdvertiseResult(nativeHandle, false, ADVERTISE_ERROR_UNAVAILABLE)
+        }
+    }
+
     private fun beginAdvertising(
         advertiser: android.bluetooth.le.BluetoothLeAdvertiser, serviceUuid: String,
         generation: Long,
         manufacturerIds: IntArray, manufacturerValues: Array<ByteArray>,
         serviceDataUuids: Array<String>, serviceDataValues: Array<ByteArray>,
         scanResponseName: ByteArray?,
+        // An update's failure must not take the server and its centrals
+        // down with the advertisement.
+        keepServerOnFailure: Boolean = false,
     ) {
         val settings = AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
@@ -1449,8 +1485,10 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 // replacement generation. Resolving the new server's advertise
                 // waiter with this attempt's outcome would report a success
                 // that belongs to an advertisement already torn down.
+                // An update keeps the generation, so the callback it
+                // replaced is told apart by identity.
                 synchronized(this@BleGattBridge) {
-                    if (serverGeneration != generation) {
+                    if (serverGeneration != generation || advertiseCallback !== this) {
                         Log.d(TAG, "advertise onStartSuccess: stale generation, ignoring")
                         return
                     }
@@ -1464,7 +1502,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 // server down, so a stale failure would destroy the
                 // advertisement that replaced this one.
                 synchronized(this@BleGattBridge) {
-                if (serverGeneration != generation) {
+                if (serverGeneration != generation || advertiseCallback !== this) {
                     Log.d(TAG, "advertise onStartFailure: stale generation, ignoring")
                     return
                 }
@@ -1473,7 +1511,12 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 // back is what stops Rust claiming the service is reachable
                 // when no advertisement exists.
                 Log.e(TAG, "advertise onStartFailure: errorCode=$errorCode serviceUuid=$serviceUuid")
-                failAdvertise(errorCode)
+                if (keepServerOnFailure) {
+                    advertiseCallback = null
+                    onAdvertiseResult(nativeHandle, false, errorCode)
+                } else {
+                    failAdvertise(errorCode)
+                }
                 }
             }
         }

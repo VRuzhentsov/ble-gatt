@@ -273,6 +273,21 @@ impl GattServiceSpec {
         }
         Ok(())
     }
+
+    /// Whether `other` describes the same GATT service: the same UUID and
+    /// characteristics, whatever its advertisement data. What
+    /// `Backend::update_advertisement` requires of its spec.
+    pub(crate) fn same_service(&self, other: &GattServiceSpec) -> bool {
+        self.uuid == other.uuid
+            && self.characteristics.len() == other.characteristics.len()
+            && self.characteristics.iter().zip(&other.characteristics).all(|(a, b)| {
+                a.uuid == b.uuid
+                    && a.readable == b.readable
+                    && a.writable == b.writable
+                    && a.notifiable == b.notifiable
+                    && a.initial_value == b.initial_value
+            })
+    }
 }
 
 /// Bytes of name a scan response holds as service data under a 128-bit

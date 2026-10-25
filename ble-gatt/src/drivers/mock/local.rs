@@ -280,6 +280,20 @@ impl LocalRadio {
         Ok(())
     }
 
+    /// Swap the advertisement data only: values and subscribers stay, so
+    /// every central keeps its subscription.
+    pub(crate) async fn update_advertisement(&self, address: &PeerAddress, service: GattServiceSpec) -> Result<()> {
+        let mut peripherals = self.peripherals.lock().unwrap();
+        let state = peripherals.get_mut(address).ok_or_else(|| BleError::Gatt("not advertising".to_string()))?;
+        if !state.service.same_service(&service) {
+            return Err(BleError::Gatt(format!("not serving service {} with these characteristics", service.uuid.0)));
+        }
+        state.manufacturer_data = service.manufacturer_data.clone();
+        state.service_data = service.service_data.clone();
+        state.service = service;
+        Ok(())
+    }
+
     pub(crate) async fn stop_advertising(&self, address: &PeerAddress) -> Result<()> {
         // Announce every subscribed central as gone before tearing the
         // server down. Both real backends now do this — neither platform
