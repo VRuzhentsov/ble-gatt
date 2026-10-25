@@ -72,7 +72,7 @@ const NOTIFY_WRITER_ACQUIRE_POLL: std::time::Duration = std::time::Duration::fro
 /// time: `bluer` sends `StopDiscovery` from a spawned task once its session
 /// token drops, so a caller that dropped its scan and dialled immediately
 /// raced `Connect()` against a still-running discovery. Real-hardware
-/// evidence (Pixel 6 Pro <-> Linux desktop, fini PR 185): that race produced
+/// evidence (Android phone <-> Linux desktop, fini PR 185): that race produced
 /// `le-connection-abort-by-local` two seconds into the dial. `connect()`
 /// now issues (or waits for) the `StopDiscovery` itself; bounded so a
 /// BlueZ that never replies costs a dial this long rather than stalling it.

@@ -87,8 +87,8 @@ pub type Dialer = Arc<dyn Fn(PeerAddress) -> DialFuture + Send + Sync>;
 /// A [`Dialer`] that opens channels with [`ble_gatt::datagram::connect`].
 ///
 /// Each new link asks for [`ConnectionPriority::High`]: QUIC needs many
-/// connection events, and on the default interval a busy radio (an AX210
-/// also serving Wi-Fi or audio) missed enough of them for the link to hit its
+/// connection events, and on the default interval a busy radio (a combo
+/// chip also serving Wi-Fi or audio) missed enough of them for the link to hit its
 /// supervision timeout within seconds. The request is best-effort; Linux has
 /// no such control, and the channel is used either way. Links close when idle,
 /// so the higher power draw lasts only while there is traffic.

@@ -29,7 +29,7 @@ both of which need real radios.
 
 Not the `hw_peer`/datagram-tier harness below — this was fini's actual
 production app (`v0.1.45`, pinning this repo at `af4ed1e`) against a real
-Pixel 6 Pro, both already paired, diagnosed read-only over `adb logcat` +
+Android phone, both already paired, diagnosed read-only over `adb logcat` +
 `journalctl` + a user-run `btmon` capture (no reinstall, no rebuild). Two
 independent defects, plus a third contributing factor, all found from the
 same session:
@@ -68,8 +68,8 @@ subscribes — then the very first characteristic write is rejected locally,
 never reaching the air.**
 
 ```
-D BleGattBridge: onMtuChanged: 88:D8:2E:BA:72:27 negotiated mtu=517
-W BleGattBridge: writeCharacteristic rejected by the stack: 88:D8:2E:BA:72:27/b1e6a001-...
+D BleGattBridge: onMtuChanged: AA:BB:… negotiated mtu=517
+W BleGattBridge: writeCharacteristic rejected by the stack: AA:BB:…/b1e6a001-...
 [transport][ble] auth with ... failed: GATT operation failed: characteristic write failed
 ```
 

@@ -68,7 +68,7 @@ A short, human-readable name a peripheral advertises so a scanner can show
 it without connecting (`GattServiceSpec::local_name` → `DiscoveredPeer::name`).
 Linux sends it as BlueZ's `LocalName`; Android, which cannot set a name per
 advertisement, sends it as service data under the advertised service UUID.
-Both go in the scan response. Not the OS device name (`Pixel 6 Pro`).
+Both go in the scan response. Not the OS device name (the phone's model name).
 
 ### Scan
 A central listening for advertisements for a while. Scanning is the most

@@ -346,8 +346,8 @@ mod tests {
         let service = ServiceUuid(uuid::Uuid::from_u128(1));
         let mut data = BTreeMap::new();
         assert_eq!(advertised_name(service, &data, Some("cached".into())), Some("cached".into()));
-        data.insert(service, b"Pixel".to_vec());
-        assert_eq!(advertised_name(service, &data, Some("cached".into())), Some("Pixel".into()));
+        data.insert(service, b"Phone".to_vec());
+        assert_eq!(advertised_name(service, &data, Some("cached".into())), Some("Phone".into()));
         data.insert(service, vec![0xFF, 0xFE]);
         assert_eq!(advertised_name(service, &data, None), None, "not UTF-8: not a name");
     }

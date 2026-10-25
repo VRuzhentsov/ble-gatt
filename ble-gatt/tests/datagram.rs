@@ -1207,7 +1207,7 @@ async fn advertised_local_name_reaches_a_scanner_through_serve() {
     let network = MockNetwork::new();
     let mut config = config();
     config.advertised_manufacturer_data.insert(0xABCDu16, vec![0x01]);
-    config.advertised_local_name = Some("Will's Pixel".to_string());
+    config.advertised_local_name = Some("Test phone".to_string());
 
     let peripheral = MockDriver::new(PeerAddress("peripheral-name".to_string()), network.clone(), full_capabilities());
     let _incoming = datagram::serve(&adapter(&Arc::new(peripheral)).await, &config)
@@ -1222,7 +1222,7 @@ async fn advertised_local_name_reaches_a_scanner_through_serve() {
         .expect("peripheral should be discovered")
         .expect("discovery should not error");
 
-    assert_eq!(peer.name.as_deref(), Some("Will's Pixel"));
+    assert_eq!(peer.name.as_deref(), Some("Test phone"));
     assert_eq!(peer.manufacturer_data.get(&0xABCD), Some(&vec![0x01]));
 }
 

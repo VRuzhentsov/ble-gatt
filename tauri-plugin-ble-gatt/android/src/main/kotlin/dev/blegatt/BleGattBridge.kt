@@ -410,7 +410,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                         // radio -- Nearby/Fast Pair scanning, other apps' GATT
                         // servers -- an equal or greater claim on connection-event
                         // time than this link. Live production capture
-                        // (2026-08-23, Pixel 6 Pro) showed the very first
+                        // (2026-08-23, Android phone) showed the very first
                         // characteristic write after connect+subscribe rejected
                         // locally by the stack for the *entire* 7s retry budget on
                         // every attempt, with `dumpsys bluetooth_manager` showing a
