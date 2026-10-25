@@ -111,7 +111,7 @@ desktop (Linux)
                         └── bluetoothd      BlueZ over D-Bus: Device1, GattManager1,
                             │                 LEAdvertisingManager1
                             └── kernel HCI  Linux Bluetooth subsystem
-                                └── chip    Bluetooth controller (Intel AX210):
+                                └── chip    Bluetooth controller:
                                               link layer + radio
 
 phone (Android)
@@ -136,7 +136,7 @@ phone (Android)
                                     │         com.android.bluetooth, over Binder
                                     └── HCI
                                         └── chip
-                                              Bluetooth controller (Pixel 6 Pro):
+                                              Bluetooth controller:
                                               link layer + radio
 ```
 
@@ -159,7 +159,7 @@ flowchart TB
         dDriver["ble-gatt drivers/linux.rs<br/>(bluer)"]
         dBluez["BlueZ bluetoothd<br/>D-Bus"]
         dHci["kernel HCI"]
-        dChip["Bluetooth chip<br/>(AX210)"]
+        dChip["Bluetooth chip"]
         dApp --> dIroh --> dTransport --> dDatagram --> dAdapter --> dDriver --> dBluez --> dHci --> dChip
     end
 
@@ -174,7 +174,7 @@ flowchart TB
         pKotlin["tauri-plugin-ble-gatt Kotlin<br/>BleGattBridge.kt + Native.kt"]
         pStack["Android Bluetooth service<br/>Binder"]
         pHci["HCI"]
-        pChip["Bluetooth chip<br/>(Pixel 6 Pro)"]
+        pChip["Bluetooth chip"]
         pApp --> pIroh --> pTransport --> pDatagram --> pAdapter --> pDriver
         pDriver -- "JNI calls" --> pKotlin
         pKotlin -- "Native.kt callbacks" --> pDriver
