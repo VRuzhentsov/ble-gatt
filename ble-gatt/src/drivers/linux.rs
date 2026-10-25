@@ -1,4 +1,4 @@
-//! Linux backend: BlueZ via `bluer` (async D-Bus binding, 442+ GitHub stars,
+//! Linux driver: BlueZ via `bluer` (async D-Bus binding, 442+ GitHub stars,
 //! the standard pure-Rust BlueZ interface). Supports both central and
 //! peripheral role, since BlueZ's D-Bus GATT API exposes both — see the
 //! plan's library-research table for why no other permissively licensed
@@ -49,7 +49,7 @@ const NOTIFY_SESSION_POLL: std::time::Duration = std::time::Duration::from_milli
 /// making the very first reply to a legitimately subscribed peer fail with
 /// "no live notify session" purely on timing. Bounded so a peer that
 /// genuinely never subscribes (the raw-GATT-tier, write-only use case this
-/// backend also serves) still fails promptly rather than stalling every
+/// driver also serves) still fails promptly rather than stalling every
 /// `notify`/`notify_peer` caller for this long.
 const NOTIFY_WRITER_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
@@ -65,7 +65,7 @@ const BLUEZ_RESTART_READY_TIMEOUT: std::time::Duration = std::time::Duration::fr
 const BLUEZ_RESTART_READY_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 const NOTIFY_WRITER_ACQUIRE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// How long `connect()` waits for this backend's own discovery to stop
+/// How long `connect()` waits for this driver's own discovery to stop
 /// before dialling anyway.
 ///
 /// Dropping a scan stream used to leave discovery running for an unknown
@@ -85,7 +85,7 @@ const DISCOVERY_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
-use crate::hal::{Backend, BoxStream, GattConnection};
+use crate::hal::{Driver, BoxStream, GattConnection};
 use crate::entities::error::{BleError, Result};
 use crate::entities::models::{
     advertised_name, truncate_name, CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattEvent,
@@ -94,14 +94,14 @@ use crate::entities::models::{
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 
-/// How long `LinuxBackend::connect` waits for BlueZ's `Connect` D-Bus method
+/// How long `LinuxDriver::connect` waits for BlueZ's `Connect` D-Bus method
 /// to reply before giving up.
 ///
 /// Real-hardware evidence: with no bound at all, a `Connect` call to an
 /// unresponsive/out-of-range peer can hang effectively forever — not just
 /// past a caller's own external timeout, since `dial_lock` is held across
 /// the whole call and every subsequent dial to that address (and, when the
-/// lock was still backend-wide, every other peer's operations; and,
+/// lock was still driver-wide, every other peer's operations; and,
 /// evidence suggests, the
 /// shared D-Bus connection's own capacity for outstanding calls) piles up
 /// behind it rather than that one dial simply failing slowly. A caller-side
@@ -130,7 +130,7 @@ const CLEANUP_DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// must not lift the quarantine either.
 const PENDING_CLEANUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Hard cap on how many `connect()` attempts this backend will allow to be
+/// Hard cap on how many `connect()` attempts this driver will allow to be
 /// outstanding at once with no guaranteed way to clean up after them if
 /// abandoned or timed out. Codex P1 ("bound cleanup attempts across peer
 /// addresses", then "reserve cleanup capacity before issuing Connect"):
@@ -145,7 +145,7 @@ const PENDING_CLEANUP_RETRY_DELAY: std::time::Duration = std::time::Duration::fr
 /// reserved by `connect()` itself, before `device.connect()` is ever
 /// issued (see the reservation site there) — a `connect()` call that
 /// cannot obtain one is rejected outright rather than proceeding into an
-/// attempt this backend cannot guarantee it can ever clean up.
+/// attempt this driver cannot guarantee it can ever clean up.
 const MAX_CONCURRENT_CLEANUP_DISCONNECTS: usize = 4;
 
 /// `read`/`write_with_type` do **not** retry a GATT operation BlueZ rejects
@@ -229,7 +229,7 @@ fn start_proved_not_running(err: &bluer::Error) -> bool {
     !is_in_progress(err) && !no_reply
 }
 
-/// This backend's own view of its discovery. Only touched briefly, never
+/// This driver's own view of its discovery. Only touched briefly, never
 /// across an `.await`; `DiscoveryBus::op` is what orders the D-Bus calls.
 #[derive(Debug, Default)]
 struct ScanState {
@@ -250,7 +250,7 @@ impl ScanState {
     }
 }
 
-/// Discovery, on a D-Bus connection this backend owns instead of `bluer`'s.
+/// Discovery, on a D-Bus connection this driver owns instead of `bluer`'s.
 ///
 /// `bluer` ignores `StopDiscovery`'s result (it is only trace-logged inside
 /// `Adapter::discovery_session`) and exposes neither a public
@@ -266,7 +266,7 @@ impl ScanState {
 /// stays on the bus for ~30 s (its event loop awaits `RemoveMatch` replies
 /// on a connection whose I/O task it already aborted), so BlueZ would keep
 /// discovering — and racing dials — for that long. Owning the connection
-/// lets this backend send `StopDiscovery` itself, see its result, and have
+/// lets this driver send `StopDiscovery` itself, see its result, and have
 /// `connect()` wait for it.
 ///
 /// BlueZ keeps discovery per D-Bus client, not per call: a second
@@ -277,7 +277,7 @@ struct DiscoveryBus {
     conn: Arc<dbus::nonblock::SyncConnection>,
     io_task: tokio::task::JoinHandle<()>,
     adapter_path: dbus::Path<'static>,
-    /// The backend's own `bluer` adapter, only for reading `Discovering`.
+    /// The driver's own `bluer` adapter, only for reading `Discovering`.
     adapter: Adapter,
     /// Serialises every `StartDiscovery`/`StopDiscovery` together with the
     /// `ScanState` decision that led to it, so a stop can never overtake
@@ -431,7 +431,7 @@ impl Drop for DiscoveryBus {
 
 /// Held by a scan stream. Dropping the last one schedules `StopDiscovery`;
 /// a `connect()` that runs before the scheduled task gets there sends it
-/// itself (`LinuxBackend::settle_discovery`).
+/// itself (`LinuxDriver::settle_discovery`).
 struct ScanGuard(Arc<DiscoveryBus>);
 
 impl Drop for ScanGuard {
@@ -453,9 +453,9 @@ impl Drop for ScanGuard {
     }
 }
 
-pub struct LinuxBackend {
+pub struct LinuxDriver {
     // Held only to keep the D-Bus session connection alive for the
-    // lifetime of the backend; `Adapter` clones its own `Arc` into the
+    // lifetime of the driver; `Adapter` clones its own `Arc` into the
     // session internals, so this field is otherwise unused.
     _session: Session,
     adapter: Adapter,
@@ -522,7 +522,7 @@ pub struct LinuxBackend {
     /// number, so the abandoned call's handlers would count as current in the
     /// replacement server. Strictly increasing, so no number is reused.
     generation_counter: Arc<AtomicU64>,
-    /// Addresses this backend dialled itself, in the central role. BlueZ
+    /// Addresses this driver dialled itself, in the central role. BlueZ
     /// reports one `Connected` property per device regardless of who
     /// initiated, so without this an outbound connection would be
     /// misreported as a central arriving at our server.
@@ -564,7 +564,7 @@ pub struct LinuxBackend {
     discovery: Arc<DiscoveryBus>,
 }
 
-impl LinuxBackend {
+impl LinuxDriver {
     /// A generation number never handed out before; see `generation_counter`.
     fn next_generation(&self) -> u64 {
         self.generation_counter.fetch_add(1, Ordering::SeqCst) + 1
@@ -621,11 +621,11 @@ fn advertisement(service: &GattServiceSpec) -> Advertisement {
     }
 }
 
-/// One dial/teardown lock per peer address (see `LinuxBackend::dial_lock`).
+/// One dial/teardown lock per peer address (see `LinuxDriver::dial_lock`).
 ///
 /// The race the lock closes is per address: `Device` resolves by address, so
 /// only operations on the *same* address can drop each other's link. A
-/// single backend-wide lock also made every other peer wait behind a slow
+/// single driver-wide lock also made every other peer wait behind a slow
 /// dial: on hardware, a 20s Connect to a stale address held a live link's
 /// write for those 20s, and the QUIC handshake on that link timed out.
 ///
@@ -704,7 +704,7 @@ async fn spawn_bluez_restart_watch(
     });
 }
 
-impl LinuxBackend {
+impl LinuxDriver {
     pub async fn new() -> Result<Self> {
         let session = Session::new()
             .await
@@ -714,7 +714,7 @@ impl LinuxBackend {
             .await
             .map_err(|err| BleError::AdapterUnavailable(err.to_string()))?;
         // An adapter that exists but is powered off is *not* a construction
-        // failure: `PeerLink` needs the backend to exist so its `Powered`
+        // failure: `PeerLink` needs the driver to exist so its `Powered`
         // watcher can report the adapter coming back, and `radio_status()`
         // reports the current state. Only a missing adapter (handled above)
         // is unrecoverable. Operations attempted while unpowered fail on
@@ -1049,7 +1049,7 @@ async fn has_live_session(
     live
 }
 
-impl LinuxBackend {
+impl LinuxDriver {
     /// Deliver to every live notify session matching `want`.
     ///
     /// Sessions are pruned before *and* after writing, because one can close
@@ -1148,7 +1148,7 @@ impl LinuxBackend {
     }
 }
 
-/// Cancellation guard for `LinuxBackend::connect`'s `device.connect().await`
+/// Cancellation guard for `LinuxDriver::connect`'s `device.connect().await`
 /// -- see the doc comment at its construction site for why this exists.
 /// `bluer::Device::disconnect()` is async and `Drop::drop` cannot await, so
 /// the actual BlueZ teardown is a detached `tokio::spawn`; only the local
@@ -1286,7 +1286,7 @@ impl Drop for LinuxConnectGuard {
                     // running — that D-Bus call proceeds independently of
                     // this lock once issued, and the address is already
                     // quarantined regardless, so holding the lock (then
-                    // backend-wide, now this address's own) for another
+                    // driver-wide, now this address's own) for another
                     // `CLEANUP_DISCONNECT_TIMEOUT` just to poll an existing
                     // task needlessly blocked other operations for that
                     // whole span, repeated on every timeout.
@@ -1470,7 +1470,7 @@ async fn read_scanned_peer(adapter: &Adapter, address: bluer::Address, target: u
 }
 
 #[async_trait]
-impl Backend for LinuxBackend {
+impl Driver for LinuxDriver {
     async fn capabilities(&self) -> CapabilityReport {
         let peripheral = self
             .adapter
@@ -1665,7 +1665,7 @@ impl Backend for LinuxBackend {
         // doc comment (Codex P1, "reserve cleanup capacity before issuing
         // Connect"): if this attempt is later abandoned or times out, its
         // cleanup will need this exact capacity, and reserving it only
-        // after the fact bounds nothing — a connect this backend cannot
+        // after the fact bounds nothing — a connect this driver cannot
         // guarantee it can ever clean up must not be issued at all.
         let cleanup_permit = match self.cleanup_permits.clone().try_acquire_owned() {
             Ok(permit) => permit,
@@ -1684,7 +1684,7 @@ impl Backend for LinuxBackend {
             }
         };
         log::info!("connect: dialling {} generation={dial_generation}", peer.0);
-        // Cancellation guard, mirroring the Android backend's `ConnectGuard`
+        // Cancellation guard, mirroring the Android driver's `ConnectGuard`
         // -- `connect()` is an async fn, so a caller can drop this future
         // mid-await (a timeout, a `select!` losing a race) while suspended
         // inside `device.connect().await` below. Without this, neither of
@@ -1763,7 +1763,7 @@ impl Backend for LinuxBackend {
         // Watch BlueZ's own Connected property so an *unsolicited* drop (peer
         // out of range, powered off) reaches `events()`. Without this a
         // caller mid-transfer has no way to distinguish "slow" from "gone" —
-        // see `Backend::events`. The task ends when the device disconnects or
+        // see `Driver::events`. The task ends when the device disconnects or
         // the property stream closes, so it does not leak per connection.
         let watch_device = device.clone();
         let watch_peer = peer.clone();
@@ -2263,12 +2263,12 @@ struct LinuxGattConnection {
     /// BlueZ through the address-backed `Device` proxy and disconnects the
     /// connection that replaced it.
     dialed: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
-    /// See `LinuxBackend::dial_lock`.
+    /// See `LinuxDriver::dial_lock`.
     dial_lock: DialLocks,
     /// Peripheral-role sessions currently being served, shared with
-    /// `LinuxBackend`. BlueZ keeps one ACL per remote address — disconnecting
+    /// `LinuxDriver`. BlueZ keeps one ACL per remote address — disconnecting
     /// it from the central role tears down a peripheral-role session on the
-    /// same peer too, since both sides of `GattConnection`/`Backend` address
+    /// same peer too, since both sides of `GattConnection`/`Driver` address
     /// the same `bluer::Device`. Checked by `disconnect()` before it would
     /// otherwise kill a link the peripheral role still needs.
     served_peers: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
@@ -2312,7 +2312,7 @@ impl LinuxGattConnection {
 
 impl LinuxGattConnection {
     /// Refuse to act when a newer dial to this peer has superseded us,
-    /// matching the Android and mock backends.
+    /// matching the Android and mock drivers.
     fn ensure_current(&self) -> Result<()> {
         // A *missing* entry is not ownership. `report_central_loss` removes
         // the address once the link drops, so treating absence as "still
@@ -2349,7 +2349,7 @@ impl GattConnection for LinuxGattConnection {
             self.att_mtu.store(mtu as u16, Ordering::Relaxed);
         }
         // A single attempt — no internal retry. See `is_transient_gatt_error`'s
-        // doc comment for why: no fixed backend-side retry budget fits every
+        // doc comment for why: no fixed driver-side retry budget fits every
         // caller, so a caller that wants to retry a `BleError::GattBusy`
         // does so itself, sized to its own timeout.
         match target.read().await {

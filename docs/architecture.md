@@ -104,10 +104,10 @@ desktop (Linux)
             └── DatagramChannel             crate ble-gatt, profile/datagram/
                 │                             whole messages: fragmentation, reassembly;
                 │                             connect() = central, serve() = peripheral
-                └── Adapter → hal::Backend  crate ble-gatt, roles/ + hal/
+                └── Adapter → hal::Driver   crate ble-gatt, roles/ + hal/
                     │                         (in a Tauri app built by tauri-plugin-ble-gatt's
-                    │                          LazyBackend on first use)
-                    └── LinuxBackend        crate ble-gatt, drivers/linux.rs (via bluer)
+                    │                          LazyDriver on first use)
+                    └── LinuxDriver         crate ble-gatt, drivers/linux.rs (via bluer)
                         └── bluetoothd      BlueZ over D-Bus: Device1, GattManager1,
                             │                 LEAdvertisingManager1
                             └── kernel HCI  Linux Bluetooth subsystem
@@ -119,9 +119,9 @@ phone (Android)
     └── iroh Endpoint                       crate iroh (outside)
         └── BleGattTransport                crate ble-gatt-iroh
             └── DatagramChannel             crate ble-gatt, profile/datagram/
-                └── Adapter → hal::Backend  crate ble-gatt; built by tauri-plugin-ble-gatt
+                └── Adapter → hal::Driver   crate ble-gatt; built by tauri-plugin-ble-gatt
                     │                         (src/lazy.rs, src/android_context.rs)
-                    └── AndroidBackend      crate ble-gatt, drivers/android.rs
+                    └── AndroidDriver       crate ble-gatt, drivers/android.rs
                         │                     Rust half of the bridge: calls Kotlin over JNI,
                         │                     receives Java_dev_blegatt_NativeKt_* callbacks
                         └── JNI bridge      tauri-plugin-ble-gatt/android/…/dev/blegatt/
@@ -155,7 +155,7 @@ flowchart TB
         dIroh["iroh Endpoint<br/>QUIC + TLS"]
         dTransport["ble-gatt-iroh<br/>BleGattTransport"]
         dDatagram["ble-gatt profile/datagram<br/>DatagramChannel"]
-        dAdapter["ble-gatt Adapter<br/>hal::Backend"]
+        dAdapter["ble-gatt Adapter<br/>hal::Driver"]
         dDriver["ble-gatt drivers/linux.rs<br/>(bluer)"]
         dBluez["BlueZ bluetoothd<br/>D-Bus"]
         dHci["kernel HCI"]
@@ -169,7 +169,7 @@ flowchart TB
         pIroh["iroh Endpoint<br/>QUIC + TLS"]
         pTransport["ble-gatt-iroh<br/>BleGattTransport"]
         pDatagram["ble-gatt profile/datagram<br/>DatagramChannel"]
-        pAdapter["ble-gatt Adapter<br/>hal::Backend<br/>(tauri-plugin-ble-gatt LazyBackend)"]
+        pAdapter["ble-gatt Adapter<br/>hal::Driver<br/>(tauri-plugin-ble-gatt LazyDriver)"]
         pDriver["ble-gatt drivers/android.rs<br/>Rust side of JNI"]
         pKotlin["tauri-plugin-ble-gatt Kotlin<br/>BleGattBridge.kt + Native.kt"]
         pStack["Android Bluetooth service<br/>Binder"]

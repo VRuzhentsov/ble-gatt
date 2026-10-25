@@ -50,7 +50,7 @@ export type GattEvent =
    * `session` distinguishes successive connections to the same address, so a
    * consumer can tell a genuine reconnect from a duplicate event and ignore
    * lifecycle events belonging to a connection it has already replaced.
-   * `null` when the backend cannot distinguish them.
+   * `null` when the driver cannot distinguish them.
    */
   | {
       type: "connected";

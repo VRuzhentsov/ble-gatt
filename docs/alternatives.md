@@ -69,7 +69,7 @@ peer-link tiers provide.
 | [nordicsemi/Android-Scanner-Compat-Library](https://github.com/nordicsemi/Android-Scanner-Compat-Library) | Java | 796 | C (scan only) | — | |
 | [PhilipsHue/flutter_reactive_ble](https://github.com/PhilipsHue/flutter_reactive_ble) | Dart | 737 | C | iOS | |
 | [weliem/blessed-android](https://github.com/weliem/blessed-android) | Java | 595 | C + P | — | Has a peripheral manager. |
-| [dotintent/FlutterBleLib](https://github.com/dotintent/FlutterBleLib) | Dart | 546 | C | iOS | Can simulate peripherals for tests; compare our `MockBackend`. |
+| [dotintent/FlutterBleLib](https://github.com/dotintent/FlutterBleLib) | Dart | 546 | C | iOS | Can simulate peripherals for tests; compare our `MockDriver`. |
 | [nordicsemi/Kotlin-BLE-Library](https://github.com/nordicsemi/Kotlin-BLE-Library) | Kotlin | 529 | C + P | — | Coroutines successor to Android-BLE-Library. |
 | [Reedyuk/blue-falcon](https://github.com/Reedyuk/blue-falcon) | Kotlin | 488 | C | iOS, macOS, Windows, JavaScript | Kotlin Multiplatform. |
 | [Beepiz/BleGattCoroutines](https://github.com/Beepiz/BleGattCoroutines) | Kotlin | 476 | C | — | |
@@ -106,7 +106,7 @@ These have 100+ stars but fail the Android rule. They are still useful
 reading:
 
 - **Rust:**
-  - `bluez/bluer` (Linux). This is `ble-gatt`'s own Linux backend.
+  - `bluez/bluer` (Linux). This is `ble-gatt`'s own Linux driver.
   - `alexmoon/bluest`. Android was "planned" when ADR-0001 was written.
   - `embassy-rs/trouble` and `embassy-rs/nrf-softdevice` (embedded).
 - **Go:**
@@ -130,7 +130,7 @@ reading:
 
 ## What to borrow
 
-- **Windows and Apple backends (M2, M3):** read btleplug's WinRT and
+- **Windows and Apple drivers (M2, M3):** read btleplug's WinRT and
   CoreBluetooth code before writing ours. bluest is a second reference even
   without Android. Both are permissively licensed and mature on the central
   side.
@@ -144,5 +144,5 @@ reading:
   Gate's IP-over-BLE, are the two serious public designs above GATT. Compare
   them with our datagram tier.
 - **Testing without radios:** FlutterBleLib's simulated peripherals do what
-  our `MockBackend` does. Google's bumble (a host stack that can be pointed at
-  a virtual controller) might let CI exercise the real BlueZ backend.
+  our `MockDriver` does. Google's bumble (a host stack that can be pointed at
+  a virtual controller) might let CI exercise the real BlueZ driver.

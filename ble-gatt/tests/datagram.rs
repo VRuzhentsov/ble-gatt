@@ -1,4 +1,4 @@
-//! Datagram-tier integration tests over the mock backend. CI-safe: no radio,
+//! Datagram-tier integration tests over the mock driver. CI-safe: no radio,
 //! no BlueZ daemon, no Android runtime.
 //!
 //! These drive the real `connect`/`serve` code paths — fragmentation against
@@ -9,15 +9,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ble_gatt::datagram::{self, DatagramChannel, DatagramConfig};
-use ble_gatt::drivers::mock::{MockBackend, MockNetwork};
-use ble_gatt::{Adapter, Backend, CapabilityReport, CharacteristicUuid, PeerAddress, ServiceUuid};
+use ble_gatt::drivers::mock::{MockDriver, MockNetwork};
+use ble_gatt::{Adapter, Driver, CapabilityReport, CharacteristicUuid, PeerAddress, ServiceUuid};
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 /// An adapter over a test's mock radio. The test keeps its own handle on
 /// the mock to drive it (drop links, power off).
-async fn adapter(backend: &Arc<MockBackend>) -> Adapter {
-    Adapter::new(backend.clone()).await
+async fn adapter(driver: &Arc<MockDriver>) -> Adapter {
+    Adapter::new(driver.clone()).await
 }
 
 fn full_capabilities() -> CapabilityReport {
@@ -35,26 +35,26 @@ fn config() -> DatagramConfig {
 }
 
 /// Stand up a peripheral serving `config` and a central connected to it.
-/// Returns both channels plus the backends, which must be kept alive — the
-/// mock deregisters a peer's event sink when its backend is dropped.
+/// Returns both channels plus the drivers, which must be kept alive — the
+/// mock deregisters a peer's event sink when its driver is dropped.
 async fn connected_pair(
     config: &DatagramConfig,
 ) -> (
     DatagramChannel,
     DatagramChannel,
-    Arc<MockBackend>,
-    Arc<MockBackend>,
+    Arc<MockDriver>,
+    Arc<MockDriver>,
 ) {
     let network = MockNetwork::new();
     let peripheral_addr = PeerAddress("peripheral".to_string());
     let central_addr = PeerAddress("central".to_string());
 
-    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let peripheral: Arc<MockDriver> = Arc::new(MockDriver::new(
         peripheral_addr.clone(),
         network.clone(),
         full_capabilities(),
     ));
-    let central: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let central: Arc<MockDriver> = Arc::new(MockDriver::new(
         central_addr,
         network.clone(),
         full_capabilities(),
@@ -218,12 +218,12 @@ async fn losing_the_peer_closes_the_channel_instead_of_hanging_forever() {
     let peripheral_addr = PeerAddress("peripheral-loss".to_string());
     let central_addr = PeerAddress("central-loss".to_string());
 
-    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let peripheral: Arc<MockDriver> = Arc::new(MockDriver::new(
         peripheral_addr.clone(),
         network.clone(),
         full_capabilities(),
     ));
-    let central: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let central: Arc<MockDriver> = Arc::new(MockDriver::new(
         central_addr.clone(),
         network.clone(),
         full_capabilities(),
@@ -277,21 +277,21 @@ async fn a_zero_queue_depth_is_rejected_rather_than_panicking() {
     // nothing observes it at all.
     let network = MockNetwork::new();
     let addr = PeerAddress("peripheral-zero".to_string());
-    let backend: Arc<MockBackend> =
-        Arc::new(MockBackend::new(addr.clone(), network, full_capabilities()));
+    let driver: Arc<MockDriver> =
+        Arc::new(MockDriver::new(addr.clone(), network, full_capabilities()));
 
     let mut zero_inbound = config();
     zero_inbound.inbound_queue_depth = 0;
-    assert!(datagram::serve(&adapter(&backend).await, &zero_inbound).await.is_err());
+    assert!(datagram::serve(&adapter(&driver).await, &zero_inbound).await.is_err());
 
     let mut zero_fragments = config();
     zero_fragments.fragment_queue_depth = 0;
-    assert!(datagram::serve(&adapter(&backend).await, &zero_fragments).await.is_err());
+    assert!(datagram::serve(&adapter(&driver).await, &zero_fragments).await.is_err());
 }
 
 #[tokio::test]
-async fn serving_and_dialling_on_one_backend_do_not_cross_over() {
-    // A backend used in both roles emits Connected for its own outbound
+async fn serving_and_dialling_on_one_driver_do_not_cross_over() {
+    // A driver used in both roles emits Connected for its own outbound
     // dial too. Without role information on the event, serve() treated that
     // as an arriving central: it yielded a phantom channel for the remote
     // peripheral *and* consumed the single-central slot, so the genuine
@@ -299,12 +299,12 @@ async fn serving_and_dialling_on_one_backend_do_not_cross_over() {
     let network = MockNetwork::new();
     let config = config();
 
-    let both_roles: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let both_roles: Arc<MockDriver> = Arc::new(MockDriver::new(
         PeerAddress("both-roles".to_string()),
         network.clone(),
         full_capabilities(),
     ));
-    let remote: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let remote: Arc<MockDriver> = Arc::new(MockDriver::new(
         PeerAddress("remote-peripheral".to_string()),
         network.clone(),
         full_capabilities(),
@@ -318,7 +318,7 @@ async fn serving_and_dialling_on_one_backend_do_not_cross_over() {
         .await
         .expect("serve");
 
-    // Dial out from the same backend that is serving.
+    // Dial out from the same driver that is serving.
     let _outbound = datagram::connect(
         &adapter(&both_roles).await,
         &PeerAddress("remote-peripheral".to_string()),
@@ -342,12 +342,12 @@ async fn a_served_channel_stops_sending_once_its_peer_disconnects() {
     let peripheral_addr = PeerAddress("peripheral-stale".to_string());
     let central_addr = PeerAddress("central-stale".to_string());
 
-    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let peripheral: Arc<MockDriver> = Arc::new(MockDriver::new(
         peripheral_addr.clone(),
         network.clone(),
         full_capabilities(),
     ));
-    let central: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let central: Arc<MockDriver> = Arc::new(MockDriver::new(
         central_addr.clone(),
         network.clone(),
         full_capabilities(),
@@ -396,12 +396,12 @@ async fn stopping_the_server_releases_the_peer_it_was_serving() {
     let network = MockNetwork::new();
     let peripheral_addr = PeerAddress("peripheral-restart".to_string());
 
-    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let peripheral: Arc<MockDriver> = Arc::new(MockDriver::new(
         peripheral_addr.clone(),
         network.clone(),
         full_capabilities(),
     ));
-    let first_central: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let first_central: Arc<MockDriver> = Arc::new(MockDriver::new(
         PeerAddress("central-before".to_string()),
         network.clone(),
         full_capabilities(),
@@ -421,7 +421,7 @@ async fn stopping_the_server_releases_the_peer_it_was_serving() {
 
     // The server goes away while that central is still attached. Neither
     // platform delivers a disconnect callback for a server teardown, so a
-    // backend that stays silent leaves the old `serve` generation believing
+    // driver that stays silent leaves the old `serve` generation believing
     // it is still serving that peer.
     peripheral.stop_advertising().await.expect("stop_advertising");
     drop(incoming);
@@ -430,7 +430,7 @@ async fn stopping_the_server_releases_the_peer_it_was_serving() {
     let mut restarted = datagram::serve(&adapter(&peripheral).await,&config)
         .await
         .expect("serve should restart");
-    let second_central: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let second_central: Arc<MockDriver> = Arc::new(MockDriver::new(
         PeerAddress("central-after".to_string()),
         network.clone(),
         full_capabilities(),
@@ -473,12 +473,12 @@ async fn inbound_overflow_is_reported_to_the_receiver_rather_than_lost_silently(
 
     let network = MockNetwork::new();
     let peripheral_addr = PeerAddress("peripheral-overflow".to_string());
-    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let peripheral: Arc<MockDriver> = Arc::new(MockDriver::new(
         peripheral_addr.clone(),
         network.clone(),
         full_capabilities(),
     ));
-    let central: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let central: Arc<MockDriver> = Arc::new(MockDriver::new(
         PeerAddress("central-overflow".to_string()),
         network.clone(),
         full_capabilities(),
@@ -536,12 +536,12 @@ async fn a_central_that_unsubscribes_frees_the_single_central_slot() {
     let peripheral_addr = PeerAddress("peripheral-unsub".to_string());
     let first_addr = PeerAddress("central-unsub".to_string());
 
-    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let peripheral: Arc<MockDriver> = Arc::new(MockDriver::new(
         peripheral_addr.clone(),
         network.clone(),
         full_capabilities(),
     ));
-    let first: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let first: Arc<MockDriver> = Arc::new(MockDriver::new(
         first_addr.clone(),
         network.clone(),
         full_capabilities(),
@@ -565,7 +565,7 @@ async fn a_central_that_unsubscribes_frees_the_single_central_slot() {
     network.simulate_unsubscribe(&peripheral_addr, &first_addr);
 
     let second_addr = PeerAddress("central-unsub-2".to_string());
-    let second: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let second: Arc<MockDriver> = Arc::new(MockDriver::new(
         second_addr.clone(),
         network.clone(),
         full_capabilities(),
@@ -596,12 +596,12 @@ async fn a_server_can_greet_the_moment_it_is_handed_a_channel() {
     let network = MockNetwork::new();
     let peripheral_addr = PeerAddress("peripheral-greet".to_string());
 
-    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let peripheral: Arc<MockDriver> = Arc::new(MockDriver::new(
         peripheral_addr.clone(),
         network.clone(),
         full_capabilities(),
     ));
-    let central: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let central: Arc<MockDriver> = Arc::new(MockDriver::new(
         PeerAddress("central-greet".to_string()),
         network.clone(),
         full_capabilities(),
@@ -646,12 +646,12 @@ async fn a_receiver_already_waiting_is_woken_when_inbound_data_is_lost() {
     let peripheral_addr = PeerAddress("peripheral-wake".to_string());
     let central_addr = PeerAddress("central-wake".to_string());
 
-    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let peripheral: Arc<MockDriver> = Arc::new(MockDriver::new(
         peripheral_addr.clone(),
         network.clone(),
         full_capabilities(),
     ));
-    let central: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let central: Arc<MockDriver> = Arc::new(MockDriver::new(
         central_addr.clone(),
         network.clone(),
         full_capabilities(),
@@ -677,7 +677,7 @@ async fn a_receiver_already_waiting_is_woken_when_inbound_data_is_lost() {
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // The backend reports a gap: payloads it dropped after the peer had
+    // The driver reports a gap: payloads it dropped after the peer had
     // already been told they were sent.
     network.simulate_notification_gap(&peripheral_addr, &central_addr);
 
@@ -694,12 +694,12 @@ async fn dropping_a_served_channel_frees_the_slot_for_the_next_central() {
     let network = MockNetwork::new();
     let peripheral_addr = PeerAddress("peripheral-drop-slot".to_string());
 
-    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let peripheral: Arc<MockDriver> = Arc::new(MockDriver::new(
         peripheral_addr.clone(),
         network.clone(),
         full_capabilities(),
     ));
-    let first: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let first: Arc<MockDriver> = Arc::new(MockDriver::new(
         PeerAddress("central-drop-slot-1".to_string()),
         network.clone(),
         full_capabilities(),
@@ -722,7 +722,7 @@ async fn dropping_a_served_channel_frees_the_slot_for_the_next_central() {
     // the peer keeps the single-central slot forever.
     drop(served);
 
-    let second: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let second: Arc<MockDriver> = Arc::new(MockDriver::new(
         PeerAddress("central-drop-slot-2".to_string()),
         network.clone(),
         full_capabilities(),
@@ -754,12 +754,12 @@ async fn a_stale_channel_drop_does_not_evict_the_reconnected_peer() {
     let peripheral_addr = PeerAddress("peripheral-reuse".to_string());
     let central_addr = PeerAddress("central-reuse".to_string());
 
-    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let peripheral: Arc<MockDriver> = Arc::new(MockDriver::new(
         peripheral_addr.clone(),
         network.clone(),
         full_capabilities(),
     ));
-    let first: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let first: Arc<MockDriver> = Arc::new(MockDriver::new(
         central_addr.clone(),
         network.clone(),
         full_capabilities(),
@@ -782,7 +782,7 @@ async fn a_stale_channel_drop_does_not_evict_the_reconnected_peer() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // The *same address* reconnects and is served afresh.
-    let second: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let second: Arc<MockDriver> = Arc::new(MockDriver::new(
         central_addr.clone(),
         network.clone(),
         full_capabilities(),
@@ -823,7 +823,7 @@ async fn a_release_survives_a_saturated_accept_queue() {
     let peripheral_addr = PeerAddress("peripheral-relqueue".to_string());
     let central_addr = PeerAddress("central-relqueue".to_string());
 
-    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let peripheral: Arc<MockDriver> = Arc::new(MockDriver::new(
         peripheral_addr.clone(),
         network.clone(),
         full_capabilities(),
@@ -838,7 +838,7 @@ async fn a_release_survives_a_saturated_accept_queue() {
     // is discarded by design (superseded), but the *live* one must not be —
     // if it is, the slot stays occupied by a channel that no longer exists
     // and nothing later can free it.
-    let first: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let first: Arc<MockDriver> = Arc::new(MockDriver::new(
         central_addr.clone(),
         network.clone(),
         full_capabilities(),
@@ -855,7 +855,7 @@ async fn a_release_survives_a_saturated_accept_queue() {
     peripheral.simulate_peer_loss(&central_addr);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let second: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let second: Arc<MockDriver> = Arc::new(MockDriver::new(
         central_addr.clone(),
         network.clone(),
         full_capabilities(),
@@ -875,7 +875,7 @@ async fn a_release_survives_a_saturated_accept_queue() {
 
     // The slot must be free: a third central has to be accepted.
     let third_addr = PeerAddress("central-relqueue-3".to_string());
-    let third: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let third: Arc<MockDriver> = Arc::new(MockDriver::new(
         third_addr,
         network.clone(),
         full_capabilities(),
@@ -896,12 +896,12 @@ async fn a_lagged_lifecycle_stream_ends_the_served_session_rather_than_stranding
     let peripheral_addr = PeerAddress("peripheral-lag".to_string());
     let first_addr = PeerAddress("central-lag".to_string());
 
-    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let peripheral: Arc<MockDriver> = Arc::new(MockDriver::new(
         peripheral_addr.clone(),
         network.clone(),
         full_capabilities(),
     ));
-    let first: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let first: Arc<MockDriver> = Arc::new(MockDriver::new(
         first_addr.clone(),
         network.clone(),
         full_capabilities(),
@@ -933,7 +933,7 @@ async fn a_lagged_lifecycle_stream_ends_the_served_session_rather_than_stranding
 
     // And the slot must be free for the next central.
     let second_addr = PeerAddress("central-lag-2".to_string());
-    let second: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let second: Arc<MockDriver> = Arc::new(MockDriver::new(
         second_addr,
         network.clone(),
         full_capabilities(),
@@ -961,7 +961,7 @@ async fn abandoning_connect_mid_setup_still_releases_the_connection() {
     let network = MockNetwork::new();
     let peripheral_addr = PeerAddress("peripheral-cancel".to_string());
 
-    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let peripheral: Arc<MockDriver> = Arc::new(MockDriver::new(
         peripheral_addr.clone(),
         network.clone(),
         full_capabilities(),
@@ -971,7 +971,7 @@ async fn abandoning_connect_mid_setup_still_releases_the_connection() {
         .await
         .expect("advertise should succeed");
 
-    let central: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let central: Arc<MockDriver> = Arc::new(MockDriver::new(
         PeerAddress("central-cancel".to_string()),
         network.clone(),
         full_capabilities(),
@@ -1013,7 +1013,7 @@ async fn dropping_a_central_channel_without_close_still_disconnects_it() {
     let network = MockNetwork::new();
     let peripheral_addr = PeerAddress("peripheral-drop-channel".to_string());
 
-    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let peripheral: Arc<MockDriver> = Arc::new(MockDriver::new(
         peripheral_addr.clone(),
         network.clone(),
         full_capabilities(),
@@ -1023,7 +1023,7 @@ async fn dropping_a_central_channel_without_close_still_disconnects_it() {
         .await
         .expect("advertise should succeed");
 
-    let central: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let central: Arc<MockDriver> = Arc::new(MockDriver::new(
         PeerAddress("central-drop-channel".to_string()),
         network.clone(),
         full_capabilities(),
@@ -1063,12 +1063,12 @@ async fn a_central_parked_in_recv_is_released_when_lifecycle_events_lag() {
     let peripheral_addr = PeerAddress("peripheral-clag".to_string());
     let central_addr = PeerAddress("central-clag".to_string());
 
-    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let peripheral: Arc<MockDriver> = Arc::new(MockDriver::new(
         peripheral_addr.clone(),
         network.clone(),
         full_capabilities(),
     ));
-    let central: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let central: Arc<MockDriver> = Arc::new(MockDriver::new(
         central_addr.clone(),
         network.clone(),
         full_capabilities(),
@@ -1111,12 +1111,12 @@ async fn a_loss_event_from_a_replaced_connection_does_not_kill_its_successor() {
     let peripheral_addr = PeerAddress("peripheral-stale-loss".to_string());
     let central_addr = PeerAddress("central-stale-loss".to_string());
 
-    let peripheral: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let peripheral: Arc<MockDriver> = Arc::new(MockDriver::new(
         peripheral_addr.clone(),
         network.clone(),
         full_capabilities(),
     ));
-    let central: Arc<MockBackend> = Arc::new(MockBackend::new(
+    let central: Arc<MockDriver> = Arc::new(MockDriver::new(
         central_addr.clone(),
         network.clone(),
         full_capabilities(),
@@ -1171,7 +1171,7 @@ async fn a_loss_event_from_a_replaced_connection_does_not_kill_its_successor() {
 
 /// Regression test for `DatagramConfig::advertised_manufacturer_data`: it
 /// reaches a scanner through the whole real pipeline (`service_spec()` ->
-/// `serve()` -> `Backend::advertise()`), not just when set directly on a
+/// `serve()` -> `Driver::advertise()`), not just when set directly on a
 /// `GattServiceSpec` (already covered in `mock_protocol.rs`). This is the
 /// mechanism a caller uses to change what's advertised between `serve`
 /// calls -- e.g. a discoverability flag toggled on and off by ending the
@@ -1184,12 +1184,12 @@ async fn advertised_manufacturer_data_reaches_a_scanner_through_serve() {
     let mut config = config();
     config.advertised_manufacturer_data.insert(0xABCDu16, vec![0x01]);
 
-    let peripheral = MockBackend::new(peripheral_addr.clone(), network.clone(), full_capabilities());
+    let peripheral = MockDriver::new(peripheral_addr.clone(), network.clone(), full_capabilities());
     let _incoming = datagram::serve(&adapter(&Arc::new(peripheral)).await, &config)
         .await
         .expect("serve should start");
 
-    let central = MockBackend::new(PeerAddress("central-config-adv".to_string()), network.clone(), full_capabilities());
+    let central = MockDriver::new(PeerAddress("central-config-adv".to_string()), network.clone(), full_capabilities());
     let mut discovered = central.scan(config.service).await.expect("scan should succeed");
     let peer = discovered
         .next()
@@ -1209,12 +1209,12 @@ async fn advertised_local_name_reaches_a_scanner_through_serve() {
     config.advertised_manufacturer_data.insert(0xABCDu16, vec![0x01]);
     config.advertised_local_name = Some("Will's Pixel".to_string());
 
-    let peripheral = MockBackend::new(PeerAddress("peripheral-name".to_string()), network.clone(), full_capabilities());
+    let peripheral = MockDriver::new(PeerAddress("peripheral-name".to_string()), network.clone(), full_capabilities());
     let _incoming = datagram::serve(&adapter(&Arc::new(peripheral)).await, &config)
         .await
         .expect("serve should start");
 
-    let central = MockBackend::new(PeerAddress("central-name".to_string()), network.clone(), full_capabilities());
+    let central = MockDriver::new(PeerAddress("central-name".to_string()), network.clone(), full_capabilities());
     let mut discovered = central.scan(config.service).await.expect("scan should succeed");
     let peer = discovered
         .next()
@@ -1268,7 +1268,7 @@ async fn update_advertisement_keeps_the_served_channel() {
 #[tokio::test]
 async fn update_advertisement_refuses_a_service_that_is_not_served() {
     let network = MockNetwork::new();
-    let peripheral = Arc::new(MockBackend::new(PeerAddress("peripheral-update".to_string()), network, full_capabilities()));
+    let peripheral = Arc::new(MockDriver::new(PeerAddress("peripheral-update".to_string()), network, full_capabilities()));
     let adapter = adapter(&peripheral).await;
     let served = config();
     assert!(datagram::update_advertisement(&adapter, &served).await.is_err());
@@ -1288,7 +1288,7 @@ async fn a_local_name_cannot_share_the_service_data_slot() {
     spec.local_name = Some("name".to_string());
     spec.service_data.insert(config.service, vec![1]);
 
-    let peripheral = MockBackend::new(PeerAddress("peripheral-clash".to_string()), network, full_capabilities());
+    let peripheral = MockDriver::new(PeerAddress("peripheral-clash".to_string()), network, full_capabilities());
     assert!(peripheral.advertise(spec).await.is_err());
 }
 

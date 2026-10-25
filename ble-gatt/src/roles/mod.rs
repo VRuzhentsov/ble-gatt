@@ -5,7 +5,7 @@
 //! role (D4), as every platform splits them: [`Central`] dials out,
 //! [`Peripheral`] hosts a GATT server and advertises it.
 //!
-//! Today's driver port (`hal::Backend`) still offers the GATT server and
+//! Today's driver port (`hal::Driver`) still offers the GATT server and
 //! advertising as one operation, so there is no separate `Advertiser` yet;
 //! it comes when the drivers split that operation.
 

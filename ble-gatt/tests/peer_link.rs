@@ -1,4 +1,4 @@
-//! Tier-3 `PeerLink` against the mock backend — CI-safe, no radio.
+//! Tier-3 `PeerLink` against the mock driver — CI-safe, no radio.
 //!
 //! Proves the consumer-facing contract in `docs/interface.md`: track a peer
 //! and get a channel + status, one wedged peer does not stall the others,
@@ -8,10 +8,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ble_gatt::drivers::mock::{MockBackend, MockNetwork};
+use ble_gatt::drivers::mock::{MockDriver, MockNetwork};
 use ble_gatt::datagram::DatagramConfig;
 use ble_gatt::{
-    Backend, BleError, CapabilityReport, ConnectionPriority, GattCharacteristicSpec, GattServiceSpec,
+    Driver, BleError, CapabilityReport, ConnectionPriority, GattCharacteristicSpec, GattServiceSpec,
     LinkRole, MaxLinks, PeerAddress, PeerLink, PeerLinkConfig, PeerLinkEvent, PeerStatus, RadioStatus,
     RetryBudget,
 };
@@ -49,8 +49,8 @@ fn tight_budget() -> RetryBudget {
     }
 }
 
-async fn advertise_peripheral(network: &Arc<MockNetwork>, address: &str) -> MockBackend {
-    let peripheral = MockBackend::new(PeerAddress(address.to_string()), network.clone(), caps());
+async fn advertise_peripheral(network: &Arc<MockNetwork>, address: &str) -> MockDriver {
+    let peripheral = MockDriver::new(PeerAddress(address.to_string()), network.clone(), caps());
     peripheral
         .advertise(GattServiceSpec::new(
             ble_gatt::ServiceUuid(SERVICE),
@@ -68,7 +68,7 @@ async fn advertise_peripheral(network: &Arc<MockNetwork>, address: &str) -> Mock
 }
 
 /// Poll `f` until it returns `true`, or panic after ~2s. For asserting a
-/// value the driver thread updates asynchronously just after an event.
+/// value the worker thread updates asynchronously just after an event.
 async fn assert_eventually<F: FnMut() -> bool>(mut f: F) {
     for _ in 0..200 {
         if f() {
@@ -103,9 +103,9 @@ where
 async fn tracking_a_peer_yields_a_working_channel() {
     let network = MockNetwork::new();
     let _peripheral = advertise_peripheral(&network, "peer-a").await;
-    let central = Arc::new(MockBackend::new(PeerAddress("me".into()), network.clone(), caps()));
+    let central = Arc::new(MockDriver::new(PeerAddress("me".into()), network.clone(), caps()));
 
-    let link = PeerLink::with_backend(central, peer_link_config(tight_budget(), 4));
+    let link = PeerLink::with_driver(central, peer_link_config(tight_budget(), 4));
     let mut events = link.events();
 
     link.track(PeerAddress("peer-a".into()), "peer-a".into());
@@ -122,11 +122,11 @@ async fn one_wedged_peer_does_not_stall_the_others() {
     let network = MockNetwork::new();
     let _a = advertise_peripheral(&network, "stuck").await;
     let _b = advertise_peripheral(&network, "fine").await;
-    let central = Arc::new(MockBackend::new(PeerAddress("me".into()), network.clone(), caps()));
+    let central = Arc::new(MockDriver::new(PeerAddress("me".into()), network.clone(), caps()));
     // "stuck" hangs its dial for far longer than the test.
     central.stall_connect(&PeerAddress("stuck".into()), Duration::from_secs(30));
 
-    let link = PeerLink::with_backend(central, peer_link_config(tight_budget(), 4));
+    let link = PeerLink::with_driver(central, peer_link_config(tight_budget(), 4));
     let mut events = link.events();
 
     link.track(PeerAddress("stuck".into()), "stuck".into());
@@ -142,9 +142,9 @@ async fn one_wedged_peer_does_not_stall_the_others() {
 async fn untracking_drops_the_link() {
     let network = MockNetwork::new();
     let _peripheral = advertise_peripheral(&network, "peer-u").await;
-    let central = Arc::new(MockBackend::new(PeerAddress("me".into()), network.clone(), caps()));
+    let central = Arc::new(MockDriver::new(PeerAddress("me".into()), network.clone(), caps()));
 
-    let link = PeerLink::with_backend(central, peer_link_config(tight_budget(), 4));
+    let link = PeerLink::with_driver(central, peer_link_config(tight_budget(), 4));
     let mut events = link.events();
 
     link.track(PeerAddress("peer-u".into()), "peer-u".into());
@@ -162,9 +162,9 @@ async fn untracking_drops_the_link() {
 async fn a_radio_toggle_drops_links_and_re_establishes_them() {
     let network = MockNetwork::new();
     let _peripheral = advertise_peripheral(&network, "peer-r").await;
-    let central = Arc::new(MockBackend::new(PeerAddress("me".into()), network.clone(), caps()));
+    let central = Arc::new(MockDriver::new(PeerAddress("me".into()), network.clone(), caps()));
 
-    let link = PeerLink::with_backend(central.clone(), peer_link_config(tight_budget(), 4));
+    let link = PeerLink::with_driver(central.clone(), peer_link_config(tight_budget(), 4));
     let mut events = link.events();
 
     link.track(PeerAddress("peer-r".into()), "peer-r".into());
@@ -192,9 +192,9 @@ async fn max_links_queues_the_overflow_and_promotes_on_a_free_slot() {
     let network = MockNetwork::new();
     let _a = advertise_peripheral(&network, "aaa").await;
     let _b = advertise_peripheral(&network, "bbb").await;
-    let central = Arc::new(MockBackend::new(PeerAddress("me".into()), network.clone(), caps()));
+    let central = Arc::new(MockDriver::new(PeerAddress("me".into()), network.clone(), caps()));
 
-    let link = PeerLink::with_backend(central, peer_link_config(tight_budget(), 1));
+    let link = PeerLink::with_driver(central, peer_link_config(tight_budget(), 1));
     let mut events = link.events();
 
     link.track(PeerAddress("aaa".into()), "aaa".into());
@@ -212,17 +212,17 @@ async fn max_links_queues_the_overflow_and_promotes_on_a_free_slot() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_role_the_backend_cannot_do_reports_unsupported() {
+async fn a_role_the_driver_cannot_do_reports_unsupported() {
     let network = MockNetwork::new();
-    // Central-only backend (like most Android devices).
+    // Central-only driver (like most Android devices).
     let central_only = CapabilityReport { central: true, peripheral: false };
-    let backend = Arc::new(MockBackend::new(PeerAddress("me".into()), network, central_only));
+    let driver = Arc::new(MockDriver::new(PeerAddress("me".into()), network, central_only));
 
-    let link = PeerLink::with_backend(
-        backend,
+    let link = PeerLink::with_driver(
+        driver,
         PeerLinkConfig {
             datagram: datagram_config(),
-            role: LinkRole::AcceptOnly, // needs peripheral, which the backend lacks
+            role: LinkRole::AcceptOnly, // needs peripheral, which the driver lacks
             retry_budget: tight_budget(),
             max_links: MaxLinks(4),
         },
@@ -240,8 +240,8 @@ async fn a_role_the_backend_cannot_do_reports_unsupported() {
 #[tokio::test(flavor = "multi_thread")]
 async fn two_symmetric_peers_connect_one_dialing_one_accepting() {
     let network = MockNetwork::new();
-    let low = Arc::new(MockBackend::new(PeerAddress("aaa".into()), network.clone(), caps()));
-    let high = Arc::new(MockBackend::new(PeerAddress("zzz".into()), network.clone(), caps()));
+    let low = Arc::new(MockDriver::new(PeerAddress("aaa".into()), network.clone(), caps()));
+    let high = Arc::new(MockDriver::new(PeerAddress("zzz".into()), network.clone(), caps()));
 
     let cfg = |id: &str| PeerLinkConfig {
         datagram: datagram_config(),
@@ -251,8 +251,8 @@ async fn two_symmetric_peers_connect_one_dialing_one_accepting() {
     };
 
     // "aaa" < "zzz", so the "aaa" side dials and the "zzz" side accepts.
-    let link_low = PeerLink::with_backend(low, cfg("aaa"));
-    let link_high = PeerLink::with_backend(high, cfg("zzz"));
+    let link_low = PeerLink::with_driver(low, cfg("aaa"));
+    let link_high = PeerLink::with_driver(high, cfg("zzz"));
     let mut ev_low = link_low.events();
     let mut ev_high = link_high.events();
 
@@ -265,16 +265,16 @@ async fn two_symmetric_peers_connect_one_dialing_one_accepting() {
     assert_eventually(|| link_high.status(&PeerAddress("aaa".into())) == PeerStatus::Connected).await;
 }
 
-/// A priority request crosses to the driver's pump and returns the link's
+/// A priority request crosses to the worker's pump and returns the link's
 /// real error — here the mock's `Unsupported`, as on Linux — not a
 /// flattened one; once the link is gone it is `NotConnected`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_priority_request_returns_the_links_real_error() {
     let network = MockNetwork::new();
     let _peripheral = advertise_peripheral(&network, "peer-p").await;
-    let central = Arc::new(MockBackend::new(PeerAddress("me".into()), network.clone(), caps()));
+    let central = Arc::new(MockDriver::new(PeerAddress("me".into()), network.clone(), caps()));
 
-    let link = PeerLink::with_backend(central, peer_link_config(tight_budget(), 4));
+    let link = PeerLink::with_driver(central, peer_link_config(tight_budget(), 4));
     let mut events = link.events();
 
     link.track(PeerAddress("peer-p".into()), "peer-p".into());

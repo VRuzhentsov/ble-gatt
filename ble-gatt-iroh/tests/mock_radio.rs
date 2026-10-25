@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ble_gatt::datagram::{self, DatagramConfig};
-use ble_gatt::drivers::mock::{MockBackend, MockNetwork};
+use ble_gatt::drivers::mock::{MockDriver, MockNetwork};
 use ble_gatt::{Adapter, CapabilityReport, CharacteristicUuid, PeerAddress, ServiceUuid};
 use ble_gatt_iroh::{custom_addr, dial_with, BleGattTransport, Dialer};
 use iroh::endpoint::{presets, Connection};
@@ -38,7 +38,7 @@ fn config() -> DatagramConfig {
 }
 
 async fn adapter(network: &Arc<MockNetwork>, address: &str) -> Adapter {
-    Adapter::new(Arc::new(MockBackend::new(
+    Adapter::new(Arc::new(MockDriver::new(
         PeerAddress(address.to_string()),
         network.clone(),
         CapabilityReport { central: true, peripheral: true },

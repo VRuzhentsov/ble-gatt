@@ -16,14 +16,14 @@ Targets are module paths, so they filter naturally:
 | Target | Covers |
 | --- | --- |
 | `ble_gatt::datagram` | fragmentation, reassembly, channel and session lifecycle |
-| `ble_gatt::backend::linux` | BlueZ: advertising, discovery, MTU, notify sessions |
-| `ble_gatt::backend::android` | JNI boundary in both directions |
-| `tauri_plugin_ble_gatt::android_lazy` | deferred backend construction |
+| `ble_gatt::drivers::linux` | BlueZ: advertising, discovery, MTU, notify sessions |
+| `ble_gatt::drivers::android` | JNI boundary in both directions |
+| `tauri_plugin_ble_gatt::android_lazy` | deferred driver construction |
 
 ```bash
 RUST_LOG=ble_gatt=debug                    # the whole library
 RUST_LOG=ble_gatt::datagram=trace          # per-fragment detail only
-RUST_LOG=ble_gatt=info,ble_gatt::backend=debug
+RUST_LOG=ble_gatt=info,ble_gatt::drivers=debug
 ```
 
 ## Levels
@@ -47,12 +47,12 @@ failure is visible at `warn` without turning anything up.
 Central side:
 
 ```
-INFO ble_gatt::backend::linux  capabilities: central=true peripheral=true
-INFO ble_gatt::backend::linux  scan: starting discovery for service 0000b1e6-…
-INFO ble_gatt::backend::linux  scan: discovered AA:BB:… name=Some("…") rssi=Some(-52)
+INFO ble_gatt::drivers::linux  capabilities: central=true peripheral=true
+INFO ble_gatt::drivers::linux  scan: starting discovery for service 0000b1e6-…
+INFO ble_gatt::drivers::linux  scan: discovered AA:BB:… name=Some("…") rssi=Some(-52)
 INFO ble_gatt::datagram        connect: dialling AA:BB:… service=0000b1e6-…
-INFO ble_gatt::backend::linux  connect: link established to AA:BB:… session=3
-INFO ble_gatt::backend::linux  subscribe: AA:BB:… negotiated ATT MTU 517
+INFO ble_gatt::drivers::linux  connect: link established to AA:BB:… session=3
+INFO ble_gatt::drivers::linux  subscribe: AA:BB:… negotiated ATT MTU 517
 INFO ble_gatt::datagram        connect: channel ready to AA:BB:… session=Some(3) fragment_budget=506 max_message_len=…
 DEBUG ble_gatt::datagram       send: 512 bytes to AA:BB:… as msg_id=0 in 2 fragment(s)
 DEBUG ble_gatt::datagram       recv: 512 bytes from AA:BB:…
@@ -62,10 +62,10 @@ Peripheral side:
 
 ```
 INFO ble_gatt::datagram        serve: advertising service 0000b1e6-…
-INFO ble_gatt::backend::linux  advertise: registering service 0000b1e6-… with 1 characteristic(s)
-INFO ble_gatt::backend::linux  advertise: registered, generation=2
+INFO ble_gatt::drivers::linux  advertise: registering service 0000b1e6-… with 1 characteristic(s)
+INFO ble_gatt::drivers::linux  advertise: registered, generation=2
 INFO ble_gatt::datagram        serve: advertising accepted, awaiting centrals
-INFO ble_gatt::backend::linux  notify session: central AA:BB:… subscribed to 0000b1e7-… session=4
+INFO ble_gatt::drivers::linux  notify session: central AA:BB:… subscribed to 0000b1e7-… session=4
 INFO ble_gatt::datagram        serve: accepted central AA:BB:… session=Some(4) generation=0 fragment_budget=…
 ```
 

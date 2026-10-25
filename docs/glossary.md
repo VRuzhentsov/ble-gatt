@@ -130,7 +130,7 @@ recognised by its address alone.
 Another device this library talks to.
 
 ### Peer address
-The value a backend uses to reach a peer right now (`PeerAddress`). It is
+The value a driver uses to reach a peer right now (`PeerAddress`). It is
 opaque and may change (see [private address](#private-address)), so it is not
 a peer's identity.
 
@@ -189,14 +189,14 @@ In this library: the `hal/` module.
 
 ### Driver
 The code that implements the `hal/` traits for one platform, or the mock
-(`drivers/`). Layer: Frameworks & Drivers. *Also called:* backend (the
-code's current word), platform implementation, executor (Nordic).
+(`drivers/`): the `hal::Driver` trait, implemented by `LinuxDriver`,
+`AndroidDriver` and `MockDriver`. Layer: Frameworks & Drivers. *Also
+called:* backend (the code's old word, and SimpleBLE's and Qt's), platform
+implementation, executor (Nordic). Not the operating system's kernel driver
+for the Bluetooth chip, which sits several levels lower.
 
 ### Platform
 One operating system's Bluetooth API: Linux (BlueZ), Android, Windows, Apple.
-
-### Backend
-The current code's word for a [driver](#driver).
 
 ### Port
 An interface (a Rust trait) a layer defines for what it needs from outside,

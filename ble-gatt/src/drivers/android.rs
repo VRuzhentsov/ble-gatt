@@ -1,4 +1,4 @@
-//! Android backend: raw JNI (`jni` crate) + `ndk-context`, calling directly
+//! Android driver: raw JNI (`jni` crate) + `ndk-context`, calling directly
 //! into `dev.blegatt.BleGattBridge` (a plain Kotlin class shipped in
 //! `tauri-plugin-ble-gatt/android/`, *not* a `@TauriPlugin`) — see
 //! docs/adr/0002 for why this bypasses Tauri's own mobile-plugin IPC path.
@@ -9,7 +9,7 @@
 //!
 //! ## The native-handle contract (read before touching this file)
 //!
-//! `Inner` is heap-allocated behind an `Arc`. `AndroidBackend::new()` passes
+//! `Inner` is heap-allocated behind an `Arc`. `AndroidDriver::new()` passes
 //! `Arc::into_raw(inner.clone()) as jlong` to the `BleGattBridge` Kotlin
 //! constructor — a strong reference the bridge owns and that is never
 //! reclaimed, so the allocation outlives any callback the JVM may still have
@@ -21,8 +21,8 @@
 //! — it never takes ownership, so the pointer must stay valid for as long
 //! as the Kotlin object might still call back. `AndroidGattConnection`
 //! holds its own `Arc<Inner>` clone, keeping the allocation alive even if
-//! `AndroidBackend` itself is dropped first while connections are still
-//! live. `Drop for AndroidBackend` calls the bridge's `closeAll()`, which
+//! `AndroidDriver` itself is dropped first while connections are still
+//! live. `Drop for AndroidDriver` calls the bridge's `closeAll()`, which
 //! disconnects and closes every open `BluetoothGatt` and the GATT server
 //! before the allocation can go away. That matters: each open GATT holds a
 //! Kotlin callback capturing `native_handle`, so leaving them open meant a
@@ -71,7 +71,7 @@ const ADVERTISE_ERROR_STOPPED: i32 = 102;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
-use crate::hal::{Backend, BoxStream, GattConnection};
+use crate::hal::{Driver, BoxStream, GattConnection};
 use crate::entities::error::{BleError, Result};
 use crate::entities::models::{
     advertised_name, truncate_name, CapabilityReport, CharacteristicUuid, ConnectionPriority, DiscoveredPeer,
@@ -85,7 +85,7 @@ const CALLBACK_CLASS: &str = "dev/blegatt/NativeKt";
 /// Bumped whenever `android.rs` gains a JNI call or callback the Kotlin
 /// bridge must implement. `BleGattBridge.kt::bridgeAbiVersion()` returns the
 /// matching number; a mismatch is logged at construction (see
-/// `AndroidBackend::new`). v2 added `onRadioState` / `bridgeAbiVersion` /
+/// `AndroidDriver::new`). v2 added `onRadioState` / `bridgeAbiVersion` /
 /// `isRadioEnabled` (ADR-0005's adapter-state receiver). v3 added
 /// `requestConnectionPriority`.
 const BRIDGE_ABI_VERSION: i32 = 3;
@@ -134,7 +134,7 @@ struct ConnectionState {
     disconnected_tx: Option<oneshot::Sender<()>>,
 }
 
-/// State of the one scan this backend allows at a time.
+/// State of the one scan this driver allows at a time.
 #[derive(Default)]
 struct ScanState {
     /// Where results go. `None` means no scan is active.
@@ -170,7 +170,7 @@ struct Inner {
     scan: StdMutex<ScanState>,
     /// Named `server_events_tx` historically, but now carries both roles'
     /// lifecycle events — including central-side link loss. See
-    /// `Backend::events`.
+    /// `Driver::events`.
     server_events_tx: broadcast::Sender<GattEvent>,
     /// Negotiated ATT MTU per peer address, populated from
     /// `onMtuChanged`. Shared rather than held per-`AndroidGattConnection`
@@ -308,7 +308,7 @@ impl Inner {
     /// — rather than this method re-attaching internally — so call sites
     /// can scope `env` (and its borrowed JNI locals) to end *before* any
     /// subsequent `.await`. `JNIEnv` is `!Send`; holding one across an
-    /// await point would make every `Backend`/`GattConnection` future
+    /// await point would make every `Driver`/`GattConnection` future
     /// non-`Send`, which the trait's `Send` supertrait bound forbids.
     fn call_void(&self, env: &mut JNIEnv, method: &str, sig: &str, args: &[JValue]) -> Result<()> {
         let bridge = self.bridge()?;
@@ -358,11 +358,11 @@ fn jni_error(env: &mut JNIEnv, method: &str, err: jni::errors::Error) -> BleErro
     ))
 }
 
-pub struct AndroidBackend {
+pub struct AndroidDriver {
     inner: Arc<Inner>,
 }
 
-impl AndroidBackend {
+impl AndroidDriver {
     /// Addresses currently subscribed to `characteristic` on our server.
     fn subscribed_peers(&self, characteristic: CharacteristicUuid) -> Result<Vec<PeerAddress>> {
         let mut env = self.inner.env()?;
@@ -393,7 +393,7 @@ impl AndroidBackend {
     }
 }
 
-impl AndroidBackend {
+impl AndroidDriver {
     pub async fn new() -> Result<Self> {
         let ctx = ndk_context::android_context();
         let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }
@@ -432,7 +432,7 @@ impl AndroidBackend {
         });
 
         // See the module doc comment: this pointer must stay valid for as
-        // long as any `Arc<Inner>` handle (this `AndroidBackend`, or any
+        // long as any `Arc<Inner>` handle (this `AndroidDriver`, or any
         // `AndroidGattConnection` cloned from it) is alive.
         // `into_raw`, not `as_ptr`: the Kotlin bridge holds a *strong*
         // reference for as long as it might call back. With `as_ptr` the
@@ -446,7 +446,7 @@ impl AndroidBackend {
         // This reference is deliberately never reclaimed. Releasing it would
         // reintroduce exactly the race it exists to remove, since nothing
         // can prove the JVM has no queued callback left. The cost is one
-        // `Inner` per backend — in practice one per process — which is a
+        // `Inner` per driver — in practice one per process — which is a
         // bounded leak traded for the elimination of a use-after-free.
         let native_handle = Arc::into_raw(inner.clone()) as jlong;
         let mut env = inner
@@ -505,7 +505,7 @@ impl AndroidBackend {
     }
 }
 
-impl Drop for AndroidBackend {
+impl Drop for AndroidDriver {
     fn drop(&mut self) {
         // Best-effort quiesce — see the module doc comment's native-handle
         // contract for what this does and does not guarantee.
@@ -520,7 +520,7 @@ impl Drop for AndroidBackend {
 }
 
 #[async_trait]
-impl Backend for AndroidBackend {
+impl Driver for AndroidDriver {
     /// Every failure path here logs before falling back. `false`/`false` is
     /// indistinguishable from "this device genuinely has no BLE support", so
     /// a silent fallback turns a real bug into a plausible-looking hardware
@@ -662,7 +662,7 @@ impl Backend for AndroidBackend {
 
         // Every failure below must clear `connected_tx`. Leaving it set once
         // its receiver is gone makes the guard above reject every retry for
-        // the lifetime of the backend — so a transient cause (a missing
+        // the lifetime of the driver — so a transient cause (a missing
         // runtime permission, a powered-down adapter) would become permanent
         // even after it was fixed.
         let dial = (|| -> Result<()> {
@@ -1116,7 +1116,7 @@ impl Backend for AndroidBackend {
 
 /// Wraps the discovery channel so dropping the stream (the caller losing
 /// interest in scan results) stops the underlying Android scan — mirrors
-/// `LinuxBackend::scan`'s stream-owns-the-scan-lifetime contract.
+/// `LinuxDriver::scan`'s stream-owns-the-scan-lifetime contract.
 struct ScanStream {
     inner: Arc<Inner>,
     rx: ReceiverStream<Result<DiscoveredPeer>>,
@@ -1611,7 +1611,7 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onPeerDiscovered<'local>(
 
     // Android already parsed these to match the scan filter, so reporting
     // them costs nothing — and an empty list made a `DiscoveredPeer` from
-    // this backend claim no advertised services at all, unlike Linux and the
+    // this driver claim no advertised services at all, unlike Linux and the
     // mock, breaking consumers that inspect the field.
     let mut services = Vec::new();
     if let Ok(len) = env.get_array_length(&advertised_service_uuids) {
@@ -1742,7 +1742,7 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onConnected<'local>(
         }
     }
     // Publish regardless of whether a client connect was pending: Linux
-    // already does this, and `Backend::events` documents both roles.
+    // already does this, and `Driver::events` documents both roles.
     //
     // Deliberately NOT emitting a peripheral-role `Connected` for
     // `from_server`. A central is connected long before it writes the CCCD,
@@ -1811,12 +1811,12 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onDisconnected<'local>(
             // A connect attempt that never reaches `onConnected` ends in
             // `onDisconnected` instead — resolving `connected_tx` here (with no
             // receiver-visible success value) makes the pending `connect()`
-            // call fail via the dropped-sender path in `Backend::connect`.
+            // call fail via the dropped-sender path in `Driver::connect`.
         }
     }
     // Publish regardless of whether we had per-connection state: this fires
     // for unsolicited drops (peer out of range, powered off) as well as
-    // disconnects we asked for, and `Backend::events()` is the only way a
+    // disconnects we asked for, and `Driver::events()` is the only way a
     // caller learns about the former.
     let _ = inner.server_events_tx.send(GattEvent::Disconnected {
         peer: PeerAddress(address),

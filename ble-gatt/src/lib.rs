@@ -1,7 +1,7 @@
 //! Async, transport-agnostic BLE GATT primitives (central + peripheral role)
 //! with no Tauri dependency — usable from any Tokio-based Rust program, not
-//! just Tauri apps. See `hal::Backend` for the platform port and
-//! `drivers::mock::MockBackend` for a CI-safe, radio-free stand-in.
+//! just Tauri apps. See `hal::Driver` for the platform port and
+//! `drivers::mock::MockDriver` for a CI-safe, radio-free stand-in.
 //!
 //! Modules follow the layer map in `docs/architecture.md` (Clean
 //! Architecture layers, Bluetooth-specification module names):
@@ -34,5 +34,5 @@ pub use connection::peer_link::{
     RetryBudget,
 };
 pub use connection::Connection;
-pub use hal::{Backend, BoxStream, GattConnection};
+pub use hal::{Driver, BoxStream, GattConnection};
 pub use roles::{Adapter, Central, Peripheral, ServerHandle};

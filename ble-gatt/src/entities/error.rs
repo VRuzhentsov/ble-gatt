@@ -7,16 +7,16 @@ pub enum BleError {
     /// The adapter exists and is usable, but refused an adapter-level
     /// operation (e.g. starting discovery) because one is already in
     /// progress — distinct from `AdapterUnavailable` so a caller does not
-    /// treat a busy radio as a missing one. Like `GattBusy`, the backend
+    /// treat a busy radio as a missing one. Like `GattBusy`, the driver
     /// has already done whatever recovery it can; retrying is the caller's
     /// decision.
     #[error("BLE adapter busy: {0}")]
     AdapterBusy(String),
 
-    #[error("peripheral (GATT server) mode not supported on this backend")]
+    #[error("peripheral (GATT server) mode not supported on this driver")]
     PeripheralUnsupported,
 
-    /// The operation exists in the API but this backend, platform or role
+    /// The operation exists in the API but this driver, platform or role
     /// cannot perform it — e.g. requesting a connection priority on Linux,
     /// where BlueZ offers no such control. Not an error in the link itself:
     /// a caller written for several platforms can treat it as a no-op.
@@ -29,14 +29,14 @@ pub enum BleError {
     #[error("GATT operation failed: {0}")]
     Gatt(String),
 
-    /// A GATT operation was rejected in a way the backend has reason to
+    /// A GATT operation was rejected in a way the driver has reason to
     /// believe is transient (e.g. BlueZ's generic "briefly not ready"
     /// rejection right after a fresh connection) — distinct from `Gatt` so
     /// a caller can retry specifically on this variant, sized to its own
     /// timeout budget, without guessing whether a given rejection is worth
-    /// retrying at all. The backend performs no retry of its own: no fixed
+    /// retrying at all. The driver performs no retry of its own: no fixed
     /// internal budget fits every caller (see `is_transient_gatt_error`'s
-    /// doc comment in the Linux backend for the real-hardware case that
+    /// doc comment in the Linux driver for the real-hardware case that
     /// motivated this split), so retrying — if any — is entirely the
     /// caller's decision.
     #[error("GATT operation rejected, possibly transient: {0}")]

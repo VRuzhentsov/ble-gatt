@@ -1032,7 +1032,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         if (advertiser == null) {
             // Central-only device, or Bluetooth switched off. Returning
             // silently left Rust's oneshot pending forever, which is worse
-            // than the unsupported error the backend contract asks for.
+            // than the unsupported error the driver contract asks for.
             Log.w(TAG, "startAdvertising: no BLE advertiser available")
             failAdvertise(ADVERTISE_ERROR_UNAVAILABLE)
             return
@@ -1628,7 +1628,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     fun bridgeAbiVersion(): Int = 3
 
     /// Whether the adapter is present and switched on. Rust's
-    /// `Backend::radio_status()` calls this once at startup, so a `PeerLink`
+    /// `Driver::radio_status()` calls this once at startup, so a `PeerLink`
     /// created while Bluetooth is off does not wrongly assume it is on.
     fun isRadioEnabled(): Boolean = adapter?.isEnabled == true
 

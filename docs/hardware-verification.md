@@ -1,7 +1,7 @@
 # Hardware verification
 
-Everything else in this repository is verified against a mock backend. That
-mock has repeatedly certified behaviour both real backends reject — writes to
+Everything else in this repository is verified against a mock driver. That
+mock has repeatedly certified behaviour both real drivers reject — writes to
 characteristics no peer declared writable, operations through connections
 that had already been closed, and for several revisions a `session: None`
 that made an entire class of session checks unreachable from any test. None
@@ -159,7 +159,7 @@ Markers:
 > between two emulators — see "Why discovery fails" below. It still proves
 > the peripheral role, so it is documented rather than deleted.
 
-No physical hardware. Exercises the Android backend, the Kotlin bridge and
+No physical hardware. Exercises the Android driver, the Kotlin bridge and
 the JNI boundary — where the majority of review findings landed.
 
 The emulator log line to look for at startup is:
@@ -244,7 +244,7 @@ finding about this library, and nothing here can work around it.
 Related and recorded earlier in `docs/adr/0002-android-jni-bridge.md`: a
 *filtered* scan against RootCanal also returned zero results with the target
 confirmed advertising and the filter accepted (`status=0`). The Android
-backend therefore scans unfiltered and matches in code. Both observations
+driver therefore scans unfiltered and matches in code. Both observations
 now look like the same underlying gap.
 
 #### What this topology does prove
@@ -282,7 +282,7 @@ Needs a second controller — a USB dongle or a second machine. This is what
 
 ## What a pass does and does not prove
 
-A pass proves the two backends interoperate for one connection, one
+A pass proves the two drivers interoperate for one connection, one
 fragmented message and one echo. It does **not** prove the behaviour that
 dominated this library's review findings: reconnection with the same
 address, session identity across a stop/restart, cancellation mid-operation,

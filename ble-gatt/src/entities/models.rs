@@ -17,7 +17,7 @@ pub enum Role {
     Peripheral,
 }
 
-/// What a `Backend` can actually do on this device, discovered at runtime
+/// What a `Driver` can actually do on this device, discovered at runtime
 /// (not assumed from the target OS alone) — e.g. an Android device whose
 /// chipset/driver doesn't expose GATT-server APIs still reports
 /// `peripheral: false` here rather than failing opaquely later. Consumers
@@ -29,7 +29,7 @@ pub struct CapabilityReport {
     pub peripheral: bool,
 }
 
-/// Opaque, backend-specific peer identifier (a BlueZ D-Bus device address on
+/// Opaque, driver-specific peer identifier (a BlueZ D-Bus device address on
 /// Linux, a Bluetooth device address on Android, etc). Callers must not
 /// parse or format it themselves.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -58,7 +58,7 @@ pub struct DiscoveredPeer {
     /// own service UUID — it lets a scanner recognise a *specific* peer
     /// without paying for a connection first.
     pub service_data: BTreeMap<ServiceUuid, Vec<u8>>,
-    /// Received signal strength in dBm, when the backend reports it. Useful
+    /// Received signal strength in dBm, when the driver reports it. Useful
     /// as a proximity gate (ignore peers below a threshold) — `None` when
     /// the platform doesn't surface it.
     pub rssi: Option<i16>,
@@ -85,7 +85,7 @@ pub enum WriteType {
 /// link — see [`GattConnection::request_connection_priority`].
 ///
 /// Android only (`BluetoothGatt.requestConnectionPriority`); BlueZ exposes
-/// no per-connection interval control over D-Bus, so the Linux backend
+/// no per-connection interval control over D-Bus, so the Linux driver
 /// returns [`BleError::Unsupported`](crate::BleError::Unsupported).
 ///
 /// [`GattConnection::request_connection_priority`]: crate::GattConnection::request_connection_priority
@@ -112,7 +112,7 @@ pub enum GattEvent {
         peer: PeerAddress,
         /// The role *this* device played. `Central` means we dialled out;
         /// `Peripheral` means a central connected to our GATT server.
-        /// Without it the two are indistinguishable, so a backend used in
+        /// Without it the two are indistinguishable, so a driver used in
         /// both roles at once cannot tell an outbound connection from an
         /// inbound one.
         local_role: Role,
@@ -122,7 +122,7 @@ pub enum GattEvent {
         /// reconnects quickly produces events that are indistinguishable by
         /// address alone — and a lifecycle event queued from the old
         /// connection would otherwise be applied to the new one, tearing
-        /// down a link that is working. `None` from backends that cannot
+        /// down a link that is working. `None` from drivers that cannot
         /// distinguish sessions; consumers then fall back to address
         /// matching.
         session: Option<u64>,
@@ -154,8 +154,8 @@ pub enum GattEvent {
     ///
     /// Emitted when the adapter is toggled (`RadioStatus::Off` / `On`) or
     /// found to be absent for this device's needs (`Unsupported`). A
-    /// transition to anything other than `On` means every link this backend
-    /// held is gone — the backend also emits the per-link `Disconnected`
+    /// transition to anything other than `On` means every link this driver
+    /// held is gone — the driver also emits the per-link `Disconnected`
     /// events, but a consumer watching connectivity as a whole keys off
     /// this. `PeerLink` turns it into its per-peer `Unavailable` status and
     /// stops a consumer polling `capabilities()` to guess.
@@ -276,7 +276,7 @@ impl GattServiceSpec {
 
     /// Whether `other` describes the same GATT service: the same UUID and
     /// characteristics, whatever its advertisement data. What
-    /// `Backend::update_advertisement` requires of its spec.
+    /// `Driver::update_advertisement` requires of its spec.
     pub(crate) fn same_service(&self, other: &GattServiceSpec) -> bool {
         self.uuid == other.uuid
             && self.characteristics.len() == other.characteristics.len()

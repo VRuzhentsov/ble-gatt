@@ -1,7 +1,7 @@
 //! Hardware verification peer — one half of a two-device BLE round trip.
 //!
 //! Everything else in this repository is verified against a mock. That mock
-//! has repeatedly certified behaviour both real backends reject, so nothing
+//! has repeatedly certified behaviour both real drivers reject, so nothing
 //! here is confirmed until two radios exchange bytes. This binary is the
 //! Linux half of that: run it as the peripheral on one machine and as the
 //! central on the other (or against the Android example app), and it proves

@@ -12,12 +12,12 @@ This repo is a Cargo workspace with three crates:
 
 - **`ble-gatt`** — the core library. Scan/advertise, GATT client
   read/write/subscribe, GATT server characteristics, connection lifecycle as
-  an event stream, and a radio-free `MockBackend` for CI-safe protocol
+  an event stream, and a radio-free `MockDriver` for CI-safe protocol
   tests. Depends on nothing Tauri-specific — usable from any Tokio-based
   Rust program (a CLI, a daemon, another GUI framework).
 - **`tauri-plugin-ble-gatt`** — the [Tauri](https://tauri.app) integration:
   ships the Android Kotlin bridge (an application never copies it), builds
-  the platform backend on first use, asks for Android's Bluetooth runtime
+  the platform driver on first use, asks for Android's Bluetooth runtime
   permissions through Tauri's permission mechanism, and exposes both a Rust
   API and JavaScript commands.
 - **`ble-gatt-iroh`** — an [iroh](https://github.com/n0-computer/iroh)
@@ -33,7 +33,7 @@ use tauri_plugin_ble_gatt::BleGattExt;
 tauri::Builder::default()
     .plugin(tauri_plugin_ble_gatt::init())
     // or, to supply a driver yourself (a mock radio in tests):
-    // .plugin(tauri_plugin_ble_gatt::Builder::new().backend(driver).build())
+    // .plugin(tauri_plugin_ble_gatt::Builder::new().driver(driver).build())
     ;
 
 // From async code:
@@ -81,7 +81,7 @@ over a socket instead of sharing an in-process `Arc`.
 | Windows (WinRT) | — | — | M2 — reserved, not implemented |
 | macOS / iOS | — | — | M3 — reserved, not implemented |
 
-Capability is always discovered at runtime via `Backend::capabilities()`,
+Capability is always discovered at runtime via `Driver::capabilities()`,
 never assumed from the target OS — an Android device whose driver can't do
 peripheral mode reports that honestly instead of failing opaquely later.
 
@@ -90,10 +90,10 @@ peripheral mode reports that honestly instead of failing opaquely later.
 ```
 ble-gatt/src/
 ├── entities/     Entities: types, events, errors
-├── hal/          Use Cases: the Backend / GattConnection ports (async, Tokio)
+├── hal/          Use Cases: the Driver / GattConnection ports (async, Tokio)
 ├── connection/   Use Cases: one connection's state machine, PeerLink
 ├── profile/      Use Cases: the datagram profile (fragmentation, reassembly)
-└── drivers/      Frameworks & Drivers: one Backend per platform
+└── drivers/      Frameworks & Drivers: one Driver per platform
     ├── linux.rs    BlueZ via bluer — central + peripheral       (M1)
     ├── android.rs  raw jni + ndk-context JNI bridge              (M1)
     ├── windows.rs  reserved                                      (M2)
@@ -107,7 +107,7 @@ ble-gatt/src/
 ```rust
 use ble_gatt::{Adapter, RadioStatus};
 
-let adapter = Adapter::platform().await?;      // or Adapter::new(backend) to inject one
+let adapter = Adapter::platform().await?;      // or Adapter::new(driver) to inject one
 adapter.wait_available().await;                 // adapter.status(): watch::Receiver<RadioStatus>
 
 let server = adapter.peripheral().serve(spec).await?; // advertising stops when `server` drops
@@ -130,12 +130,12 @@ specification (ADR-0007). The short paths `ble_gatt::datagram` and
 `ble_gatt::peer_link` still resolve; `ble_gatt::backend::…` is gone (use
 `ble_gatt::drivers` and `ble_gatt::hal`). Application code takes an
 `Adapter` (`datagram::connect`/`serve`, `ble_gatt_iroh::dial_with`);
-`Backend` is the driver port underneath it.
+`Driver` is the driver port underneath it.
 
-Every backend speaks the same generic GATT vocabulary
+Every driver speaks the same generic GATT vocabulary
 (`ServiceUuid`/`CharacteristicUuid`/`GattEvent`/`GattServiceSpec`/...) —
 callers never see platform types (no `bluer::Device`, no JNI handles)
-crossing the `Backend`/`GattConnection` port boundary.
+crossing the `Driver`/`GattConnection` port boundary.
 
 ### Three tiers, one carrier
 
@@ -144,7 +144,7 @@ picks the tier that fits:
 
 | Tier | Use for | Owns the connection? |
 |---|---|---|
-| **raw GATT** (`Backend`) | a vendor device with its own protocol | you |
+| **raw GATT** (`Driver`) | a vendor device with its own protocol | you |
 | **datagram** (`datagram::connect` / `serve`) | one message pipe, driven by hand | you |
 | **`PeerLink`** | app-to-app links to a set of peers | the library |
 
@@ -157,15 +157,15 @@ Read the doc next to each before changing it:
 
 | File | What it governs | Doc |
 |---|---|---|
-| `src/backend/link_state.rs` | `RadioState` / `CentralLink` / `PeripheralLink` — whether a dial happens, whether a stale record blocks one, whether a consumer is told a link died | `docs/adr/0005` |
+| `src/connection/link_state.rs` | `RadioState` / `CentralLink` / `PeripheralLink` — whether a dial happens, whether a stale record blocks one, whether a consumer is told a link died | `docs/adr/0005` |
 | `src/peer_link.rs` | the tier-3 API and its dedicated-thread driver | `docs/interface.md`, `docs/adr/0005` |
-| `src/backend/linux.rs` — `LinuxConnectGuard` / `pending_cleanup` | abandoned-connect cleanup, hardware-proven over ~6 review rounds | code comments + `docs/adr/0005` |
+| `src/drivers/linux.rs` — `LinuxConnectGuard` / `pending_cleanup` | abandoned-connect cleanup, hardware-proven over ~6 review rounds | code comments + `docs/adr/0005` |
 | `src/datagram/mod.rs` | fragmentation, the one-central and one-link-per-peer limits | ADR-0003 |
 
 ## Status
 
-Early, under active development. `ble-gatt`'s Linux backend is real and
-tested against BlueZ hardware. The Android backend is implemented and its
+Early, under active development. `ble-gatt`'s Linux driver is real and
+tested against BlueZ hardware. The Android driver is implemented and its
 individual pieces run correctly on a real emulator, but it is **not yet
 verified as a working bridge** — that requires a real device-to-device round
 trip, planned on physical hardware after the next minor patch/release (see
