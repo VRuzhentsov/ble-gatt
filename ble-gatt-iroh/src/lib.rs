@@ -246,9 +246,10 @@ impl BleGattTransport {
         tokio::spawn(run_link(self.inner.clone(), peer, channel, rx, tx, close))
     }
 
-    /// Closes every channel to `peer`, including one being dialled (it
-    /// closes once the dial completes) and one a newer channel replaced, as
-    /// if each had gone idle. For an application that knows it is done with
+    /// Closes every channel to `peer`, including one a newer channel
+    /// replaced, as if each had gone idle, and cancels a dial to it still
+    /// running. Dropping iroh's connect future does not reach the dial,
+    /// which runs on its own: call this when giving up on a connect. For an application that knows it is done with
     /// a peer before the idle timeout: on hardware, a lingering channel to a
     /// phone's old address made BlueZ abort every dial to its new one
     /// (`le-connection-abort-by-local`).
@@ -637,7 +638,20 @@ impl Sender {
         let peer = peer.clone();
         tokio::spawn(async move {
             log::debug!("dialling {}", peer.0);
-            match dialer(peer.clone()).await {
+            // `close_link` cancels the dial: dropping the dialer's future
+            // drops the connect under it, which on Linux cancels BlueZ's
+            // pending Connect. Waiting for the dial instead kept BlueZ
+            // busy, unable to scan or advertise, until its 20s timeout.
+            let dialled = tokio::select! {
+                dialled = dialer(peer.clone()) => dialled,
+                () = close.notified() => {
+                    log::debug!("dial to {}: cancelled by the application", peer.0);
+                    remove_closer(&inner, &peer, &close);
+                    remove_link(&inner, &peer, &tx);
+                    return;
+                }
+            };
+            match dialled {
                 Ok(channel) => {
                     // Reachable by dialling after all: no longer inbound-only.
                     inner.answered.lock().expect("poisoned").remove(&peer);
