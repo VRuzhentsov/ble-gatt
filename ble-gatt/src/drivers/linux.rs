@@ -2444,8 +2444,12 @@ impl GattConnection for LinuxGattConnection {
         // call, so a reconnect cannot slip in between them. Checking and
         // then awaiting was still a check-then-act, just with a smaller
         // window.
+        log::debug!("disconnect: {} session={} requested", self.peer.0, self.session);
         let _dial = self.dial_lock.lock(&self.peer).await;
-        self.ensure_current()?;
+        if let Err(err) = self.ensure_current() {
+            log::debug!("disconnect: {} session={} not current: {err}", self.peer.0, self.session);
+            return Err(err);
+        }
 
         // BlueZ keeps exactly one ACL per remote address. If the same peer
         // also holds a live peripheral-role session right now (it dialled
@@ -2468,11 +2472,15 @@ impl GattConnection for LinuxGattConnection {
         // ACL ~2s after the call, which no lock here can cover.
         let _admission = self.notify_writers.lock().await;
         if self.served_peers.lock().unwrap().contains_key(&self.peer) {
+            log::debug!("disconnect: {} is also served here; leaving the shared link up", self.peer.0);
             report_central_loss(&self.events_tx, &self.dialed, &self.peer, self.session);
             return Ok(());
         }
 
-        self.device.disconnect().await.map_err(|err| BleError::Gatt(err.to_string()))
+        log::debug!("disconnect: {} session={} asking BlueZ to disconnect", self.peer.0, self.session);
+        let result = self.device.disconnect().await.map_err(|err| BleError::Gatt(err.to_string()));
+        log::debug!("disconnect: {} session={} BlueZ answered: {result:?}", self.peer.0, self.session);
+        result
     }
 }
 
