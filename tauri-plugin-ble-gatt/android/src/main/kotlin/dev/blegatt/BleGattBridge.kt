@@ -1647,7 +1647,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         //
         // `failPendingNotifications` re-enters this monitor; Java monitors
         // are reentrant, so that is safe.
-        synchronized(this) {
+        val served = synchronized(this) {
             failPendingNotifications()
             // Nothing staged survives the server that was collecting it.
             preparedWrites.clear()
@@ -1658,13 +1658,24 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             // onConnectionStateChange for the centrals attached to it, so
             // without this Rust keeps them in its single-central map with
             // their channels live.
-            val served = subscribedDevices.values.flatten().map { it.address }.distinct()
+            val served = subscribedDevices.values.flatten().distinctBy { it.address }
             subscribedDevices.clear()
-            for (address in served) {
-                onDisconnected(nativeHandle, address, true)
+            for (device in served) {
+                onDisconnected(nativeHandle, device.address, true)
             }
+            served
         }
 
+        // Disconnect them too. Closing the server leaves the link up and the
+        // replacement server reports it connected again, so the central kept
+        // writing into the replacement with no subscription and the default
+        // MTU, and never learned its channel was gone. On BlueZ that
+        // leftover link also aborted dials to this phone's next address.
+        // The disconnect callbacks this fires carry the old generation and
+        // are ignored.
+        for (device in served) {
+            gattServer?.cancelConnection(device)
+        }
         gattServer?.close()
         gattServer = null
         serverCharacteristics.clear()
