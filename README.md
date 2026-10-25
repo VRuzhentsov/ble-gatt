@@ -170,7 +170,22 @@ individual pieces run correctly on a real emulator, but it is **not yet
 verified as a working bridge** — that requires a real device-to-device round
 trip, planned on physical hardware after the next minor patch/release (see
 ADR-0002). Not yet published to crates.io/npm — consume as a git
-dependency.
+dependency, pinned to a release tag:
+
+```toml
+ble-gatt = { git = "https://github.com/VRuzhentsov/ble-gatt", tag = "v0.1.0" }
+```
+
+## Releasing
+
+1. In a pull request, set `[workspace.package] version` in `Cargo.toml` to
+   the new version, and merge it.
+2. Actions → **Release Button** → Run workflow, on `main`.
+
+The button refuses a version that is already tagged, and refuses if main
+moves while it runs. It runs CI on main's last commit, tags that commit
+`vX.Y.Z` (annotated, unsigned) and publishes a GitHub release with generated
+notes.
 
 ## License
 
