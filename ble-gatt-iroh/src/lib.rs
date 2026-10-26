@@ -46,7 +46,7 @@ use ble_gatt::{Adapter, ConnectionPriority, PeerAddress, Role};
 use iroh::address_lookup::{self, AddressLookup, EndpointData, EndpointInfo, Item};
 use iroh::endpoint::transports::{CustomEndpoint, CustomSender, CustomTransport, RecvInfo, Transmit};
 use iroh_base::{CustomAddr, EndpointId, TransportAddr};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, watch, Notify};
 
 /// The custom address id of this transport ("BLEG"). iroh keeps a registry of
 /// transport ids in its `TRANSPORTS.md`; this one is private to `ble-gatt`.
@@ -73,6 +73,11 @@ pub const DEFAULT_LINK_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 /// tearing the other down. The dialler re-dials within a second or two (a
 /// dial times out at 20s), so this only has to outlast one dial attempt.
 const REDIAL_YIELD: Duration = Duration::from_secs(30);
+
+/// How long a dial waits for links to the same endpoint's other addresses
+/// to finish closing; see `Sender::send`. A BlueZ disconnect took about 2s
+/// on hardware.
+const CLOSE_WAIT_LIMIT: Duration = Duration::from_secs(5);
 
 /// A packet received from a peer.
 type Inbound = (PeerAddress, Vec<u8>);
@@ -167,6 +172,7 @@ impl BleGattTransportBuilder {
                 peers: Mutex::new(HashMap::new()),
                 retired: Mutex::new(HashMap::new()),
                 closers: Mutex::new(HashMap::new()),
+                closing: Mutex::new(HashMap::new()),
                 inbound_tx,
                 inbound_rx: Mutex::new(Some(inbound_rx)),
                 answered: Mutex::new(HashMap::new()),
@@ -197,6 +203,9 @@ struct Inner {
     /// A close signal per running link, replaced ones included; see
     /// [`BleGattTransport::close_link`].
     closers: Mutex<HashMap<PeerAddress, Vec<Arc<Notify>>>>,
+    /// Links still disconnecting, by address. Each sender drops when its
+    /// disconnect ends.
+    closing: Mutex<HashMap<PeerAddress, Vec<watch::Receiver<()>>>>,
     inbound_tx: mpsc::Sender<Inbound>,
     /// Taken by the one endpoint that binds this transport.
     inbound_rx: Mutex<Option<mpsc::Receiver<Inbound>>>,
@@ -412,7 +421,24 @@ async fn run_link(
     }
     send_task.abort();
     remove_closer(&inner, &peer, &close);
+    let (_closed, closing) = watch::channel(());
+    inner
+        .closing
+        .lock()
+        .expect("poisoned")
+        .entry(peer.clone())
+        .or_default()
+        .push(closing.clone());
     let _ = channel.close().await;
+    {
+        let mut all = inner.closing.lock().expect("poisoned");
+        if let Some(list) = all.get_mut(&peer) {
+            list.retain(|other| !other.same_channel(&closing));
+            if list.is_empty() {
+                all.remove(&peer);
+            }
+        }
+    }
     // Only while this link still owns the peer: an old inbound link ending
     // after a newer one was attached would otherwise mark the peer as having
     // dialled us, and the yield would then hold back dials the newer link's
@@ -443,6 +469,27 @@ fn add_closer(inner: &Inner, peer: &PeerAddress) -> Arc<Notify> {
         .or_default()
         .push(close.clone());
     close
+}
+
+/// Closes still running on addresses `set_peer_address` replaced for the
+/// endpoint `peer` is the current address of.
+fn closing_for_same_endpoint(inner: &Inner, peer: &PeerAddress) -> Vec<watch::Receiver<()>> {
+    let peers = inner.peers.lock().expect("poisoned");
+    let endpoints: Vec<EndpointId> =
+        peers.iter().filter(|(_, address)| *address == peer).map(|(endpoint, _)| *endpoint).collect();
+    drop(peers);
+    if endpoints.is_empty() {
+        return Vec::new();
+    }
+    let retired = inner.retired.lock().expect("poisoned");
+    let closing = inner.closing.lock().expect("poisoned");
+    retired
+        .iter()
+        .filter(|(address, owner)| *address != peer && endpoints.contains(*owner))
+        .filter_map(|(address, _)| closing.get(address))
+        .flatten()
+        .cloned()
+        .collect()
 }
 
 fn remove_closer(inner: &Inner, peer: &PeerAddress, close: &Arc<Notify>) {
@@ -634,16 +681,33 @@ impl Sender {
         // Registered before dialling, so `close_link` during the dial closes
         // the channel as soon as it is up.
         let close = add_closer(&self.inner, peer);
+        let earlier = closing_for_same_endpoint(&self.inner, peer);
         let inner = self.inner.clone();
         let peer = peer.clone();
         tokio::spawn(async move {
-            log::debug!("dialling {}", peer.0);
+            // A dial while a link to the same endpoint's old address was
+            // still disconnecting was aborted by BlueZ on hardware
+            // (`le-connection-abort-by-local`), and the redial cost ~5s.
+            let dial = async {
+                if !earlier.is_empty() {
+                    log::debug!("dial to {}: waiting for the endpoint's other links to close", peer.0);
+                    let _ = tokio::time::timeout(CLOSE_WAIT_LIMIT, async {
+                        for mut closing in earlier {
+                            // Ends with an error once the close is done.
+                            let _ = closing.changed().await;
+                        }
+                    })
+                    .await;
+                }
+                log::debug!("dialling {}", peer.0);
+                dialer(peer.clone()).await
+            };
             // `close_link` cancels the dial: dropping the dialer's future
             // drops the connect under it, which on Linux cancels BlueZ's
             // pending Connect. Waiting for the dial instead kept BlueZ
             // busy, unable to scan or advertise, until its 20s timeout.
             let dialled = tokio::select! {
-                dialled = dialer(peer.clone()) => dialled,
+                dialled = dial => dialled,
                 () = close.notified() => {
                     log::debug!("dial to {}: cancelled by the application", peer.0);
                     remove_closer(&inner, &peer, &close);
