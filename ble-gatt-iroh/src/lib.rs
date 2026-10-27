@@ -85,10 +85,16 @@ const REDIAL_YIELD: Duration = Duration::from_secs(30);
 /// on hardware.
 const CLOSE_WAIT_LIMIT: Duration = Duration::from_secs(5);
 
-/// How long a link stays up after the last iroh connection on it ended, for
-/// a new connection to take it over (ADR-0008 D3). A handshake over BLE took
-/// 1-3s on hardware.
-pub const DEFAULT_LINK_RELEASE_DELAY: Duration = Duration::from_secs(3);
+/// How long a link stays up after the last iroh connection on it has
+/// drained (ADR-0008 D3). None: draining already outlasts the
+/// CONNECTION_CLOSE, so the peer has it before the link goes. An application
+/// that wants a link kept for a connection it has yet to open keeps an
+/// earlier connection open until then, or sets a delay.
+pub const DEFAULT_LINK_RELEASE_DELAY: Duration = Duration::ZERO;
+
+/// How often a closed connection is checked for having drained. noq reports
+/// no event for it.
+const DRAINED_CHECK_INTERVAL: Duration = Duration::from_millis(10);
 
 /// A packet received from a peer.
 type Inbound = (PeerAddress, Vec<u8>);
@@ -176,7 +182,7 @@ impl BleGattTransportBuilder {
     }
 
     /// How long a channel stays up after the last iroh connection on it
-    /// ended; default [`DEFAULT_LINK_RELEASE_DELAY`]. Applies only with
+    /// drained; default [`DEFAULT_LINK_RELEASE_DELAY`] (none). Applies only with
     /// [`BleGattTransport::hooks`] installed.
     pub fn link_release_delay(mut self, delay: Duration) -> Self {
         self.link_release_delay = Some(delay);
@@ -333,10 +339,10 @@ impl BleGattTransport {
     /// ```
     ///
     /// With them, [`close_links`](Self::close_links) reaches links the peer
-    /// dialled, and a link closes
-    /// [`link_release_delay`](BleGattTransportBuilder::link_release_delay)
-    /// after the last iroh connection on it ended, instead of after the idle
-    /// timeout. That close leaves a link the peer dialled to the peer, as an
+    /// dialled, and a link closes once the last iroh connection on it has
+    /// drained (its CONNECTION_CLOSE sent and the draining period over), plus
+    /// any [`link_release_delay`](BleGattTransportBuilder::link_release_delay),
+    /// instead of after the idle timeout. That close leaves a link the peer dialled to the peer, as an
     /// idle close does; only [`close_link`](Self::close_link) disconnects it.
     pub fn hooks(&self) -> BleGattHooks {
         BleGattHooks { inner: self.inner.clone() }
@@ -674,7 +680,8 @@ impl EndpointHooks for BleGattHooks {
         }
         // Neither keeps the connection alive; see `EndpointHooks`.
         let mut events = conn.path_events();
-        let closed = conn.weak_handle().closed();
+        let weak = conn.weak_handle();
+        let closed = weak.closed();
         let inner = self.inner.clone();
         tokio::spawn(async move {
             tokio::pin!(closed);
@@ -689,6 +696,16 @@ impl EndpointHooks for BleGattHooks {
                         None => break,
                     },
                 }
+            }
+            // `closed` fires when the close starts: at `close()`, before its
+            // CONNECTION_CLOSE is even sent, or when the peer's arrives.
+            // Cutting the link then lost the peer's copy on hardware. QUIC
+            // still drains for three probe timeouts; noq's driver holds the
+            // connection until that ends, so the weak handle dies exactly
+            // when it is drained (and the application dropped its handles).
+            // Neither noq nor iroh signals that, so it is checked.
+            while weak.upgrade().is_some() {
+                tokio::time::sleep(DRAINED_CHECK_INTERVAL).await;
             }
             forget_connection(&inner, connection);
         });

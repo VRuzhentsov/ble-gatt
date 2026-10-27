@@ -69,12 +69,23 @@ rather than the connection.
 closes links in either role, using `DatagramChannel::disconnect` (the
 peripheral side drops the central). Its signature does not change.
 
-**D3 — A link closes when the last iroh connection on it ends.** The hooks
-keep a weak handle per connection; when every connection using a link has
-closed, the transport closes the link after `link_release_delay` (default
-3 s), without waiting for the idle timeout. A connection that takes the link
-over within the delay keeps it, which is how the first session can still use
-the pairing link. The idle timeout stays as a backstop for a link no
+**D3 — A link closes when the last iroh connection on it has drained.** The
+hooks keep a weak handle per connection. "Ended" means drained, not closed:
+`on_closed` fires when the close starts (at `close()`, before its
+CONNECTION_CLOSE is sent, or when the peer's arrives), and cutting the link
+then lost the peer's copy on hardware. QUIC then drains for three probe
+timeouts; noq's connection driver holds the connection until that is over,
+so the weak handle dies exactly when it has drained and the application has
+dropped its own handles. Neither noq nor iroh signals that moment, so the
+hook checks the weak handle every 10 ms after `on_closed`. On the mock radio
+(RTT 8 ms) `on_closed` fired 0.25 ms after `close()` and the handle died
+after 201 ms (346 ms on the peer's side).
+
+When every connection using a link has drained, the transport closes it,
+with no delay by default (`link_release_delay` can add one). A connection
+that has taken the link over by then keeps it. An application that wants a
+link kept for a connection it has yet to open keeps an earlier connection
+open until then. The idle timeout stays as a backstop for a link no
 connection ever used (a peer that dialled and never finished the handshake).
 Fini's calls after a session, a rejection and an unused pairing link should
 then become unnecessary.
@@ -142,7 +153,7 @@ hardware decides whether Fini can drop its "smaller id dials" rule.
 
 - Whether BlueZ still aborts one of two dials that cross at the same instant
   once D4 makes them rare. Only hardware shows that.
-- Whether `link_release_delay` covers Fini's reuse of the pairing link for
-  the first session (`keep_pairing_link`). If the session starts later than
-  the delay, Fini keeps an iroh connection open until it does, or sets a
-  longer delay.
+- Fini's reuse of the pairing link for the first session
+  (`keep_pairing_link`): with no release delay, the link goes once the
+  pairing connection drains, so Fini keeps that connection open until the
+  session's is up.
