@@ -578,6 +578,28 @@ impl DatagramChannel {
             Sink::Notify { .. } => Ok(()),
         }
     }
+
+    /// Like [`close`](Self::close), and in the peripheral role also drops
+    /// the central's connection to the GATT server, as Android's
+    /// `BluetoothGattServer.cancelConnection` does. For an application done
+    /// with the peer: on hardware, a phone that only closed its own dial
+    /// kept the desktop's link to its server up for 3-4s, until the
+    /// desktop's BlueZ dropped it. On Linux this ends the whole link to that
+    /// address, a link this side dialled on it included.
+    pub async fn disconnect(&mut self) -> Result<()> {
+        let mut sink = self.sink.lock().await;
+        match &mut *sink {
+            Sink::Connection { connection, .. } => match connection.take() {
+                Some(mut connection) => connection.disconnect().await,
+                None => Ok(()),
+            },
+            Sink::Notify { driver, active } => {
+                active.store(false, Ordering::SeqCst);
+                log::info!("disconnect: central {} session={:?}", self.peer.0, self.session);
+                driver.disconnect_peer(&self.peer, self.session).await
+            }
+        }
+    }
 }
 
 /// Sends on a [`DatagramChannel`] without holding it, from

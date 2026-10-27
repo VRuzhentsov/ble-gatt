@@ -256,8 +256,9 @@ impl BleGattTransport {
     }
 
     /// Closes every channel to `peer`, including one a newer channel
-    /// replaced, as if each had gone idle, and cancels a dial to it still
-    /// running. Dropping iroh's connect future does not reach the dial,
+    /// replaced, and cancels a dial to it still running. Unlike an idle
+    /// close, a channel the peer dialled is disconnected too
+    /// ([`DatagramChannel::disconnect`]). Dropping iroh's connect future does not reach the dial,
     /// which runs on its own: call this when giving up on a connect. For an application that knows it is done with
     /// a peer before the idle timeout: on hardware, a lingering channel to a
     /// phone's old address made BlueZ abort every dial to its new one
@@ -380,6 +381,7 @@ async fn run_link(
     tokio::pin!(idle);
     // Closed by this side (idle or `close_link`), not dropped by the peer.
     let mut closed_here = false;
+    let mut closed_by_application = false;
     loop {
         tokio::select! {
             () = &mut idle => {
@@ -390,6 +392,7 @@ async fn run_link(
             () = close.notified() => {
                 log::debug!("link to {}: closed by the application", peer.0);
                 closed_here = true;
+                closed_by_application = true;
                 break;
             }
             _ = &mut send_task => break,
@@ -429,7 +432,14 @@ async fn run_link(
         .entry(peer.clone())
         .or_default()
         .push(closing.clone());
-    let _ = channel.close().await;
+    // `close_link` ends a link the peer dialled too. An idle close leaves
+    // that to the peer: on Linux dropping it would also drop a busy link
+    // this side dialled to the same address.
+    if closed_by_application {
+        let _ = channel.disconnect().await;
+    } else {
+        let _ = channel.close().await;
+    }
     {
         let mut all = inner.closing.lock().expect("poisoned");
         if let Some(list) = all.get_mut(&peer) {
