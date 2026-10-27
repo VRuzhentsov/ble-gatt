@@ -16,7 +16,9 @@
 //!   heard the peer;
 //! - supplies a [`Dialer`] the transport uses to open a channel the first time
 //!   iroh sends to an address with no channel yet ([`dial_with`] wraps
-//!   [`ble_gatt::datagram::connect`]).
+//!   [`ble_gatt::datagram::connect`]);
+//! - installs [`BleGattTransport::hooks`], so the transport learns from iroh
+//!   which endpoint each link carries (ADR-0008).
 //!
 //! ```ignore
 //! let transport = BleGattTransport::builder()
@@ -26,17 +28,19 @@
 //!     .clear_ip_transports()
 //!     .add_custom_transport(Arc::new(transport.clone()))
 //!     .address_lookup(transport.address_lookup())
+//!     .hooks(transport.hooks())
 //!     .bind()
 //!     .await?;
 //! ```
 //!
 //! [iroh]: https://docs.rs/iroh
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -44,8 +48,10 @@ use std::time::{Duration, Instant};
 use ble_gatt::datagram::{DatagramChannel, DatagramConfig};
 use ble_gatt::{Adapter, ConnectionPriority, PeerAddress, Role};
 use iroh::address_lookup::{self, AddressLookup, EndpointData, EndpointInfo, Item};
+use iroh::endpoint::{AfterHandshakeOutcome, Connection, EndpointHooks, PathEvent};
 use iroh::endpoint::transports::{CustomEndpoint, CustomSender, CustomTransport, RecvInfo, Transmit};
 use iroh_base::{CustomAddr, EndpointId, TransportAddr};
+use n0_future::StreamExt;
 use tokio::sync::{mpsc, watch, Notify};
 
 /// The custom address id of this transport ("BLEG"). iroh keeps a registry of
@@ -78,6 +84,11 @@ const REDIAL_YIELD: Duration = Duration::from_secs(30);
 /// to finish closing; see `Sender::send`. A BlueZ disconnect took about 2s
 /// on hardware.
 const CLOSE_WAIT_LIMIT: Duration = Duration::from_secs(5);
+
+/// How long a link stays up after the last iroh connection on it ended, for
+/// a new connection to take it over (ADR-0008 D3). A handshake over BLE took
+/// 1-3s on hardware.
+pub const DEFAULT_LINK_RELEASE_DELAY: Duration = Duration::from_secs(3);
 
 /// A packet received from a peer.
 type Inbound = (PeerAddress, Vec<u8>);
@@ -139,6 +150,7 @@ pub struct BleGattTransportBuilder {
     dialer: Option<Dialer>,
     local_address: Option<PeerAddress>,
     link_idle_timeout: Option<Duration>,
+    link_release_delay: Option<Duration>,
 }
 
 impl BleGattTransportBuilder {
@@ -163,6 +175,14 @@ impl BleGattTransportBuilder {
         self
     }
 
+    /// How long a channel stays up after the last iroh connection on it
+    /// ended; default [`DEFAULT_LINK_RELEASE_DELAY`]. Applies only with
+    /// [`BleGattTransport::hooks`] installed.
+    pub fn link_release_delay(mut self, delay: Duration) -> Self {
+        self.link_release_delay = Some(delay);
+        self
+    }
+
     pub fn build(self) -> BleGattTransport {
         let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE_DEPTH);
         let local = self.local_address.iter().map(custom_addr).collect();
@@ -173,12 +193,16 @@ impl BleGattTransportBuilder {
                 retired: Mutex::new(HashMap::new()),
                 closers: Mutex::new(HashMap::new()),
                 closing: Mutex::new(HashMap::new()),
+                learned: Mutex::new(HashMap::new()),
+                releasers: Mutex::new(HashMap::new()),
+                next_connection: AtomicU64::new(0),
                 inbound_tx,
                 inbound_rx: Mutex::new(Some(inbound_rx)),
                 answered: Mutex::new(HashMap::new()),
                 dialer: self.dialer,
                 local: n0_watcher::Watchable::new(local),
                 link_idle_timeout: self.link_idle_timeout.unwrap_or(DEFAULT_LINK_IDLE_TIMEOUT),
+                link_release_delay: self.link_release_delay.unwrap_or(DEFAULT_LINK_RELEASE_DELAY),
             }),
         }
     }
@@ -206,6 +230,13 @@ struct Inner {
     /// Links still disconnecting, by address. Each sender drops when its
     /// disconnect ends.
     closing: Mutex<HashMap<PeerAddress, Vec<watch::Receiver<()>>>>,
+    /// What iroh's handshakes and path events taught, by address: whose
+    /// link it is, in either role (ADR-0008 D1). Kept while the link is up.
+    learned: Mutex<HashMap<PeerAddress, Learned>>,
+    /// A signal per running link, fired when the last iroh connection on its
+    /// address ends (ADR-0008 D3).
+    releasers: Mutex<HashMap<PeerAddress, Vec<Arc<Notify>>>>,
+    next_connection: AtomicU64,
     inbound_tx: mpsc::Sender<Inbound>,
     /// Taken by the one endpoint that binds this transport.
     inbound_rx: Mutex<Option<mpsc::Receiver<Inbound>>>,
@@ -217,6 +248,14 @@ struct Inner {
     dialer: Option<Dialer>,
     local: n0_watcher::Watchable<Vec<CustomAddr>>,
     link_idle_timeout: Duration,
+    link_release_delay: Duration,
+}
+
+/// One address's owner, as iroh's connections over it showed.
+struct Learned {
+    endpoint: EndpointId,
+    /// The live iroh connections that have used the address.
+    connections: HashSet<u64>,
 }
 
 impl fmt::Debug for BleGattTransport {
@@ -271,24 +310,36 @@ impl BleGattTransport {
         }
     }
 
-    /// [`close_link`](Self::close_link) for `endpoint`'s current address and
+    /// [`close_link`](Self::close_link) for `endpoint`'s current address,
     /// every address [`set_peer_address`](Self::set_peer_address) replaced
-    /// for it. A channel the peer dialled from an address never set here
-    /// is not reached: close it by its address.
+    /// for it and, with [`hooks`](Self::hooks) installed, every address an
+    /// iroh connection to it came over: links the peer dialled included.
+    /// Without the hooks, a channel the peer dialled from an address never
+    /// set here is not reached: close it by its address.
     pub fn close_links(&self, endpoint: &EndpointId) {
-        let mut addresses: Vec<PeerAddress> = self
-            .inner
-            .retired
-            .lock()
-            .expect("poisoned")
-            .iter()
-            .filter(|(_, owner)| *owner == endpoint)
-            .map(|(address, _)| address.clone())
-            .collect();
-        addresses.extend(self.inner.peers.lock().expect("poisoned").get(endpoint).cloned());
-        for address in &addresses {
+        for address in &addresses_of(&self.inner, endpoint) {
             self.close_link(address);
         }
+    }
+
+    /// Endpoint hooks that tell the transport which endpoint each link
+    /// carries, in either role, from iroh's own handshakes and paths
+    /// (ADR-0008). Install them on the endpoint this transport is bound to:
+    ///
+    /// ```ignore
+    /// iroh::Endpoint::builder(presets::Minimal)
+    ///     .add_custom_transport(Arc::new(transport.clone()))
+    ///     .hooks(transport.hooks())
+    /// ```
+    ///
+    /// With them, [`close_links`](Self::close_links) reaches links the peer
+    /// dialled, and a link closes
+    /// [`link_release_delay`](BleGattTransportBuilder::link_release_delay)
+    /// after the last iroh connection on it ended, instead of after the idle
+    /// timeout. That close leaves a link the peer dialled to the peer, as an
+    /// idle close does; only [`close_link`](Self::close_link) disconnects it.
+    pub fn hooks(&self) -> BleGattHooks {
+        BleGattHooks { inner: self.inner.clone() }
     }
 
     /// Like [`attach`](Self::attach), for a channel whose first datagram
@@ -379,13 +430,35 @@ async fn run_link(
     });
     let idle = tokio::time::sleep(inner.link_idle_timeout);
     tokio::pin!(idle);
-    // Closed by this side (idle or `close_link`), not dropped by the peer.
+    let release = add_releaser(&inner, &peer);
+    // Armed once the last iroh connection on the link ended; a connection
+    // that takes the link over before it fires disarms it.
+    let released = tokio::time::sleep(Duration::MAX);
+    tokio::pin!(released);
+    let mut release_armed = false;
+    // Closed by this side (idle, released or `close_link`), not dropped by
+    // the peer.
     let mut closed_here = false;
     let mut closed_by_application = false;
     loop {
         tokio::select! {
             () = &mut idle => {
                 log::debug!("link to {}: idle, closing", peer.0);
+                closed_here = true;
+                break;
+            }
+            () = release.notified() => {
+                if !in_use(&inner, &peer) {
+                    released.as_mut().reset(tokio::time::Instant::now() + inner.link_release_delay);
+                    release_armed = true;
+                }
+            }
+            () = &mut released, if release_armed => {
+                if in_use(&inner, &peer) {
+                    release_armed = false;
+                    continue;
+                }
+                log::debug!("link to {}: no iroh connection left on it, closing", peer.0);
                 closed_here = true;
                 break;
             }
@@ -424,6 +497,7 @@ async fn run_link(
     }
     send_task.abort();
     remove_closer(&inner, &peer, &close);
+    remove_releaser(&inner, &peer, &release);
     let (_closed, closing) = watch::channel(());
     inner
         .closing
@@ -463,6 +537,12 @@ async fn run_link(
                 inner.answered.lock().expect("poisoned").insert(peer.clone(), dropped);
             }
             links.remove(&peer);
+            // No link is left at the address. A connection still using it
+            // keeps the entry, for `close_links` and a link that replaces it.
+            let mut learned = inner.learned.lock().expect("poisoned");
+            if learned.get(&peer).is_some_and(|learned| learned.connections.is_empty()) {
+                learned.remove(&peer);
+            }
         }
     }
     log::debug!("link to {} down", peer.0);
@@ -481,25 +561,161 @@ fn add_closer(inner: &Inner, peer: &PeerAddress) -> Arc<Notify> {
     close
 }
 
-/// Closes still running on addresses `set_peer_address` replaced for the
-/// endpoint `peer` is the current address of.
+/// Closes still running on the other addresses of the endpoint `peer` is
+/// the current address of.
 fn closing_for_same_endpoint(inner: &Inner, peer: &PeerAddress) -> Vec<watch::Receiver<()>> {
-    let peers = inner.peers.lock().expect("poisoned");
-    let endpoints: Vec<EndpointId> =
-        peers.iter().filter(|(_, address)| *address == peer).map(|(endpoint, _)| *endpoint).collect();
-    drop(peers);
-    if endpoints.is_empty() {
-        return Vec::new();
-    }
-    let retired = inner.retired.lock().expect("poisoned");
-    let closing = inner.closing.lock().expect("poisoned");
-    retired
+    let endpoints: Vec<EndpointId> = inner
+        .peers
+        .lock()
+        .expect("poisoned")
         .iter()
-        .filter(|(address, owner)| *address != peer && endpoints.contains(*owner))
-        .filter_map(|(address, _)| closing.get(address))
+        .filter(|(_, address)| *address == peer)
+        .map(|(endpoint, _)| *endpoint)
+        .collect();
+    let addresses: HashSet<PeerAddress> = endpoints
+        .iter()
+        .flat_map(|endpoint| addresses_of(inner, endpoint))
+        .filter(|address| address != peer)
+        .collect();
+    let closing = inner.closing.lock().expect("poisoned");
+    addresses
+        .iter()
+        .filter_map(|address| closing.get(address))
         .flatten()
         .cloned()
         .collect()
+}
+
+/// Every address known for `endpoint`: the one `set_peer_address` set, the
+/// ones it replaced, and the ones iroh's connections to it came over.
+fn addresses_of(inner: &Inner, endpoint: &EndpointId) -> Vec<PeerAddress> {
+    let mut addresses: Vec<PeerAddress> = inner
+        .retired
+        .lock()
+        .expect("poisoned")
+        .iter()
+        .filter(|(_, owner)| *owner == endpoint)
+        .map(|(address, _)| address.clone())
+        .collect();
+    addresses.extend(inner.peers.lock().expect("poisoned").get(endpoint).cloned());
+    for (address, learned) in inner.learned.lock().expect("poisoned").iter() {
+        if learned.endpoint == *endpoint && !addresses.contains(address) {
+            addresses.push(address.clone());
+        }
+    }
+    addresses
+}
+
+/// Records that iroh connection `connection` to `endpoint` uses `addr`.
+fn learn(inner: &Inner, endpoint: EndpointId, connection: u64, addr: &TransportAddr) {
+    let TransportAddr::Custom(addr) = addr else { return };
+    let Some(address) = peer_address(addr) else { return };
+    let mut learned = inner.learned.lock().expect("poisoned");
+    let entry = learned.entry(address.clone()).or_insert_with(|| Learned {
+        endpoint,
+        connections: HashSet::new(),
+    });
+    // A private address another device now uses.
+    if entry.endpoint != endpoint {
+        entry.endpoint = endpoint;
+        entry.connections.clear();
+    }
+    if entry.connections.insert(connection) {
+        log::debug!("link to {}: carries {}", address.0, endpoint.fmt_short());
+    }
+}
+
+/// iroh connection `connection` ended: each link it used and no other live
+/// connection uses is released.
+fn forget_connection(inner: &Inner, connection: u64) {
+    let mut released = Vec::new();
+    for (address, learned) in inner.learned.lock().expect("poisoned").iter_mut() {
+        if learned.connections.remove(&connection) && learned.connections.is_empty() {
+            released.push(address.clone());
+        }
+    }
+    let releasers = inner.releasers.lock().expect("poisoned");
+    for address in &released {
+        for release in releasers.get(address).into_iter().flatten() {
+            // Stores a permit when the link is not waiting yet.
+            release.notify_one();
+        }
+    }
+}
+
+/// Whether a live iroh connection uses `peer`.
+fn in_use(inner: &Inner, peer: &PeerAddress) -> bool {
+    inner
+        .learned
+        .lock()
+        .expect("poisoned")
+        .get(peer)
+        .is_some_and(|learned| !learned.connections.is_empty())
+}
+
+/// Endpoint hooks from [`BleGattTransport::hooks`].
+#[derive(Clone)]
+pub struct BleGattHooks {
+    inner: Arc<Inner>,
+}
+
+impl fmt::Debug for BleGattHooks {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ble_gatt_iroh::BleGattHooks")
+    }
+}
+
+impl EndpointHooks for BleGattHooks {
+    async fn after_handshake<'a>(&'a self, conn: &'a Connection) -> AfterHandshakeOutcome {
+        let endpoint = conn.remote_id();
+        let connection = self.inner.next_connection.fetch_add(1, Ordering::Relaxed);
+        for path in conn.paths().iter() {
+            learn(&self.inner, endpoint, connection, path.remote_addr());
+        }
+        // Neither keeps the connection alive; see `EndpointHooks`.
+        let mut events = conn.path_events();
+        let closed = conn.weak_handle().closed();
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            tokio::pin!(closed);
+            loop {
+                tokio::select! {
+                    _ = &mut closed => break,
+                    event = events.next() => match event {
+                        Some(PathEvent::Opened { remote_addr, .. }) => {
+                            learn(&inner, endpoint, connection, &remote_addr);
+                        }
+                        Some(_) => {}
+                        None => break,
+                    },
+                }
+            }
+            forget_connection(&inner, connection);
+        });
+        AfterHandshakeOutcome::accept()
+    }
+}
+
+fn add_releaser(inner: &Inner, peer: &PeerAddress) -> Arc<Notify> {
+    let release = Arc::new(Notify::new());
+    inner
+        .releasers
+        .lock()
+        .expect("poisoned")
+        .entry(peer.clone())
+        .or_default()
+        .push(release.clone());
+    release
+}
+
+fn remove_releaser(inner: &Inner, peer: &PeerAddress, release: &Arc<Notify>) {
+    let mut releasers = inner.releasers.lock().expect("poisoned");
+    if let Some(list) = releasers.get_mut(peer) {
+        list.retain(|other| !Arc::ptr_eq(other, release));
+        if list.is_empty() {
+            releasers.remove(peer);
+        }
+    }
 }
 
 fn remove_closer(inner: &Inner, peer: &PeerAddress, close: &Arc<Notify>) {

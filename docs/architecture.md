@@ -103,7 +103,8 @@ desktop (Linux)
             │                                 retired addresses, close_link / close_links
             │                                 (cancel a dial, disconnect either role);
             │                                 a dial waits for the peer's old links to close;
-            │                                 ADR-0008: learn key ↔ link from iroh hooks
+            │                                 hooks(): learn key ↔ link from iroh (ADR-0008),
+            │                                 close a link once no connection uses it
             └── DatagramChannel             crate ble-gatt, profile/datagram/
                 │                             whole messages: fragmentation, reassembly;
                 │                             connect() = central, serve() = peripheral

@@ -2,7 +2,8 @@
 
 ## Status
 
-Proposed. Not implemented yet; see Plan.
+Accepted. Plan steps 1 and 2 (D1–D3) are implemented in `ble-gatt-iroh`;
+step 3 (D4, D5) is not yet.
 
 ## Context
 
@@ -69,11 +70,19 @@ peripheral side drops the central). Its signature does not change.
 
 **D3 — A link closes when the last iroh connection on it ends.** The hooks
 keep a weak handle per connection; when every connection using a link has
-closed, the transport closes the link, without waiting for the idle timeout.
-The idle timeout stays as a backstop for a link no connection ever used (a
-peer that dialled and never finished the handshake). Fini's calls after a
-session, a rejection and an unused pairing link should then become
-unnecessary.
+closed, the transport closes the link after `link_release_delay` (default
+3 s), without waiting for the idle timeout. A connection that takes the link
+over within the delay keeps it, which is how the first session can still use
+the pairing link. The idle timeout stays as a backstop for a link no
+connection ever used (a peer that dialled and never finished the handshake).
+Fini's calls after a session, a rejection and an unused pairing link should
+then become unnecessary.
+
+This close is the idle kind: it ends a link this side dialled, and leaves a
+link the peer dialled to the peer, whose own D3 ends it. Only `close_link`
+and `close_links` drop a link the peer dialled (`DatagramChannel::disconnect`).
+On Linux, dropping it ends the whole link to that address, including a busy
+link this side dialled, so it must stay an explicit request.
 
 **D4 — One link to a peer carries both directions.** A BLE link already does:
 the central writes, the peripheral notifies. When iroh sends to a peer key
@@ -91,7 +100,7 @@ also never starts a second dial to a peer while one is pending, which
 ## Consequences
 
 - An application must install the hooks to get D1–D4. Without them the
-  transport behaves as today; the README says so.
+  transport behaves as before; the crate docs and `hooks()` say so.
 - Fini can drop its "smaller id dials" rule on Bluetooth, or keep it only for
   a cold start, when neither device has a link yet. That is Fini's decision;
   this ADR only makes it possible.
@@ -117,5 +126,7 @@ also never starts a second dial to a peer while one is pending, which
 
 - Whether BlueZ still aborts one of two dials that cross at the same instant
   once D4 makes them rare. Only hardware shows that.
-- Whether D3 breaks Fini's reuse of the pairing link for the first session
-  (`keep_pairing_link`), where no iroh connection may be up for a moment.
+- Whether `link_release_delay` covers Fini's reuse of the pairing link for
+  the first session (`keep_pairing_link`). If the session starts later than
+  the delay, Fini keeps an iroh connection open until it does, or sets a
+  longer delay.

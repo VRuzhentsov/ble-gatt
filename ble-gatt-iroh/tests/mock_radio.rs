@@ -416,3 +416,147 @@ async fn a_large_echo_moves_both_ways_at_once() {
     writing.await.expect("writer");
     assert_eq!(reply, payload);
 }
+
+/// Both sides with the transport's hooks installed; the dialer reaches the
+/// listener by key.
+struct HookedPair {
+    dialer: Endpoint,
+    dialer_id: iroh::EndpointId,
+    dialer_transport: BleGattTransport,
+    listener_id: iroh::EndpointId,
+    listener_transport: BleGattTransport,
+    _router: Router,
+}
+
+async fn hooked_pair(listener: &str, dialer: &str, release_delay: Duration) -> HookedPair {
+    let network = MockNetwork::new();
+    let listener_address = PeerAddress(listener.to_string());
+    let listener_transport = BleGattTransport::builder()
+        .link_release_delay(release_delay)
+        .build();
+    let incoming = datagram::serve(&adapter(&network, listener).await, &config())
+        .await
+        .expect("serve");
+    let attach_to = listener_transport.clone();
+    tokio::spawn(async move {
+        let mut incoming = incoming;
+        while let Some(channel) = incoming.next().await {
+            attach_to.attach(channel);
+        }
+    });
+    let listener_key = SecretKey::generate();
+    let listener_id = listener_key.public();
+    let listener = Endpoint::builder(presets::Minimal)
+        .secret_key(listener_key)
+        .relay_mode(RelayMode::Disabled)
+        .clear_ip_transports()
+        .add_custom_transport(Arc::new(listener_transport.clone()))
+        .hooks(listener_transport.hooks())
+        .bind()
+        .await
+        .expect("bind listener");
+    let router = Router::builder(listener).accept(ECHO_ALPN, Echo).spawn();
+
+    let dialer_transport = BleGattTransport::builder()
+        .dialer(dial_with(adapter(&network, dialer).await, config()))
+        .link_release_delay(release_delay)
+        .build();
+    dialer_transport.set_peer_address(listener_id, listener_address);
+    let dialer_key = SecretKey::generate();
+    let dialer_id = dialer_key.public();
+    let dialer = Endpoint::builder(presets::Minimal)
+        .secret_key(dialer_key)
+        .relay_mode(RelayMode::Disabled)
+        .clear_ip_transports()
+        .add_custom_transport(Arc::new(dialer_transport.clone()))
+        .address_lookup(dialer_transport.address_lookup())
+        .hooks(dialer_transport.hooks())
+        .bind()
+        .await
+        .expect("bind dialer");
+    HookedPair {
+        dialer,
+        dialer_id,
+        dialer_transport,
+        listener_id,
+        listener_transport,
+        _router: router,
+    }
+}
+
+async fn until_no_links(transport: &BleGattTransport, within: Duration) -> bool {
+    tokio::time::timeout(within, async {
+        while !transport.linked_peers().is_empty() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// With the hooks, `close_links` by key reaches a link the peer dialled:
+/// its address was never set on this side (ADR-0008 D2). The release delay
+/// is longer than the test, so only `close_links` can close it.
+#[tokio::test(flavor = "multi_thread")]
+async fn close_links_reaches_a_link_the_peer_dialled() {
+    let pair = hooked_pair("AA:00:00:00:00:12", "AA:00:00:00:00:11", Duration::from_secs(60)).await;
+    let connection = tokio::time::timeout(TIMEOUT, pair.dialer.connect(pair.listener_id, ECHO_ALPN))
+        .await
+        .expect("connect in time")
+        .expect("connect");
+    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&connection, b"in")).await.expect("echo in time"), b"in");
+    // Ended first, or the dialer's iroh would dial the link straight back.
+    connection.close(0u32.into(), b"done");
+    drop(connection);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(pair.listener_transport.linked_peers().len(), 1);
+
+    pair.listener_transport.close_links(&pair.dialer_id);
+    assert!(
+        until_no_links(&pair.listener_transport, Duration::from_secs(5)).await,
+        "the link the peer dialled closes by key"
+    );
+}
+
+/// With the hooks, a link closes soon after the last iroh connection on it
+/// ends, long before the idle timeout (ADR-0008 D3).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_link_closes_when_its_last_connection_ends() {
+    let pair = hooked_pair("AA:00:00:00:00:14", "AA:00:00:00:00:13", Duration::from_millis(300)).await;
+    let connection = tokio::time::timeout(TIMEOUT, pair.dialer.connect(pair.listener_id, ECHO_ALPN))
+        .await
+        .expect("connect in time")
+        .expect("connect");
+    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&connection, b"once")).await.expect("echo in time"), b"once");
+    connection.close(0u32.into(), b"done");
+    drop(connection);
+    assert!(
+        until_no_links(&pair.dialer_transport, Duration::from_secs(5)).await,
+        "the dialled link closes before the 20s idle timeout"
+    );
+    assert!(
+        until_no_links(&pair.listener_transport, Duration::from_secs(5)).await,
+        "the served link closes before the 20s idle timeout"
+    );
+}
+
+/// A second connection that starts within the release delay keeps the link
+/// (ADR-0008 D3).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_connection_keeps_a_released_link() {
+    let pair = hooked_pair("AA:00:00:00:00:16", "AA:00:00:00:00:15", Duration::from_millis(300)).await;
+    let first = tokio::time::timeout(TIMEOUT, pair.dialer.connect(pair.listener_id, ECHO_ALPN))
+        .await
+        .expect("connect in time")
+        .expect("connect");
+    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&first, b"first")).await.expect("echo in time"), b"first");
+    let second = tokio::time::timeout(TIMEOUT, pair.dialer.connect(pair.listener_id, ECHO_ALPN))
+        .await
+        .expect("connect in time")
+        .expect("connect");
+    first.close(0u32.into(), b"done");
+    drop(first);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(pair.dialer_transport.linked_peers().len(), 1, "the link stays for the second connection");
+    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&second, b"second")).await.expect("echo in time"), b"second");
+}
