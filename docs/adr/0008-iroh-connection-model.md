@@ -2,8 +2,9 @@
 
 ## Status
 
-Accepted. Plan steps 1 and 2 (D1–D3) are implemented in `ble-gatt-iroh`;
-step 3 (D4, D5) is not yet.
+Accepted. D1–D3 are implemented in `ble-gatt-iroh`. D4 and D5 needed no
+transport code: on the mock radio iroh already does both (see their notes).
+What is left is Fini's side and hardware.
 
 ## Context
 
@@ -89,6 +90,12 @@ the central writes, the peripheral notifies. When iroh sends to a peer key
 that has a link in either role, the transport sends on it and does not dial.
 In most cases this removes crossed dials instead of breaking the tie.
 
+*Outcome.* iroh does this itself. On the mock radio, after B dialled A, A
+connected back to B's key with B recorded at another address: iroh sent
+everything over the path B's connection came in on and never tried the
+other address, even 8 s later. Rerouting in the transport changed nothing a
+test could see, so it was not kept.
+
 **D5 — Duplicates are tolerated, as iroh-gossip does.** If two dials still
 cross, both links come up. The newest carries the traffic; the older one
 closes when no connection uses it (D3). No comparison of ids. Precedent:
@@ -96,6 +103,13 @@ closes when no connection uses it (D3). No comparison of ids. Precedent:
 connection, sends only on the new one, and lets the unused one close; it
 also never starts a second dial to a peer while one is pending, which
 `ble-gatt-iroh` already does.
+
+*Outcome.* No transport code: `crossed_connects_both_work_and_their_links_close`
+shows both connections working with no tie-break, and every link closing
+once they end. Refusing the second connection, as Fini's crossing rule does,
+is an application choice; iroh-gossip keeps the newest instead. The mock
+radio does not reproduce BlueZ aborting one of two crossed dials, so
+hardware decides whether Fini can drop its "smaller id dials" rule.
 
 ## Consequences
 
@@ -112,15 +126,17 @@ also never starts a second dial to a peer while one is pending, which
 
 ## Plan
 
-1. Hooks that record key ↔ address and follow path events (D1), with
-   `close_links` using the map (D2). Mock test: a peer-dialled link closed by
-   key.
-2. Close on the last connection's end (D3). Mock test: the link closes well
-   before the idle timeout.
-3. Send on an existing link in either role (D4) and tolerate duplicates (D5).
-   Mock test: both sides connect at once and end with one link in use.
-4. Hardware run in Fini after each step; Fini removes its own workarounds
-   only after the step that replaces them passes.
+1. Done: hooks that record key ↔ address and follow path events (D1), with
+   `close_links` using the map (D2). Mock test:
+   `close_links_reaches_a_link_the_peer_dialled`.
+2. Done: close on the last connection's end (D3). Mock tests:
+   `a_link_closes_when_its_last_connection_ends`,
+   `a_new_connection_keeps_a_released_link`.
+3. Done, no code: D4 and D5 come from iroh (see their outcomes). Mock test:
+   `crossed_connects_both_work_and_their_links_close`.
+4. Hardware run in Fini; Fini removes its own workarounds (the extra
+   `close_links` calls, then the "smaller id dials" rule) only after a run
+   shows they are no longer needed.
 
 ## Open questions
 

@@ -560,3 +560,62 @@ async fn a_new_connection_keeps_a_released_link() {
     assert_eq!(pair.dialer_transport.linked_peers().len(), 1, "the link stays for the second connection");
     assert_eq!(tokio::time::timeout(TIMEOUT, echo(&second, b"second")).await.expect("echo in time"), b"second");
 }
+
+/// Both sides connect to each other at the same moment. Both connections
+/// work, with no tie-break, and once both end every link closes
+/// (ADR-0008 D5).
+#[tokio::test(flavor = "multi_thread")]
+async fn crossed_connects_both_work_and_their_links_close() {
+    let network = MockNetwork::new();
+    let a_address = PeerAddress("AA:00:00:00:00:1A".to_string());
+    let b_address = PeerAddress("AA:00:00:00:00:1B".to_string());
+    let mut sides = Vec::new();
+    for own in [&a_address, &b_address] {
+        let adapter = adapter(&network, &own.0).await;
+        let transport = BleGattTransport::builder()
+            .dialer(dial_with(adapter.clone(), config()))
+            .link_release_delay(Duration::from_millis(300))
+            .build();
+        let incoming = datagram::serve(&adapter, &config()).await.expect("serve");
+        let attach_to = transport.clone();
+        tokio::spawn(async move {
+            let mut incoming = incoming;
+            while let Some(channel) = incoming.next().await {
+                attach_to.attach(channel);
+            }
+        });
+        let key = SecretKey::generate();
+        let id = key.public();
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .secret_key(key)
+            .relay_mode(RelayMode::Disabled)
+            .clear_ip_transports()
+            .add_custom_transport(Arc::new(transport.clone()))
+            .address_lookup(transport.address_lookup())
+            .hooks(transport.hooks())
+            .bind()
+            .await
+            .expect("bind");
+        let router = Router::builder(endpoint.clone()).accept(ECHO_ALPN, Echo).spawn();
+        sides.push((transport, endpoint, id, router));
+    }
+    let (a_transport, a, a_id, _a_router) = &sides[0];
+    let (b_transport, b, b_id, _b_router) = &sides[1];
+    a_transport.set_peer_address(*b_id, b_address.clone());
+    b_transport.set_peer_address(*a_id, a_address.clone());
+
+    let (a_to_b, b_to_a) = tokio::join!(
+        tokio::time::timeout(TIMEOUT, a.connect(*b_id, ECHO_ALPN)),
+        tokio::time::timeout(TIMEOUT, b.connect(*a_id, ECHO_ALPN)),
+    );
+    let a_to_b = a_to_b.expect("a connects in time").expect("a connects");
+    let b_to_a = b_to_a.expect("b connects in time").expect("b connects");
+    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&a_to_b, b"a to b")).await.expect("echo in time"), b"a to b");
+    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&b_to_a, b"b to a")).await.expect("echo in time"), b"b to a");
+
+    a_to_b.close(0u32.into(), b"done");
+    b_to_a.close(0u32.into(), b"done");
+    drop((a_to_b, b_to_a));
+    assert!(until_no_links(a_transport, Duration::from_secs(5)).await, "a's links close");
+    assert!(until_no_links(b_transport, Duration::from_secs(5)).await, "b's links close");
+}
