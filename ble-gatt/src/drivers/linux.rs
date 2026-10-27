@@ -562,6 +562,8 @@ pub struct LinuxDriver {
     cleanup_permits: Arc<tokio::sync::Semaphore>,
     /// See `DiscoveryBus`.
     discovery: Arc<DiscoveryBus>,
+    /// Services `sweep_leftover_links` already ran for.
+    swept: StdMutex<HashSet<ServiceUuid>>,
 }
 
 impl LinuxDriver {
@@ -775,7 +777,51 @@ impl LinuxDriver {
             in_flight: Arc::new(StdMutex::new(HashSet::new())),
             cleanup_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CLEANUP_DISCONNECTS)),
             discovery,
+            swept: StdMutex::new(HashSet::new()),
         })
+    }
+
+    /// The first time a service is scanned for or advertised, before either
+    /// starts: disconnect every device BlueZ reports connected that offers
+    /// the service and that this process neither dialled nor serves
+    /// (ADR-0009 D2). BlueZ keeps the links of a process that died, and on
+    /// hardware one left at a phone's old address made it abort every dial
+    /// to the phone's new one until the adapter was power-cycled. Android,
+    /// Apple and Windows release a dead app's links themselves.
+    async fn sweep_leftover_links(&self, service: ServiceUuid) {
+        if !self.swept.lock().unwrap().insert(service) {
+            return;
+        }
+        let Ok(addresses) = self.adapter.device_addresses().await else {
+            return;
+        };
+        for address in addresses {
+            let peer = PeerAddress(address.to_string());
+            if self.dialed.lock().unwrap().contains_key(&peer) || self.served_peers.lock().unwrap().contains_key(&peer) {
+                continue;
+            }
+            let Ok(device) = self.adapter.device(address) else {
+                continue;
+            };
+            if !device.is_connected().await.unwrap_or(false) {
+                continue;
+            }
+            let offers = device.uuids().await.ok().flatten().is_some_and(|uuids| uuids.contains(&service.0));
+            if !offers {
+                continue;
+            }
+            log::warn!(
+                "startup: disconnecting {}: connected with service {}, but not by this process (left by an earlier one)",
+                peer.0,
+                service.0
+            );
+            let _dial = self.dial_lock.lock(&peer).await;
+            match tokio::time::timeout(CLEANUP_DISCONNECT_TIMEOUT, device.disconnect()).await {
+                Ok(Ok(())) => log::info!("startup: {} disconnected", peer.0),
+                Ok(Err(err)) => log::warn!("startup: disconnecting {} failed: {err}", peer.0),
+                Err(_) => log::warn!("startup: disconnecting {} timed out after {CLEANUP_DISCONNECT_TIMEOUT:?}", peer.0),
+            }
+        }
     }
 
     /// Before a dial: if discovery is still on with no scan left using it
@@ -1487,6 +1533,7 @@ impl Driver for LinuxDriver {
     }
 
     async fn scan(&self, service: ServiceUuid) -> Result<BoxStream<Result<DiscoveredPeer>>> {
+        self.sweep_leftover_links(service).await;
         let adapter = self.adapter.clone();
         log::info!("scan: starting discovery for service {}", service.0);
         // The guard is created before the calls below, so a failure in
@@ -1815,6 +1862,9 @@ impl Driver for LinuxDriver {
             service.characteristics.len()
         );
         service.validate()?;
+        // Before anything is registered, so no central can have connected to
+        // this process yet.
+        self.sweep_leftover_links(service.uuid).await;
         // Held for the whole setup, including both BlueZ registrations, so a
         // concurrent stop cannot interleave with installing the handles.
         let _serialise = self.advertise_lock.lock().await;
@@ -2158,6 +2208,30 @@ impl Driver for LinuxDriver {
         self.release_served_peers("stop").await;
         *self.app_handle.lock().await = None;
         *self.adv_handle.lock().await = None;
+        Ok(())
+    }
+
+    async fn close(&self) -> Result<()> {
+        log::info!("close: releasing this process's links");
+        if let Err(err) = self.stop_advertising().await {
+            log::warn!("close: stopping the server failed: {err}");
+        }
+        let dialed: Vec<PeerAddress> = self.dialed.lock().unwrap().keys().cloned().collect();
+        for peer in dialed {
+            let Ok(address) = peer.0.parse::<bluer::Address>() else {
+                continue;
+            };
+            let Ok(device) = self.adapter.device(address) else {
+                continue;
+            };
+            let _dial = self.dial_lock.lock(&peer).await;
+            match tokio::time::timeout(CLEANUP_DISCONNECT_TIMEOUT, device.disconnect()).await {
+                Ok(Ok(())) => log::info!("close: {} disconnected", peer.0),
+                Ok(Err(err)) if is_not_connected(&err) => {}
+                Ok(Err(err)) => log::warn!("close: disconnecting {} failed: {err}", peer.0),
+                Err(_) => log::warn!("close: disconnecting {} timed out after {CLEANUP_DISCONNECT_TIMEOUT:?}", peer.0),
+            }
+        }
         Ok(())
     }
 

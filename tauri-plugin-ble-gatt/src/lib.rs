@@ -41,6 +41,10 @@ pub enum Error {
     PluginInvoke(#[from] tauri::plugin::mobile::PluginInvokeError),
 }
 
+/// How long quitting the app waits for Bluetooth to be released. A BlueZ
+/// disconnect took about 2s on hardware.
+const EXIT_CLOSE_LIMIT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Registers the plugin with the platform's default driver.
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
     Builder::new().build()
@@ -88,6 +92,20 @@ impl Builder {
                 app.manage(BleGatt::new(app, api, driver.clone())?);
                 app.manage(PluginState::new(driver));
                 Ok(())
+            })
+            // BlueZ keeps a process's links after it exits; release them on
+            // the way out (ADR-0009 D1). Bounded, so a radio that does not
+            // answer cannot hold up quitting.
+            .on_event(|app, event| {
+                if let tauri::RunEvent::Exit = event {
+                    let driver = app.state::<BleGatt<R>>().driver.clone();
+                    let closed = tauri::async_runtime::block_on(tokio::time::timeout(EXIT_CLOSE_LIMIT, driver.close()));
+                    match closed {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => log::warn!("closing Bluetooth on exit failed: {err}"),
+                        Err(_) => log::warn!("closing Bluetooth on exit timed out after {EXIT_CLOSE_LIMIT:?}"),
+                    }
+                }
             })
             .build()
     }

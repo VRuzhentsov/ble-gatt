@@ -269,6 +269,14 @@ subscribed.
 on or be stopped by. A connection hands one out that fires when it
 disconnects.
 
+### Leftover link
+A link BlueZ still holds for a process that exited or crashed: on Linux a
+link belongs to `bluetoothd`, not to the app that dialled it. Android, Apple
+and Windows release a dead app's links themselves. The Linux driver
+disconnects leftover links that offer the app's service before its first
+scan or advertisement, and `Adapter::close` releases the app's own links on
+the way out (ADR-0009).
+
 ### Endpoint hooks
 Callbacks an application installs on its iroh endpoint
 (`iroh::endpoint::EndpointHooks`). `after_handshake` runs for every

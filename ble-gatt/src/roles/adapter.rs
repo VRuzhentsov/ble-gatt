@@ -89,6 +89,15 @@ impl Adapter {
     pub fn peripheral(&self) -> Peripheral {
         Peripheral::new(self.inner.driver.clone())
     }
+
+    /// Release what this process holds on the radio, before it exits: stop
+    /// serving and disconnect every link it dialled (ADR-0009). Android,
+    /// Apple and Windows do this themselves when a process ends; BlueZ keeps
+    /// the links, so on Linux call this on the way out. As Windows'
+    /// `BluetoothLEDevice.Dispose` and Android's `BluetoothGatt.close`.
+    pub async fn close(&self) -> crate::Result<()> {
+        self.inner.driver.close().await
+    }
 }
 
 async fn publish_status(mut events: BoxStream<GattEvent>, status_tx: watch::Sender<RadioStatus>) {

@@ -173,6 +173,16 @@ pub trait Driver: Send + Sync {
 
     async fn stop_advertising(&self) -> Result<()>;
 
+    /// Release what this process holds on the radio before it exits: stop
+    /// serving and disconnect every link it dialled (ADR-0009 D1).
+    ///
+    /// Android, Apple and Windows release a dead app's links themselves, so
+    /// the default does nothing. BlueZ keeps them, and a link left at a
+    /// peer's old address made it abort every dial to the peer's new one.
+    async fn close(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Push a value to **every** central currently subscribed to
     /// `characteristic` on the local GATT server. Errors if it reached
     /// nobody — a reliable caller must not be told a dropped payload was

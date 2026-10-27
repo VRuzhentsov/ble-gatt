@@ -107,6 +107,15 @@ impl Driver for LazyDriver {
         self.inner().await?.stop_advertising().await
     }
 
+    async fn close(&self) -> Result<()> {
+        // Nothing to release if the driver was never built; building one
+        // just to close it would hold up an exit.
+        match self.cell.get() {
+            Some(driver) => driver.close().await,
+            None => Ok(()),
+        }
+    }
+
     async fn notify(&self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
         self.inner().await?.notify(characteristic, value).await
     }
@@ -168,5 +177,18 @@ mod tests {
         assert!(lazy.stop_advertising().await.is_ok());
         assert!(lazy.stop_advertising().await.is_ok());
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    /// Closing on exit must not build a driver the app never used.
+    #[tokio::test]
+    async fn close_does_not_build_the_driver() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = attempts.clone();
+        let lazy = LazyDriver::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async { Err(BleError::AdapterUnavailable("off".into())) }
+        });
+        assert!(lazy.close().await.is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
     }
 }
