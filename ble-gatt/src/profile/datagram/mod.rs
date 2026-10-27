@@ -1116,9 +1116,10 @@ pub async fn update_advertisement(adapter: &Adapter, config: &DatagramConfig) ->
 /// channels; the server keeps advertising and accepting. On hardware a phone
 /// that only dropped it stayed discoverable for 30 s, and a desktop connected
 /// and wrote into a server nobody read. Call this when the device should no
-/// longer be reachable. Like blew's `Peripheral::stop_advertising`, except
-/// that it also closes the server: on Android an open server still accepts a
-/// central that knows the address.
+/// longer be reachable. It stops both, as Android's
+/// `BluetoothLeAdvertiser.stopAdvertising` plus `BluetoothGattServer.close`
+/// and BlueZ's dropped `AdvertisementHandle` plus `ApplicationHandle` do:
+/// on Android an open server still accepts a central that knows the address.
 pub async fn stop_serving(adapter: &Adapter) -> Result<()> {
     log::info!("serve: stopping");
     adapter.driver().stop_advertising().await
