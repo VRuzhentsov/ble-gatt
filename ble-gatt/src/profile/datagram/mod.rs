@@ -1109,6 +1109,21 @@ pub async fn update_advertisement(adapter: &Adapter, config: &DatagramConfig) ->
     adapter.driver().update_advertisement(config.service_spec()).await
 }
 
+/// Stop a running [`serve`]: its advertisement and its GATT server, which
+/// drops the centrals connected to it. Waits until the platform did.
+///
+/// Dropping the stream [`serve`] returned only stops handing out new
+/// channels; the server keeps advertising and accepting. On hardware a phone
+/// that only dropped it stayed discoverable for 30 s, and a desktop connected
+/// and wrote into a server nobody read. Call this when the device should no
+/// longer be reachable. Like blew's `Peripheral::stop_advertising`, except
+/// that it also closes the server: on Android an open server still accepts a
+/// central that knows the address.
+pub async fn stop_serving(adapter: &Adapter) -> Result<()> {
+    log::info!("serve: stopping");
+    adapter.driver().stop_advertising().await
+}
+
 /// [`serve`] over a driver directly, for `PeerLink`, which holds one.
 pub(crate) async fn serve_driver(
     driver: Arc<dyn Driver>, config: &DatagramConfig,

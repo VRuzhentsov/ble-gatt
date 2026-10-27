@@ -1278,6 +1278,37 @@ async fn update_advertisement_refuses_a_service_that_is_not_served() {
     assert!(datagram::update_advertisement(&adapter, &served).await.is_ok());
 }
 
+/// Dropping the serve stream leaves the server accepting centrals;
+/// `stop_serving` stops it, so a central can no longer connect.
+#[tokio::test]
+async fn stop_serving_stops_the_server_a_dropped_stream_left_running() {
+    let network = MockNetwork::new();
+    let config = config();
+    let peripheral_addr = PeerAddress("peripheral-stop".to_string());
+    let peripheral = Arc::new(MockDriver::new(peripheral_addr.clone(), network.clone(), full_capabilities()));
+    let central = Arc::new(MockDriver::new(PeerAddress("central-stop".to_string()), network, full_capabilities()));
+    let peripheral_adapter = adapter(&peripheral).await;
+    let central_adapter = adapter(&central).await;
+
+    let incoming = datagram::serve(&peripheral_adapter, &config).await.expect("serve should start");
+    drop(incoming);
+    let mut still_served = datagram::connect(&central_adapter, &peripheral_addr, &config)
+        .await
+        .expect("a dropped stream leaves the server accepting");
+    let _ = still_served.close().await;
+
+    datagram::stop_serving(&peripheral_adapter).await.expect("stop_serving");
+    let after = tokio::time::timeout(
+        Duration::from_secs(2),
+        datagram::connect(&central_adapter, &peripheral_addr, &config),
+    )
+    .await;
+    assert!(
+        !matches!(after, Ok(Ok(_))),
+        "a central must not connect once the server is stopped"
+    );
+}
+
 /// A name and service data under the advertised service would both travel
 /// as that service data, so advertising refuses the pair.
 #[tokio::test]

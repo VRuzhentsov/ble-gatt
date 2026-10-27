@@ -57,6 +57,12 @@ Changing what a peripheral advertises while it keeps serving
 GATT server, and every central connected to it with its subscription, stay.
 Advertising again with `serve` replaces the server and drops those centrals.
 
+### Stop serving
+Ending a peripheral's advertisement and GATT server together
+(`datagram::stop_serving`), which drops the centrals connected to it.
+Dropping the stream `serve` returned is not stopping: it only ends handing
+out new channels, and the server keeps advertising and accepting.
+
 ### Scan response
 A second packet of up to 31 bytes that an advertiser sends only when a
 scanner asks for it. Scanners ask during an *active* scan, which is how both
