@@ -1,0 +1,121 @@
+# 0008 — `ble-gatt-iroh` follows iroh's connection model
+
+## Status
+
+Proposed. Not implemented yet; see Plan.
+
+## Context
+
+`ble-gatt-iroh` (ADR-0006) carries iroh's QUIC packets over datagram
+channels. Today it decides which BLE link belongs to which peer from one
+source only: the address the application records with `set_peer_address`
+when it dials. A link the peer dialled into this device arrives from an
+address nobody recorded, so the transport cannot tell whose it is.
+
+Hardware runs in Fini (Android phone and Linux desktop, Bluetooth switched
+off and on) showed what that costs:
+
+- `close_links(peer_key)` on the phone closed nothing. The only link was the
+  one the desktop had dialled in, and its address was not recorded for the
+  desktop's key. It stayed up about 3 s, until the desktop's BlueZ dropped
+  it, and the desktop did not re-advertise meanwhile.
+- A link outlives the iroh connection on it until it carries nothing for
+  `link_idle_timeout` (20 s). Fini added a `close_links` call after each
+  place where that was too long: a session ending, a rejected session, a
+  pairing link left unused.
+- Fini lets only the device with the smaller id dial over Bluetooth. Two
+  dials crossing made BlueZ abort one (`le-connection-abort-by-local`), and
+  Fini's crossing rule refused the other. With that rule, the device with
+  the larger id only ever accepts, so it can never close its session link
+  itself.
+
+Terms used below:
+
+- **Endpoint hooks** (`iroh::endpoint::EndpointHooks`): callbacks an
+  application installs on its iroh endpoint. `after_handshake` runs for
+  every connection, incoming and outgoing, once TLS has proved the peer's
+  key.
+- **Path**: one transport address a QUIC connection can use to reach the
+  peer. iroh lists them (`Connection::paths`) and reports them opening and
+  closing (`Connection::path_events`). For this transport a path's address is
+  the peer's BLE address.
+- **Crossed dials**: both devices dialling each other at the same moment.
+
+On the mock radio, `after_handshake` on the accepting side lists a path whose
+address is the dialling device's BLE address, and on the dialling side the
+address it dialled. Both sides can therefore learn key ↔ link from iroh
+itself.
+
+## Decisions
+
+**D1 — The transport learns which key each link belongs to from iroh.**
+`ble-gatt-iroh` provides endpoint hooks (`BleGattTransport::hooks()`), which
+the application installs once with `Endpoint::builder().hooks(..)`. After
+each handshake they record the connection's peer key against the BLE
+addresses of its paths, and follow `path_events` for later paths. This covers
+links the peer dialled in. `set_peer_address` stays for what iroh cannot know
+yet: where to dial a peer before any connection exists.
+
+*Alternatives.* The application could keep its own key → inbound address
+map (every application would repeat it), or tell the transport with a new
+call when it accepts a connection (easy to forget). Both duplicate what iroh
+already knows. Precedent: iroh documents hooks as the place to inspect a
+connection once its key is known, and to keep a `WeakConnectionHandle`
+rather than the connection.
+
+**D2 — `close_links(peer_key)` reaches every link to that key.** With D1 it
+closes links in either role, using `DatagramChannel::disconnect` (the
+peripheral side drops the central). Its signature does not change.
+
+**D3 — A link closes when the last iroh connection on it ends.** The hooks
+keep a weak handle per connection; when every connection using a link has
+closed, the transport closes the link, without waiting for the idle timeout.
+The idle timeout stays as a backstop for a link no connection ever used (a
+peer that dialled and never finished the handshake). Fini's calls after a
+session, a rejection and an unused pairing link should then become
+unnecessary.
+
+**D4 — One link to a peer carries both directions.** A BLE link already does:
+the central writes, the peripheral notifies. When iroh sends to a peer key
+that has a link in either role, the transport sends on it and does not dial.
+In most cases this removes crossed dials instead of breaking the tie.
+
+**D5 — Duplicates are tolerated, as iroh-gossip does.** If two dials still
+cross, both links come up. The newest carries the traffic; the older one
+closes when no connection uses it (D3). No comparison of ids. Precedent:
+`iroh-gossip` (n0's own protocol on iroh, `src/net.rs`) keeps the old
+connection, sends only on the new one, and lets the unused one close; it
+also never starts a second dial to a peer while one is pending, which
+`ble-gatt-iroh` already does.
+
+## Consequences
+
+- An application must install the hooks to get D1–D4. Without them the
+  transport behaves as today; the README says so.
+- Fini can drop its "smaller id dials" rule on Bluetooth, or keep it only for
+  a cold start, when neither device has a link yet. That is Fini's decision;
+  this ADR only makes it possible.
+- The mapping exists only once TLS has finished. A dial that starts before a
+  handshake completes cannot use it, so a crossed dial is rarer, not
+  impossible; D5 covers what is left.
+- iroh's hooks and path events are stable API in iroh 1.3. The custom
+  transport itself stays behind `unstable-custom-transports` (ADR-0006).
+
+## Plan
+
+1. Hooks that record key ↔ address and follow path events (D1), with
+   `close_links` using the map (D2). Mock test: a peer-dialled link closed by
+   key.
+2. Close on the last connection's end (D3). Mock test: the link closes well
+   before the idle timeout.
+3. Send on an existing link in either role (D4) and tolerate duplicates (D5).
+   Mock test: both sides connect at once and end with one link in use.
+4. Hardware run in Fini after each step; Fini removes its own workarounds
+   only after the step that replaces them passes.
+
+## Open questions
+
+- Whether BlueZ still aborts one of two dials that cross at the same instant
+  once D4 makes them rare. Only hardware shows that.
+- Whether D3 breaks Fini's reuse of the pairing link for the first session
+  (`keep_pairing_link`), where no iroh connection may be up for a moment.

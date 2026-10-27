@@ -101,6 +101,9 @@ desktop (Linux)
             │                                 iroh custom transport: EndpointId ↔ PeerAddress,
             │                                 one link per address, redial yield,
             │                                 retired addresses, close_link / close_links
+            │                                 (cancel a dial, disconnect either role);
+            │                                 a dial waits for the peer's old links to close;
+            │                                 ADR-0008: learn key ↔ link from iroh hooks
             └── DatagramChannel             crate ble-gatt, profile/datagram/
                 │                             whole messages: fragmentation, reassembly;
                 │                             connect() = central, serve() = peripheral

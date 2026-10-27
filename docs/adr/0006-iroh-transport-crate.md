@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted. Implemented in `ble-gatt-iroh/`.
+Accepted. Implemented in `ble-gatt-iroh/`. How the transport tells which
+peer a link belongs to, and when it closes links, is proposed in ADR-0008.
 
 ## Context
 

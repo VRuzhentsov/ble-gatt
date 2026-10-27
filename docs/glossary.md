@@ -263,6 +263,21 @@ subscribed.
 on or be stopped by. A connection hands one out that fires when it
 disconnects.
 
+### Endpoint hooks
+Callbacks an application installs on its iroh endpoint
+(`iroh::endpoint::EndpointHooks`). `after_handshake` runs for every
+connection, incoming and outgoing, once TLS has proved the peer's key
+(ADR-0008).
+
+### Path
+One transport address an iroh connection can use to reach the peer
+(`Connection::paths`). For `ble-gatt-iroh` it is the peer's BLE address.
+*Not the same as* a filesystem path.
+
+### Crossed dials
+Both devices dialling each other at the same moment, so two links or two
+connections come up where one was wanted.
+
 ### Adapter crate
 A crate that connects `ble-gatt` to something outside it, such as iroh
 (`ble-gatt-iroh`) or Tauri (`tauri-plugin-ble-gatt`). Layer: Interface
