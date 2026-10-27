@@ -1122,7 +1122,12 @@ pub async fn update_advertisement(adapter: &Adapter, config: &DatagramConfig) ->
 /// on Android an open server still accepts a central that knows the address.
 pub async fn stop_serving(adapter: &Adapter) -> Result<()> {
     log::info!("serve: stopping");
-    adapter.driver().stop_advertising().await
+    let stopped = adapter.driver().stop_advertising().await;
+    match &stopped {
+        Ok(()) => log::info!("serve: stopped"),
+        Err(err) => log::warn!("serve: stopping failed: {err}"),
+    }
+    stopped
 }
 
 /// [`serve`] over a driver directly, for `PeerLink`, which holds one.
