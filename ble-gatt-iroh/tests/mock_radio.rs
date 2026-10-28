@@ -30,6 +30,23 @@ impl ProtocolHandler for Echo {
     }
 }
 
+const CLOSE_ALPN: &[u8] = b"ble-gatt-iroh/test/close";
+
+/// Echoes once, then closes the connection from the accepting side.
+#[derive(Debug, Clone)]
+struct EchoThenClose;
+
+impl ProtocolHandler for EchoThenClose {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let (mut send, mut recv) = connection.accept_bi().await?;
+        tokio::io::copy(&mut recv, &mut send).await?;
+        send.finish()?;
+        let _ = send.stopped().await;
+        connection.close(2u32.into(), b"off");
+        Ok(())
+    }
+}
+
 fn config() -> DatagramConfig {
     DatagramConfig::new(
         ServiceUuid(uuid::Uuid::parse_str("b1e6a100-f101-4000-8000-00805f9b34fb").unwrap()),
@@ -429,10 +446,18 @@ struct HookedPair {
 }
 
 async fn hooked_pair(listener: &str, dialer: &str, release_delay: Duration) -> HookedPair {
+    hooked_pair_with_delays(listener, dialer, release_delay, release_delay).await
+}
+
+/// A listener's release delay longer than the test keeps its side of the
+/// link, so only the dialer's own release can close it.
+async fn hooked_pair_with_delays(
+    listener: &str, dialer: &str, listener_delay: Duration, release_delay: Duration,
+) -> HookedPair {
     let network = MockNetwork::new();
     let listener_address = PeerAddress(listener.to_string());
     let listener_transport = BleGattTransport::builder()
-        .link_release_delay(release_delay)
+        .link_release_delay(listener_delay)
         .build();
     let incoming = datagram::serve(&adapter(&network, listener).await, &config())
         .await
@@ -455,7 +480,10 @@ async fn hooked_pair(listener: &str, dialer: &str, release_delay: Duration) -> H
         .bind()
         .await
         .expect("bind listener");
-    let router = Router::builder(listener).accept(ECHO_ALPN, Echo).spawn();
+    let router = Router::builder(listener)
+        .accept(ECHO_ALPN, Echo)
+        .accept(CLOSE_ALPN, EchoThenClose)
+        .spawn();
 
     let dialer_transport = BleGattTransport::builder()
         .dialer(dial_with(adapter(&network, dialer).await, config()))
@@ -537,6 +565,31 @@ async fn a_link_closes_when_its_last_connection_ends() {
     assert!(
         until_no_links(&pair.listener_transport, Duration::from_secs(5)).await,
         "the served link closes before the 20s idle timeout"
+    );
+}
+
+/// The accepting side closes the connection; the dialling side, which only
+/// receives the close, drops its handle and releases its link once drained
+/// (ADR-0008 D3).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_link_closes_when_the_peer_closes_its_connection() {
+    let pair = hooked_pair_with_delays(
+        "AA:00:00:00:00:18",
+        "AA:00:00:00:00:17",
+        Duration::from_secs(60),
+        Duration::ZERO,
+    )
+    .await;
+    let connection = tokio::time::timeout(TIMEOUT, pair.dialer.connect(pair.listener_id, CLOSE_ALPN))
+        .await
+        .expect("connect in time")
+        .expect("connect");
+    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&connection, b"once")).await.expect("echo in time"), b"once");
+    tokio::time::timeout(TIMEOUT, connection.closed()).await.expect("closed by the peer in time");
+    drop(connection);
+    assert!(
+        until_no_links(&pair.dialer_transport, Duration::from_secs(5)).await,
+        "the dialled link closes before the 20s idle timeout"
     );
 }
 

@@ -76,7 +76,10 @@ CONNECTION_CLOSE is sent, or when the peer's arrives), and cutting the link
 then lost the peer's copy on hardware. QUIC then drains for three probe
 timeouts; noq's connection driver holds the connection until that is over,
 so the weak handle dies exactly when it has drained and the application has
-dropped its own handles. Neither noq nor iroh signals that moment, so the
+dropped its own handles. Streams count as handles: each `SendStream` and
+`RecvStream` holds the connection (noq `send_stream.rs`, `recv_stream.rs`),
+and on the mock radio one stream kept after a peer's close held the link up
+past the test's 5 s. Neither noq nor iroh signals that moment, so the
 hook checks the weak handle every 10 ms after `on_closed`. On the mock radio
 (RTT 8 ms) `on_closed` fired 0.25 ms after `close()` and the handle died
 after 201 ms (346 ms on the peer's side).

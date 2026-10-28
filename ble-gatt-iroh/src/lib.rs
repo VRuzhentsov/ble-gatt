@@ -344,6 +344,12 @@ impl BleGattTransport {
     /// any [`link_release_delay`](BleGattTransportBuilder::link_release_delay),
     /// instead of after the idle timeout. That close leaves a link the peer dialled to the peer, as an
     /// idle close does; only [`close_link`](Self::close_link) disconnects it.
+    ///
+    /// iroh reports no drained event, so the hooks wait for the last strong
+    /// reference to the connection to go. Every `Connection` clone and every
+    /// `SendStream` and `RecvStream` the application keeps is one: keep any
+    /// of them after the connection closed and the link stays up until the
+    /// idle timeout.
     pub fn hooks(&self) -> BleGattHooks {
         BleGattHooks { inner: self.inner.clone() }
     }
@@ -642,6 +648,11 @@ fn forget_connection(inner: &Inner, connection: u64) {
     }
     let releasers = inner.releasers.lock().expect("poisoned");
     for address in &released {
+        log::debug!(
+            "link to {}: its last connection ended, {} link(s) to release",
+            address.0,
+            releasers.get(address).map_or(0, Vec::len)
+        );
         for release in releasers.get(address).into_iter().flatten() {
             // Stores a permit when the link is not waiting yet.
             release.notify_one();
@@ -703,10 +714,22 @@ impl EndpointHooks for BleGattHooks {
             // still drains for three probe timeouts; noq's driver holds the
             // connection until that ends, so the weak handle dies exactly
             // when it is drained (and the application dropped its handles).
-            // Neither noq nor iroh signals that, so it is checked.
+            // Neither noq nor iroh signals that, so it is checked. A stream
+            // or path handle the application keeps also holds it.
+            let reason = weak.upgrade().and_then(|conn| conn.close_reason());
+            log::debug!(
+                "connection {connection} to {}: closing ({reason:?}), waiting for it to drain",
+                endpoint.fmt_short()
+            );
+            let closing = Instant::now();
             while weak.upgrade().is_some() {
                 tokio::time::sleep(DRAINED_CHECK_INTERVAL).await;
             }
+            log::debug!(
+                "connection {connection} to {}: drained after {:?}",
+                endpoint.fmt_short(),
+                closing.elapsed()
+            );
             forget_connection(&inner, connection);
         });
         AfterHandshakeOutcome::accept()
