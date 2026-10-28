@@ -1520,12 +1520,12 @@ fn describe_pending_exception(env: &mut JNIEnv) -> Option<String> {
 /// build of this file failed with `ClassNotFoundException: Didn't find
 /// class "dev.blegatt.BleGattBridge"` at exactly this call site. The
 /// standard fix is to resolve the class through the app's own classloader,
-/// obtained from any object the app's classloader already loaded — the
-/// `Context` passed in at construction time.
+/// `Context.getClassLoader()`. Not the classloader of the context's class:
+/// the context is the Application, and an app without its own subclass has
+/// a plain `android.app.Application`, a framework class.
 fn load_app_class<'a>(env: &mut JNIEnv<'a>, context: &JObject, binary_name: &str) -> Result<JClass<'a>> {
-    let context_class = env.get_object_class(context).map_err(|err| BleError::Gatt(err.to_string()))?;
     let class_loader = env
-        .call_method(&context_class, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+        .call_method(context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
         .and_then(|v| v.l())
         .map_err(|err| BleError::Gatt(format!("getClassLoader failed: {err}")))?;
     let name = env.new_string(binary_name).map_err(|err| BleError::Gatt(err.to_string()))?;

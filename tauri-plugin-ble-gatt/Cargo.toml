@@ -22,6 +22,7 @@ uuid.workspace = true
 [target.'cfg(target_os = "android")'.dependencies]
 tao = "0.35"
 ndk-context = "0.1"
+jni = "0.21"
 
 [build-dependencies]
 tauri-plugin = { version = "2", features = ["build"] }
