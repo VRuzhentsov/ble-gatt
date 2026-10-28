@@ -45,8 +45,11 @@ went to its new one.
 `Driver::close()`: stop serving and disconnect every link this process
 dialled, waiting a bounded time for each. On Linux it does that work; the
 other drivers keep the default, which does nothing, because their platforms
-release a dead app's links themselves. `tauri-plugin-ble-gatt` calls it when
-the app exits (`RunEvent::Exit`). It cannot run on `kill -9` or a crash.
+release a dead app's links themselves. `tauri-plugin-ble-gatt` calls it on
+Linux when the app exits (`RunEvent::Exit`). It cannot run on `kill -9` or a
+crash. It does not run on Android: there Tauri sends `Exit` whenever the
+last activity is destroyed, also while the process keeps running and the
+system starts a new activity (seen on hardware about 3 s after launch).
 
 **D2 — Sweep at startup.** The first time the Linux driver scans for or
 advertises a service, before it starts, it disconnects every device BlueZ

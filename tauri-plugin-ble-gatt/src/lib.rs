@@ -43,6 +43,7 @@ pub enum Error {
 
 /// How long quitting the app waits for Bluetooth to be released. A BlueZ
 /// disconnect took about 2s on hardware.
+#[cfg(target_os = "linux")]
 const EXIT_CLOSE_LIMIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Registers the plugin with the platform's default driver.
@@ -95,11 +96,19 @@ impl Builder {
             })
             // BlueZ keeps a process's links after it exits; release them on
             // the way out (ADR-0009 D1). Bounded, so a radio that does not
-            // answer cannot hold up quitting.
-            .on_event(|app, event| {
-                if let tauri::RunEvent::Exit = event {
-                    let driver = app.state::<BleGatt<R>>().driver.clone();
-                    let closed = tauri::async_runtime::block_on(tokio::time::timeout(EXIT_CLOSE_LIMIT, driver.close()));
+            // answer cannot hold up quitting. Linux only: on Android, Tauri
+            // sends Exit when the activity is destroyed while the process
+            // keeps running (seen on hardware when the system relaunched it),
+            // and Android releases a dead app's links itself.
+            .on_event(|_app, _event| {
+                #[cfg(target_os = "linux")]
+                if let tauri::RunEvent::Exit = _event {
+                    let driver = _app.state::<BleGatt<R>>().driver.clone();
+                    // The timeout is built inside the runtime: its timer
+                    // needs a reactor when it is created.
+                    let closed = tauri::async_runtime::block_on(async move {
+                        tokio::time::timeout(EXIT_CLOSE_LIMIT, driver.close()).await
+                    });
                     match closed {
                         Ok(Ok(())) => {}
                         Ok(Err(err)) => log::warn!("closing Bluetooth on exit failed: {err}"),
