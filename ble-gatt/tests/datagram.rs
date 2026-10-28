@@ -1356,3 +1356,44 @@ async fn a_sender_sends_while_the_channel_receives() {
     central.close().await.expect("close");
     assert!(sender.send(b"late".to_vec()).await.is_err(), "a closed channel refuses sends");
 }
+
+/// Closing a served channel frees the server for the next channel and keeps
+/// the central connected and subscribed: the central's next write opens a
+/// channel that can answer. On Android a disconnect of a link the central
+/// opened did not end it but forgot the subscription, so every later
+/// channel failed its first notify.
+#[tokio::test]
+async fn closing_a_served_channel_keeps_its_central_for_the_next_one() {
+    let network = MockNetwork::new();
+    let config = config();
+    let peripheral_addr = PeerAddress("peripheral-keep".to_string());
+    let peripheral = Arc::new(MockDriver::new(peripheral_addr.clone(), network.clone(), full_capabilities()));
+    let central = Arc::new(MockDriver::new(PeerAddress("central-keep".to_string()), network, full_capabilities()));
+
+    let mut incoming = datagram::serve(&adapter(&peripheral).await, &config).await.expect("serve should start");
+    let mut dialled = datagram::connect(&adapter(&central).await, &peripheral_addr, &config)
+        .await
+        .expect("connect should succeed");
+    dialled.send(b"first".to_vec()).await.expect("first send");
+    let mut served = tokio::time::timeout(Duration::from_secs(2), incoming.next())
+        .await
+        .expect("serve should yield a channel")
+        .expect("channel stream should not be closed");
+    assert_eq!(served.recv().await.expect("first message").expect("first message"), b"first");
+    served.close().await.expect("close");
+    drop(served);
+
+    dialled.send(b"second".to_vec()).await.expect("the central is still connected");
+    let mut next = tokio::time::timeout(Duration::from_secs(2), incoming.next())
+        .await
+        .expect("the next write opens a channel")
+        .expect("channel stream should not be closed");
+    assert_eq!(next.recv().await.expect("second message").expect("second message"), b"second");
+    next.send(b"answer".to_vec()).await.expect("the new channel can answer");
+    let answer = tokio::time::timeout(Duration::from_secs(2), dialled.recv())
+        .await
+        .expect("answer in time")
+        .expect("channel open")
+        .expect("answer");
+    assert_eq!(answer, b"answer");
+}

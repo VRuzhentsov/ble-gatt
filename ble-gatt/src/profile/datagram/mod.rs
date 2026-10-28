@@ -349,7 +349,10 @@ pub struct DatagramChannel {
     /// in `inbound`, so subsequent writes went to a closed receiver, the
     /// entry was never removed, and every other central was refused
     /// indefinitely.
-    release: Option<(mpsc::UnboundedSender<(PeerAddress, u64)>, u64)>,
+    release: Option<(mpsc::UnboundedSender<Released>, u64)>,
+    /// Set by `close()` in the peripheral role: the release then frees the
+    /// slot and leaves the central connected and subscribed.
+    keep_peer: bool,
     /// The driver session this channel is bound to, when the driver can
     /// distinguish successive connections to one address.
     session: Option<u64>,
@@ -391,7 +394,11 @@ impl Drop for DatagramChannel {
         // release whatever entry the *same address* currently occupies,
         // disconnecting a central that had just reconnected.
         if let Some((release, generation)) = &self.release {
-            let _ = release.send((self.peer.clone(), *generation));
+            let _ = release.send(Released {
+                peer: self.peer.clone(),
+                generation: *generation,
+                keep_peer: self.keep_peer,
+            });
         }
         // Central role only: `close()` is the normal way to tear down the
         // platform connection, but a caller that drops the channel without
@@ -574,8 +581,17 @@ impl DatagramChannel {
             },
             // The peripheral does not own the link; a central disconnecting
             // is what ends it. Stopping advertising here would tear down
-            // every other peer's channel too.
-            Sink::Notify { .. } => Ok(()),
+            // every other peer's channel too. Releasing the channel then
+            // keeps the central connected and subscribed, so its next write
+            // opens a channel that can answer: Android does not drop a link
+            // the central opened (`cancelConnection` found no app holding
+            // it, on hardware), and forgetting the subscription left every
+            // later channel unable to notify. Apple's `CBPeripheralManager`
+            // has no call to disconnect a central at all.
+            Sink::Notify { .. } => {
+                self.keep_peer = true;
+                Ok(())
+            }
         }
     }
 
@@ -706,6 +722,14 @@ impl DatagramSender {
 
 /// A served peer's fragment sender, channel-liveness flag, and overflow
 /// signal, as held by `serve` while that peer occupies the single slot.
+/// A served channel was dropped. `keep_peer` when it was closed first, so
+/// the central keeps its connection.
+struct Released {
+    peer: PeerAddress,
+    generation: u64,
+    keep_peer: bool,
+}
+
 struct ServedPeer {
     /// The driver's own session id for this peer's connection, so a
     /// lifecycle event from a previous one can be recognised and ignored.
@@ -719,12 +743,13 @@ struct ServedPeer {
 }
 
 /// Free the single-central slot for a peer whose channel the caller dropped,
-/// and drop the peer so it is not left subscribed to a server that is no
-/// longer reading from it.
+/// and, unless the caller closed it first, drop the peer so it is not left
+/// subscribed to a server that is no longer reading from it.
 async fn release_peer(
-    inbound: &mut HashMap<PeerAddress, ServedPeer>, peer: &PeerAddress, generation: u64,
-    driver: &dyn Driver,
+    inbound: &mut HashMap<PeerAddress, ServedPeer>, released: Released, driver: &dyn Driver,
 ) {
+    let Released { peer, generation, keep_peer } = released;
+    let peer = &peer;
     // Only if this release belongs to the channel currently holding the
     // slot. A late release from a superseded generation must not evict the
     // peer that replaced it.
@@ -733,6 +758,10 @@ async fn release_peer(
     }
     if let Some(served) = inbound.remove(peer) {
         served.active.store(false, Ordering::SeqCst);
+        if keep_peer {
+            log::info!("release: central {} session={:?}, kept connected", peer.0, served.driver_session);
+            return;
+        }
         // Named by the driver session this channel was serving. Releasing a
         // channel from a superseded `serve` generation would otherwise
         // disconnect whatever now holds the address — the peer's own
@@ -993,6 +1022,7 @@ pub(crate) async fn connect_driver(
         // Central channels are not held in anyone's slot, so nothing needs
         // telling when this one goes away.
         release: None,
+        keep_peer: false,
         session,
         // Set when the driver reports it dropped notifications — the
         // central-side equivalent of `serve`'s fragment-queue overflow.
@@ -1151,7 +1181,7 @@ pub(crate) async fn serve_driver(
     log::info!("serve: advertising accepted, awaiting centrals");
 
     let (channels_tx, channels_rx) = mpsc::channel(config.accept_queue_depth);
-    let (release_tx, mut release_rx) = mpsc::unbounded_channel::<(PeerAddress, u64)>();
+    let (release_tx, mut release_rx) = mpsc::unbounded_channel::<Released>();
     let config = config.clone();
     // Fallback when the driver cannot report a peer's notification size
     // (`Driver::notify_max_len`): the spec-minimum. Conservative on purpose:
@@ -1183,8 +1213,8 @@ pub(crate) async fn serve_driver(
             let event = if accept_closed {
                 tokio::select! {
                     released = release_rx.recv() => {
-                        let Some((peer, generation)) = released else { return };
-                        release_peer(&mut inbound, &peer, generation, driver.as_ref()).await;
+                        let Some(released) = released else { return };
+                        release_peer(&mut inbound, released, driver.as_ref()).await;
                         if inbound.is_empty() {
                             return;
                         }
@@ -1208,8 +1238,8 @@ pub(crate) async fn serve_driver(
                     // this the peer stayed in `inbound` forever, holding the
                     // single-central slot against everyone else.
                     released = release_rx.recv() => {
-                        if let Some((peer, generation)) = released {
-                            release_peer(&mut inbound, &peer, generation, driver.as_ref()).await;
+                        if let Some(released) = released {
+                            release_peer(&mut inbound, released, driver.as_ref()).await;
                         }
                         continue;
                     }
@@ -1237,8 +1267,8 @@ pub(crate) async fn serve_driver(
                     // the arriving central is refused *and disconnected* on
                     // behalf of a peer that is already gone, and the caller
                     // never learns why.
-                    while let Ok((released, generation)) = release_rx.try_recv() {
-                        release_peer(&mut inbound, &released, generation, driver.as_ref()).await;
+                    while let Ok(released) = release_rx.try_recv() {
+                        release_peer(&mut inbound, released, driver.as_ref()).await;
                     }
 
                     // `Connected` is NOT once-per-connection. Both real
@@ -1310,6 +1340,7 @@ pub(crate) async fn serve_driver(
                         })),
                         inbound: ReceiverStream::new(msg_rx),
                         release: Some((release_tx.clone(), generation)),
+                        keep_peer: false,
                         session: driver_session,
                         overflow: overflow.clone(),
                         next_msg_id: Arc::default(),

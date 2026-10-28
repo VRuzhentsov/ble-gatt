@@ -99,6 +99,17 @@ and `close_links` drop a link the peer dialled (`DatagramChannel::disconnect`).
 On Linux, dropping it ends the whole link to that address, including a busy
 link this side dialled, so it must stay an explicit request.
 
+*Outcome.* On hardware the peripheral's release still disconnected the
+central: a served channel dropped after `close()` went through the same
+release as one simply dropped, which disconnects. Android did not end the
+link (`cancelConnection` found no app holding a link the central opened) but
+forgot the central's subscription, so each later write opened a channel
+whose first notify failed, and the next connection never got through. Now a
+served channel closed with `close()` frees the server and keeps the central
+connected and subscribed; dropping one without `close()` still disconnects
+it. Precedent: Apple's `CBPeripheralManager` has no call to disconnect a
+central at all. Test: `closing_a_served_channel_keeps_its_central_for_the_next_one`.
+
 **D4 — One link to a peer carries both directions.** A BLE link already does:
 the central writes, the peripheral notifies. When iroh sends to a peer key
 that has a link in either role, the transport sends on it and does not dial.
