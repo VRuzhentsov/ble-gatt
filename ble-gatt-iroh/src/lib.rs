@@ -277,6 +277,9 @@ struct Learned {
     /// Those of them not closing yet: a closing connection sends nothing,
     /// so it never makes the peer dial back; see `REDIAL_YIELD`.
     open: HashSet<u64>,
+    /// Connections that used the address and have ended (their close sent
+    /// or received) but not drained yet; see `Sender::send`.
+    ended: HashSet<u64>,
 }
 
 impl fmt::Debug for BleGattTransport {
@@ -600,7 +603,10 @@ async fn run_link(
             // No link is left at the address. A connection still using it
             // keeps the entry, for `close_links` and a link that replaces it.
             let mut learned = inner.learned.lock().expect("poisoned");
-            if learned.get(&peer).is_some_and(|learned| learned.connections.is_empty()) {
+            if learned
+                .get(&peer)
+                .is_some_and(|learned| learned.connections.is_empty() && learned.ended.is_empty())
+            {
                 learned.remove(&peer);
             }
         }
@@ -675,12 +681,14 @@ fn learn(inner: &Inner, endpoint: EndpointId, connection: u64, addr: &TransportA
         endpoint,
         connections: HashSet::new(),
         open: HashSet::new(),
+        ended: HashSet::new(),
     });
     // A private address another device now uses.
     if entry.endpoint != endpoint {
         entry.endpoint = endpoint;
         entry.connections.clear();
         entry.open.clear();
+        entry.ended.clear();
     }
     entry.open.insert(connection);
     if entry.connections.insert(connection) {
@@ -700,8 +708,11 @@ fn connection_closing(inner: &Inner, connection: u64) {
 fn forget_connection(inner: &Inner, connection: u64) {
     let mut released = Vec::new();
     for (address, learned) in inner.learned.lock().expect("poisoned").iter_mut() {
-        if learned.connections.remove(&connection) && learned.connections.is_empty() {
-            released.push(address.clone());
+        if learned.connections.remove(&connection) {
+            learned.ended.insert(connection);
+            if learned.connections.is_empty() {
+                released.push(address.clone());
+            }
         }
     }
     let releasers = inner.releasers.lock().expect("poisoned");
@@ -716,6 +727,27 @@ fn forget_connection(inner: &Inner, connection: u64) {
             release.notify_one();
         }
     }
+}
+
+/// iroh connection `connection`, ended earlier, has drained. An address with
+/// no link left and nothing else using it is forgotten.
+fn connection_drained(inner: &Inner, connection: u64) {
+    // `links` before `learned`, as in `run_link`.
+    let links = inner.links.lock().expect("poisoned");
+    inner.learned.lock().expect("poisoned").retain(|address, learned| {
+        learned.ended.remove(&connection);
+        !learned.connections.is_empty() || !learned.ended.is_empty() || links.contains_key(address)
+    });
+}
+
+/// Whether only connections that have ended use `peer`.
+fn only_ended(inner: &Inner, peer: &PeerAddress) -> bool {
+    inner
+        .learned
+        .lock()
+        .expect("poisoned")
+        .get(peer)
+        .is_some_and(|learned| learned.connections.is_empty() && !learned.ended.is_empty())
 }
 
 /// Whether a live iroh connection uses `peer`.
@@ -808,6 +840,11 @@ impl EndpointHooks for BleGattHooks {
                 }
             }
             forget_connection(&inner, connection);
+            // Still known until drained, so its late packets dial nothing.
+            while weak.upgrade().is_some() {
+                tokio::time::sleep(DRAINED_CHECK_INTERVAL).await;
+            }
+            connection_drained(&inner, connection);
         });
         AfterHandshakeOutcome::accept()
     }
@@ -833,14 +870,19 @@ async fn close_sent(inner: &Inner, weak: &WeakConnectionHandle, connection: u64)
         }
         tokio::time::sleep(DRAINED_CHECK_INTERVAL).await;
     }
+    // `learned` is released before `links` is taken: `run_link` takes them
+    // the other way round.
+    let addresses: Vec<PeerAddress> = inner
+        .learned
+        .lock()
+        .expect("poisoned")
+        .iter()
+        .filter(|(_, learned)| learned.connections.contains(&connection))
+        .map(|(address, _)| address.clone())
+        .collect();
     let links: Vec<mpsc::Sender<Outgoing>> = {
-        let learned = inner.learned.lock().expect("poisoned");
         let links = inner.links.lock().expect("poisoned");
-        learned
-            .iter()
-            .filter(|(_, learned)| learned.connections.contains(&connection))
-            .filter_map(|(address, _)| links.get(address).cloned())
-            .collect()
+        addresses.iter().filter_map(|address| links.get(address).cloned()).collect()
     };
     let sent = async {
         for link in links {
@@ -1036,6 +1078,16 @@ impl Sender {
         if self.inner.retired.lock().expect("poisoned").contains_key(peer) {
             log::debug!("not dialling {}: replaced by set_peer_address", peer.0);
             return Ok(());
+        }
+        // Only connections that have ended use the address. A closing one
+        // answers the peer's late packets with its CONNECTION_CLOSE, and
+        // dialling to carry that brought a link back up right after its
+        // release. A new connection starts with an Initial, which dials.
+        if let Outgoing::Packet(bytes) = &packet {
+            if !is_quic_initial(bytes) && only_ended(&self.inner, peer) {
+                log::debug!("not dialling {}: only connections that have ended use it", peer.0);
+                return Ok(());
+            }
         }
         // The last link with this address was one the peer dialled. Dropping
         // the packet reads to QUIC as loss, and it resends once a link exists.
