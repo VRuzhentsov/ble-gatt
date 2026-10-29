@@ -672,3 +672,69 @@ async fn crossed_connects_both_work_and_their_links_close() {
     assert!(until_no_links(a_transport, Duration::from_secs(5)).await, "a's links close");
     assert!(until_no_links(b_transport, Duration::from_secs(5)).await, "b's links close");
 }
+
+/// A refuses the connection B dialled in, and B's release then drops the
+/// link. Nothing is left to make B dial back, so A's own connect goes out at
+/// once instead of waiting out REDIAL_YIELD.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_connection_does_not_hold_back_a_dial() {
+    let network = MockNetwork::new();
+    let a_address = PeerAddress("AA:00:00:00:00:1C".to_string());
+    let b_address = PeerAddress("AA:00:00:00:00:1D".to_string());
+    let mut sides = Vec::new();
+    // A's release delay is longer than the test, so only B's release can
+    // drop the link, as on hardware.
+    for (own, release_delay) in [(&a_address, Duration::from_secs(60)), (&b_address, Duration::ZERO)] {
+        let adapter = adapter(&network, &own.0).await;
+        let transport = BleGattTransport::builder()
+            .dialer(dial_with(adapter.clone(), config()))
+            .link_release_delay(release_delay)
+            .build();
+        let incoming = datagram::serve(&adapter, &config()).await.expect("serve");
+        let attach_to = transport.clone();
+        tokio::spawn(async move {
+            let mut incoming = incoming;
+            while let Some(channel) = incoming.next().await {
+                attach_to.attach(channel);
+            }
+        });
+        let key = SecretKey::generate();
+        let id = key.public();
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .secret_key(key)
+            .relay_mode(RelayMode::Disabled)
+            .clear_ip_transports()
+            .add_custom_transport(Arc::new(transport.clone()))
+            .address_lookup(transport.address_lookup())
+            .hooks(transport.hooks())
+            .bind()
+            .await
+            .expect("bind");
+        let router = Router::builder(endpoint.clone())
+            .accept(ECHO_ALPN, Echo)
+            .accept(CLOSE_ALPN, EchoThenClose)
+            .spawn();
+        sides.push((transport, endpoint, id, router));
+    }
+    let (a_transport, a, a_id, _a_router) = &sides[0];
+    let (b_transport, b, b_id, _b_router) = &sides[1];
+    a_transport.set_peer_address(*b_id, b_address.clone());
+    b_transport.set_peer_address(*a_id, a_address.clone());
+
+    let refused = tokio::time::timeout(TIMEOUT, b.connect(*a_id, CLOSE_ALPN))
+        .await
+        .expect("connect in time")
+        .expect("connect");
+    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&refused, b"b to a")).await.expect("echo in time"), b"b to a");
+    tokio::time::timeout(TIMEOUT, refused.closed()).await.expect("closed by A in time");
+    drop(refused);
+    assert!(until_no_links(b_transport, Duration::from_secs(5)).await, "b's link closes");
+    assert!(until_no_links(a_transport, Duration::from_secs(5)).await, "a sees the link drop");
+
+    // Well inside REDIAL_YIELD (30s): A dials B at once.
+    let connection = tokio::time::timeout(Duration::from_secs(10), a.connect(*b_id, ECHO_ALPN))
+        .await
+        .expect("A dials without waiting for B to dial back")
+        .expect("connect");
+    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&connection, b"a to b")).await.expect("echo in time"), b"a to b");
+}

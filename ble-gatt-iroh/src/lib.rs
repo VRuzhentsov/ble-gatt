@@ -78,6 +78,8 @@ pub const DEFAULT_LINK_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 /// re-dialling at once crossed on hardware: two links to one peer, each
 /// tearing the other down. The dialler re-dials within a second or two (a
 /// dial times out at 20s), so this only has to outlast one dial attempt.
+/// Not started when no open connection is left to make the peer re-dial;
+/// see `run_link`.
 const REDIAL_YIELD: Duration = Duration::from_secs(30);
 
 /// How long a dial waits for links to the same endpoint's other addresses
@@ -262,6 +264,9 @@ struct Learned {
     endpoint: EndpointId,
     /// The live iroh connections that have used the address.
     connections: HashSet<u64>,
+    /// Those of them not closing yet: a closing connection sends nothing,
+    /// so it never makes the peer dial back; see `REDIAL_YIELD`.
+    open: HashSet<u64>,
 }
 
 impl fmt::Debug for BleGattTransport {
@@ -540,12 +545,22 @@ async fn run_link(
     // dialled us, and the yield would then hold back dials the newer link's
     // side is entitled to make. A close by this side starts no yield: no
     // QUIC connection is left to resend, so the peer will not dial back, and
-    // on hardware this side's next connect timed out waiting for it.
+    // on hardware this side's next connect timed out waiting for it. Nor
+    // does a drop after every connection the hooks saw on the link had
+    // started to close (a refused session, say): a closing connection
+    // sends nothing (RFC 9000 §10.2), so again nothing makes the peer dial
+    // back. Without the hooks nothing is known, and the yield starts.
     {
         let mut links = inner.links.lock().expect("poisoned");
         if links.get(&peer).is_some_and(|current| current.same_channel(&link)) {
             if role == Role::Peripheral {
-                let dropped = (!closed_here).then(Instant::now);
+                let all_closing = inner
+                    .learned
+                    .lock()
+                    .expect("poisoned")
+                    .get(&peer)
+                    .is_some_and(|learned| learned.open.is_empty());
+                let dropped = (!closed_here && !all_closing).then(Instant::now);
                 inner.answered.lock().expect("poisoned").insert(peer.clone(), dropped);
             }
             links.remove(&peer);
@@ -626,14 +641,24 @@ fn learn(inner: &Inner, endpoint: EndpointId, connection: u64, addr: &TransportA
     let entry = learned.entry(address.clone()).or_insert_with(|| Learned {
         endpoint,
         connections: HashSet::new(),
+        open: HashSet::new(),
     });
     // A private address another device now uses.
     if entry.endpoint != endpoint {
         entry.endpoint = endpoint;
         entry.connections.clear();
+        entry.open.clear();
     }
+    entry.open.insert(connection);
     if entry.connections.insert(connection) {
         log::debug!("link to {}: carries {}", address.0, endpoint.fmt_short());
+    }
+}
+
+/// iroh connection `connection` started to close.
+fn connection_closing(inner: &Inner, connection: u64) {
+    for learned in inner.learned.lock().expect("poisoned").values_mut() {
+        learned.open.remove(&connection);
     }
 }
 
@@ -708,6 +733,7 @@ impl EndpointHooks for BleGattHooks {
                     },
                 }
             }
+            connection_closing(&inner, connection);
             // `closed` fires when the close starts: at `close()`, before its
             // CONNECTION_CLOSE is even sent, or when the peer's arrives.
             // Cutting the link then lost the peer's copy on hardware. QUIC

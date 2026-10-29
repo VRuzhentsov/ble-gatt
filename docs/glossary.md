@@ -292,6 +292,13 @@ One transport address an iroh connection can use to reach the peer
 Both devices dialling each other at the same moment, so two links or two
 connections come up where one was wanted.
 
+### Redial yield
+After a link the peer dialled drops, the time (`REDIAL_YIELD`, 30 s) for
+which `ble-gatt-iroh` does not dial that peer, so that the peer, which re-dials
+for its still-open iroh connection, does not cross with it. It starts only
+when such a connection may still be open: not after this side closed the
+link, nor after every connection on it had started to close.
+
 ### Adapter crate
 A crate that connects `ble-gatt` to something outside it, such as iroh
 (`ble-gatt-iroh`) or Tauri (`tauri-plugin-ble-gatt`). Layer: Interface

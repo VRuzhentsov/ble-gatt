@@ -110,6 +110,18 @@ connected and subscribed; dropping one without `close()` still disconnects
 it. Precedent: Apple's `CBPeripheralManager` has no call to disconnect a
 central at all. Test: `closing_a_served_channel_keeps_its_central_for_the_next_one`.
 
+*Outcome, the redial yield.* When the peer's release drops a link the peer
+dialled, the accepting side waited the redial yield (30 s) for the peer to
+dial back, but nothing was left to make it. On hardware the phone refused
+the desktop's connection; the desktop's D3 dropped the link, and the phone's
+own connect after the user switched the channel on was held back until it
+timed out. The yield now starts only if a connection the hooks saw on the
+link had not started to close: a closing connection sends nothing (RFC 9000
+§10.2), so only an open one makes the peer re-dial. Without the hooks it
+starts as before. A peer whose handshake is still running when the link
+drops is not seen and could cross; D5 covers that. Test:
+`a_refused_connection_does_not_hold_back_a_dial`.
+
 **D4 — One link to a peer carries both directions.** A BLE link already does:
 the central writes, the peripheral notifies. When iroh sends to a peer key
 that has a link in either role, the transport sends on it and does not dial.
