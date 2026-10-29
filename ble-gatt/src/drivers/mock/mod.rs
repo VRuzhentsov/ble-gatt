@@ -282,6 +282,8 @@ pub struct MockDriver {
     network: Arc<MockNetwork>,
     capabilities: CapabilityReport,
     events_tx: broadcast::Sender<GattEvent>,
+    /// What `Driver::served_service` reports, as the real drivers keep it.
+    served: std::sync::Mutex<Option<GattServiceSpec>>,
 }
 
 impl MockDriver {
@@ -291,7 +293,7 @@ impl MockDriver {
     pub fn new(address: PeerAddress, network: Arc<MockNetwork>, capabilities: CapabilityReport) -> Self {
         let (events_tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         network.register_events_sender(address.clone(), events_tx.clone());
-        Self { address, network, capabilities, events_tx }
+        Self { address, network, capabilities, events_tx, served: std::sync::Mutex::new(None) }
     }
 
     /// Simulate the peer dropping the link without warning — out of range,
@@ -356,15 +358,25 @@ impl Driver for MockDriver {
             return Err(BleError::PeripheralUnsupported);
         }
         service.validate()?;
-        self.network.advertise(&self.address, service).await
+        *self.served.lock().unwrap() = None;
+        self.network.advertise(&self.address, service.clone()).await?;
+        *self.served.lock().unwrap() = Some(service);
+        Ok(())
     }
 
     async fn update_advertisement(&self, service: GattServiceSpec) -> Result<()> {
         service.validate()?;
-        self.network.update_advertisement(&self.address, service).await
+        self.network.update_advertisement(&self.address, service.clone()).await?;
+        *self.served.lock().unwrap() = Some(service);
+        Ok(())
+    }
+
+    fn served_service(&self) -> Option<GattServiceSpec> {
+        self.served.lock().unwrap().clone()
     }
 
     async fn stop_advertising(&self) -> Result<()> {
+        *self.served.lock().unwrap() = None;
         self.network.stop_advertising(&self.address).await
     }
 

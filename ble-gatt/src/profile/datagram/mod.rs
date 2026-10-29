@@ -1575,7 +1575,15 @@ pub(crate) async fn serve_driver(
                         continue;
                     }
                     log::info!("serve: radio back; re-advertising service {}", config.service.0);
-                    if let Err(err) = driver.advertise(config.service_spec()).await {
+                    // With the latest `update_advertisement`'s data, not the
+                    // data `serve` started with: an update must survive a
+                    // power cycle.
+                    let spec = config.service_spec();
+                    let spec = driver
+                        .served_service()
+                        .filter(|served| served.same_service(&spec))
+                        .unwrap_or(spec);
+                    if let Err(err) = driver.advertise(spec).await {
                         log::warn!("serve: re-advertising after radio recovery failed: {err}");
                     }
                 }

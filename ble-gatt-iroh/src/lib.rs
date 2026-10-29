@@ -207,6 +207,7 @@ impl BleGattTransportBuilder {
         BleGattTransport {
             inner: Arc::new(Inner {
                 links: Mutex::new(HashMap::new()),
+                dropped: Mutex::new(HashMap::new()),
                 peers: Mutex::new(HashMap::new()),
                 retired: Mutex::new(HashMap::new()),
                 closers: Mutex::new(HashMap::new()),
@@ -236,6 +237,9 @@ pub struct BleGattTransport {
 struct Inner {
     /// One outbound queue per peer with a channel (open or being dialled).
     links: Mutex<HashMap<PeerAddress, mpsc::Sender<Outgoing>>>,
+    /// When a link to each address last dropped a packet for a full queue;
+    /// see `close_sent`.
+    dropped: Mutex<HashMap<PeerAddress, Instant>>,
     /// Where each known endpoint can be reached, for address lookup.
     peers: Mutex<HashMap<EndpointId, PeerAddress>>,
     /// Addresses `set_peer_address` replaced or `forget_peer` removed, and
@@ -521,7 +525,9 @@ async fn run_link(
                         tokio::spawn(async move { to_send.send(barrier).await });
                     }
                     // Like a full socket buffer: drop, QUIC recovers.
-                    Err(mpsc::error::TrySendError::Full(Outgoing::Packet(_))) => {}
+                    Err(mpsc::error::TrySendError::Full(Outgoing::Packet(_))) => {
+                        inner.dropped.lock().expect("poisoned").insert(peer.clone(), Instant::now());
+                    }
                     Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
@@ -830,7 +836,7 @@ impl EndpointHooks for BleGattHooks {
                         "connection {connection} to {}: closing ({reason:?}), waiting for its CONNECTION_CLOSE to go out",
                         endpoint.fmt_short()
                     );
-                    let sent = close_sent(&inner, &weak, connection).await;
+                    let sent = close_sent(&inner, &weak, connection, closing).await;
                     log::debug!(
                         "connection {connection} to {}: {} after {:?}",
                         endpoint.fmt_short(),
@@ -857,7 +863,13 @@ impl EndpointHooks for BleGattHooks {
 /// behind it on each link the connection used comes out once it was sent.
 /// Neither noq nor iroh signals either moment, so the count is checked like
 /// the drain.
-async fn close_sent(inner: &Inner, weak: &WeakConnectionHandle, connection: u64) -> bool {
+///
+/// A full queue drops packets without telling noq, so the barrier alone
+/// does not prove the close went out. When a link the connection used
+/// dropped one since the close started (`closing`, when the hooks saw it,
+/// less one check interval for the wake-up between the two), the close may
+/// be the one lost, and this waits for the drain, as before.
+async fn close_sent(inner: &Inner, weak: &WeakConnectionHandle, connection: u64, closing: Instant) -> bool {
     loop {
         // Dropped before the sleep: a kept `Connection` would hold the
         // drain off.
@@ -898,10 +910,22 @@ async fn close_sent(inner: &Inner, weak: &WeakConnectionHandle, connection: u64)
             tokio::time::sleep(DRAINED_CHECK_INTERVAL).await;
         }
     };
+    tokio::pin!(drained);
     tokio::select! {
-        () = sent => true,
-        () = drained => false,
+        () = sent => {}
+        () = &mut drained => return false,
     }
+    let since = closing.checked_sub(DRAINED_CHECK_INTERVAL).unwrap_or(closing);
+    let lost = {
+        let dropped = inner.dropped.lock().expect("poisoned");
+        addresses.iter().any(|address| dropped.get(address).is_some_and(|at| *at >= since))
+    };
+    if lost {
+        log::debug!("connection {connection}: a packet was dropped while it closed, waiting for it to drain");
+        drained.await;
+        return false;
+    }
+    true
 }
 
 fn add_releaser(inner: &Inner, peer: &PeerAddress) -> Arc<Notify> {
@@ -1064,7 +1088,11 @@ impl Sender {
         let mut links = self.inner.links.lock().expect("poisoned");
         let packet = match links.get(peer) {
             Some(link) => match link.try_send(Outgoing::Packet(packet)) {
-                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => return Ok(()),
+                Ok(()) => return Ok(()),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.inner.dropped.lock().expect("poisoned").insert(peer.clone(), Instant::now());
+                    return Ok(());
+                }
                 // The link ended; dial again below.
                 Err(mpsc::error::TrySendError::Closed(packet)) => {
                     links.remove(peer);

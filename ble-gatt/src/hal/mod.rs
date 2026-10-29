@@ -171,6 +171,14 @@ pub trait Driver: Send + Sync {
         Err(crate::BleError::Unsupported("updating the advertisement on this driver".into()))
     }
 
+    /// The service `advertise` serves, with the advertisement data of its
+    /// latest `update_advertisement`; `None` when nothing is served, or by
+    /// default. Serving re-advertises it after the radio comes back, so an
+    /// update is not undone by a power cycle.
+    fn served_service(&self) -> Option<GattServiceSpec> {
+        None
+    }
+
     async fn stop_advertising(&self) -> Result<()>;
 
     /// Release what this process holds on the radio before it exits: stop

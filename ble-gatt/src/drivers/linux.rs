@@ -82,6 +82,14 @@ const DISCOVERY_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// `StopDiscovery` on the discovery connection.
 const DISCOVERY_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long `update_advertisement` waits for BlueZ to free the instance of
+/// the advertisement it withdrew, on a controller with no spare one; bounded
+/// so a BlueZ that never reports it costs an update this long, not a hang.
+const ADVERTISING_INSTANCE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often that wait reads BlueZ's free instance count.
+const ADVERTISING_INSTANCE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
@@ -2156,6 +2164,10 @@ impl Driver for LinuxDriver {
         Ok(())
     }
 
+    fn served_service(&self) -> Option<GattServiceSpec> {
+        self.served_service.lock().unwrap().clone()
+    }
+
     async fn update_advertisement(&self, service: GattServiceSpec) -> Result<()> {
         service.validate()?;
         let _serialise = self.advertise_lock.lock().await;
@@ -2173,9 +2185,26 @@ impl Driver for LinuxDriver {
         }
         // Only the LEAdvertisement1 object is replaced. The GATT application,
         // its generation and every served central stay as they are.
-        // Registered before the old one is dropped, as `advertise` does.
-        let registered = self.adapter.advertise(advertisement(&service)).await;
+        // Registered before the old one is dropped, as `advertise` does, so
+        // advertising never pauses. Except on a controller with no free
+        // instance (some have one): BlueZ would refuse the second, so the
+        // old one is withdrawn first.
         let mut adv_handle = self.adv_handle.lock().await;
+        if adv_handle.is_some() && self.adapter.supported_advertising_instances().await.unwrap_or(1) == 0 {
+            // Dropping only queues bluer's UnregisterAdvertisement, so wait
+            // for BlueZ to report the instance free.
+            *adv_handle = None;
+            let freed = tokio::time::timeout(ADVERTISING_INSTANCE_WAIT, async {
+                while self.adapter.supported_advertising_instances().await.unwrap_or(1) == 0 {
+                    tokio::time::sleep(ADVERTISING_INSTANCE_CHECK_INTERVAL).await;
+                }
+            })
+            .await;
+            if freed.is_err() {
+                log::warn!("advertise: the old advertisement's instance is still in use");
+            }
+        }
+        let registered = self.adapter.advertise(advertisement(&service)).await;
         match registered {
             Ok(handle) => {
                 *adv_handle = Some(handle);

@@ -87,8 +87,9 @@ const CALLBACK_CLASS: &str = "dev/blegatt/NativeKt";
 /// matching number; a mismatch is logged at construction (see
 /// `AndroidDriver::new`). v2 added `onRadioState` / `bridgeAbiVersion` /
 /// `isRadioEnabled` (ADR-0005's adapter-state receiver). v3 added
-/// `requestConnectionPriority`.
-const BRIDGE_ABI_VERSION: i32 = 3;
+/// `requestConnectionPriority`. v4 added the local-name byte array to
+/// `startAdvertising`.
+const BRIDGE_ABI_VERSION: i32 = 4;
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 
@@ -854,6 +855,10 @@ impl Driver for AndroidDriver {
         let mut guard = guard;
         guard.armed = false;
         outcome
+    }
+
+    fn served_service(&self) -> Option<GattServiceSpec> {
+        self.inner.served_service.lock().unwrap().clone()
     }
 
     async fn update_advertisement(&self, service: GattServiceSpec) -> Result<()> {

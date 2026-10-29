@@ -190,6 +190,8 @@ async fn dropping_the_server_handle_stops_advertising() {
 struct CountingDriver {
     inner: Arc<dyn Driver>,
     advertise_calls: Arc<AtomicUsize>,
+    /// What the latest `advertise` call carried.
+    last_advertised: Arc<std::sync::Mutex<Option<GattServiceSpec>>>,
 }
 
 #[async_trait::async_trait]
@@ -207,8 +209,17 @@ impl Driver for CountingDriver {
     }
 
     async fn advertise(&self, service: GattServiceSpec) -> ble_gatt::Result<()> {
+        *self.last_advertised.lock().unwrap() = Some(service.clone());
         self.advertise_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.advertise(service).await
+    }
+
+    async fn update_advertisement(&self, service: GattServiceSpec) -> ble_gatt::Result<()> {
+        self.inner.update_advertisement(service).await
+    }
+
+    fn served_service(&self) -> Option<GattServiceSpec> {
+        self.inner.served_service()
     }
 
     async fn stop_advertising(&self) -> ble_gatt::Result<()> {
@@ -247,6 +258,7 @@ async fn a_radio_recovery_re_registers_the_service() {
     let counting = Arc::new(CountingDriver {
         inner: peripheral_driver.clone() as Arc<dyn Driver>,
         advertise_calls: advertise_calls.clone(),
+        last_advertised: Arc::default(),
     });
 
     let _server = Adapter::new(counting as Arc<dyn Driver>).await.peripheral().serve(service()).await.unwrap();
@@ -268,4 +280,65 @@ async fn a_radio_recovery_re_registers_the_service() {
     })
     .await
     .expect("a radio recovery re-registers the service");
+}
+
+/// Cycles `peripheral`'s radio once `serve` (by `start`) advertised and an
+/// update changed its manufacturer data, and returns what the recovery
+/// re-advertised.
+async fn re_advertised_after_an_update<F, Fut>(start: F) -> GattServiceSpec
+where
+    F: FnOnce(Adapter, GattServiceSpec) -> Fut,
+    Fut: std::future::Future<Output = Box<dyn std::any::Any>>,
+{
+    let network = MockNetwork::new();
+    let peripheral = device(&network, "peripheral");
+    let advertise_calls = Arc::new(AtomicUsize::new(0));
+    let last_advertised = Arc::new(std::sync::Mutex::new(None));
+    let counting = Arc::new(CountingDriver {
+        inner: peripheral.clone() as Arc<dyn Driver>,
+        advertise_calls: advertise_calls.clone(),
+        last_advertised: last_advertised.clone(),
+    });
+    let mut spec = service();
+    spec.manufacturer_data.insert(0xABCD, vec![0x01]);
+    let _server = start(Adapter::new(counting.clone() as Arc<dyn Driver>).await, spec.clone()).await;
+    // `datagram::serve` builds its own characteristic from its config.
+    spec = counting.served_service().expect("served");
+    spec.manufacturer_data.insert(0xABCD, vec![0x02]);
+    counting.update_advertisement(spec).await.expect("the advertisement should update");
+
+    peripheral.simulate_radio(RadioStatus::Off);
+    peripheral.simulate_radio(RadioStatus::On);
+    timeout(WAIT, async {
+        while advertise_calls.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a radio recovery re-registers the service");
+    let advertised = last_advertised.lock().unwrap().clone();
+    advertised.expect("advertised")
+}
+
+/// `Peripheral::serve`'s recovery re-advertises the updated data, so an
+/// update survives a power cycle.
+#[tokio::test]
+async fn a_radio_recovery_keeps_an_advertisement_update() {
+    let advertised = re_advertised_after_an_update(|adapter, spec| async move {
+        Box::new(adapter.peripheral().serve(spec).await.unwrap()) as Box<dyn std::any::Any>
+    })
+    .await;
+    assert_eq!(advertised.manufacturer_data.get(&0xABCD), Some(&vec![0x02]));
+}
+
+/// The same for `datagram::serve`.
+#[tokio::test]
+async fn a_radio_recovery_keeps_a_datagram_advertisement_update() {
+    let advertised = re_advertised_after_an_update(|adapter, spec| async move {
+        let mut config = ble_gatt::datagram::DatagramConfig::new(spec.uuid, spec.characteristics[0].uuid);
+        config.advertised_manufacturer_data = spec.manufacturer_data.clone();
+        Box::new(ble_gatt::datagram::serve(&adapter, &config).await.unwrap()) as Box<dyn std::any::Any>
+    })
+    .await;
+    assert_eq!(advertised.manufacturer_data.get(&0xABCD), Some(&vec![0x02]));
 }

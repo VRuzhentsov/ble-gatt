@@ -138,6 +138,8 @@ above), and BlueZ aborted its three dials to the phone meanwhile
   closing period, which only resends the close in answer to the peer's
   packets, is skipped: a lost close leaves the peer's connection to its
   idle timeout. If the connection drains first, it ends then, as before.
+  So does one whose link dropped a packet for a full queue while it
+  closed: the dropped packet may be the close, and noq is not told.
 - A release in the peripheral role disconnects the central on Linux, where
   no connection uses the address any more. On Android it still keeps the
   central (the outcome above).

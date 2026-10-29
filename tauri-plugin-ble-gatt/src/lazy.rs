@@ -103,6 +103,10 @@ impl Driver for LazyDriver {
         self.inner().await?.update_advertisement(service).await
     }
 
+    fn served_service(&self) -> Option<GattServiceSpec> {
+        self.cell.get()?.served_service()
+    }
+
     async fn stop_advertising(&self) -> Result<()> {
         self.inner().await?.stop_advertising().await
     }

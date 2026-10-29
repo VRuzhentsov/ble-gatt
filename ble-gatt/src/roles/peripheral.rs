@@ -117,7 +117,13 @@ fn spawn_recovery(
         while let Some(event) = events.next().await {
             if let GattEvent::RadioChanged { status: RadioStatus::On } = event {
                 log::info!("serve: radio recovered, re-registering service {}", service.uuid.0);
-                if let Err(err) = driver.advertise(service.clone()).await {
+                // With the latest `update_advertisement`'s data, so an update
+                // survives a power cycle.
+                let spec = driver
+                    .served_service()
+                    .filter(|served| served.same_service(&service))
+                    .unwrap_or_else(|| service.clone());
+                if let Err(err) = driver.advertise(spec).await {
                     log::warn!("serve: failed to re-register after radio recovery: {err}");
                 }
             }

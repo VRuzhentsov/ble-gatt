@@ -1624,8 +1624,9 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     /// a mismatch, which is the only signal a consumer vendoring an
     /// out-of-date copy of this file will get. v2: added `onRadioState` /
     /// `isRadioEnabled` / this method (ADR-0005). v3: added
-    /// `requestConnectionPriority`.
-    fun bridgeAbiVersion(): Int = 3
+    /// `requestConnectionPriority`. v4: added the local-name byte array to
+    /// `startAdvertising`.
+    fun bridgeAbiVersion(): Int = 4
 
     /// Whether the adapter is present and switched on. Rust's
     /// `Driver::radio_status()` calls this once at startup, so a `PeerLink`
