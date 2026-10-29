@@ -342,3 +342,27 @@ async fn a_radio_recovery_keeps_a_datagram_advertisement_update() {
     .await;
     assert_eq!(advertised.manufacturer_data.get(&0xABCD), Some(&vec![0x02]));
 }
+
+/// A server `stop_serving` stopped stays stopped across a radio recovery,
+/// even while its accept stream is still held.
+#[tokio::test]
+async fn a_radio_recovery_does_not_restart_a_stopped_server() {
+    let network = MockNetwork::new();
+    let peripheral = device(&network, "peripheral");
+    let advertise_calls = Arc::new(AtomicUsize::new(0));
+    let counting = Arc::new(CountingDriver {
+        inner: peripheral.clone() as Arc<dyn Driver>,
+        advertise_calls: advertise_calls.clone(),
+        last_advertised: Arc::default(),
+    });
+    let adapter = Adapter::new(counting as Arc<dyn Driver>).await;
+    let spec = service();
+    let config = ble_gatt::datagram::DatagramConfig::new(spec.uuid, spec.characteristics[0].uuid);
+    let _incoming = ble_gatt::datagram::serve(&adapter, &config).await.unwrap();
+    ble_gatt::datagram::stop_serving(&adapter).await.unwrap();
+
+    peripheral.simulate_radio(RadioStatus::Off);
+    peripheral.simulate_radio(RadioStatus::On);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(advertise_calls.load(Ordering::SeqCst), 1, "only serve's own advertise");
+}

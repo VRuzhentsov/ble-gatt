@@ -172,12 +172,13 @@ pub trait Driver: Send + Sync {
     }
 
     /// The service `advertise` serves, with the advertisement data of its
-    /// latest `update_advertisement`; `None` when nothing is served, or by
-    /// default. Serving re-advertises it after the radio comes back, so an
-    /// update is not undone by a power cycle.
-    fn served_service(&self) -> Option<GattServiceSpec> {
-        None
-    }
+    /// latest `update_advertisement`; `None` once `stop_advertising` ran or
+    /// before anything was served. Kept across a radio loss. Serving
+    /// re-advertises it after the radio comes back, so an update is not
+    /// undone by a power cycle, and re-advertises nothing when it is `None`,
+    /// so a stopped server stays stopped. No default: a wrapping driver must
+    /// forward it, or serving never recovers.
+    fn served_service(&self) -> Option<GattServiceSpec>;
 
     async fn stop_advertising(&self) -> Result<()>;
 

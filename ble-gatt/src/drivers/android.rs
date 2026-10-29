@@ -1871,6 +1871,13 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onRadioState<'local>(
             });
         }
         inner.server_sessions.lock().unwrap().clear();
+        // Kotlin's radio receiver stopped advertising, so a start result
+        // still awaited is ignored when it comes, as after
+        // `stop_advertising`: end the wait here, or `update_advertisement`
+        // keeps `advertise_lock` and blocks every later advertise.
+        if let Some(pending) = inner.advertise_tx.lock().unwrap().take() {
+            let _ = pending.send(Err(ADVERTISE_ERROR_STOPPED));
+        }
     }
     let _ = inner
         .server_events_tx

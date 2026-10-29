@@ -1574,15 +1574,18 @@ pub(crate) async fn serve_driver(
                     if accept_closed {
                         continue;
                     }
-                    log::info!("serve: radio back; re-advertising service {}", config.service.0);
                     // With the latest `update_advertisement`'s data, not the
                     // data `serve` started with: an update must survive a
-                    // power cycle.
-                    let spec = config.service_spec();
-                    let spec = driver
+                    // power cycle. Nothing served: `stop_serving` ran, and a
+                    // device stopped to be unreachable stays so.
+                    let Some(spec) = driver
                         .served_service()
-                        .filter(|served| served.same_service(&spec))
-                        .unwrap_or(spec);
+                        .filter(|served| served.same_service(&config.service_spec()))
+                    else {
+                        log::info!("serve: radio back; service {} was stopped, not re-advertising", config.service.0);
+                        continue;
+                    };
+                    log::info!("serve: radio back; re-advertising service {}", config.service.0);
                     if let Err(err) = driver.advertise(spec).await {
                         log::warn!("serve: re-advertising after radio recovery failed: {err}");
                     }
