@@ -48,11 +48,13 @@ use std::time::{Duration, Instant};
 use ble_gatt::datagram::{DatagramChannel, DatagramConfig};
 use ble_gatt::{Adapter, ConnectionPriority, PeerAddress, Role};
 use iroh::address_lookup::{self, AddressLookup, EndpointData, EndpointInfo, Item};
-use iroh::endpoint::{AfterHandshakeOutcome, Connection, EndpointHooks, PathEvent};
+use iroh::endpoint::{
+    AfterHandshakeOutcome, Connection, ConnectionError, EndpointHooks, PathEvent, WeakConnectionHandle,
+};
 use iroh::endpoint::transports::{CustomEndpoint, CustomSender, CustomTransport, RecvInfo, Transmit};
 use iroh_base::{CustomAddr, EndpointId, TransportAddr};
 use n0_future::StreamExt;
-use tokio::sync::{mpsc, watch, Notify};
+use tokio::sync::{mpsc, oneshot, watch, Notify};
 
 /// The custom address id of this transport ("BLEG"). iroh keeps a registry of
 /// transport ids in its `TRANSPORTS.md`; this one is private to `ble-gatt`.
@@ -87,9 +89,9 @@ const REDIAL_YIELD: Duration = Duration::from_secs(30);
 /// on hardware.
 const CLOSE_WAIT_LIMIT: Duration = Duration::from_secs(5);
 
-/// How long a link stays up after the last iroh connection on it has
-/// drained (ADR-0008 D3). None: draining already outlasts the
-/// CONNECTION_CLOSE, so the peer has it before the link goes. An application
+/// How long a link stays up after the last iroh connection on it has ended
+/// (ADR-0008 D3). None: the closing side waits for its CONNECTION_CLOSE to
+/// be sent, so the peer has it before the link goes. An application
 /// that wants a link kept for a connection it has yet to open keeps an
 /// earlier connection open until then, or sets a delay.
 pub const DEFAULT_LINK_RELEASE_DELAY: Duration = Duration::ZERO;
@@ -100,6 +102,14 @@ const DRAINED_CHECK_INTERVAL: Duration = Duration::from_millis(10);
 
 /// A packet received from a peer.
 type Inbound = (PeerAddress, Vec<u8>);
+
+/// What a link's queue carries to its channel.
+enum Outgoing {
+    Packet(Vec<u8>),
+    /// Fired once every packet queued before it has been sent (or the link
+    /// ended): the queue is first in, first out.
+    Barrier(oneshot::Sender<()>),
+}
 
 /// A future opening a datagram channel to a peer.
 pub type DialFuture = Pin<Box<dyn Future<Output = ble_gatt::Result<DatagramChannel>> + Send>>;
@@ -225,7 +235,7 @@ pub struct BleGattTransport {
 
 struct Inner {
     /// One outbound queue per peer with a channel (open or being dialled).
-    links: Mutex<HashMap<PeerAddress, mpsc::Sender<Vec<u8>>>>,
+    links: Mutex<HashMap<PeerAddress, mpsc::Sender<Outgoing>>>,
     /// Where each known endpoint can be reached, for address lookup.
     peers: Mutex<HashMap<EndpointId, PeerAddress>>,
     /// Addresses `set_peer_address` replaced or `forget_peer` removed, and
@@ -345,16 +355,17 @@ impl BleGattTransport {
     ///
     /// With them, [`close_links`](Self::close_links) reaches links the peer
     /// dialled, and a link closes once the last iroh connection on it has
-    /// drained (its CONNECTION_CLOSE sent and the draining period over), plus
-    /// any [`link_release_delay`](BleGattTransportBuilder::link_release_delay),
-    /// instead of after the idle timeout. That close leaves a link the peer dialled to the peer, as an
-    /// idle close does; only [`close_link`](Self::close_link) disconnects it.
+    /// ended, plus any
+    /// [`link_release_delay`](BleGattTransportBuilder::link_release_delay),
+    /// instead of after the idle timeout. A connection the peer closed ends
+    /// at once; one this side closed, once its CONNECTION_CLOSE was sent.
+    /// Neither waits out QUIC's closing or draining period. In the
+    /// peripheral role that close disconnects the central, except on
+    /// Android (ADR-0008 D3).
     ///
-    /// iroh reports no drained event, so the hooks wait for the last strong
-    /// reference to the connection to go. Every `Connection` clone and every
-    /// `SendStream` and `RecvStream` the application keeps is one: keep any
-    /// of them after the connection closed and the link stays up until the
-    /// idle timeout.
+    /// A connection that was not closed holds the link while any
+    /// `Connection` clone, `SendStream` or `RecvStream` the application
+    /// keeps is alive, since a lost connection ends only when those go.
     pub fn hooks(&self) -> BleGattHooks {
         BleGattHooks { inner: self.inner.clone() }
     }
@@ -428,17 +439,24 @@ async fn run_link(
     inner: Arc<Inner>,
     peer: PeerAddress,
     mut channel: DatagramChannel,
-    mut outbound: mpsc::Receiver<Vec<u8>>,
-    link: mpsc::Sender<Vec<u8>>,
+    mut outbound: mpsc::Receiver<Outgoing>,
+    link: mpsc::Sender<Outgoing>,
     close: Arc<Notify>,
 ) {
     log::debug!("link to {} up", peer.0);
     let role = channel.local_role();
-    let (to_send, mut sending) = mpsc::channel::<Vec<u8>>(LINK_QUEUE_DEPTH);
+    let (to_send, mut sending) = mpsc::channel::<Outgoing>(LINK_QUEUE_DEPTH);
     let sender = channel.sender();
     let send_peer = peer.clone();
     let mut send_task = tokio::spawn(async move {
-        while let Some(packet) = sending.recv().await {
+        while let Some(outgoing) = sending.recv().await {
+            let packet = match outgoing {
+                Outgoing::Packet(packet) => packet,
+                Outgoing::Barrier(reached) => {
+                    let _ = reached.send(());
+                    continue;
+                }
+            };
             if let Err(err) = sender.send(packet).await {
                 log::debug!("link to {}: send failed: {err}", send_peer.0);
                 break;
@@ -457,6 +475,7 @@ async fn run_link(
     // the peer.
     let mut closed_here = false;
     let mut closed_by_application = false;
+    let mut released_here = false;
     loop {
         tokio::select! {
             () = &mut idle => {
@@ -477,6 +496,7 @@ async fn run_link(
                 }
                 log::debug!("link to {}: no iroh connection left on it, closing", peer.0);
                 closed_here = true;
+                released_here = true;
                 break;
             }
             () = close.notified() => {
@@ -489,9 +509,17 @@ async fn run_link(
             packet = outbound.recv() => {
                 idle.as_mut().reset(tokio::time::Instant::now() + inner.link_idle_timeout);
                 let Some(packet) = packet else { break };
-                // Like a full socket buffer: drop, QUIC recovers.
-                if let Err(mpsc::error::TrySendError::Closed(_)) = to_send.try_send(packet) {
-                    break;
+                match to_send.try_send(packet) {
+                    Ok(()) => {}
+                    // A barrier is never dropped: it waits for room, behind
+                    // the packets queued before it.
+                    Err(mpsc::error::TrySendError::Full(barrier @ Outgoing::Barrier(_))) => {
+                        let to_send = to_send.clone();
+                        tokio::spawn(async move { to_send.send(barrier).await });
+                    }
+                    // Like a full socket buffer: drop, QUIC recovers.
+                    Err(mpsc::error::TrySendError::Full(Outgoing::Packet(_))) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
             // `recv` is cancel-safe: a message is only taken off the queue
@@ -525,8 +553,13 @@ async fn run_link(
         .push(closing.clone());
     // `close_link` ends a link the peer dialled too. An idle close leaves
     // that to the peer: on Linux dropping it would also drop a busy link
-    // this side dialled to the same address.
-    if closed_by_application {
+    // this side dialled to the same address. A release ends it on Linux:
+    // no connection uses the address any more, and a central the
+    // peripheral kept made BlueZ abort the next dial to the phone on
+    // hardware. Not on Android, where disconnecting a central that dialled
+    // in does not end the link but forgets its subscription (ADR-0008 D3).
+    let disconnect_central = released_here && role == Role::Peripheral && !cfg!(target_os = "android");
+    if closed_by_application || disconnect_central {
         let _ = channel.disconnect().await;
     } else {
         let _ = channel.close().await;
@@ -736,29 +769,96 @@ impl EndpointHooks for BleGattHooks {
             connection_closing(&inner, connection);
             // `closed` fires when the close starts: at `close()`, before its
             // CONNECTION_CLOSE is even sent, or when the peer's arrives.
-            // Cutting the link then lost the peer's copy on hardware. QUIC
-            // still drains for three probe timeouts; noq's driver holds the
-            // connection until that ends, so the weak handle dies exactly
-            // when it is drained (and the application dropped its handles).
-            // Neither noq nor iroh signals that, so it is checked. A stream
-            // or path handle the application keeps also holds it.
             let reason = weak.upgrade().and_then(|conn| conn.close_reason());
-            log::debug!(
-                "connection {connection} to {}: closing ({reason:?}), waiting for it to drain",
-                endpoint.fmt_short()
-            );
             let closing = Instant::now();
-            while weak.upgrade().is_some() {
-                tokio::time::sleep(DRAINED_CHECK_INTERVAL).await;
+            match reason {
+                // Closed by the peer, reset, or silent: this side is draining
+                // and sends nothing more (RFC 9000 §10.2.2), so ending the
+                // link now loses nothing. Waiting out the drain instead kept
+                // a phone's link up 13s on hardware, and the old link made
+                // BlueZ abort every dial to the phone meanwhile.
+                Some(
+                    ConnectionError::ConnectionClosed(_)
+                    | ConnectionError::ApplicationClosed(_)
+                    | ConnectionError::Reset
+                    | ConnectionError::TimedOut,
+                ) => {
+                    log::debug!(
+                        "connection {connection} to {}: closed by the peer ({reason:?}), its links can go",
+                        endpoint.fmt_short()
+                    );
+                }
+                // Closed by this side. Cutting the link at once lost the
+                // peer's copy of the CONNECTION_CLOSE on hardware, so the link
+                // goes once that packet has been sent, without the closing
+                // period after it: like `iroh-ble-transport`, which tears its
+                // link down as soon as a connection closes.
+                _ => {
+                    log::debug!(
+                        "connection {connection} to {}: closing ({reason:?}), waiting for its CONNECTION_CLOSE to go out",
+                        endpoint.fmt_short()
+                    );
+                    let sent = close_sent(&inner, &weak, connection).await;
+                    log::debug!(
+                        "connection {connection} to {}: {} after {:?}",
+                        endpoint.fmt_short(),
+                        if sent { "CONNECTION_CLOSE sent" } else { "drained" },
+                        closing.elapsed()
+                    );
+                }
             }
-            log::debug!(
-                "connection {connection} to {}: drained after {:?}",
-                endpoint.fmt_short(),
-                closing.elapsed()
-            );
             forget_connection(&inner, connection);
         });
         AfterHandshakeOutcome::accept()
+    }
+}
+
+/// Waits until connection `connection`, closed by this side, has sent its
+/// CONNECTION_CLOSE; false if it drained first. noq counts the frame when it
+/// builds the packet and hands the packet to the transport under the same
+/// lock, so once counted it is in a link's queue, and a barrier queued
+/// behind it on each link the connection used comes out once it was sent.
+/// Neither noq nor iroh signals either moment, so the count is checked like
+/// the drain.
+async fn close_sent(inner: &Inner, weak: &WeakConnectionHandle, connection: u64) -> bool {
+    loop {
+        // Dropped before the sleep: a kept `Connection` would hold the
+        // drain off.
+        let built = match weak.upgrade() {
+            Some(conn) => conn.stats().frame_tx.connection_close > 0,
+            None => return false,
+        };
+        if built {
+            break;
+        }
+        tokio::time::sleep(DRAINED_CHECK_INTERVAL).await;
+    }
+    let links: Vec<mpsc::Sender<Outgoing>> = {
+        let learned = inner.learned.lock().expect("poisoned");
+        let links = inner.links.lock().expect("poisoned");
+        learned
+            .iter()
+            .filter(|(_, learned)| learned.connections.contains(&connection))
+            .filter_map(|(address, _)| links.get(address).cloned())
+            .collect()
+    };
+    let sent = async {
+        for link in links {
+            let (reached, barrier) = oneshot::channel();
+            if link.send(Outgoing::Barrier(reached)).await.is_ok() {
+                // An error: the link ended, and the packet with it.
+                let _ = barrier.await;
+            }
+        }
+    };
+    let drained = async {
+        while weak.upgrade().is_some() {
+            tokio::time::sleep(DRAINED_CHECK_INTERVAL).await;
+        }
+    };
+    tokio::select! {
+        () = sent => true,
+        () = drained => false,
     }
 }
 
@@ -796,7 +896,7 @@ fn remove_closer(inner: &Inner, peer: &PeerAddress, close: &Arc<Notify>) {
 
 /// Removes `peer`'s link only if it is still `link`: a replacement attached
 /// meanwhile stays.
-fn remove_link(inner: &Inner, peer: &PeerAddress, link: &mpsc::Sender<Vec<u8>>) {
+fn remove_link(inner: &Inner, peer: &PeerAddress, link: &mpsc::Sender<Outgoing>) {
     let mut links = inner.links.lock().expect("poisoned");
     if links.get(peer).is_some_and(|current| current.same_channel(link)) {
         links.remove(peer);
@@ -921,7 +1021,7 @@ impl Sender {
     fn send(&self, peer: &PeerAddress, packet: Vec<u8>) -> io::Result<()> {
         let mut links = self.inner.links.lock().expect("poisoned");
         let packet = match links.get(peer) {
-            Some(link) => match link.try_send(packet) {
+            Some(link) => match link.try_send(Outgoing::Packet(packet)) {
                 Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => return Ok(()),
                 // The link ended; dial again below.
                 Err(mpsc::error::TrySendError::Closed(packet)) => {
@@ -929,7 +1029,7 @@ impl Sender {
                     packet
                 }
             },
-            None => packet,
+            None => Outgoing::Packet(packet),
         };
         // An address the caller replaced; see `set_peer_address`. Dropped
         // like any packet with no link: QUIC uses its other paths.

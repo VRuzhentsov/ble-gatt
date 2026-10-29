@@ -593,6 +593,59 @@ async fn a_link_closes_when_the_peer_closes_its_connection() {
     );
 }
 
+/// The closing side releases its link once its CONNECTION_CLOSE was sent,
+/// not after the drain: a `Connection` it keeps no longer holds the link.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_closing_side_releases_its_link_once_its_close_is_sent() {
+    let pair = hooked_pair_with_delays(
+        "AA:00:00:00:00:1F",
+        "AA:00:00:00:00:1E",
+        Duration::from_secs(60),
+        Duration::ZERO,
+    )
+    .await;
+    let connection = tokio::time::timeout(TIMEOUT, pair.dialer.connect(pair.listener_id, ECHO_ALPN))
+        .await
+        .expect("connect in time")
+        .expect("connect");
+    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&connection, b"once")).await.expect("echo in time"), b"once");
+    connection.close(0u32.into(), b"done");
+    assert!(
+        until_no_links(&pair.dialer_transport, Duration::from_secs(5)).await,
+        "the dialled link closes while the connection is still held"
+    );
+    drop(connection);
+}
+
+/// The peer closes; the peripheral side, which only receives the close,
+/// disconnects the central at once. The dialer's own release delay is longer
+/// than the test, so only that disconnect can close its link.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_receiving_peripheral_disconnects_the_central() {
+    let pair = hooked_pair_with_delays(
+        "AA:00:00:00:00:21",
+        "AA:00:00:00:00:20",
+        Duration::ZERO,
+        Duration::from_secs(60),
+    )
+    .await;
+    let connection = tokio::time::timeout(TIMEOUT, pair.dialer.connect(pair.listener_id, ECHO_ALPN))
+        .await
+        .expect("connect in time")
+        .expect("connect");
+    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&connection, b"once")).await.expect("echo in time"), b"once");
+    connection.close(0u32.into(), b"done");
+    assert!(
+        until_no_links(&pair.listener_transport, Duration::from_secs(5)).await,
+        "the served link closes"
+    );
+    assert!(
+        until_no_links(&pair.dialer_transport, Duration::from_secs(5)).await,
+        "the central is disconnected"
+    );
+    drop(connection);
+}
+
 /// A second connection that starts within the release delay keeps the link
 /// (ADR-0008 D3).
 #[tokio::test(flavor = "multi_thread")]

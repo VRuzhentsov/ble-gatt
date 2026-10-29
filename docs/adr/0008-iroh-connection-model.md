@@ -122,6 +122,33 @@ starts as before. A peer whose handshake is still running when the link
 drops is not seen and could cross; D5 covers that. Test:
 `a_refused_connection_does_not_hold_back_a_dial`.
 
+*Outcome, no wait for the drain.* With the phone as central and the closer,
+it held its link for the whole closing period (13.4 s on hardware, with
+RTTs in seconds), and Android kept the ACL 4 s more after its GATT
+disconnect. The desktop had kept that central (the idle kind of close
+above), and BlueZ aborted its three dials to the phone meanwhile
+(`le-connection-abort-by-local`). Now:
+
+- A connection the peer closed, reset or timed out ends at once: this side
+  is draining and sends nothing more (RFC 9000 §10.2.2).
+- A connection this side closed ends once its CONNECTION_CLOSE has been
+  sent. noq counts the frame (`stats().frame_tx.connection_close`) when it
+  builds the packet, and hands the packet to the transport under the same
+  lock. A barrier queued behind it on each link then shows it sent. The
+  closing period, which only resends the close in answer to the peer's
+  packets, is skipped: a lost close leaves the peer's connection to its
+  idle timeout. If the connection drains first, it ends then, as before.
+- A release in the peripheral role disconnects the central on Linux, where
+  no connection uses the address any more. On Android it still keeps the
+  central (the outcome above).
+
+Precedent: `iroh-ble-transport` (AGPL, ideas only) tears its link down as
+soon as a connection's `closed()` fires, in both directions, and drops
+writes still queued. Here the close is sent first, because cutting at
+`closed()` lost the peer's copy on hardware. Tests:
+`the_closing_side_releases_its_link_once_its_close_is_sent`,
+`the_receiving_peripheral_disconnects_the_central`.
+
 **D4 — One link to a peer carries both directions.** A BLE link already does:
 the central writes, the peripheral notifies. When iroh sends to a peer key
 that has a link in either role, the transport sends on it and does not dial.
