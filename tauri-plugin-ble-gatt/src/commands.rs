@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ble_gatt::{
-    Backend, CharacteristicUuid, GattCharacteristicSpec, GattConnection, GattEvent, GattServiceSpec,
+    Driver, CharacteristicUuid, GattCharacteristicSpec, GattConnection, GattEvent, GattServiceSpec,
     PeerAddress, ServiceUuid, WriteType,
 };
 use serde::{Deserialize, Serialize};
@@ -31,7 +31,7 @@ pub struct PluginState {
     /// on its own — otherwise a channel dropped by a webview reload leaves
     /// a completed handle here for the life of the plugin.
     watchers: Arc<Mutex<HashMap<u64, tokio::task::JoinHandle<()>>>>,
-    backend: Arc<dyn Backend>,
+    driver: Arc<dyn Driver>,
     /// Each connection gets its own lock. A single map-wide mutex was held
     /// across `.await`, so one slow or hung GATT operation blocked every
     /// command on every other connection.
@@ -40,9 +40,9 @@ pub struct PluginState {
 }
 
 impl PluginState {
-    pub fn new(backend: Arc<dyn Backend>) -> Self {
+    pub fn new(driver: Arc<dyn Driver>) -> Self {
         Self {
-            backend,
+            driver,
             connections: Mutex::new(HashMap::new()),
             watchers: Arc::new(Mutex::new(HashMap::new())),
             next_handle: AtomicU64::new(1),
@@ -51,17 +51,6 @@ impl PluginState {
 }
 
 impl PluginState {
-    /// The backend this plugin drives.
-    ///
-    /// Exposed so a Rust-side consumer of the plugin — the hardware
-    /// verification harness in `examples/tauri-app`, for instance — can use
-    /// the `ble-gatt` API directly instead of going out through the JS
-    /// command surface and back. On Android this is the only way to reach a
-    /// working backend, since the JNI bridge is set up by the plugin.
-    pub fn backend(&self) -> Arc<dyn Backend> {
-        self.backend.clone()
-    }
-
     /// Look up a connection and release the map lock immediately, so a slow
     /// operation on one connection cannot block commands on another.
     async fn connection(&self, handle: u64) -> Result<SharedConnection, String> {
@@ -120,7 +109,7 @@ pub enum GattEventDto {
         address: String,
         local_role: String,
         /// Distinguishes successive connections to one address; see
-        /// `ble_gatt::GattEvent`. `null` when the backend cannot tell them
+        /// `ble_gatt::GattEvent`. `null` when the driver cannot tell them
         /// apart.
         session: Option<u64>,
     },
@@ -206,7 +195,7 @@ impl From<GattEvent> for GattEventDto {
 
 #[tauri::command]
 pub async fn ble_capabilities(state: tauri::State<'_, PluginState>) -> Result<CapabilitiesResponse, String> {
-    let caps = state.backend.capabilities().await;
+    let caps = state.driver.capabilities().await;
     Ok(CapabilitiesResponse {
         central: caps.central,
         peripheral: caps.peripheral,
@@ -231,7 +220,7 @@ pub async fn ble_advertise(
         })
         .collect::<Result<Vec<_>, String>>()?;
     state
-        .backend
+        .driver
         .advertise(GattServiceSpec::new(ServiceUuid(uuid), specs))
         .await
         .map_err(|err| err.to_string())
@@ -239,7 +228,7 @@ pub async fn ble_advertise(
 
 #[tauri::command]
 pub async fn ble_stop_advertising(state: tauri::State<'_, PluginState>) -> Result<(), String> {
-    state.backend.stop_advertising().await.map_err(|err| err.to_string())
+    state.driver.stop_advertising().await.map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -248,7 +237,7 @@ pub async fn ble_notify(
 ) -> Result<(), String> {
     let uuid = parse_uuid(&characteristic_uuid)?;
     state
-        .backend
+        .driver
         .notify(CharacteristicUuid(uuid), value)
         .await
         .map_err(|err| err.to_string())
@@ -260,7 +249,7 @@ pub async fn ble_scan_once(
 ) -> Result<Vec<DiscoveredPeerDto>, String> {
     let uuid = parse_uuid(&service_uuid)?;
     let mut stream = state
-        .backend
+        .driver
         .scan(ServiceUuid(uuid))
         .await
         .map_err(|err| err.to_string())?;
@@ -268,7 +257,7 @@ pub async fn ble_scan_once(
     // Keyed by address, not appended. Android re-reports a matching
     // advertiser on every advertising interval, so appending returned the
     // same device many times and let the vector grow with the timeout rather
-    // than with the number of peers — the backend's bounded queue does not
+    // than with the number of peers — the driver's bounded queue does not
     // bound it, because this loop drains that queue continuously.
     let mut found: BTreeMap<String, DiscoveredPeerDto> = BTreeMap::new();
     let deadline = tokio::time::sleep(Duration::from_millis(timeout_ms));
@@ -310,7 +299,7 @@ pub async fn ble_scan_once(
 #[tauri::command]
 pub async fn ble_connect(state: tauri::State<'_, PluginState>, address: String) -> Result<u64, String> {
     let connection = state
-        .backend
+        .driver
         .connect(&PeerAddress(address))
         .await
         .map_err(|err| err.to_string())?;
@@ -393,7 +382,7 @@ pub async fn ble_connection_mtu(
 pub async fn ble_watch_events(
     state: tauri::State<'_, PluginState>, on_event: Channel<GattEventDto>,
 ) -> Result<u64, String> {
-    let mut events = state.backend.events();
+    let mut events = state.driver.events();
     let id = state.next_handle.fetch_add(1, Ordering::SeqCst);
     let watchers = state.watchers.clone();
     // The task must not be able to finish — and try to remove itself —
@@ -440,7 +429,7 @@ pub async fn ble_disconnect(state: tauri::State<'_, PluginState>, handle: u64) -
     // Look up without removing. Removing first made a failed disconnect
     // unrecoverable: the caller loses the handle it would retry or clean up
     // with, while on Android the platform GATT may well still be live — so
-    // the backend's live-connection guard then refuses a fresh connection to
+    // the driver's live-connection guard then refuses a fresh connection to
     // that address, and the dropped Rust handle is no longer able to close
     // the one holding it open.
     let Some(connection) = state.connection(handle).await.ok() else {

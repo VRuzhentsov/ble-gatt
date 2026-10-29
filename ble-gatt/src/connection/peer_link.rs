@@ -1,7 +1,7 @@
 //! Tier 3: `PeerLink` — keep app-to-app links to a set of peers alive.
 //!
 //! **Read `docs/interface.md` for when to use this instead of the raw
-//! `Backend` or the `datagram` tier, and `docs/adr/0005` for the state
+//! `Driver` or the `datagram` tier, and `docs/adr/0005` for the state
 //! machines underneath.**
 //!
 //! The consumer declares which peers it cares about (`track`) and one policy
@@ -27,7 +27,7 @@ use tokio_stream::StreamExt;
 use crate::connection::link_state::{
     CentralEvent, CentralLink, PeripheralEvent, PeripheralLink, RadioEvent, RadioState,
 };
-use crate::hal::{Backend, BoxStream};
+use crate::hal::{Driver, BoxStream};
 use crate::profile::datagram::{self, DatagramChannel, DatagramConfig};
 use crate::entities::error::{BleError, Result};
 use crate::entities::models::{ConnectionPriority, GattEvent, PeerAddress, RadioStatus, Role};
@@ -163,10 +163,10 @@ pub enum PeerLinkEvent {
 }
 
 /// Message-passing handle to one peer's live link. `send` / `recv` cross to
-/// the driver thread, which does the GATT work. Contract (see
+/// the worker thread, which does the GATT work. Contract (see
 /// `docs/interface.md`): `send` returns the real `BleError`
 /// (`GattBusy` stays distinguishable); `recv` → `None` on close, including
-/// the driver being gone; a full send queue → `BleError::GattBusy`.
+/// the worker being gone; a full send queue → `BleError::GattBusy`.
 pub struct PeerChannel {
     peer: PeerAddress,
     max_message_len: usize,
@@ -253,15 +253,15 @@ pub struct PeerLink {
     events_tx: broadcast::Sender<PeerLinkEvent>,
     status: Arc<StdMutex<HashMap<PeerAddress, PeerStatus>>>,
     radio: Arc<StdMutex<RadioStatus>>,
-    _driver: DriverHandle,
+    _worker: WorkerHandle,
 }
 
-struct DriverHandle {
+struct WorkerHandle {
     shutdown: Option<oneshot::Sender<()>>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
-impl Drop for DriverHandle {
+impl Drop for WorkerHandle {
     fn drop(&mut self) {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
@@ -273,30 +273,30 @@ impl Drop for DriverHandle {
 }
 
 impl PeerLink {
-    /// Build a `PeerLink` that constructs and owns the platform backend.
-    /// Synchronous and infallible: the backend is acquired on the driver
+    /// Build a `PeerLink` that constructs and owns the platform driver.
+    /// Synchronous and infallible: the driver is acquired on the worker
     /// thread and surfaces as `radio()` reporting `Off` / `Unsupported`.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn new(config: PeerLinkConfig) -> Arc<Self> {
         Self::spawn(config, None)
     }
 
-    /// Build a `PeerLink` over an already-constructed backend — for tests and
+    /// Build a `PeerLink` over an already-constructed driver — for tests and
     /// the mock.
-    pub fn with_backend(backend: Arc<dyn Backend>, config: PeerLinkConfig) -> Arc<Self> {
-        Self::spawn(config, Some(backend))
+    pub fn with_driver(driver: Arc<dyn Driver>, config: PeerLinkConfig) -> Arc<Self> {
+        Self::spawn(config, Some(driver))
     }
 
-    fn spawn(config: PeerLinkConfig, backend: Option<Arc<dyn Backend>>) -> Arc<Self> {
+    fn spawn(config: PeerLinkConfig, driver: Option<Arc<dyn Driver>>) -> Arc<Self> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (events_tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let status = Arc::new(StdMutex::new(HashMap::new()));
         let radio = Arc::new(StdMutex::new(RadioStatus::Off));
 
-        let driver = Driver {
+        let worker = Worker {
             config,
-            provided_backend: backend,
+            provided_driver: driver,
             cmd_rx,
             events_tx: events_tx.clone(),
             status: status.clone(),
@@ -309,17 +309,17 @@ impl PeerLink {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .expect("PeerLink driver runtime");
-                rt.block_on(driver.run(shutdown_rx));
+                    .expect("PeerLink worker runtime");
+                rt.block_on(worker.run(shutdown_rx));
             })
-            .expect("spawn PeerLink driver thread");
+            .expect("spawn PeerLink worker thread");
 
         Arc::new(PeerLink {
             cmd_tx,
             events_tx,
             status,
             radio,
-            _driver: DriverHandle { shutdown: Some(shutdown_tx), join: Some(join) },
+            _worker: WorkerHandle { shutdown: Some(shutdown_tx), join: Some(join) },
         })
     }
 
@@ -345,9 +345,9 @@ impl PeerLink {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(Command::Discover(tx))
-            .map_err(|_| BleError::AdapterUnavailable("PeerLink driver is gone".into()))?;
+            .map_err(|_| BleError::AdapterUnavailable("PeerLink worker is gone".into()))?;
         rx.await
-            .map_err(|_| BleError::AdapterUnavailable("PeerLink driver is gone".into()))?
+            .map_err(|_| BleError::AdapterUnavailable("PeerLink worker is gone".into()))?
     }
 
     /// Subscribe to the event stream. Each call is an independent
@@ -373,12 +373,12 @@ impl PeerLink {
 }
 
 // ---------------------------------------------------------------------------
-// The driver — runs on the dedicated thread's runtime.
+// The worker — runs on the dedicated thread's runtime.
 // ---------------------------------------------------------------------------
 
-struct Driver {
+struct Worker {
     config: PeerLinkConfig,
-    provided_backend: Option<Arc<dyn Backend>>,
+    provided_driver: Option<Arc<dyn Driver>>,
     cmd_rx: mpsc::UnboundedReceiver<Command>,
     events_tx: broadcast::Sender<PeerLinkEvent>,
     status: Arc<StdMutex<HashMap<PeerAddress, PeerStatus>>>,
@@ -387,12 +387,12 @@ struct Driver {
     /// `Peer` is discarded on `Untrack` and rebuilt from scratch on the next
     /// `Track`, so a per-`Peer` counter would restart at the same values a
     /// just-discarded pump's queued `linkgone` still carries — letting that
-    /// stale notification tear down the replacement's first link. The driver
+    /// stale notification tear down the replacement's first link. The worker
     /// runs on one task (see `run`'s `select!` loop), so a `Cell` is enough.
     next_link_gen: std::cell::Cell<u64>,
 }
 
-/// Per-tracked-peer state the driver owns.
+/// Per-tracked-peer state the worker owns.
 struct Peer {
     central: CentralLink,
     peripheral: PeripheralLink,
@@ -408,7 +408,7 @@ struct Peer {
     link: Option<LiveLink>,
     /// The in-flight `datagram::connect` task, while `central` is `Dialing`.
     /// Aborted when the state leaves `Dialing` (deadline, radio loss,
-    /// untrack) so the abandoned attempt does not keep the backend's
+    /// untrack) so the abandoned attempt does not keep the driver's
     /// connection slot while `pump_dials` starts another.
     dial_task: Option<tokio::task::AbortHandle>,
 }
@@ -421,9 +421,9 @@ struct LiveLink {
     _teardown: oneshot::Sender<()>,
 }
 
-impl Driver {
+impl Worker {
     async fn run(mut self, mut shutdown: oneshot::Receiver<()>) {
-        let backend = match self.acquire_backend().await {
+        let driver = match self.acquire_driver().await {
             Some(b) => b,
             None => {
                 self.set_radio(RadioStatus::Unsupported);
@@ -441,8 +441,8 @@ impl Driver {
         // permanent `Unsupported` that ignores the later `On` broadcast.
         // `Off` is recoverable; `Unsupported` is not, so it must only be
         // concluded against a usable radio.
-        let mut events = backend.events();
-        let initial = self.assess_radio(&backend).await;
+        let mut events = driver.events();
+        let initial = self.assess_radio(&driver).await;
         self.set_radio(initial);
         let _ = self
             .events_tx
@@ -459,7 +459,7 @@ impl Driver {
         let (linkgone_tx, mut linkgone_rx) = mpsc::unbounded_channel::<(PeerAddress, u64)>();
         let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<DatagramChannel>();
         // The inbound server: a task, plus when to (re)start it. `serve`
-        // exits on a transient advertise/setup failure, so the driver must
+        // exits on a transient advertise/setup failure, so the worker must
         // notice and restart it rather than sitting without a server until
         // the radio next toggles.
         let mut serve: Option<tokio::task::JoinHandle<()>> = None;
@@ -468,7 +468,7 @@ impl Driver {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         if self.accepts() && radio.usable() {
-            serve = Some(self.spawn_serve(&backend, &inbound_tx));
+            serve = Some(self.spawn_serve(&driver, &inbound_tx));
         }
 
         loop {
@@ -479,7 +479,7 @@ impl Driver {
                 && serve.is_none()
                 && serve_retry_at.is_none_or(|at| Instant::now() >= at)
             {
-                serve = Some(self.spawn_serve(&backend, &inbound_tx));
+                serve = Some(self.spawn_serve(&driver, &inbound_tx));
                 serve_retry_at = None;
             }
 
@@ -538,24 +538,24 @@ impl Driver {
                         }
                     }
                     Some(Command::Discover(reply)) => {
-                        let _ = reply.send(self.discover_now(&backend).await);
+                        let _ = reply.send(self.discover_now(&driver).await);
                     }
                 },
 
                 Some(ev) = events.next() => {
                     let was_usable = radio.usable();
-                    // A `RadioChanged { On }` from a backend that cannot do
+                    // A `RadioChanged { On }` from a driver that cannot do
                     // this role (Android reporting the adapter back but
                     // still no advertiser for `AcceptOnly`) becomes
                     // `Unsupported` — the capability check that could not run
                     // while the adapter was off runs now.
                     let ev = match ev {
                         GattEvent::RadioChanged { status: RadioStatus::On } => {
-                            GattEvent::RadioChanged { status: self.assess_radio(&backend).await }
+                            GattEvent::RadioChanged { status: self.assess_radio(&driver).await }
                         }
                         other => other,
                     };
-                    self.on_backend_event(&mut peers, &mut radio, ev);
+                    self.on_driver_event(&mut peers, &mut radio, ev);
                     // Stop the inbound server when the radio goes down; the
                     // top of the loop restarts it when the radio is back.
                     if self.accepts() && was_usable && !radio.usable() {
@@ -582,7 +582,7 @@ impl Driver {
                     self.on_tick(&mut peers, radio);
                 }
             }
-            self.pump_dials(&backend, &mut peers, radio, &conn_tx);
+            self.pump_dials(&driver, &mut peers, radio, &conn_tx);
             self.refresh_all_status(&peers, radio);
         }
 
@@ -599,14 +599,14 @@ impl Driver {
         !matches!(self.config.role, LinkRole::DialOnly)
     }
 
-    /// The radio's status *and* whether the backend can do the configured
+    /// The radio's status *and* whether the driver can do the configured
     /// role. `Off` (recoverable) is decided from the radio alone; the
     /// permanent `Unsupported` is only concluded against a usable radio,
     /// since `capabilities()` under-reports while the adapter is off.
-    async fn assess_radio(&self, backend: &Arc<dyn Backend>) -> RadioStatus {
-        match backend.radio_status().await {
+    async fn assess_radio(&self, driver: &Arc<dyn Driver>) -> RadioStatus {
+        match driver.radio_status().await {
             RadioStatus::On => {
-                let caps = backend.capabilities().await;
+                let caps = driver.capabilities().await;
                 let ok = match self.config.role {
                     LinkRole::DialOnly => caps.central,
                     LinkRole::AcceptOnly => caps.peripheral,
@@ -624,7 +624,7 @@ impl Driver {
         }
     }
 
-    /// The earliest instant the driver needs to wake — a backoff expiring, a
+    /// The earliest instant the worker needs to wake — a backoff expiring, a
     /// give-up clock running out, or the inbound server's restart backoff.
     fn next_wake(
         &self, peers: &HashMap<PeerAddress, Peer>, radio: RadioState,
@@ -664,13 +664,13 @@ impl Driver {
     }
 
     fn spawn_serve(
-        &self, backend: &Arc<dyn Backend>, inbound_tx: &mpsc::UnboundedSender<DatagramChannel>,
+        &self, driver: &Arc<dyn Driver>, inbound_tx: &mpsc::UnboundedSender<DatagramChannel>,
     ) -> tokio::task::JoinHandle<()> {
-        let backend = backend.clone();
+        let driver = driver.clone();
         let cfg = self.config.datagram.clone();
         let inbound_tx = inbound_tx.clone();
         tokio::spawn(async move {
-            match datagram::serve(backend, &cfg).await {
+            match datagram::serve_driver(driver, &cfg).await {
                 Ok(mut stream) => {
                     while let Some(channel) = stream.next().await {
                         if inbound_tx.send(channel).is_err() {
@@ -727,8 +727,8 @@ impl Driver {
         });
     }
 
-    async fn acquire_backend(&mut self) -> Option<Arc<dyn Backend>> {
-        if let Some(b) = self.provided_backend.take() {
+    async fn acquire_driver(&mut self) -> Option<Arc<dyn Driver>> {
+        if let Some(b) = self.provided_driver.take() {
             return Some(b);
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -759,8 +759,8 @@ impl Driver {
         }
     }
 
-    async fn discover_now(&self, backend: &Arc<dyn Backend>) -> Result<Vec<PeerAddress>> {
-        let mut stream = backend.scan(self.config.datagram.service).await?;
+    async fn discover_now(&self, driver: &Arc<dyn Driver>) -> Result<Vec<PeerAddress>> {
+        let mut stream = driver.scan(self.config.datagram.service).await?;
         let mut out = Vec::new();
         let deadline = tokio::time::Instant::now() + DISCOVER_WINDOW;
         loop {
@@ -806,7 +806,7 @@ impl Driver {
     }
 
     fn pump_dials(
-        &self, backend: &Arc<dyn Backend>, peers: &mut HashMap<PeerAddress, Peer>,
+        &self, driver: &Arc<dyn Driver>, peers: &mut HashMap<PeerAddress, Peer>,
         radio: RadioState,
         conn_tx: &mpsc::UnboundedSender<(PeerAddress, u64, Result<DatagramChannel>)>,
     ) {
@@ -848,13 +848,13 @@ impl Driver {
             // charged for the wait.
             p.trying_since.get_or_insert(now);
 
-            let backend = backend.clone();
+            let driver = driver.clone();
             let cfg = self.config.datagram.clone();
             let conn_tx = conn_tx.clone();
             let peer2 = peer.clone();
             let session = next_session;
             let task = tokio::spawn(async move {
-                let result = datagram::connect(backend, &peer2, &cfg).await;
+                let result = datagram::connect_driver(driver, &peer2, &cfg).await;
                 let _ = conn_tx.send((peer2, session, result));
             });
             p.dial_task = Some(task.abort_handle());
@@ -972,8 +972,8 @@ impl Driver {
         p.retry_at = Some(now + backoff[idx]);
     }
 
-    /// The next `LiveLink` generation, unique for the driver's whole
-    /// lifetime -- not just for one `Peer`'s. See `Driver::next_link_gen`'s
+    /// The next `LiveLink` generation, unique for the worker's whole
+    /// lifetime -- not just for one `Peer`'s. See `Worker::next_link_gen`'s
     /// doc comment for why this must not reset on `Untrack`.
     fn alloc_link_gen(&self) -> u64 {
         let gen = self.next_link_gen.get() + 1;
@@ -1061,7 +1061,7 @@ impl Driver {
         (LiveLink { gen, pump: task.abort_handle(), _teardown: teardown_tx }, handle)
     }
 
-    fn on_backend_event(
+    fn on_driver_event(
         &self, peers: &mut HashMap<PeerAddress, Peer>, radio: &mut RadioState, ev: GattEvent,
     ) {
         match ev {
@@ -1127,7 +1127,7 @@ impl Driver {
             let (c, _) = p.central.apply(CentralEvent::Tick, now);
             p.central = c;
             // A dial that timed out (`Dialing` -> `Idle` on `Tick`) leaves a
-            // `datagram::connect` task still holding the backend's slot —
+            // `datagram::connect` task still holding the driver's slot —
             // abort it before `pump_dials` starts a fresh attempt Android
             // would reject as already in progress.
             Self::clear_stale_dial(p);

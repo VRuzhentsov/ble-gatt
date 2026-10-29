@@ -13,20 +13,20 @@ pub mod mock;
 pub mod windows;
 
 use crate::entities::error::Result;
-use crate::hal::Backend;
+use crate::hal::Driver;
 
-/// Construct the backend for the platform this binary runs on. Used by
-/// `PeerLink::new`; a consumer using the `Backend` trait directly picks its
-/// own constructor (`linux::LinuxBackend::new`, `android::AndroidBackend::new`,
-/// or `mock::MockBackend::new`).
+/// Construct the driver for the platform this binary runs on. Used by
+/// `PeerLink::new`; a consumer using the `Driver` trait directly picks its
+/// own constructor (`linux::LinuxDriver::new`, `android::AndroidDriver::new`,
+/// or `mock::MockDriver::new`).
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub async fn platform() -> Result<std::sync::Arc<dyn Backend>> {
+pub async fn platform() -> Result<std::sync::Arc<dyn Driver>> {
     #[cfg(target_os = "linux")]
     {
-        Ok(std::sync::Arc::new(linux::LinuxBackend::new().await?))
+        Ok(std::sync::Arc::new(linux::LinuxDriver::new().await?))
     }
     #[cfg(target_os = "android")]
     {
-        Ok(std::sync::Arc::new(android::AndroidBackend::new().await?))
+        Ok(std::sync::Arc::new(android::AndroidDriver::new().await?))
     }
 }

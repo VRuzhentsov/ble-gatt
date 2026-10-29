@@ -84,6 +84,111 @@ Fini's `DataLink` is named after OSI L2 and corresponds to this library's
 | `ble-gatt-iroh` | Interface Adapters | `ble-gatt`, `iroh` |
 | `tauri-plugin-ble-gatt` | Interface Adapters | `ble-gatt`, `tauri` |
 
+## A connection end to end
+
+This section shows how one iroh connection between two Fini devices crosses
+every part, from the application down to the Bluetooth chip. The example
+devices are a Linux desktop and an Android phone. Each level of the tree sits
+on top of the level below it, like nested folders, and every line names the
+crate or file it lives in.
+
+```
+desktop (Linux)
+└── Fini                                    application (outside this repo)
+    └── iroh Endpoint                       crate iroh (outside): QUIC + TLS,
+        │                                     a peer is addressed by its public key
+        └── BleGattTransport                crate ble-gatt-iroh, src/lib.rs
+            │                                 iroh custom transport: EndpointId ↔ PeerAddress,
+            │                                 one link per address, redial yield,
+            │                                 retired addresses, close_link / close_links
+            │                                 (cancel a dial, disconnect either role);
+            │                                 a dial waits for the peer's old links to close;
+            │                                 hooks(): learn key ↔ link from iroh (ADR-0008),
+            │                                 close a link once no connection uses it
+            └── DatagramChannel             crate ble-gatt, profile/datagram/
+                │                             whole messages: fragmentation, reassembly;
+                │                             connect() = central, serve() = peripheral
+                └── Adapter → hal::Driver   crate ble-gatt, roles/ + hal/
+                    │                         (in a Tauri app built by tauri-plugin-ble-gatt's
+                    │                          LazyDriver on first use)
+                    └── LinuxDriver         crate ble-gatt, drivers/linux.rs (via bluer)
+                        └── bluetoothd      BlueZ over D-Bus: Device1, GattManager1,
+                            │                 LEAdvertisingManager1
+                            └── kernel HCI  Linux Bluetooth subsystem
+                                └── chip    Bluetooth controller:
+                                              link layer + radio
+
+phone (Android)
+└── Fini                                    application, Tauri app (Rust in the APK)
+    └── iroh Endpoint                       crate iroh (outside)
+        └── BleGattTransport                crate ble-gatt-iroh
+            └── DatagramChannel             crate ble-gatt, profile/datagram/
+                └── Adapter → hal::Driver   crate ble-gatt; built by tauri-plugin-ble-gatt
+                    │                         (src/lazy.rs, src/android_context.rs)
+                    └── AndroidDriver       crate ble-gatt, drivers/android.rs
+                        │                     Rust half of the bridge: calls Kotlin over JNI,
+                        │                     receives Java_dev_blegatt_NativeKt_* callbacks
+                        └── JNI bridge      tauri-plugin-ble-gatt/android/…/dev/blegatt/
+                            ├── Native.kt   external funs: the callbacks into Rust
+                            ├── BleGattPlugin.kt
+                            │                 Tauri plugin: runtime permissions
+                            └── BleGattBridge.kt
+                                │             BluetoothLeScanner, BluetoothGatt (central),
+                                │             BluetoothGattServer + BluetoothLeAdvertiser
+                                │             (peripheral)
+                                └── Android Bluetooth service
+                                    │         com.android.bluetooth, over Binder
+                                    └── HCI
+                                        └── chip
+                                              Bluetooth controller:
+                                              link layer + radio
+```
+
+The two chips share one BLE link. On it, the device that dialled is the
+central and writes to the other device's GATT characteristic; the other
+device is the peripheral and answers with notifications on the same
+characteristic. Either device can take either role. iroh's QUIC packets ride
+inside those writes and notifications, so the BLE link and GATT see only
+encrypted bytes.
+
+```mermaid
+flowchart TB
+    subgraph desktop["Desktop (Linux)"]
+        direction TB
+        dApp["Fini<br/>(application)"]
+        dIroh["iroh Endpoint<br/>QUIC + TLS"]
+        dTransport["ble-gatt-iroh<br/>BleGattTransport"]
+        dDatagram["ble-gatt profile/datagram<br/>DatagramChannel"]
+        dAdapter["ble-gatt Adapter<br/>hal::Driver"]
+        dDriver["ble-gatt drivers/linux.rs<br/>(bluer)"]
+        dBluez["BlueZ bluetoothd<br/>D-Bus"]
+        dHci["kernel HCI"]
+        dChip["Bluetooth chip"]
+        dApp --> dIroh --> dTransport --> dDatagram --> dAdapter --> dDriver --> dBluez --> dHci --> dChip
+    end
+
+    subgraph phone["Phone (Android)"]
+        direction TB
+        pApp["Fini<br/>(Tauri app)"]
+        pIroh["iroh Endpoint<br/>QUIC + TLS"]
+        pTransport["ble-gatt-iroh<br/>BleGattTransport"]
+        pDatagram["ble-gatt profile/datagram<br/>DatagramChannel"]
+        pAdapter["ble-gatt Adapter<br/>hal::Driver<br/>(tauri-plugin-ble-gatt LazyDriver)"]
+        pDriver["ble-gatt drivers/android.rs<br/>Rust side of JNI"]
+        pKotlin["tauri-plugin-ble-gatt Kotlin<br/>BleGattBridge.kt + Native.kt"]
+        pStack["Android Bluetooth service<br/>Binder"]
+        pHci["HCI"]
+        pChip["Bluetooth chip"]
+        pApp --> pIroh --> pTransport --> pDatagram --> pAdapter --> pDriver
+        pDriver -- "JNI calls" --> pKotlin
+        pKotlin -- "Native.kt callbacks" --> pDriver
+        pKotlin --> pStack --> pHci --> pChip
+    end
+
+    dChip <-->|"BLE link: GATT writes (central → peripheral)<br/>and notifications (peripheral → central)"| pChip
+    dIroh -.-|"one QUIC connection, end-to-end encrypted"| pIroh
+```
+
 ## Module map of the core crate
 
 The target layout. Moving today's modules into it is planned work

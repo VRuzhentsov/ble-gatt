@@ -19,7 +19,7 @@ use crate::entities::models::{
 pub type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
 
 /// The ATT MTU every BLE connection is required to support before any
-/// negotiation happens (Bluetooth Core spec). Backends report this until a
+/// negotiation happens (Bluetooth Core spec). Drivers report this until a
 /// larger MTU is actually agreed with the peer.
 pub const DEFAULT_ATT_MTU: u16 = 23;
 
@@ -50,7 +50,7 @@ pub trait GattConnection: Send {
         None
     }
 
-    /// The negotiated ATT MTU for this connection. Backends request a larger
+    /// The negotiated ATT MTU for this connection. Drivers request a larger
     /// MTU on connect where the platform allows it, but the peer decides —
     /// never assume this is more than [`DEFAULT_ATT_MTU`].
     fn att_mtu(&self) -> u16;
@@ -83,7 +83,7 @@ pub trait GattConnection: Send {
     /// Stream of server-initiated notifications for `characteristic`.
     ///
     /// Items are `Result` for the same reason `scan`'s are: the failure is
-    /// asynchronous. A backend that must bound its inbound buffering drops
+    /// asynchronous. A driver that must bound its inbound buffering drops
     /// payloads when the consumer falls behind, and the peer has *already*
     /// been told the notification was delivered — so unless the loss is
     /// reported here, neither endpoint ever learns, and a message either
@@ -109,18 +109,18 @@ pub trait GattConnection: Send {
     /// [`BleError::Unsupported`]: crate::BleError::Unsupported
     async fn request_connection_priority(&mut self, priority: ConnectionPriority) -> Result<()> {
         let _ = priority;
-        Err(crate::BleError::Unsupported("connection priority on this backend".into()))
+        Err(crate::BleError::Unsupported("connection priority on this driver".into()))
     }
 }
 
-/// Platform BLE backend: scan/connect as a GATT central, and/or
-/// advertise/serve as a GATT peripheral. A backend that can't do peripheral
+/// Platform BLE driver: scan/connect as a GATT central, and/or
+/// advertise/serve as a GATT peripheral. A driver that can't do peripheral
 /// mode (most mobile OSes, some adapters) still implements this trait —
 /// `capabilities()` reports it honestly and `advertise()` returns
 /// `BleError::PeripheralUnsupported` rather than the caller having to guess
 /// from the target OS. See `models::CapabilityReport`.
 #[async_trait]
-pub trait Backend: Send + Sync {
+pub trait Driver: Send + Sync {
     async fn capabilities(&self) -> CapabilityReport;
 
     // --- Central role ---
@@ -147,14 +147,57 @@ pub trait Backend: Send + Sync {
     /// first to change the served service.
     async fn advertise(&self, service: GattServiceSpec) -> Result<()>;
 
+    /// Replace the advertisement of the service `advertise` is serving,
+    /// leaving the GATT server, its connected centrals, their subscriptions
+    /// and their channels untouched. `advertise` replaces the server too,
+    /// which drops every central.
+    ///
+    /// `service` must describe the served service (same UUID and
+    /// characteristics); only its advertisement data
+    /// (`manufacturer_data`, `service_data`, `local_name`) is applied.
+    /// Errors when nothing is being advertised, the service differs, or the
+    /// platform refuses the new advertisement. After a refusal the server
+    /// keeps serving but nothing is advertised, so a caller that wants to be
+    /// discoverable falls back to `advertise`.
+    ///
+    /// Android and BlueZ both keep the two apart: `BluetoothLeAdvertiser`
+    /// next to `BluetoothGattServer`, and `LEAdvertisingManager1` next to
+    /// `GattManager1` (bluer returns an `AdvertisementHandle` and an
+    /// `ApplicationHandle`). Returns [`BleError::Unsupported`] by default.
+    ///
+    /// [`BleError::Unsupported`]: crate::BleError::Unsupported
+    async fn update_advertisement(&self, service: GattServiceSpec) -> Result<()> {
+        let _ = service;
+        Err(crate::BleError::Unsupported("updating the advertisement on this driver".into()))
+    }
+
+    /// The service `advertise` serves, with the advertisement data of its
+    /// latest `update_advertisement`; `None` once `stop_advertising` ran or
+    /// before anything was served. Kept across a radio loss. Serving
+    /// re-advertises it after the radio comes back, so an update is not
+    /// undone by a power cycle, and re-advertises nothing when it is `None`,
+    /// so a stopped server stays stopped. No default: a wrapping driver must
+    /// forward it, or serving never recovers (ADR-0010).
+    fn served_service(&self) -> Option<GattServiceSpec>;
+
     async fn stop_advertising(&self) -> Result<()>;
+
+    /// Release what this process holds on the radio before it exits: stop
+    /// serving and disconnect every link it dialled (ADR-0009 D1).
+    ///
+    /// Android, Apple and Windows release a dead app's links themselves, so
+    /// the default does nothing. BlueZ keeps them, and a link left at a
+    /// peer's old address made it abort every dial to the peer's new one.
+    async fn close(&self) -> Result<()> {
+        Ok(())
+    }
 
     /// Push a value to **every** central currently subscribed to
     /// `characteristic` on the local GATT server. Errors if it reached
     /// nobody — a reliable caller must not be told a dropped payload was
     /// sent.
     ///
-    /// Prefer [`Backend::notify_peer`] for anything carrying per-peer data.
+    /// Prefer [`Driver::notify_peer`] for anything carrying per-peer data.
     /// Subscribing is a client-side act needing no server consent, so a
     /// central a higher layer believes it refused is still subscribed until
     /// it is disconnected, and this delivers to it.
@@ -173,7 +216,7 @@ pub trait Backend: Send + Sync {
     /// would hand the refused peer the served peer's traffic. Errors if
     /// `peer` has no live notify session.
     /// `session` names which of that address's notify sessions to target,
-    /// for the same reason [`Backend::disconnect_peer`] takes one: both
+    /// for the same reason [`Driver::disconnect_peer`] takes one: both
     /// platforms select subscriptions by address, so a caller holding a
     /// stale channel would otherwise route its payloads into the
     /// subscription that replaced it — where they are reassembled as
@@ -189,7 +232,7 @@ pub trait Backend: Send + Sync {
     /// subscribed until it is dropped, so this is what actually excludes it.
     /// Best-effort and idempotent: a peer that is already gone is `Ok`.
     ///
-    /// `session` names *which* connection to drop — every backend addresses
+    /// `session` names *which* connection to drop — every driver addresses
     /// peers by address, so without it a caller holding stale state can
     /// disconnect a peer's replacement session instead of the one it meant.
     /// `None` disconnects whatever currently holds the address, which is
@@ -198,7 +241,7 @@ pub trait Backend: Send + Sync {
 
     /// Largest value a single notification to `peer` can carry, once the
     /// platform knows it (Linux: the MTU BlueZ returns with `AcquireNotify`).
-    /// `None` where the backend cannot tell, or before the peer subscribed —
+    /// `None` where the driver cannot tell, or before the peer subscribed —
     /// callers then budget against [`DEFAULT_ATT_MTU`].
     async fn notify_max_len(&self, peer: &PeerAddress, session: Option<u64>) -> Option<usize> {
         let _ = (peer, session);
@@ -219,7 +262,7 @@ pub trait Backend: Send + Sync {
     /// `GattConnection` open across time should watch this stream.
     ///
     /// **`Connected` is not once-per-connection — treat it as idempotent.**
-    /// Neither platform backend has a reliable server-side connection
+    /// Neither platform driver has a reliable server-side connection
     /// signal, so both re-emit `Connected` for a peer ahead of every
     /// characteristic write. A consumer that allocates per-peer state on
     /// each `Connected` will tear down and replace that state mid-session;
@@ -233,7 +276,7 @@ pub trait Backend: Send + Sync {
     /// [`GattEvent::RadioChanged`] transitions; this is the initial value a
     /// consumer needs before the first transition arrives (a `PeerLink`
     /// created while Bluetooth is already off must not assume `On`).
-    /// Defaults to `On` for backends with no notion of a togglable radio.
+    /// Defaults to `On` for drivers with no notion of a togglable radio.
     async fn radio_status(&self) -> crate::entities::models::RadioStatus {
         crate::entities::models::RadioStatus::On
     }

@@ -23,8 +23,8 @@
 //!
 //! ## Known limitation: the peripheral role serves one central at a time
 //!
-//! `Backend::notify` pushes to *every* subscribed central — the only
-//! per-characteristic primitive both platform backends expose today. With a
+//! `Driver::notify` pushes to *every* subscribed central — the only
+//! per-characteristic primitive both platform drivers expose today. With a
 //! single connected central this is exactly point-to-point, which is what
 //! both current consumers need.
 //!
@@ -37,7 +37,7 @@
 //! valid, with no error.
 //!
 //! `serve` therefore refuses additional centrals while one is active.
-//! Lifting that needs a per-peer notify on the `Backend` port:
+//! Lifting that needs a per-peer notify on the `Driver` port:
 //! straightforward on Android (`notifyCharacteristicChanged` already takes a
 //! device), unresolved on BlueZ where `bluer`'s notifier does not identify
 //! its subscriber.
@@ -133,7 +133,8 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
-use crate::hal::{Backend, BoxStream, GattConnection};
+use crate::hal::{Driver, BoxStream, GattConnection};
+use crate::roles::Adapter;
 use crate::profile::datagram::fragment::{split, FragmentHeader, FRAGMENT_HEADER_LEN, MAX_FRAGMENTS};
 use crate::profile::datagram::reassembly::{Accept, Reassembler, ReassemblyLimits};
 use crate::entities::error::{BleError, Result};
@@ -191,7 +192,7 @@ pub struct DatagramConfig {
     pub fragment_queue_depth: usize,
     /// Accepted-but-not-yet-taken peripheral channels buffered by [`serve`]
     /// before further centrals are refused. Each queued channel pins a
-    /// backend `Arc`, its reassembly buffers and a live task, so an
+    /// driver `Arc`, its reassembly buffers and a live task, so an
     /// unbounded queue lets a peer that connects and disconnects in a loop
     /// grow the process without limit while the caller is slow to accept.
     pub accept_queue_depth: usize,
@@ -203,6 +204,10 @@ pub struct DatagramConfig {
     /// discoverability flag toggled on and off) re-advertises by ending the
     /// current `serve` stream and calling it again with an updated config.
     pub advertised_manufacturer_data: BTreeMap<u16, Vec<u8>>,
+    /// Becomes [`service_spec`](Self::service_spec)'s
+    /// `GattServiceSpec.local_name`: a short name scanners read from the
+    /// scan response without connecting. `None` by default.
+    pub advertised_local_name: Option<String>,
 }
 
 impl DatagramConfig {
@@ -218,6 +223,7 @@ impl DatagramConfig {
             fragment_queue_depth: DEFAULT_FRAGMENT_QUEUE_DEPTH,
             accept_queue_depth: DEFAULT_ACCEPT_QUEUE_DEPTH,
             advertised_manufacturer_data: BTreeMap::new(),
+            advertised_local_name: None,
         }
     }
 
@@ -266,6 +272,7 @@ impl DatagramConfig {
             }],
         );
         spec.manufacturer_data = self.advertised_manufacturer_data.clone();
+        spec.local_name = self.advertised_local_name.clone();
         spec
     }
 }
@@ -294,7 +301,7 @@ enum Sink {
     /// Peripheral: notify subscribed centrals. See the module-level note on
     /// this being a broadcast.
     Notify {
-        backend: Arc<dyn Backend>,
+        driver: Arc<dyn Driver>,
         /// Cleared when this channel's peer disconnects.
         ///
         /// Because notify is a broadcast that cannot be addressed to one
@@ -342,8 +349,11 @@ pub struct DatagramChannel {
     /// in `inbound`, so subsequent writes went to a closed receiver, the
     /// entry was never removed, and every other central was refused
     /// indefinitely.
-    release: Option<(mpsc::UnboundedSender<(PeerAddress, u64)>, u64)>,
-    /// The backend session this channel is bound to, when the backend can
+    release: Option<(mpsc::UnboundedSender<Released>, u64)>,
+    /// Set by `close()` in the peripheral role: the release then frees the
+    /// slot and leaves the central connected and subscribed.
+    keep_peer: bool,
+    /// The driver session this channel is bound to, when the driver can
     /// distinguish successive connections to one address.
     session: Option<u64>,
     /// Raised when inbound data was dropped for this channel.
@@ -384,12 +394,16 @@ impl Drop for DatagramChannel {
         // release whatever entry the *same address* currently occupies,
         // disconnecting a central that had just reconnected.
         if let Some((release, generation)) = &self.release {
-            let _ = release.send((self.peer.clone(), *generation));
+            let _ = release.send(Released {
+                peer: self.peer.clone(),
+                generation: *generation,
+                keep_peer: self.keep_peer,
+            });
         }
         // Central role only: `close()` is the normal way to tear down the
         // platform connection, but a caller that drops the channel without
         // calling it — cancellation, an early error, simply forgetting —
-        // must not leak it. None of the backends disconnect on their own
+        // must not leak it. None of the drivers disconnect on their own
         // `Drop`; on Android in particular the Kotlin `BluetoothGatt` stays
         // open, and a later `connect` to the same address is rejected as
         // already open. `Drop` cannot await, so the connection is handed to
@@ -448,7 +462,7 @@ impl DatagramChannel {
         }
     }
 
-    /// The backend session this channel is bound to, when the backend can
+    /// The driver session this channel is bound to, when the driver can
     /// distinguish successive connections to the same address.
     pub fn session(&self) -> Option<u64> {
         self.session
@@ -567,8 +581,39 @@ impl DatagramChannel {
             },
             // The peripheral does not own the link; a central disconnecting
             // is what ends it. Stopping advertising here would tear down
-            // every other peer's channel too.
-            Sink::Notify { .. } => Ok(()),
+            // every other peer's channel too. Releasing the channel then
+            // keeps the central connected and subscribed, so its next write
+            // opens a channel that can answer: Android does not drop a link
+            // the central opened (`cancelConnection` found no app holding
+            // it, on hardware), and forgetting the subscription left every
+            // later channel unable to notify. Apple's `CBPeripheralManager`
+            // has no call to disconnect a central at all.
+            Sink::Notify { .. } => {
+                self.keep_peer = true;
+                Ok(())
+            }
+        }
+    }
+
+    /// Like [`close`](Self::close), and in the peripheral role also drops
+    /// the central's connection to the GATT server, as Android's
+    /// `BluetoothGattServer.cancelConnection` does. For an application done
+    /// with the peer: on hardware, a phone that only closed its own dial
+    /// kept the desktop's link to its server up for 3-4s, until the
+    /// desktop's BlueZ dropped it. On Linux this ends the whole link to that
+    /// address, a link this side dialled on it included.
+    pub async fn disconnect(&mut self) -> Result<()> {
+        let mut sink = self.sink.lock().await;
+        match &mut *sink {
+            Sink::Connection { connection, .. } => match connection.take() {
+                Some(mut connection) => connection.disconnect().await,
+                None => Ok(()),
+            },
+            Sink::Notify { driver, active } => {
+                active.store(false, Ordering::SeqCst);
+                log::info!("disconnect: central {} session={:?}", self.peer.0, self.session);
+                driver.disconnect_peer(&self.peer, self.session).await
+            }
         }
     }
 }
@@ -640,7 +685,7 @@ impl DatagramSender {
                         return Err(err);
                     }
                 }
-                Sink::Notify { backend, active } => {
+                Sink::Notify { driver, active } => {
                     if !active.load(Ordering::SeqCst) {
                         log::warn!(
                             "send: refusing msg_id={msg_id} — channel to {} is no longer active",
@@ -657,7 +702,7 @@ impl DatagramSender {
                     // channel must not route its fragments through the
                     // subscription that replaced its peer, where they would
                     // be reassembled as current data.
-                    if let Err(err) = backend
+                    if let Err(err) = driver
                         .notify_peer(&self.peer, self.session, characteristic, fragment)
                         .await
                     {
@@ -677,10 +722,18 @@ impl DatagramSender {
 
 /// A served peer's fragment sender, channel-liveness flag, and overflow
 /// signal, as held by `serve` while that peer occupies the single slot.
+/// A served channel was dropped. `keep_peer` when it was closed first, so
+/// the central keeps its connection.
+struct Released {
+    peer: PeerAddress,
+    generation: u64,
+    keep_peer: bool,
+}
+
 struct ServedPeer {
-    /// The backend's own session id for this peer's connection, so a
+    /// The driver's own session id for this peer's connection, so a
     /// lifecycle event from a previous one can be recognised and ignored.
-    backend_session: Option<u64>,
+    driver_session: Option<u64>,
     fragments: mpsc::Sender<Vec<u8>>,
     active: Arc<AtomicBool>,
     overflow: Arc<OverflowSignal>,
@@ -690,12 +743,13 @@ struct ServedPeer {
 }
 
 /// Free the single-central slot for a peer whose channel the caller dropped,
-/// and drop the peer so it is not left subscribed to a server that is no
-/// longer reading from it.
+/// and, unless the caller closed it first, drop the peer so it is not left
+/// subscribed to a server that is no longer reading from it.
 async fn release_peer(
-    inbound: &mut HashMap<PeerAddress, ServedPeer>, peer: &PeerAddress, generation: u64,
-    backend: &dyn Backend,
+    inbound: &mut HashMap<PeerAddress, ServedPeer>, released: Released, driver: &dyn Driver,
 ) {
+    let Released { peer, generation, keep_peer } = released;
+    let peer = &peer;
     // Only if this release belongs to the channel currently holding the
     // slot. A late release from a superseded generation must not evict the
     // peer that replaced it.
@@ -704,12 +758,16 @@ async fn release_peer(
     }
     if let Some(served) = inbound.remove(peer) {
         served.active.store(false, Ordering::SeqCst);
-        // Named by the backend session this channel was serving. Releasing a
+        if keep_peer {
+            log::info!("release: central {} session={:?}, kept connected", peer.0, served.driver_session);
+            return;
+        }
+        // Named by the driver session this channel was serving. Releasing a
         // channel from a superseded `serve` generation would otherwise
         // disconnect whatever now holds the address — the peer's own
         // replacement session, established by the server that replaced us.
-        log::info!("release: central {} session={:?}", peer.0, served.backend_session);
-        if let Err(err) = backend.disconnect_peer(peer, served.backend_session).await {
+        log::info!("release: central {} session={:?}", peer.0, served.driver_session);
+        if let Err(err) = driver.disconnect_peer(peer, served.driver_session).await {
             log::warn!("release: could not disconnect central {}: {err}", peer.0);
         }
     }
@@ -719,11 +777,11 @@ async fn release_peer(
 ///
 /// Every refusal path must go through this. Refusing to allocate state does
 /// not stop the peer receiving traffic: it is still subscribed, and
-/// `Backend::notify` is a broadcast that cannot be addressed to one peer on
+/// `Driver::notify` is a broadcast that cannot be addressed to one peer on
 /// BlueZ. Disconnecting is the only portable exclusion.
-async fn disconnect_refused(backend: &dyn Backend, peer: &PeerAddress, session: Option<u64>) {
+async fn disconnect_refused(driver: &dyn Driver, peer: &PeerAddress, session: Option<u64>) {
     log::info!("refuse: disconnecting central {} session={session:?}", peer.0);
-    if let Err(err) = backend.disconnect_peer(peer, session).await {
+    if let Err(err) = driver.disconnect_peer(peer, session).await {
         log::warn!(
             "refuse: could not disconnect central {}: {err} \
              — it may still receive broadcast notifications",
@@ -763,7 +821,7 @@ where
                         // `out` here is what makes `recv()` return `None`.
                         return;
                     };
-                    // A gap reported by the backend — payloads the peer was
+                    // A gap reported by the driver — payloads the peer was
                     // told were delivered but that never reached us. Surface
                     // it rather than letting the affected message expire
                     // unexplained, and discard partial sets, since any of
@@ -772,7 +830,7 @@ where
                         Ok(raw) => raw,
                         Err(_) => {
                             log::warn!(
-                                "reassembly: backend reported dropped notifications from {}; \
+                                "reassembly: driver reported dropped notifications from {}; \
                                  discarding partial messages",
                                 peer.0
                             );
@@ -866,17 +924,24 @@ impl Drop for PendingConnection {
 /// Central role: connect to `peer` and bring up a channel over `config`'s
 /// service.
 pub async fn connect(
-    backend: Arc<dyn Backend>, peer: &PeerAddress, config: &DatagramConfig,
+    adapter: &Adapter, peer: &PeerAddress, config: &DatagramConfig,
+) -> Result<DatagramChannel> {
+    connect_driver(adapter.driver(), peer, config).await
+}
+
+/// [`connect`] over a driver directly, for `PeerLink`, which holds one.
+pub(crate) async fn connect_driver(
+    driver: Arc<dyn Driver>, peer: &PeerAddress, config: &DatagramConfig,
 ) -> Result<DatagramChannel> {
     config.validate()?;
     log::info!("connect: dialling {} service={}", peer.0, config.service.0);
     // Subscribe before connecting, for the same reason `serve` subscribes
     // before advertising: `events()` is a broadcast, so a disconnect landing
     // between `connect`/`subscribe` succeeding and this call is lost. The
-    // backend contract explicitly does not promise that a notification
+    // driver contract explicitly does not promise that a notification
     // stream closes with the link, so losing it leaves `recv()` pending
     // forever with nothing left to wake it.
-    let events = backend.events();
+    let events = driver.events();
     // Past this point the platform connection exists, so *every* way out has
     // to tear it down — including the caller dropping this future mid-setup,
     // where no code on this path runs at all. Dropping the `GattConnection`
@@ -885,7 +950,7 @@ pub async fn connect(
     // refused as "already open". A retryable setup failure, or a plain
     // timeout, would otherwise kill the address permanently.
     let mut pending = PendingConnection {
-        connection: Some(backend.connect(peer).await?),
+        connection: Some(driver.connect(peer).await?),
         peer: peer.clone(),
     };
 
@@ -957,8 +1022,9 @@ pub async fn connect(
         // Central channels are not held in anyone's slot, so nothing needs
         // telling when this one goes away.
         release: None,
+        keep_peer: false,
         session,
-        // Set when the backend reports it dropped notifications — the
+        // Set when the driver reports it dropped notifications — the
         // central-side equivalent of `serve`'s fragment-queue overflow.
         overflow,
         next_msg_id: Arc::default(),
@@ -974,7 +1040,7 @@ pub async fn connect(
 /// No error is delivered — "the peer walked away" is not a fault of the
 /// caller, and a closed channel already says everything it needs to. The
 /// notification stream itself cannot be relied on to end here: on a real
-/// backend a subscription outlives the link, so waiting for it to close
+/// driver a subscription outlives the link, so waiting for it to close
 /// would be waiting forever.
 fn spawn_link_loss_watch(
     mut events: BoxStream<GattEvent>, peer: PeerAddress, reassembly: tokio::task::AbortHandle,
@@ -988,7 +1054,7 @@ fn spawn_link_loss_watch(
                 // in that gap would otherwise be lost), so this stream can
                 // legitimately carry a loss event belonging to a *previous*
                 // connection to the same address — and acting on it would
-                // tear down a channel that is working. When the backend
+                // tear down a channel that is working. When the driver
                 // cannot distinguish sessions it reports `None`, and address
                 // matching alone is the best available.
                 GattEvent::Disconnected {
@@ -1036,7 +1102,7 @@ fn spawn_link_loss_watch(
 ///
 /// # Why one, and not many
 ///
-/// `Backend::notify` broadcasts to every subscribed central — it is the only
+/// `Driver::notify` broadcasts to every subscribed central — it is the only
 /// per-characteristic primitive both platforms expose. That makes serving
 /// two centrals concurrently actively unsafe, not merely wasteful:
 ///
@@ -1050,33 +1116,75 @@ fn spawn_link_loss_watch(
 ///
 /// Silent corruption is worse than a missing feature, so additional centrals
 /// are refused while one is active rather than served incorrectly. Lifting
-/// this needs a per-peer notify on the `Backend` port: straightforward on
+/// this needs a per-peer notify on the `Driver` port: straightforward on
 /// Android (`notifyCharacteristicChanged` already takes a device),
 /// unresolved on BlueZ.
-pub async fn serve(
-    backend: Arc<dyn Backend>, config: &DatagramConfig,
+pub async fn serve(adapter: &Adapter, config: &DatagramConfig) -> Result<BoxStream<DatagramChannel>> {
+    serve_driver(adapter.driver(), config).await
+}
+
+/// Change what a running [`serve`] advertises (`config`'s manufacturer data
+/// and local name) and keep its GATT server. A central already connected
+/// keeps its link and its [`DatagramChannel`]; calling [`serve`] again
+/// replaces the server instead, which drops every central.
+///
+/// `config` must name the service and characteristic `serve` was started
+/// with. Errors when nothing is served, the service differs, or the platform
+/// refuses the advertisement; after a refusal nothing is advertised, and a
+/// caller that needs to be discoverable falls back to [`serve`]. See
+/// `Driver::update_advertisement`.
+pub async fn update_advertisement(adapter: &Adapter, config: &DatagramConfig) -> Result<()> {
+    config.validate()?;
+    log::info!("serve: updating the advertisement for {}", config.service.0);
+    adapter.driver().update_advertisement(config.service_spec()).await
+}
+
+/// Stop a running [`serve`]: its advertisement and its GATT server, which
+/// drops the centrals connected to it. Waits until the platform did.
+///
+/// Dropping the stream [`serve`] returned only stops handing out new
+/// channels; the server keeps advertising and accepting. On hardware a phone
+/// that only dropped it stayed discoverable for 30 s, and a desktop connected
+/// and wrote into a server nobody read. Call this when the device should no
+/// longer be reachable. It stops both, as Android's
+/// `BluetoothLeAdvertiser.stopAdvertising` plus `BluetoothGattServer.close`
+/// and BlueZ's dropped `AdvertisementHandle` plus `ApplicationHandle` do:
+/// on Android an open server still accepts a central that knows the address.
+pub async fn stop_serving(adapter: &Adapter) -> Result<()> {
+    log::info!("serve: stopping");
+    let stopped = adapter.driver().stop_advertising().await;
+    match &stopped {
+        Ok(()) => log::info!("serve: stopped"),
+        Err(err) => log::warn!("serve: stopping failed: {err}"),
+    }
+    stopped
+}
+
+/// [`serve`] over a driver directly, for `PeerLink`, which holds one.
+pub(crate) async fn serve_driver(
+    driver: Arc<dyn Driver>, config: &DatagramConfig,
 ) -> Result<BoxStream<DatagramChannel>> {
     config.validate()?;
     // Subscribe *before* advertising. `events()` is a broadcast subscription,
-    // so anything emitted before this call is lost — and both backends can
+    // so anything emitted before this call is lost — and both drivers can
     // emit a peripheral-role `Connected` during `advertise`: Android can
     // accept a central before its advertise callback returns, and Linux
     // starts its inbound watcher inside `advertise`. With a central that
     // waits for the server to speak first there is no later write to
     // recreate the event, so losing it hangs `serve` forever.
-    let mut events = backend.events();
+    let mut events = driver.events();
     log::info!("serve: advertising service {}", config.service.0);
-    if let Err(err) = backend.advertise(config.service_spec()).await {
+    if let Err(err) = driver.advertise(config.service_spec()).await {
         log::warn!("serve: advertise failed for {}: {err}", config.service.0);
         return Err(err);
     }
     log::info!("serve: advertising accepted, awaiting centrals");
 
     let (channels_tx, channels_rx) = mpsc::channel(config.accept_queue_depth);
-    let (release_tx, mut release_rx) = mpsc::unbounded_channel::<(PeerAddress, u64)>();
+    let (release_tx, mut release_rx) = mpsc::unbounded_channel::<Released>();
     let config = config.clone();
-    // Fallback when the backend cannot report a peer's notification size
-    // (`Backend::notify_max_len`): the spec-minimum. Conservative on purpose:
+    // Fallback when the driver cannot report a peer's notification size
+    // (`Driver::notify_max_len`): the spec-minimum. Conservative on purpose:
     // undersized fragments always fit, oversized ones would be truncated by
     // the stack with no error.
     let default_peripheral_budget = crate::hal::DEFAULT_ATT_MTU as usize
@@ -1096,7 +1204,7 @@ pub async fn serve(
         // loop to deliver their inbound fragments. So the task ends only
         // once the stream is closed *and* no channel is still being served;
         // until then it would otherwise sit on `events.next()` forever,
-        // holding the backend `Arc` and the event subscription alive with
+        // holding the driver `Arc` and the event subscription alive with
         // nothing able to wake it (`stop_advertising` does not close the
         // event stream).
         let mut accept_closed = false;
@@ -1105,8 +1213,8 @@ pub async fn serve(
             let event = if accept_closed {
                 tokio::select! {
                     released = release_rx.recv() => {
-                        let Some((peer, generation)) = released else { return };
-                        release_peer(&mut inbound, &peer, generation, backend.as_ref()).await;
+                        let Some(released) = released else { return };
+                        release_peer(&mut inbound, released, driver.as_ref()).await;
                         if inbound.is_empty() {
                             return;
                         }
@@ -1130,8 +1238,8 @@ pub async fn serve(
                     // this the peer stayed in `inbound` forever, holding the
                     // single-central slot against everyone else.
                     released = release_rx.recv() => {
-                        if let Some((peer, generation)) = released {
-                            release_peer(&mut inbound, &peer, generation, backend.as_ref()).await;
+                        if let Some(released) = released {
+                            release_peer(&mut inbound, released, driver.as_ref()).await;
                         }
                         continue;
                     }
@@ -1143,7 +1251,7 @@ pub async fn serve(
             };
             match event {
                 // Only inbound connections belong to the peripheral role.
-                // Without the role check, this backend's own *outbound*
+                // Without the role check, this driver's own *outbound*
                 // `connect` calls also surface here — yielding a phantom
                 // channel for a remote peripheral and, worse, occupying the
                 // single-central slot so the genuine inbound central is
@@ -1151,7 +1259,7 @@ pub async fn serve(
                 GattEvent::Connected {
                     peer,
                     local_role: Role::Peripheral,
-                    session: backend_session,
+                    session: driver_session,
                 } => {
                     // Drain releases first. A caller that drops a channel and
                     // immediately accepts the next peer would otherwise race:
@@ -1159,14 +1267,14 @@ pub async fn serve(
                     // the arriving central is refused *and disconnected* on
                     // behalf of a peer that is already gone, and the caller
                     // never learns why.
-                    while let Ok((released, generation)) = release_rx.try_recv() {
-                        release_peer(&mut inbound, &released, generation, backend.as_ref()).await;
+                    while let Ok(released) = release_rx.try_recv() {
+                        release_peer(&mut inbound, released, driver.as_ref()).await;
                     }
 
                     // `Connected` is NOT once-per-connection. Both real
-                    // backends re-emit it ahead of every characteristic
+                    // drivers re-emit it ahead of every characteristic
                     // write, because neither has a true server-side
-                    // connection signal to key off (see `Backend::events`).
+                    // connection signal to key off (see `Driver::events`).
                     // Rebuilding the channel each time would drop the
                     // previous fragment sender, killing the channel already
                     // handed to the caller and making any multi-fragment
@@ -1177,7 +1285,7 @@ pub async fn serve(
                     // Shutting down: service what we still hold, but take on
                     // nothing new — and in particular do not refuse-and-
                     // disconnect, which would evict a peer belonging to a
-                    // newer generation on this same backend.
+                    // newer generation on this same driver.
                     if accept_closed {
                         continue;
                     }
@@ -1196,17 +1304,17 @@ pub async fn serve(
                         // peer's fragments, interleaved into its own stream.
                         // Disconnecting is the only portable exclusion: BlueZ
                         // cannot address a notification to one peer at all.
-                        disconnect_refused(backend.as_ref(), &peer, backend_session).await;
+                        disconnect_refused(driver.as_ref(), &peer, driver_session).await;
                         continue;
                     }
                     let generation = next_generation;
                     next_generation += 1;
                     // A central usually subscribes before its first write, so
-                    // the backend can normally size notifications to this
+                    // the driver can normally size notifications to this
                     // peer's real MTU by now — 537 bytes as 2 notifications
                     // instead of 45 at the spec-minimum.
-                    let peripheral_budget = backend
-                        .notify_max_len(&peer, backend_session)
+                    let peripheral_budget = driver
+                        .notify_max_len(&peer, driver_session)
                         .await
                         .and_then(|len| len.checked_sub(FRAGMENT_HEADER_LEN))
                         .filter(|budget| *budget > 0)
@@ -1227,12 +1335,13 @@ pub async fn serve(
                         peer: peer.clone(),
                         characteristic: config.characteristic,
                         sink: Arc::new(Mutex::new(Sink::Notify {
-                            backend: backend.clone(),
+                            driver: driver.clone(),
                             active: active.clone(),
                         })),
                         inbound: ReceiverStream::new(msg_rx),
                         release: Some((release_tx.clone(), generation)),
-                        session: backend_session,
+                        keep_peer: false,
+                        session: driver_session,
                         overflow: overflow.clone(),
                         next_msg_id: Arc::default(),
                         max_message_len: effective_max_message_len(
@@ -1251,14 +1360,14 @@ pub async fn serve(
                     match channels_tx.try_send(channel) {
                         Ok(()) => {
                             log::info!(
-                                "serve: accepted central {} session={backend_session:?} \
+                                "serve: accepted central {} session={driver_session:?} \
                                  generation={generation} fragment_budget={peripheral_budget}",
                                 peer.0
                             );
                             inbound.insert(
                                 peer.clone(),
                                 ServedPeer {
-                                    backend_session,
+                                    driver_session,
                                     fragments: frag_tx,
                                     active,
                                     overflow: overflow.clone(),
@@ -1278,12 +1387,12 @@ pub async fn serve(
                             // queue drains and another central is accepted,
                             // every broadcast notification reaches this one
                             // too.
-                            disconnect_refused(backend.as_ref(), &peer, backend_session).await;
+                            disconnect_refused(driver.as_ref(), &peer, driver_session).await;
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             // Do NOT disconnect here. A generation that is
                             // shutting down must not touch peers it is not
-                            // serving: the same backend may already have a
+                            // serving: the same driver may already have a
                             // *newer* `serve` that legitimately owns this
                             // peer, and disconnecting it would kill the new
                             // session on behalf of a dead one.
@@ -1380,7 +1489,7 @@ pub async fn serve(
                     // from a previous session for this address must not
                     // evict the peer that replaced it.
                     let stale = match (lost_session, inbound.get(&peer)) {
-                        (Some(lost), Some(served)) => match served.backend_session {
+                        (Some(lost), Some(served)) => match served.driver_session {
                             Some(current) => lost != current,
                             None => false,
                         },
@@ -1434,11 +1543,11 @@ pub async fn serve(
                             // close, then invalidate the channel.
                             state.overflow.raise();
                             state.active.store(false, Ordering::SeqCst);
-                            state.backend_session
+                            state.driver_session
                         } else {
                             None
                         };
-                        disconnect_refused(backend.as_ref(), &peer, session).await;
+                        disconnect_refused(driver.as_ref(), &peer, session).await;
                     }
                     if accept_closed && inbound.is_empty() {
                         return;
@@ -1465,8 +1574,19 @@ pub async fn serve(
                     if accept_closed {
                         continue;
                     }
+                    // With the latest `update_advertisement`'s data, not the
+                    // data `serve` started with: an update must survive a
+                    // power cycle. Nothing served: `stop_serving` ran, and a
+                    // device stopped to be unreachable stays so.
+                    let Some(spec) = driver
+                        .served_service()
+                        .filter(|served| served.same_service(&config.service_spec()))
+                    else {
+                        log::info!("serve: radio back; service {} was stopped, not re-advertising", config.service.0);
+                        continue;
+                    };
                     log::info!("serve: radio back; re-advertising service {}", config.service.0);
-                    if let Err(err) = backend.advertise(config.service_spec()).await {
+                    if let Err(err) = driver.advertise(spec).await {
                         log::warn!("serve: re-advertising after radio recovery failed: {err}");
                     }
                 }

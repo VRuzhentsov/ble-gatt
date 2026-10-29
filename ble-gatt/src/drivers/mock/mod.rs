@@ -1,6 +1,6 @@
-//! In-process mock backend: no radio, no OS Bluetooth stack. Two
-//! `MockBackend`s that share the same `MockNetwork` can scan/connect/serve
-//! against each other, exercising the real `Backend`/`GattConnection` trait
+//! In-process mock driver: no radio, no OS Bluetooth stack. Two
+//! `MockDriver`s that share the same `MockNetwork` can scan/connect/serve
+//! against each other, exercising the real `Driver`/`GattConnection` trait
 //! contract end-to-end. Mirrors Fini's `transport::sim` adapter — a
 //! first-class stand-in for CI-safe protocol tests, not a mock of one.
 //!
@@ -26,7 +26,7 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
-use crate::hal::{Backend, BoxStream, GattConnection};
+use crate::hal::{Driver, BoxStream, GattConnection};
 use crate::entities::error::{BleError, Result};
 use crate::entities::models::{
     CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress,
@@ -53,7 +53,7 @@ enum Radio {
     Remote(remote::RemoteClient),
 }
 
-/// Shared "radio" for a set of `MockBackend`s. Construct one per test and
+/// Shared "radio" for a set of `MockDriver`s. Construct one per test and
 /// hand an `Arc` clone to each simulated peer — there is no global registry,
 /// so unrelated tests never see each other's peers.
 ///
@@ -74,7 +74,7 @@ impl MockNetwork {
         Arc::new(Self::default())
     }
 
-    /// Connect to a `MockNetwork::serve()` broker over TCP, so `MockBackend`s
+    /// Connect to a `MockNetwork::serve()` broker over TCP, so `MockDriver`s
     /// built against the returned network can bridge two separate OS
     /// processes instead of sharing this `Arc` in one. See
     /// docs/adr/0004-mock-broker-for-cross-process-e2e.md.
@@ -129,7 +129,7 @@ impl MockNetwork {
         self.as_local().simulate_event_lag(to, dropped)
     }
 
-    /// The backend reports that it dropped notifications for `central`.
+    /// The driver reports that it dropped notifications for `central`.
     pub fn simulate_notification_gap(&self, peripheral: &PeerAddress, central: &PeerAddress) {
         self.as_local().simulate_notification_gap(peripheral, central)
     }
@@ -145,7 +145,7 @@ impl MockNetwork {
         self.as_local().stall_subscribe(delay)
     }
 
-    /// Make the next `scan` on any backend in this network end with an
+    /// Make the next `scan` on any driver in this network end with an
     /// error item, the way Android's `onScanFailed` does.
     pub fn arm_scan_failure(&self, message: impl Into<String>) {
         self.as_local().arm_scan_failure(message)
@@ -191,6 +191,14 @@ impl MockNetwork {
             Radio::Local(r) => r.advertise(address, service).await,
             #[cfg(feature = "mock-broker")]
             Radio::Remote(r) => r.advertise(address, service).await,
+        }
+    }
+
+    async fn update_advertisement(&self, address: &PeerAddress, service: GattServiceSpec) -> Result<()> {
+        match &self.0 {
+            Radio::Local(r) => r.update_advertisement(address, service).await,
+            #[cfg(feature = "mock-broker")]
+            Radio::Remote(r) => r.update_advertisement(address, service).await,
         }
     }
 
@@ -269,34 +277,36 @@ impl MockNetwork {
     }
 }
 
-pub struct MockBackend {
+pub struct MockDriver {
     address: PeerAddress,
     network: Arc<MockNetwork>,
     capabilities: CapabilityReport,
     events_tx: broadcast::Sender<GattEvent>,
+    /// What `Driver::served_service` reports, as the real drivers keep it.
+    served: std::sync::Mutex<Option<GattServiceSpec>>,
 }
 
-impl MockBackend {
+impl MockDriver {
     /// `capabilities` lets tests simulate a peer that can't do peripheral
-    /// mode (e.g. most Android devices) without a second backend impl — see
+    /// mode (e.g. most Android devices) without a second driver impl — see
     /// the plan's role-assignment-with-capability-fallback decision.
     pub fn new(address: PeerAddress, network: Arc<MockNetwork>, capabilities: CapabilityReport) -> Self {
         let (events_tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         network.register_events_sender(address.clone(), events_tx.clone());
-        Self { address, network, capabilities, events_tx }
+        Self { address, network, capabilities, events_tx, served: std::sync::Mutex::new(None) }
     }
 
     /// Simulate the peer dropping the link without warning — out of range,
     /// battery dead, firmware crash. There is no API-initiated disconnect
-    /// involved, which is exactly the case `Backend::events()` exists to
+    /// involved, which is exactly the case `Driver::events()` exists to
     /// surface; tests use this to prove a consumer learns about it.
     pub fn simulate_peer_loss(&self, peer: &PeerAddress) {
         self.network.as_local().simulate_peer_loss(&self.address, peer);
     }
 
     /// Simulate the local radio being toggled off / on (or found absent).
-    /// Pushes a `GattEvent::RadioChanged` onto this backend's own event
-    /// stream, the same signal a real backend emits from its adapter-state
+    /// Pushes a `GattEvent::RadioChanged` onto this driver's own event
+    /// stream, the same signal a real driver emits from its adapter-state
     /// watcher. `PeerLink` turns it into per-peer `Unavailable` and, on a
     /// return to `On`, re-establishes links to tracked peers.
     ///
@@ -316,14 +326,14 @@ impl MockBackend {
 }
 
 #[async_trait]
-impl Backend for MockBackend {
+impl Driver for MockDriver {
     async fn capabilities(&self) -> CapabilityReport {
         self.capabilities
     }
 
     async fn scan(&self, service: ServiceUuid) -> Result<BoxStream<Result<DiscoveredPeer>>> {
         let (matches, armed_failure) = self.network.scan(&self.address, service).await?;
-        // Mirrors the real backends' asynchronous-failure contract: an
+        // Mirrors the real drivers' asynchronous-failure contract: an
         // armed failure is delivered as an error *item*, after any peers
         // already matched, rather than as an error from `scan` itself.
         if let Some(message) = armed_failure {
@@ -347,10 +357,26 @@ impl Backend for MockBackend {
         if !self.capabilities.peripheral {
             return Err(BleError::PeripheralUnsupported);
         }
-        self.network.advertise(&self.address, service).await
+        service.validate()?;
+        *self.served.lock().unwrap() = None;
+        self.network.advertise(&self.address, service.clone()).await?;
+        *self.served.lock().unwrap() = Some(service);
+        Ok(())
+    }
+
+    async fn update_advertisement(&self, service: GattServiceSpec) -> Result<()> {
+        service.validate()?;
+        self.network.update_advertisement(&self.address, service.clone()).await?;
+        *self.served.lock().unwrap() = Some(service);
+        Ok(())
+    }
+
+    fn served_service(&self) -> Option<GattServiceSpec> {
+        self.served.lock().unwrap().clone()
     }
 
     async fn stop_advertising(&self) -> Result<()> {
+        *self.served.lock().unwrap() = None;
         self.network.stop_advertising(&self.address).await
     }
 
@@ -369,10 +395,10 @@ impl Backend for MockBackend {
     }
 
     fn events(&self) -> BoxStream<GattEvent> {
-        // This backend's own view, in both roles — available immediately,
+        // This driver's own view, in both roles — available immediately,
         // not conditional on advertising, since a central-only consumer
         // needs it to learn about unsolicited peer loss. Purely local to
-        // this backend regardless of Local/Remote: `register_events_sender`
+        // this driver regardless of Local/Remote: `register_events_sender`
         // is what wires the network side up to feed this channel.
         let rx = self.events_tx.subscribe();
         Box::pin(BroadcastStream::new(rx).map(|item| match item {

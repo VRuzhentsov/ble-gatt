@@ -51,6 +51,40 @@ One of those broadcast packets: up to about 31 bytes carrying service UUIDs
 and small data (for example the manufacturer data where this library puts a
 peer's identity fingerprint). *Also called:* advertising data, adv.
 
+### Advertisement update
+Changing what a peripheral advertises while it keeps serving
+(`datagram::update_advertisement`). Only the advertisement is replaced; the
+GATT server, and every central connected to it with its subscription, stay.
+Advertising again with `serve` replaces the server and drops those centrals.
+An update survives a [radio recovery](#radio-recovery).
+
+### Stop serving
+Ending a peripheral's advertisement and GATT server together
+(`datagram::stop_serving`), which drops the centrals connected to it.
+Dropping the stream `serve` returned is not stopping: it only ends handing
+out new channels, and the server keeps advertising and accepting. A stopped
+server stays stopped across a [radio recovery](#radio-recovery).
+
+### Radio recovery
+The radio coming back on (`RadioChanged { On }`) after it was off or the
+Bluetooth service restarted. The platform has forgotten the advertisement
+and GATT server by then, so serving registers again what the driver last
+served (`Driver::served_service`), and nothing if serving was stopped
+(ADR-0010).
+
+### Scan response
+A second packet of up to 31 bytes that an advertiser sends only when a
+scanner asks for it. Scanners ask during an *active* scan, which is how both
+Android and BlueZ scan. This library puts a peer's local name there, because
+the advertisement itself is full. *Also called:* SCAN_RSP.
+
+### Local name
+A short, human-readable name a peripheral advertises so a scanner can show
+it without connecting (`GattServiceSpec::local_name` → `DiscoveredPeer::name`).
+Linux sends it as BlueZ's `LocalName`; Android, which cannot set a name per
+advertisement, sends it as service data under the advertised service UUID.
+Both go in the scan response. Not the OS device name (the phone's model name).
+
 ### Scan
 A central listening for advertisements for a while. Scanning is the most
 battery-expensive thing BLE does on a phone.
@@ -111,7 +145,7 @@ recognised by its address alone.
 Another device this library talks to.
 
 ### Peer address
-The value a backend uses to reach a peer right now (`PeerAddress`). It is
+The value a driver uses to reach a peer right now (`PeerAddress`). It is
 opaque and may change (see [private address](#private-address)), so it is not
 a peer's identity.
 
@@ -170,14 +204,14 @@ In this library: the `hal/` module.
 
 ### Driver
 The code that implements the `hal/` traits for one platform, or the mock
-(`drivers/`). Layer: Frameworks & Drivers. *Also called:* backend (the
-code's current word), platform implementation, executor (Nordic).
+(`drivers/`): the `hal::Driver` trait, implemented by `LinuxDriver`,
+`AndroidDriver` and `MockDriver`. Layer: Frameworks & Drivers. *Also
+called:* backend (the code's old word, and SimpleBLE's and Qt's), platform
+implementation, executor (Nordic). Not the operating system's kernel driver
+for the Bluetooth chip, which sits several levels lower.
 
 ### Platform
 One operating system's Bluetooth API: Linux (BlueZ), Android, Windows, Apple.
-
-### Backend
-The current code's word for a [driver](#driver).
 
 ### Port
 An interface (a Rust trait) a layer defines for what it needs from outside,
@@ -243,6 +277,36 @@ subscribed.
 `tokio_util::sync::CancellationToken`: a one-shot signal that tasks can wait
 on or be stopped by. A connection hands one out that fires when it
 disconnects.
+
+### Leftover link
+A link BlueZ still holds for a process that exited or crashed: on Linux a
+link belongs to `bluetoothd`, not to the app that dialled it. Android, Apple
+and Windows release a dead app's links themselves. The Linux driver
+disconnects leftover links that offer the app's service before its first
+scan or advertisement, and `Adapter::close` releases the app's own links on
+the way out (ADR-0009).
+
+### Endpoint hooks
+Callbacks an application installs on its iroh endpoint
+(`iroh::endpoint::EndpointHooks`). `after_handshake` runs for every
+connection, incoming and outgoing, once TLS has proved the peer's key
+(ADR-0008).
+
+### Path
+One transport address an iroh connection can use to reach the peer
+(`Connection::paths`). For `ble-gatt-iroh` it is the peer's BLE address.
+*Not the same as* a filesystem path.
+
+### Crossed dials
+Both devices dialling each other at the same moment, so two links or two
+connections come up where one was wanted.
+
+### Redial yield
+After a link the peer dialled drops, the time (`REDIAL_YIELD`, 30 s) for
+which `ble-gatt-iroh` does not dial that peer, so that the peer, which re-dials
+for its still-open iroh connection, does not cross with it. It starts only
+when such a connection may still be open: not after this side closed the
+link, nor after every connection on it had started to close.
 
 ### Adapter crate
 A crate that connects `ble-gatt` to something outside it, such as iroh

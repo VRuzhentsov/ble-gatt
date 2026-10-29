@@ -1,7 +1,7 @@
 # Hardware verification
 
-Everything else in this repository is verified against a mock backend. That
-mock has repeatedly certified behaviour both real backends reject — writes to
+Everything else in this repository is verified against a mock driver. That
+mock has repeatedly certified behaviour both real drivers reject — writes to
 characteristics no peer declared writable, operations through connections
 that had already been closed, and for several revisions a `session: None`
 that made an entire class of session checks unreachable from any test. None
@@ -29,7 +29,7 @@ both of which need real radios.
 
 Not the `hw_peer`/datagram-tier harness below — this was fini's actual
 production app (`v0.1.45`, pinning this repo at `af4ed1e`) against a real
-Pixel 6 Pro, both already paired, diagnosed read-only over `adb logcat` +
+Android phone, both already paired, diagnosed read-only over `adb logcat` +
 `journalctl` + a user-run `btmon` capture (no reinstall, no rebuild). Two
 independent defects, plus a third contributing factor, all found from the
 same session:
@@ -68,8 +68,8 @@ subscribes — then the very first characteristic write is rejected locally,
 never reaching the air.**
 
 ```
-D BleGattBridge: onMtuChanged: 88:D8:2E:BA:72:27 negotiated mtu=517
-W BleGattBridge: writeCharacteristic rejected by the stack: 88:D8:2E:BA:72:27/b1e6a001-...
+D BleGattBridge: onMtuChanged: AA:BB:… negotiated mtu=517
+W BleGattBridge: writeCharacteristic rejected by the stack: AA:BB:…/b1e6a001-...
 [transport][ble] auth with ... failed: GATT operation failed: characteristic write failed
 ```
 
@@ -159,7 +159,7 @@ Markers:
 > between two emulators — see "Why discovery fails" below. It still proves
 > the peripheral role, so it is documented rather than deleted.
 
-No physical hardware. Exercises the Android backend, the Kotlin bridge and
+No physical hardware. Exercises the Android driver, the Kotlin bridge and
 the JNI boundary — where the majority of review findings landed.
 
 The emulator log line to look for at startup is:
@@ -244,7 +244,7 @@ finding about this library, and nothing here can work around it.
 Related and recorded earlier in `docs/adr/0002-android-jni-bridge.md`: a
 *filtered* scan against RootCanal also returned zero results with the target
 confirmed advertising and the filter accepted (`status=0`). The Android
-backend therefore scans unfiltered and matches in code. Both observations
+driver therefore scans unfiltered and matches in code. Both observations
 now look like the same underlying gap.
 
 #### What this topology does prove
@@ -282,7 +282,7 @@ Needs a second controller — a USB dongle or a second machine. This is what
 
 ## What a pass does and does not prove
 
-A pass proves the two backends interoperate for one connection, one
+A pass proves the two drivers interoperate for one connection, one
 fragmented message and one echo. It does **not** prove the behaviour that
 dominated this library's review findings: reconnection with the same
 address, session identity across a stop/restart, cancellation mid-operation,

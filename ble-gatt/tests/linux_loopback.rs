@@ -1,4 +1,4 @@
-//! Real-BlueZ verification for the Linux backend. `#[ignore]`d by default —
+//! Real-BlueZ verification for the Linux driver. `#[ignore]`d by default —
 //! run explicitly with `cargo test --test linux_loopback -- --ignored`, and
 //! only on a Linux machine with `bluetoothd` running and a powered adapter.
 //!
@@ -11,29 +11,29 @@
 //!   D-Bus registration this crate builds is accepted by the real
 //!   `org.bluez` daemon, not just internally consistent Rust.
 //! - `two_adapter_central_to_peripheral_round_trip` — the true loopback the
-//!   plan calls for (one `LinuxBackend` as central, a second as
+//!   plan calls for (one `LinuxDriver` as central, a second as
 //!   peripheral, over real BLE). `#[ignore]`d with a reason explaining the
 //!   missing second adapter — a second Bluetooth controller (a USB dongle)
 //!   or a second Linux machine is required; this is the documented,
 //!   non-blocking follow-up the plan already anticipated for real-hardware
 //!   verification.
 
-// `backend::linux` only exists on Linux, so without this gate the whole
+// `drivers::linux` only exists on Linux, so without this gate the whole
 // crate fails to build under `--all-targets` for the Android targets.
 #![cfg(target_os = "linux")]
 
 use std::time::Duration;
 
-use ble_gatt::backend::linux::LinuxBackend;
-use ble_gatt::{Backend, CharacteristicUuid, GattCharacteristicSpec, GattServiceSpec, ServiceUuid};
+use ble_gatt::drivers::linux::LinuxDriver;
+use ble_gatt::{Driver, CharacteristicUuid, GattCharacteristicSpec, GattServiceSpec, ServiceUuid};
 use uuid::Uuid;
 
 #[tokio::test]
 #[ignore = "requires a real, powered BlueZ adapter"]
 async fn peripheral_advertise_and_serve_smoke_test() {
-    let backend = LinuxBackend::new().await.expect("bring up BlueZ session + default adapter");
+    let driver = LinuxDriver::new().await.expect("bring up BlueZ session + default adapter");
 
-    let capabilities = backend.capabilities().await;
+    let capabilities = driver.capabilities().await;
     assert!(capabilities.central, "BlueZ adapters are always capable of the central role");
 
     let service = GattServiceSpec::new(
@@ -47,7 +47,7 @@ async fn peripheral_advertise_and_serve_smoke_test() {
         }],
     );
 
-    backend
+    driver
         .advertise(service)
         .await
         .expect("real BlueZ daemon should accept the GATT application + advertisement");
@@ -57,7 +57,7 @@ async fn peripheral_advertise_and_serve_smoke_test() {
     // alongside `cargo test -- --ignored --nocapture` if desired.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    backend.stop_advertising().await.expect("stop_advertising should succeed");
+    driver.stop_advertising().await.expect("stop_advertising should succeed");
 }
 
 #[tokio::test]
@@ -65,7 +65,7 @@ async fn peripheral_advertise_and_serve_smoke_test() {
             see the module doc comment; this machine currently has one adapter"]
 async fn two_adapter_central_to_peripheral_round_trip() {
     unimplemented!(
-        "wire this up once a second adapter is available: bring up two LinuxBackends \
+        "wire this up once a second adapter is available: bring up two LinuxDrivers \
          bound to different adapter names via bluer::Session::adapter, advertise a test \
          service on one, scan+connect+read/write/notify from the other"
     );

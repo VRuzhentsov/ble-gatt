@@ -1,7 +1,7 @@
 package dev.blegatt
 
 /**
- * Native callbacks implemented in Rust (`ble-gatt/src/backend/android.rs`,
+ * Native callbacks implemented in Rust (`ble-gatt/src/drivers/android.rs`,
  * `#[no_mangle] extern "system" fn Java_dev_blegatt_NativeKt_<name>`).
  * Declared as top-level functions (not class members) so Kotlin compiles
  * them as static methods on `NativeKt` — a fixed, unmangled JNI symbol name
@@ -29,7 +29,7 @@ external fun onPeerDiscovered(
 
 /// `fromServer` distinguishes an inbound central (our GATT server) from our
 /// own outbound connection. Without it Rust cannot tell the two apart, and a
-/// backend used in both roles treats its own dial-out as an arriving peer.
+/// driver used in both roles treats its own dial-out as an arriving peer.
 external fun onConnected(nativeHandle: Long, address: String, fromServer: Boolean)
 
 external fun onDisconnected(nativeHandle: Long, address: String, fromServer: Boolean)

@@ -20,7 +20,7 @@ genuinely wants to drive one channel by hand.
 
 ---
 
-## Tier 1 — raw GATT (`Backend`)
+## Tier 1 — raw GATT (`Driver`)
 
 Scan, connect, read, write, subscribe; advertise, notify. You speak in
 characteristics and MTUs. This tier imposes nothing — it exists for the
@@ -28,7 +28,7 @@ app-to-device case (a vendor sensor with its own command framing, CRC, and
 challenge/response) where any layer the library added would be dead weight.
 
 ```rust
-let mut conn = backend.connect(&peer).await?;
+let mut conn = driver.connect(&peer).await?;
 let value = conn.read(SENSOR_CHAR).await?;
 conn.write(COMMAND_CHAR, cmd_bytes).await?;
 let mut notifications = conn.subscribe(TELEMETRY_CHAR).await?;
@@ -46,14 +46,14 @@ the negotiated MTU and bounded reassembly are handled inside; boundaries are
 preserved so you can layer encryption on top without reinventing framing.
 
 ```rust
-let mut channel = datagram::connect(backend, &peer, &config).await?;
+let mut channel = datagram::connect(driver, &peer, &config).await?;
 channel.send(encrypted_message).await?;
 let incoming = channel.recv().await?;
 ```
 
 **You still own the connection lifecycle**: deciding to dial, redialing after a
 drop, ensuring one link per peer, resolving simultaneous-dial glare, recovering
-from an adapter power-cycle. You also supply the `Backend` and run on your own
+from an adapter power-cycle. You also supply the `Driver` and run on your own
 runtime — the `DatagramChannel` here holds the `GattConnection` directly. For a
 one-shot transfer or a test that is fine. For a long-lived app-to-app
 relationship it is a lot of machinery to get right — which is why Tier 3
@@ -69,7 +69,7 @@ library owns keeping links alive; you consume channels and status.
 ### Configure once
 
 ```rust
-// Normal case: PeerLink builds and owns the platform backend.
+// Normal case: PeerLink builds and owns the platform driver.
 let link: Arc<PeerLink> = PeerLink::new(PeerLinkConfig {
     // service + characteristic + fragmentation bounds all live here
     datagram:     DatagramConfig::new(MY_SERVICE, MY_CHARACTERISTIC),
@@ -78,13 +78,13 @@ let link: Arc<PeerLink> = PeerLink::new(PeerLinkConfig {
     max_links:    MaxLinks::default(),   // concurrent-link cap; conservative default
 });
 
-// Tests / advanced: inject an already-built backend (e.g. a MockBackend).
-let link = PeerLink::with_backend(backend, config);
+// Tests / advanced: inject an already-built driver (e.g. a MockDriver).
+let link = PeerLink::with_driver(driver, config);
 ```
 
 **`PeerLink::new` is synchronous, infallible, and needs no ambient runtime.**
 It returns a handle immediately. Internally it spawns **one dedicated OS thread
-hosting its own Tokio runtime** — the driver, the platform backend, and all
+hosting its own Tokio runtime** — the worker, the platform driver, and all
 per-peer machinery live there. So `new()` works in any binary, including one
 with no `#[tokio::main]` (a CLI entry point). Adapter acquisition happens on
 that thread, asynchronously, and may fail or be slow — that shows up as
@@ -93,9 +93,9 @@ exists, the radio may not" is a cleaner story than "the handle may not exist
 yet," and "one call, works anywhere" beats "one call, but only from async
 context" — a requirement a sync signature does not advertise.
 
-Because the driver owns its own runtime, the `PeerChannel` handed out by
+Because the worker owns its own runtime, the `PeerChannel` handed out by
 `PeerLinkEvent::Up` is a **message-passing handle** — `send` / `recv` move bytes
-across a channel to the driver thread, which does the GATT work. It is usable
+across a channel to the worker thread, which does the GATT work. It is usable
 from any context (the consumer's runtime, or none). This differs from Tier 2's
 `DatagramChannel`, which holds the `GattConnection` directly and runs on the
 caller's runtime.
@@ -107,7 +107,7 @@ The handle's contract across that hop:
   distinguishable from a permanent refusal — the crossing must not collapse
   them, or the caller-side retry that replaced the removed internal one
   (`docs/adr/0005` context) silently becomes retry-everything or retry-nothing.
-- **`recv()` returns `None` when the link is closed** — and driver-thread death
+- **`recv()` returns `None` when the link is closed** — and worker-thread death
   maps to `None`, never a hang. A handle whose far end is gone reads as closed.
 - **A full internal send queue surfaces as `BleError::GattBusy`**, not as
   backpressure indistinguishable from a stall — so it slots into the same retry.
@@ -115,10 +115,10 @@ The handle's contract across that hop:
   the platform for a latency/power trade-off on the live link
   (`ConnectionPriority::LowPower` while idle, `High` while traffic is expected)
   and can be called any number of times. Android only, and only on a link this
-  side dialled — the Linux backend and accepted links return
+  side dialled — the Linux driver and accepted links return
   `BleError::Unsupported`, which a cross-platform caller treats as a no-op. A
   request, not a guarantee: `Ok` means the platform accepted it. The first
-  explicit request replaces the Android backend's automatic bootstrap priority
+  explicit request replaces the Android driver's automatic bootstrap priority
   (HIGH at connect, BALANCED once bootstrap ends) for that connection; a
   reconnect starts over, so re-request after each `Up`. Also on
   `GattConnection` (Tier 1) and `DatagramChannel` (Tier 2).
@@ -148,7 +148,7 @@ cannot be addressed to one peer). So on the acceptor side of `Symmetric`, or
 in `AcceptOnly`, a second tracked peer stays `Connecting` until the first
 inbound link frees or it gives up. `max_links > 1` only widens the *dialer*
 side. A consumer that needs to serve many peers at once wants a per-peer
-notify on the `Backend` port first (tracked separately).
+notify on the `Driver` port first (tracked separately).
 
 ### Declare interest
 
@@ -212,7 +212,7 @@ replaces a consumer polling `capabilities()` to guess.
 
 ### The library owns
 
-- building and owning the platform backend (Tier 3 consumers never touch `Backend`)
+- building and owning the platform driver (Tier 3 consumers never touch `Driver`)
 - dialing tracked peers (when `role` and the tiebreak allow)
 - the retry budget on *both* sides — redials for the dialer, an inbound-link
   deadline for the acceptor — and giving up (observable as `GaveUp`)
@@ -245,9 +245,9 @@ events per peer. Three guarantees make N peers safe rather than N times the
 risk:
 
 - **Per-peer isolation.** One unresponsive peer does not stall the others. The
-  per-peer state machines are independent, and the driver does not hold a
-  backend-wide lock across any one peer's platform call (the current Linux
-  backend does — a stuck dial there freezes every peer, and the host app; that
+  per-peer state machines are independent, and the worker does not hold a
+  driver-wide lock across any one peer's platform call (the current Linux
+  driver does — a stuck dial there freezes every peer, and the host app; that
   lock becomes per-address as part of this work). A test proves one wedged peer
   leaves the rest connecting.
 - **The link cap is visible.** More tracked peers than `max_links` → the extra
@@ -309,7 +309,7 @@ while let Some(ev) = events.next().await {
 }
 ```
 
-What Fini **no longer does**: `backend.connect()`, a `HashMap<(peer,transport),
+What Fini **no longer does**: `driver.connect()`, a `HashMap<(peer,transport),
 LinkState>` for the transport layer, `should_dial_peer` wiring beyond supplying
 `local_id`, redial loops, glare resolution, adapter-bounce recovery.
 
@@ -332,6 +332,6 @@ LinkState>` for the transport layer, `should_dial_peer` wiring beyond supplying
   ~60s total, acceptor inbound deadline ~60s), fully overridable.
 - **`Up` carries the peer's `max_message_len`** — a consumer sizing its own
   payloads needs it.
-- **Construction:** `new(config)` builds the backend internally (a Tier-3
-  consumer never touches `Backend`); `with_backend(backend, config)` injects
+- **Construction:** `new(config)` builds the driver internally (a Tier-3
+  consumer never touches `Driver`); `with_driver(driver, config)` injects
   one, for tests and the mock.

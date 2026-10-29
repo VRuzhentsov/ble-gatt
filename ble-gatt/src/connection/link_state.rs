@@ -19,7 +19,7 @@
 //! Nothing here is exposed to consumers; `PeerLink` projects a `PeerStatus`.
 
 // `PeripheralLink` / `PeripheralEvent` and a few `CentralLink` helpers have
-// only their tests as callers until the backend fold-in follow-up wires the
+// only their tests as callers until the driver fold-in follow-up wires the
 // per-peer machines into `android.rs` / `linux.rs` (see ADR-0005 — the Linux
 // `Draining` migration in particular is deferred). `PeerLink` already
 // consumes `CentralLink` / `RadioState`.
@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 pub(crate) type Session = u64;
 
 /// How long a dial may run before it is abandoned. Seeded from the Linux
-/// backend's former `CONNECT_TIMEOUT`; tuned on hardware evidence.
+/// driver's former `CONNECT_TIMEOUT`; tuned on hardware evidence.
 pub(crate) const DIAL_WINDOW: Duration = Duration::from_secs(20);
 
 /// How long to wait for the platform to confirm a `disconnect()` before
@@ -41,16 +41,16 @@ pub(crate) const DIAL_WINDOW: Duration = Duration::from_secs(20);
 pub(crate) const DISCONNECT_WINDOW: Duration = Duration::from_secs(5);
 
 /// How long one abandoned-dial cleanup attempt may run before it is retried.
-/// Seeded from the Linux backend's former `CLEANUP_DISCONNECT_TIMEOUT`.
+/// Seeded from the Linux driver's former `CLEANUP_DISCONNECT_TIMEOUT`.
 pub(crate) const DRAIN_WINDOW: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
-// RadioState — the universal power-state seam, one per backend.
+// RadioState — the universal power-state seam, one per driver.
 // ---------------------------------------------------------------------------
 
 /// Whether the platform BLE radio is usable.
 ///
-/// A new backend implements exactly one thing — feeding this machine
+/// A new driver implements exactly one thing — feeding this machine
 /// `PoweredOff` / `PoweredOn` / `NoAdapter` — and inherits correct teardown
 /// of every link for free.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,7 +71,7 @@ pub(crate) enum RadioEvent {
     NoAdapter,
 }
 
-/// What the backend must do when the radio stops being usable: submit
+/// What the driver must do when the radio stops being usable: submit
 /// `CentralEvent::RadioLost` / `PeripheralEvent::RadioLost` to every per-peer
 /// machine it holds, then run their effects. Not a command channel — this is
 /// the one thing `RadioState` must cause to keep the per-peer invariants true.
@@ -95,8 +95,8 @@ impl RadioState {
             (S::On, E::NoAdapter) => (S::Unsupported, vec![RadioEffect::InvalidateAllLinks]),
             (S::Off, E::PoweredOn) => (S::On, vec![]),
             (S::Off, E::NoAdapter) => (S::Unsupported, vec![]),
-            // `Unsupported` is reached two ways: a backend genuinely has no
-            // adapter, or (the only path any backend actually takes today)
+            // `Unsupported` is reached two ways: a driver genuinely has no
+            // adapter, or (the only path any driver actually takes today)
             // `PeerLink::assess_radio` downgraded a powered, present radio
             // because it currently lacks a capability the configured role
             // needs. The latter is re-probed on every `RadioChanged { On }`

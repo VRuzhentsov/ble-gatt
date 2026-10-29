@@ -37,7 +37,7 @@ for its transport layer.
 
 ### The failure it produced
 
-Real hardware, Pixel 6 Pro + Linux desktop, both on merged `3483f81`:
+Real hardware, an Android phone + a Linux desktop, both on merged `3483f81`:
 
 1. BLE session up, both sides green.
 2. Phone adapter off (`adb shell svc bluetooth disable`).
@@ -45,7 +45,7 @@ Real hardware, Pixel 6 Pro + Linux desktop, both on merged `3483f81`:
 4. Phone dials the desktop.
 
 ```
-11:49:20 datagram  connect: dialling 88:D8:2E:BA:72:27
+11:49:20 datagram  connect: dialling AA:BB:…
 11:49:20 transport connect ... failed: a connection to this peer is already open
 11:49:28 ... identical    11:49:44 ... identical
 11:50:14 did not complete auth within 60s; pausing automatic retries

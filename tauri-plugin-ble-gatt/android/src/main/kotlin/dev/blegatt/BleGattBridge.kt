@@ -304,7 +304,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             override fun onScanResult(callbackType: Int, result: ScanResult) {
                 val record = result.scanRecord
                 val uuids = record?.serviceUuids
-                Log.d(TAG, "onScanResult: ${result.device.address} name=${result.device.name} advertisedUuids=$uuids")
+                Log.d(TAG, "onScanResult: ${result.device.address} name=${record?.deviceName} advertisedUuids=$uuids")
                 if (uuids == null || !uuids.contains(ParcelUuid(target))) {
                     return
                 }
@@ -337,7 +337,11 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                     // costs nothing and is what Linux and the mock report.
                     (uuids ?: emptyList()).map { it.uuid.toString() }.toTypedArray(),
                     result.device.address,
-                    result.device.name,
+                    // The name in this advertisement and its scan response
+                    // (a Linux peer's LocalName), not `device.name`, which is
+                    // the name cached from an earlier connection. An Android
+                    // peer's name arrives as service data; Rust picks it.
+                    record.deviceName,
                     result.rssi,
                     manufacturerIds,
                     manufacturerValues as Array<ByteArray>,
@@ -406,7 +410,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                         // radio -- Nearby/Fast Pair scanning, other apps' GATT
                         // servers -- an equal or greater claim on connection-event
                         // time than this link. Live production capture
-                        // (2026-08-23, Pixel 6 Pro) showed the very first
+                        // (2026-08-23, Android phone) showed the very first
                         // characteristic write after connect+subscribe rejected
                         // locally by the stack for the *entire* 7s retry budget on
                         // every attempt, with `dumpsys bluetooth_manager` showing a
@@ -1008,6 +1012,9 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         // side would have to walk it back out again either way.
         manufacturerIds: IntArray, manufacturerValues: Array<ByteArray>,
         serviceDataUuids: Array<String>, serviceDataValues: Array<ByteArray>,
+        // The short name, already truncated by Rust, sent as service data
+        // under serviceUuid in the scan response. Null for none.
+        scanResponseName: ByteArray?,
     ) {
         // Tear down any predecessor first. This bridge holds a single
         // `gattServer`/`advertiseCallback` pair, so starting without
@@ -1025,7 +1032,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         if (advertiser == null) {
             // Central-only device, or Bluetooth switched off. Returning
             // silently left Rust's oneshot pending forever, which is worse
-            // than the unsupported error the backend contract asks for.
+            // than the unsupported error the driver contract asks for.
             Log.w(TAG, "startAdvertising: no BLE advertiser available")
             failAdvertise(ADVERTISE_ERROR_UNAVAILABLE)
             return
@@ -1067,6 +1074,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                     beginAdvertising(
                         advertiser, serviceUuid, generation,
                         manufacturerIds, manufacturerValues, serviceDataUuids, serviceDataValues,
+                        scanResponseName,
                     )
                 }
             }
@@ -1102,7 +1110,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                                 Log.d(TAG, "server: stale generation disconnect, ignoring")
                                 return
                             }
-                            Log.d(TAG, "server: central disconnected ${device.address}")
+                            Log.d(TAG, "server: central disconnected ${device.address} status=$status")
                             // Discard anything this peer had prepared but not
                             // executed. Left behind, a later connection from
                             // the same address could prepare the remaining
@@ -1398,11 +1406,48 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         // actually succeeded.
     }
 
+    /// Replace the advertisement and keep the GATT server, so connected
+    /// centrals keep their link, subscription and MTU. `startAdvertising`
+    /// opens a new server, which drops them.
+    ///
+    /// Reports through `onAdvertiseResult` like `startAdvertising`. A refusal
+    /// leaves the server serving with nothing advertised.
+    fun updateAdvertising(
+        serviceUuid: String,
+        manufacturerIds: IntArray, manufacturerValues: Array<ByteArray>,
+        serviceDataUuids: Array<String>, serviceDataValues: Array<ByteArray>,
+        scanResponseName: ByteArray?,
+    ) {
+        val advertiser = adapter?.bluetoothLeAdvertiser
+        val started = synchronized(this) {
+            if (advertiser == null || gattServer == null) {
+                false
+            } else {
+                advertiseCallback?.let { advertiser.stopAdvertising(it) }
+                advertiseCallback = null
+                beginAdvertising(
+                    advertiser, serviceUuid, serverGeneration,
+                    manufacturerIds, manufacturerValues, serviceDataUuids, serviceDataValues,
+                    scanResponseName, keepServerOnFailure = true,
+                )
+                true
+            }
+        }
+        if (!started) {
+            Log.w(TAG, "updateAdvertising: no server or advertiser")
+            onAdvertiseResult(nativeHandle, false, ADVERTISE_ERROR_UNAVAILABLE)
+        }
+    }
+
     private fun beginAdvertising(
         advertiser: android.bluetooth.le.BluetoothLeAdvertiser, serviceUuid: String,
         generation: Long,
         manufacturerIds: IntArray, manufacturerValues: Array<ByteArray>,
         serviceDataUuids: Array<String>, serviceDataValues: Array<ByteArray>,
+        scanResponseName: ByteArray?,
+        // An update's failure must not take the server and its centrals
+        // down with the advertisement.
+        keepServerOnFailure: Boolean = false,
     ) {
         val settings = AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
@@ -1422,14 +1467,28 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             dataBuilder.addServiceData(ParcelUuid(UUID.fromString(serviceDataUuids[i])), serviceDataValues[i])
         }
         val data = dataBuilder.build()
+        // The advertising packet is full (service UUID + manufacturer data),
+        // so the name goes in the scan response, which scanners request
+        // during an active scan. Android cannot set a custom local name per
+        // advertisement, hence service data under our own service UUID.
+        val scanResponse = if (scanResponseName != null && scanResponseName.isNotEmpty()) {
+            AdvertiseData.Builder()
+                .setIncludeDeviceName(false)
+                .addServiceData(ParcelUuid(UUID.fromString(serviceUuid)), scanResponseName)
+                .build()
+        } else {
+            null
+        }
         val callback = object : AdvertiseCallback() {
             override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
                 // A stop/restart can leave this callback running against a
                 // replacement generation. Resolving the new server's advertise
                 // waiter with this attempt's outcome would report a success
                 // that belongs to an advertisement already torn down.
+                // An update keeps the generation, so the callback it
+                // replaced is told apart by identity.
                 synchronized(this@BleGattBridge) {
-                    if (serverGeneration != generation) {
+                    if (serverGeneration != generation || advertiseCallback !== this) {
                         Log.d(TAG, "advertise onStartSuccess: stale generation, ignoring")
                         return
                     }
@@ -1443,7 +1502,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 // server down, so a stale failure would destroy the
                 // advertisement that replaced this one.
                 synchronized(this@BleGattBridge) {
-                if (serverGeneration != generation) {
+                if (serverGeneration != generation || advertiseCallback !== this) {
                     Log.d(TAG, "advertise onStartFailure: stale generation, ignoring")
                     return
                 }
@@ -1452,13 +1511,22 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 // back is what stops Rust claiming the service is reachable
                 // when no advertisement exists.
                 Log.e(TAG, "advertise onStartFailure: errorCode=$errorCode serviceUuid=$serviceUuid")
-                failAdvertise(errorCode)
+                if (keepServerOnFailure) {
+                    advertiseCallback = null
+                    onAdvertiseResult(nativeHandle, false, errorCode)
+                } else {
+                    failAdvertise(errorCode)
+                }
                 }
             }
         }
         advertiseCallback = callback
-        Log.d(TAG, "startAdvertising: serviceUuid=$serviceUuid advertiser=${advertiser != null}")
-        advertiser.startAdvertising(settings, data, callback)
+        Log.d(TAG, "startAdvertising: serviceUuid=$serviceUuid advertiser=${advertiser != null} scanResponseName=${scanResponse != null}")
+        if (scanResponse != null) {
+            advertiser.startAdvertising(settings, data, scanResponse, callback)
+        } else {
+            advertiser.startAdvertising(settings, data, callback)
+        }
     }
 
     /// Close every open GATT and the server, so no Kotlin object is left
@@ -1556,11 +1624,12 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     /// a mismatch, which is the only signal a consumer vendoring an
     /// out-of-date copy of this file will get. v2: added `onRadioState` /
     /// `isRadioEnabled` / this method (ADR-0005). v3: added
-    /// `requestConnectionPriority`.
-    fun bridgeAbiVersion(): Int = 3
+    /// `requestConnectionPriority`. v4: added the local-name byte array to
+    /// `startAdvertising`.
+    fun bridgeAbiVersion(): Int = 4
 
     /// Whether the adapter is present and switched on. Rust's
-    /// `Backend::radio_status()` calls this once at startup, so a `PeerLink`
+    /// `Driver::radio_status()` calls this once at startup, so a `PeerLink`
     /// created while Bluetooth is off does not wrongly assume it is on.
     fun isRadioEnabled(): Boolean = adapter?.isEnabled == true
 
@@ -1622,7 +1691,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         //
         // `failPendingNotifications` re-enters this monitor; Java monitors
         // are reentrant, so that is safe.
-        synchronized(this) {
+        val served = synchronized(this) {
             failPendingNotifications()
             // Nothing staged survives the server that was collecting it.
             preparedWrites.clear()
@@ -1633,13 +1702,24 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             // onConnectionStateChange for the centrals attached to it, so
             // without this Rust keeps them in its single-central map with
             // their channels live.
-            val served = subscribedDevices.values.flatten().map { it.address }.distinct()
+            val served = subscribedDevices.values.flatten().distinctBy { it.address }
             subscribedDevices.clear()
-            for (address in served) {
-                onDisconnected(nativeHandle, address, true)
+            for (device in served) {
+                onDisconnected(nativeHandle, device.address, true)
             }
+            served
         }
 
+        // Disconnect them too. Closing the server leaves the link up and the
+        // replacement server reports it connected again, so the central kept
+        // writing into the replacement with no subscription and the default
+        // MTU, and never learned its channel was gone. On BlueZ that
+        // leftover link also aborted dials to this phone's next address.
+        // The disconnect callbacks this fires carry the old generation and
+        // are ignored.
+        for (device in served) {
+            gattServer?.cancelConnection(device)
+        }
         gattServer?.close()
         gattServer = null
         serverCharacteristics.clear()

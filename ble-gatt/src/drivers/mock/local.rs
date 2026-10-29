@@ -1,7 +1,7 @@
 //! The in-process "radio": today's exact `MockNetwork` state and logic,
 //! relocated (not rewritten) behind named async methods so `mock/mod.rs` can
 //! dispatch to either this or, behind `mock-broker`, `remote::RemoteClient`
-//! identically. `MockBackend`/`MockGattConnection` no longer reach into these
+//! identically. `MockDriver`/`MockGattConnection` no longer reach into these
 //! fields directly — every access goes through a method here.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -38,11 +38,11 @@ struct PeripheralState {
 #[derive(Default)]
 pub(crate) struct LocalRadio {
     peripherals: Mutex<HashMap<PeerAddress, PeripheralState>>,
-    /// Every backend's own event sender, keyed by its address, so an event
+    /// Every driver's own event sender, keyed by its address, so an event
     /// can be delivered to the party that actually observes it — a
     /// peripheral learns that a central connected to *it*, and a central
-    /// learns that its peer vanished. Mirrors how the real backends behave:
-    /// `events()` is this backend's view, not a global feed.
+    /// learns that its peer vanished. Mirrors how the real drivers behave:
+    /// `events()` is this driver's view, not a global feed.
     event_senders: Mutex<HashMap<PeerAddress, broadcast::Sender<GattEvent>>>,
     /// Every `GattConnection::disconnect` this network has seen, so a test
     /// can assert that an abandoned setup actually released the platform
@@ -59,7 +59,7 @@ pub(crate) struct LocalRadio {
     /// without a radio.
     armed_scan_failure: Mutex<Option<String>>,
     /// Session ids handed to connections, so the mock reproduces the real
-    /// backends' ability to distinguish successive links to one address.
+    /// drivers' ability to distinguish successive links to one address.
     next_session: AtomicU64,
     /// Newest session per (central, peripheral) pair, so the mock can
     /// reproduce a stale handle being superseded.
@@ -115,7 +115,7 @@ impl LocalRadio {
         );
     }
 
-    /// Extracted verbatim from the old `MockBackend::simulate_peer_loss` body
+    /// Extracted verbatim from the old `MockDriver::simulate_peer_loss` body
     /// — `host` is the peripheral whose view of `peer` is being cleared.
     pub(crate) fn simulate_peer_loss(&self, host: &PeerAddress, peer: &PeerAddress) {
         self.live_sessions.lock().unwrap().remove(&(peer.clone(), host.clone()));
@@ -211,7 +211,7 @@ impl LocalRadio {
         Ok(())
     }
 
-    // --- Backend/GattConnection-driving methods ---
+    // --- Driver/GattConnection-driving methods ---
 
     pub(crate) async fn scan(
         &self, requester: &PeerAddress, service: ServiceUuid,
@@ -222,7 +222,7 @@ impl LocalRadio {
             .filter(|(addr, state)| *addr != requester && state.service.uuid == service)
             .map(|(addr, state)| DiscoveredPeer {
                 address: addr.clone(),
-                name: None,
+                name: state.service.local_name.clone(),
                 services: vec![state.service.uuid],
                 manufacturer_data: state.manufacturer_data.clone(),
                 service_data: state.service_data.clone(),
@@ -246,7 +246,7 @@ impl LocalRadio {
         }
         // Only the central's own view is emitted here. The *peripheral*
         // learns about this peer from `subscribe`, matching both real
-        // backends: announcing at connection time would let `serve` yield a
+        // drivers: announcing at connection time would let `serve` yield a
         // channel before the notify path exists, so a server that greets
         // immediately would fail with "no live notify session".
         self.emit(central, GattEvent::Connected { peer: peer.clone(), local_role: Role::Central, session: None });
@@ -280,9 +280,23 @@ impl LocalRadio {
         Ok(())
     }
 
+    /// Swap the advertisement data only: values and subscribers stay, so
+    /// every central keeps its subscription.
+    pub(crate) async fn update_advertisement(&self, address: &PeerAddress, service: GattServiceSpec) -> Result<()> {
+        let mut peripherals = self.peripherals.lock().unwrap();
+        let state = peripherals.get_mut(address).ok_or_else(|| BleError::Gatt("not advertising".to_string()))?;
+        if !state.service.same_service(&service) {
+            return Err(BleError::Gatt(format!("not serving service {} with these characteristics", service.uuid.0)));
+        }
+        state.manufacturer_data = service.manufacturer_data.clone();
+        state.service_data = service.service_data.clone();
+        state.service = service;
+        Ok(())
+    }
+
     pub(crate) async fn stop_advertising(&self, address: &PeerAddress) -> Result<()> {
         // Announce every subscribed central as gone before tearing the
-        // server down. Both real backends now do this — neither platform
+        // server down. Both real drivers now do this — neither platform
         // delivers a disconnect callback when the *server* goes away, so
         // without it `datagram::serve` keeps serving peers that no longer
         // have a server to talk to, and locks out the next `serve`.
@@ -389,7 +403,7 @@ impl LocalRadio {
             let state = peripherals.get_mut(peripheral).ok_or_else(|| BleError::NotConnected(peripheral.0.clone()))?;
             state.values.insert(characteristic, value.clone());
         }
-        // Mirrors what the real backends do: both re-emit `Connected` ahead
+        // Mirrors what the real drivers do: both re-emit `Connected` ahead
         // of every write, because neither has a true server-side connection
         // signal.
         self.emit(
@@ -415,7 +429,7 @@ impl LocalRadio {
         // Checking only before meant a stalled subscribe could be superseded
         // by a reconnect and then install its sender into the replacement's
         // state and announce a peer — accepting an operation both real
-        // backends reject as stale, in the one place tests use to exercise
+        // drivers reject as stale, in the one place tests use to exercise
         // exactly that timing.
         //
         // Lock order is `live_sessions` then `peripherals`, matching

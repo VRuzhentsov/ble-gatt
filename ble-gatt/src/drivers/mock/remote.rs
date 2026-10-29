@@ -205,6 +205,13 @@ impl RemoteClient {
         }
     }
 
+    pub(crate) async fn update_advertisement(&self, address: &PeerAddress, service: GattServiceSpec) -> Result<()> {
+        match self.call(Request::UpdateAdvertisement { address: address.clone(), service }).await? {
+            Response::Unit => Ok(()),
+            _ => Err(BleError::Transport("unexpected response to UpdateAdvertisement".to_string())),
+        }
+    }
+
     pub(crate) async fn stop_advertising(&self, address: &PeerAddress) -> Result<()> {
         match self.call(Request::StopAdvertising { address: address.clone() }).await? {
             Response::Unit => Ok(()),

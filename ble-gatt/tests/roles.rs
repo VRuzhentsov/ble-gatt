@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use ble_gatt::backend::mock::{MockBackend, MockNetwork};
+use ble_gatt::drivers::mock::{MockDriver, MockNetwork};
 use ble_gatt::{
-    Adapter, Backend, BoxStream, CapabilityReport, CharacteristicUuid, ConnectionState, DiscoveredPeer,
+    Adapter, Driver, BoxStream, CapabilityReport, CharacteristicUuid, ConnectionState, DiscoveredPeer,
     GattCharacteristicSpec, GattConnection, GattEvent, GattServiceSpec, PeerAddress, RadioStatus,
     ServiceUuid,
 };
@@ -37,36 +37,36 @@ fn service() -> GattServiceSpec {
     )
 }
 
-fn device(network: &Arc<MockNetwork>, name: &str) -> Arc<MockBackend> {
-    Arc::new(MockBackend::new(PeerAddress(name.into()), network.clone(), capabilities()))
+fn device(network: &Arc<MockNetwork>, name: &str) -> Arc<MockDriver> {
+    Arc::new(MockDriver::new(PeerAddress(name.into()), network.clone(), capabilities()))
 }
 
 #[tokio::test]
 async fn adapter_publishes_the_radio_status() {
     let network = MockNetwork::new();
-    let backend = device(&network, "a");
-    let adapter = Adapter::new(backend.clone() as Arc<dyn Backend>).await;
+    let driver = device(&network, "a");
+    let adapter = Adapter::new(driver.clone() as Arc<dyn Driver>).await;
     let mut status = adapter.status();
     assert_eq!(*status.borrow(), RadioStatus::On);
 
-    backend.simulate_radio(RadioStatus::Off);
+    driver.simulate_radio(RadioStatus::Off);
     timeout(WAIT, status.wait_for(|s| *s == RadioStatus::Off)).await.unwrap().unwrap();
 
-    backend.simulate_radio(RadioStatus::On);
+    driver.simulate_radio(RadioStatus::On);
     timeout(WAIT, adapter.wait_available()).await.unwrap();
 }
 
 #[tokio::test]
 async fn a_connection_publishes_disconnected_when_the_peer_goes_away() {
     let network = MockNetwork::new();
-    let peripheral_backend = device(&network, "peripheral");
-    let central_backend = device(&network, "central");
-    let peripheral = Adapter::new(peripheral_backend.clone() as Arc<dyn Backend>).await.peripheral();
+    let peripheral_driver = device(&network, "peripheral");
+    let central_driver = device(&network, "central");
+    let peripheral = Adapter::new(peripheral_driver.clone() as Arc<dyn Driver>).await.peripheral();
     let spec = service();
     let characteristic = spec.characteristics[0].uuid;
     let _server = peripheral.serve(spec).await.unwrap();
 
-    let central = Adapter::new(central_backend.clone() as Arc<dyn Backend>).await.central();
+    let central = Adapter::new(central_driver.clone() as Arc<dyn Driver>).await.central();
     let mut connection = central.connect(&PeerAddress("peripheral".into())).await.unwrap();
     assert_eq!(connection.read(characteristic).await.unwrap(), b"hi");
 
@@ -75,7 +75,7 @@ async fn a_connection_publishes_disconnected_when_the_peer_goes_away() {
     assert_eq!(*state.borrow(), ConnectionState::Connected);
 
     // The mock reports a lost link from the server's side.
-    peripheral_backend.simulate_peer_loss(&PeerAddress("central".into()));
+    peripheral_driver.simulate_peer_loss(&PeerAddress("central".into()));
     timeout(WAIT, state.wait_for(|s| s.is_disconnected())).await.unwrap().unwrap();
     timeout(WAIT, token.cancelled()).await.unwrap();
 }
@@ -83,15 +83,15 @@ async fn a_connection_publishes_disconnected_when_the_peer_goes_away() {
 #[tokio::test]
 async fn dropping_a_connection_cancels_its_token() {
     let network = MockNetwork::new();
-    let peripheral_backend = device(&network, "peripheral");
-    let central_backend = device(&network, "central");
-    let _server = Adapter::new(peripheral_backend as Arc<dyn Backend>)
+    let peripheral_driver = device(&network, "peripheral");
+    let central_driver = device(&network, "central");
+    let _server = Adapter::new(peripheral_driver as Arc<dyn Driver>)
         .await
         .peripheral()
         .serve(service())
         .await
         .unwrap();
-    let connection = Adapter::new(central_backend as Arc<dyn Backend>)
+    let connection = Adapter::new(central_driver as Arc<dyn Driver>)
         .await
         .central()
         .connect(&PeerAddress("peripheral".into()))
@@ -107,13 +107,13 @@ async fn dropping_a_connection_cancels_its_token() {
 #[tokio::test]
 async fn dropping_a_connection_disconnects_it() {
     let network = MockNetwork::new();
-    let _server = Adapter::new(device(&network, "peripheral") as Arc<dyn Backend>)
+    let _server = Adapter::new(device(&network, "peripheral") as Arc<dyn Driver>)
         .await
         .peripheral()
         .serve(service())
         .await
         .unwrap();
-    let connection = Adapter::new(device(&network, "central") as Arc<dyn Backend>)
+    let connection = Adapter::new(device(&network, "central") as Arc<dyn Driver>)
         .await
         .central()
         .connect(&PeerAddress("peripheral".into()))
@@ -134,13 +134,13 @@ async fn dropping_a_connection_disconnects_it() {
 #[tokio::test]
 async fn an_explicit_disconnect_is_not_repeated_on_drop() {
     let network = MockNetwork::new();
-    let _server = Adapter::new(device(&network, "peripheral") as Arc<dyn Backend>)
+    let _server = Adapter::new(device(&network, "peripheral") as Arc<dyn Driver>)
         .await
         .peripheral()
         .serve(service())
         .await
         .unwrap();
-    let mut connection = Adapter::new(device(&network, "central") as Arc<dyn Backend>)
+    let mut connection = Adapter::new(device(&network, "central") as Arc<dyn Driver>)
         .await
         .central()
         .connect(&PeerAddress("peripheral".into()))
@@ -156,17 +156,17 @@ async fn an_explicit_disconnect_is_not_repeated_on_drop() {
 #[tokio::test]
 async fn dropping_the_server_handle_stops_advertising() {
     let network = MockNetwork::new();
-    let peripheral_backend = device(&network, "peripheral");
-    let central_backend = device(&network, "central");
+    let peripheral_driver = device(&network, "peripheral");
+    let central_driver = device(&network, "central");
     let spec = service();
     let service_uuid = spec.uuid;
-    let server = Adapter::new(peripheral_backend as Arc<dyn Backend>)
+    let server = Adapter::new(peripheral_driver as Arc<dyn Driver>)
         .await
         .peripheral()
         .serve(spec)
         .await
         .unwrap();
-    let central = Adapter::new(central_backend as Arc<dyn Backend>).await.central();
+    let central = Adapter::new(central_driver as Arc<dyn Driver>).await.central();
 
     let mut scan = central.scan(service_uuid).await.unwrap();
     let found = timeout(WAIT, scan.next()).await.unwrap().unwrap().unwrap();
@@ -185,15 +185,17 @@ async fn dropping_the_server_handle_stops_advertising() {
 
 /// Counts `advertise` calls while delegating everything else, so a test can
 /// observe `Peripheral::serve`'s radio-recovery behavior (re-registering on
-/// `RadioChanged::On`) without the mock backend needing to model BlueZ
+/// `RadioChanged::On`) without the mock driver needing to model BlueZ
 /// forgetting its GATT app on a radio loss, which it doesn't.
-struct CountingBackend {
-    inner: Arc<dyn Backend>,
+struct CountingDriver {
+    inner: Arc<dyn Driver>,
     advertise_calls: Arc<AtomicUsize>,
+    /// What the latest `advertise` call carried.
+    last_advertised: Arc<std::sync::Mutex<Option<GattServiceSpec>>>,
 }
 
 #[async_trait::async_trait]
-impl Backend for CountingBackend {
+impl Driver for CountingDriver {
     async fn capabilities(&self) -> CapabilityReport {
         self.inner.capabilities().await
     }
@@ -207,8 +209,17 @@ impl Backend for CountingBackend {
     }
 
     async fn advertise(&self, service: GattServiceSpec) -> ble_gatt::Result<()> {
+        *self.last_advertised.lock().unwrap() = Some(service.clone());
         self.advertise_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.advertise(service).await
+    }
+
+    async fn update_advertisement(&self, service: GattServiceSpec) -> ble_gatt::Result<()> {
+        self.inner.update_advertisement(service).await
+    }
+
+    fn served_service(&self) -> Option<GattServiceSpec> {
+        self.inner.served_service()
     }
 
     async fn stop_advertising(&self) -> ble_gatt::Result<()> {
@@ -242,17 +253,18 @@ impl Backend for CountingBackend {
 #[tokio::test]
 async fn a_radio_recovery_re_registers_the_service() {
     let network = MockNetwork::new();
-    let peripheral_backend = device(&network, "peripheral");
+    let peripheral_driver = device(&network, "peripheral");
     let advertise_calls = Arc::new(AtomicUsize::new(0));
-    let counting = Arc::new(CountingBackend {
-        inner: peripheral_backend.clone() as Arc<dyn Backend>,
+    let counting = Arc::new(CountingDriver {
+        inner: peripheral_driver.clone() as Arc<dyn Driver>,
         advertise_calls: advertise_calls.clone(),
+        last_advertised: Arc::default(),
     });
 
-    let _server = Adapter::new(counting as Arc<dyn Backend>).await.peripheral().serve(service()).await.unwrap();
+    let _server = Adapter::new(counting as Arc<dyn Driver>).await.peripheral().serve(service()).await.unwrap();
     assert_eq!(advertise_calls.load(Ordering::SeqCst), 1, "serve's own initial advertise");
 
-    peripheral_backend.simulate_radio(RadioStatus::Off);
+    peripheral_driver.simulate_radio(RadioStatus::Off);
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
         advertise_calls.load(Ordering::SeqCst),
@@ -260,7 +272,7 @@ async fn a_radio_recovery_re_registers_the_service() {
         "a radio loss alone must not trigger a re-advertise"
     );
 
-    peripheral_backend.simulate_radio(RadioStatus::On);
+    peripheral_driver.simulate_radio(RadioStatus::On);
     timeout(WAIT, async {
         while advertise_calls.load(Ordering::SeqCst) < 2 {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -268,4 +280,89 @@ async fn a_radio_recovery_re_registers_the_service() {
     })
     .await
     .expect("a radio recovery re-registers the service");
+}
+
+/// Cycles `peripheral`'s radio once `serve` (by `start`) advertised and an
+/// update changed its manufacturer data, and returns what the recovery
+/// re-advertised.
+async fn re_advertised_after_an_update<F, Fut>(start: F) -> GattServiceSpec
+where
+    F: FnOnce(Adapter, GattServiceSpec) -> Fut,
+    Fut: std::future::Future<Output = Box<dyn std::any::Any>>,
+{
+    let network = MockNetwork::new();
+    let peripheral = device(&network, "peripheral");
+    let advertise_calls = Arc::new(AtomicUsize::new(0));
+    let last_advertised = Arc::new(std::sync::Mutex::new(None));
+    let counting = Arc::new(CountingDriver {
+        inner: peripheral.clone() as Arc<dyn Driver>,
+        advertise_calls: advertise_calls.clone(),
+        last_advertised: last_advertised.clone(),
+    });
+    let mut spec = service();
+    spec.manufacturer_data.insert(0xABCD, vec![0x01]);
+    let _server = start(Adapter::new(counting.clone() as Arc<dyn Driver>).await, spec.clone()).await;
+    // `datagram::serve` builds its own characteristic from its config.
+    spec = counting.served_service().expect("served");
+    spec.manufacturer_data.insert(0xABCD, vec![0x02]);
+    counting.update_advertisement(spec).await.expect("the advertisement should update");
+
+    peripheral.simulate_radio(RadioStatus::Off);
+    peripheral.simulate_radio(RadioStatus::On);
+    timeout(WAIT, async {
+        while advertise_calls.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a radio recovery re-registers the service");
+    let advertised = last_advertised.lock().unwrap().clone();
+    advertised.expect("advertised")
+}
+
+/// `Peripheral::serve`'s recovery re-advertises the updated data, so an
+/// update survives a power cycle.
+#[tokio::test]
+async fn a_radio_recovery_keeps_an_advertisement_update() {
+    let advertised = re_advertised_after_an_update(|adapter, spec| async move {
+        Box::new(adapter.peripheral().serve(spec).await.unwrap()) as Box<dyn std::any::Any>
+    })
+    .await;
+    assert_eq!(advertised.manufacturer_data.get(&0xABCD), Some(&vec![0x02]));
+}
+
+/// The same for `datagram::serve`.
+#[tokio::test]
+async fn a_radio_recovery_keeps_a_datagram_advertisement_update() {
+    let advertised = re_advertised_after_an_update(|adapter, spec| async move {
+        let mut config = ble_gatt::datagram::DatagramConfig::new(spec.uuid, spec.characteristics[0].uuid);
+        config.advertised_manufacturer_data = spec.manufacturer_data.clone();
+        Box::new(ble_gatt::datagram::serve(&adapter, &config).await.unwrap()) as Box<dyn std::any::Any>
+    })
+    .await;
+    assert_eq!(advertised.manufacturer_data.get(&0xABCD), Some(&vec![0x02]));
+}
+
+/// A server `stop_serving` stopped stays stopped across a radio recovery,
+/// even while its accept stream is still held.
+#[tokio::test]
+async fn a_radio_recovery_does_not_restart_a_stopped_server() {
+    let network = MockNetwork::new();
+    let peripheral = device(&network, "peripheral");
+    let advertise_calls = Arc::new(AtomicUsize::new(0));
+    let counting = Arc::new(CountingDriver {
+        inner: peripheral.clone() as Arc<dyn Driver>,
+        advertise_calls: advertise_calls.clone(),
+        last_advertised: Arc::default(),
+    });
+    let adapter = Adapter::new(counting as Arc<dyn Driver>).await;
+    let spec = service();
+    let config = ble_gatt::datagram::DatagramConfig::new(spec.uuid, spec.characteristics[0].uuid);
+    let _incoming = ble_gatt::datagram::serve(&adapter, &config).await.unwrap();
+    ble_gatt::datagram::stop_serving(&adapter).await.unwrap();
+
+    peripheral.simulate_radio(RadioStatus::Off);
+    peripheral.simulate_radio(RadioStatus::On);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(advertise_calls.load(Ordering::SeqCst), 1, "only serve's own advertise");
 }

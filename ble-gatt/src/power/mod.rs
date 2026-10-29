@@ -8,11 +8,11 @@
 //! and may ignore or override it.
 //!
 //! ```
-//! use ble_gatt::power::{PowerAdvisor, PowerInputs, PowerMode};
+//! use ble_gatt::power::{PowerInputs, PowerMode, PowerProfiles};
 //!
-//! let advisor = PowerAdvisor::new(PowerInputs::default());
-//! let mut profile = advisor.profile();          // watch::Receiver<PowerProfile>
-//! advisor.update(|inputs| inputs.battery_percent = Some(8));
+//! let profiles = PowerProfiles::new(PowerInputs::default());
+//! let mut profile = profiles.profile();         // watch::Receiver<PowerProfile>
+//! profiles.update(|inputs| inputs.battery_percent = Some(8));
 //! assert_eq!(profile.borrow_and_update().mode, PowerMode::UltraLowPower);
 //! ```
 
@@ -163,13 +163,13 @@ impl PowerPolicy {
 /// Publishes the profile for the current inputs (pub/sub, as the rest of
 /// the library): the application updates the inputs as the device's
 /// situation changes, and every subscriber sees the profile change.
-pub struct PowerAdvisor {
+pub struct PowerProfiles {
     policy: PowerPolicy,
     inputs: watch::Sender<PowerInputs>,
     profile: watch::Sender<PowerProfile>,
 }
 
-impl PowerAdvisor {
+impl PowerProfiles {
     pub fn new(inputs: PowerInputs) -> Self {
         Self::with_policy(PowerPolicy::default(), inputs)
     }
@@ -239,17 +239,17 @@ mod tests {
     }
 
     #[test]
-    fn the_advisor_publishes_only_real_changes() {
-        let advisor = PowerAdvisor::new(PowerInputs::default());
-        let mut profile = advisor.profile();
+    fn power_profiles_publish_only_real_changes() {
+        let profiles = PowerProfiles::new(PowerInputs::default());
+        let mut profile = profiles.profile();
         assert_eq!(profile.borrow_and_update().mode, PowerMode::Balanced);
 
         // Same mode: nothing published.
-        advisor.update(|inputs| inputs.peers_nearby = 4);
+        profiles.update(|inputs| inputs.peers_nearby = 4);
         assert!(!profile.has_changed().unwrap());
 
-        advisor.update(|inputs| inputs.foreground = false);
-        advisor.update(|inputs| inputs.peers_nearby = 0);
+        profiles.update(|inputs| inputs.foreground = false);
+        profiles.update(|inputs| inputs.peers_nearby = 0);
         assert!(profile.has_changed().unwrap());
         assert_eq!(profile.borrow_and_update().mode, PowerMode::PowerSaver);
     }

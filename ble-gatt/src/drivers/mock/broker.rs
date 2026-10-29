@@ -117,7 +117,7 @@ async fn dispatch(request: Request, radio: &Arc<LocalRadio>, conn: &Arc<ConnHand
                             }
                         }
                         // Forward the gap as `GattEvent::Lagged`, exactly as
-                        // the local backend's own `events()` converts a
+                        // the local driver's own `events()` converts a
                         // `BroadcastStreamRecvError::Lagged` — not swallow
                         // it. The datagram layer's `serve`/`connect` treat
                         // `Lagged` as terminal specifically because the
@@ -162,6 +162,12 @@ async fn dispatch(request: Request, radio: &Arc<LocalRadio>, conn: &Arc<ConnHand
             Ok(()) => Response::Unit,
             Err(e) => Response::Err(e),
         },
+        Request::UpdateAdvertisement { address, service } => {
+            match radio.update_advertisement(&address, service).await {
+                Ok(()) => Response::Unit,
+                Err(e) => Response::Err(e),
+            }
+        }
         Request::StopAdvertising { address } => match radio.stop_advertising(&address).await {
             Ok(()) => Response::Unit,
             Err(e) => Response::Err(e),

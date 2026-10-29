@@ -1,7 +1,7 @@
 //! Hardware verification peer — one half of a two-device BLE round trip.
 //!
 //! Everything else in this repository is verified against a mock. That mock
-//! has repeatedly certified behaviour both real backends reject, so nothing
+//! has repeatedly certified behaviour both real drivers reject, so nothing
 //! here is confirmed until two radios exchange bytes. This binary is the
 //! Linux half of that: run it as the peripheral on one machine and as the
 //! central on the other (or against the Android example app), and it proves
@@ -26,9 +26,8 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
-use ble_gatt::backend::Backend;
 use ble_gatt::datagram::{self, DatagramConfig};
-use ble_gatt::{CharacteristicUuid, PeerAddress, ServiceUuid};
+use ble_gatt::{Adapter, CharacteristicUuid, PeerAddress, ServiceUuid};
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
@@ -109,17 +108,16 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn backend() -> Result<std::sync::Arc<dyn Backend>, String> {
+async fn adapter() -> Result<Adapter, String> {
     #[cfg(target_os = "linux")]
     {
-        let backend = ble_gatt::backend::linux::LinuxBackend::new()
+        Adapter::platform()
             .await
-            .map_err(|err| format!("no usable BlueZ adapter: {err}"))?;
-        Ok(std::sync::Arc::new(backend))
+            .map_err(|err| format!("no usable BlueZ adapter: {err}"))
     }
     #[cfg(not(target_os = "linux"))]
     {
-        Err("this harness only builds a real backend on Linux".to_string())
+        Err("this harness only builds a real adapter on Linux".to_string())
     }
 }
 
@@ -129,15 +127,15 @@ async fn backend() -> Result<std::sync::Arc<dyn Backend>, String> {
 /// peripheral's notify path, which is where most of this library's
 /// review findings landed and which no mock test can confirm.
 async fn run_peripheral() -> Result<(), String> {
-    let backend = backend().await?;
-    let caps = backend.capabilities().await;
+    let adapter = adapter().await?;
+    let caps = adapter.capabilities().await;
     println!("HWVERIFY: INFO capabilities central={} peripheral={}", caps.central, caps.peripheral);
     if !caps.peripheral {
         return Err("adapter reports no peripheral support".to_string());
     }
 
     let config = config();
-    let mut incoming = datagram::serve(backend, &config)
+    let mut incoming = datagram::serve(&adapter, &config)
         .await
         .map_err(|err| format!("serve failed: {err}"))?;
     println!("HWVERIFY: INFO advertising service {SERVICE}");
@@ -166,15 +164,16 @@ async fn run_peripheral() -> Result<(), String> {
 
 /// Scan, connect, send the probe, and require it back byte-for-byte.
 async fn run_central(target: Option<String>) -> Result<(), String> {
-    let backend = backend().await?;
-    let caps = backend.capabilities().await;
+    let adapter = adapter().await?;
+    let caps = adapter.capabilities().await;
     println!("HWVERIFY: INFO capabilities central={} peripheral={}", caps.central, caps.peripheral);
 
     let peer = match target {
         Some(address) => PeerAddress(address),
         None => {
             println!("HWVERIFY: INFO scanning for {SERVICE}");
-            let mut found = backend
+            let mut found = adapter
+                .central()
                 .scan(ServiceUuid(SERVICE))
                 .await
                 .map_err(|err| format!("scan failed to start: {err}"))?;
@@ -194,7 +193,7 @@ async fn run_central(target: Option<String>) -> Result<(), String> {
     };
 
     let config = config();
-    let mut channel = datagram::connect(backend, &peer, &config)
+    let mut channel = datagram::connect(&adapter, &peer, &config)
         .await
         .map_err(|err| format!("connect failed: {err}"))?;
     println!(
