@@ -56,12 +56,21 @@ Changing what a peripheral advertises while it keeps serving
 (`datagram::update_advertisement`). Only the advertisement is replaced; the
 GATT server, and every central connected to it with its subscription, stay.
 Advertising again with `serve` replaces the server and drops those centrals.
+An update survives a [radio recovery](#radio-recovery).
 
 ### Stop serving
 Ending a peripheral's advertisement and GATT server together
 (`datagram::stop_serving`), which drops the centrals connected to it.
 Dropping the stream `serve` returned is not stopping: it only ends handing
-out new channels, and the server keeps advertising and accepting.
+out new channels, and the server keeps advertising and accepting. A stopped
+server stays stopped across a [radio recovery](#radio-recovery).
+
+### Radio recovery
+The radio coming back on (`RadioChanged { On }`) after it was off or the
+Bluetooth service restarted. The platform has forgotten the advertisement
+and GATT server by then, so serving registers again what the driver last
+served (`Driver::served_service`), and nothing if serving was stopped
+(ADR-0010).
 
 ### Scan response
 A second packet of up to 31 bytes that an advertiser sends only when a

@@ -177,7 +177,7 @@ pub trait Driver: Send + Sync {
     /// re-advertises it after the radio comes back, so an update is not
     /// undone by a power cycle, and re-advertises nothing when it is `None`,
     /// so a stopped server stays stopped. No default: a wrapping driver must
-    /// forward it, or serving never recovers.
+    /// forward it, or serving never recovers (ADR-0010).
     fn served_service(&self) -> Option<GattServiceSpec>;
 
     async fn stop_advertising(&self) -> Result<()>;

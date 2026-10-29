@@ -2,9 +2,10 @@
 
 ## Status
 
-Accepted. D1–D3 are implemented in `ble-gatt-iroh`. D4 and D5 needed no
-transport code: on the mock radio iroh already does both (see their notes).
-What is left is Fini's side and hardware.
+Accepted. D1–D3 and D6 are implemented in `ble-gatt-iroh`; D3 was revised
+after hardware runs (see its history). D4 and D5 needed no transport code:
+on the mock radio iroh already does both (see their notes). What is left is
+Fini's side and hardware.
 
 ## Context
 
@@ -69,87 +70,72 @@ rather than the connection.
 closes links in either role, using `DatagramChannel::disconnect` (the
 peripheral side drops the central). Its signature does not change.
 
-**D3 — A link closes when the last iroh connection on it has drained.** The
-hooks keep a weak handle per connection. "Ended" means drained, not closed:
-`on_closed` fires when the close starts (at `close()`, before its
-CONNECTION_CLOSE is sent, or when the peer's arrives), and cutting the link
-then lost the peer's copy on hardware. QUIC then drains for three probe
-timeouts; noq's connection driver holds the connection until that is over,
-so the weak handle dies exactly when it has drained and the application has
-dropped its own handles. Streams count as handles: each `SendStream` and
-`RecvStream` holds the connection (noq `send_stream.rs`, `recv_stream.rs`),
-and on the mock radio one stream kept after a peer's close held the link up
-past the test's 5 s. Neither noq nor iroh signals that moment, so the
-hook checks the weak handle every 10 ms after `on_closed`. On the mock radio
-(RTT 8 ms) `on_closed` fired 0.25 ms after `close()` and the handle died
-after 201 ms (346 ms on the peer's side).
+**D3 — A link closes when the last iroh connection on it has ended.** The
+hooks keep a weak handle per connection and watch `closed()`, which fires
+when the close starts: at `close()`, before its CONNECTION_CLOSE is sent, or
+when the peer's arrives. A connection has *ended* when:
 
-When every connection using a link has drained, the transport closes it,
-with no delay by default (`link_release_delay` can add one). A connection
-that has taken the link over by then keeps it. An application that wants a
-link kept for a connection it has yet to open keeps an earlier connection
-open until then. The idle timeout stays as a backstop for a link no
-connection ever used (a peer that dialled and never finished the handshake).
-Fini's calls after a session, a rejection and an unused pairing link should
-then become unnecessary.
+- the peer closed it, reset it or it timed out: this side is draining and
+  sends nothing more (RFC 9000 §10.2.2), so it ends at once;
+- this side closed it, and its CONNECTION_CLOSE has been sent. noq counts
+  the frame (`stats().frame_tx.connection_close`) when it builds the packet
+  and hands the packet to the transport under the same lock; a barrier
+  queued behind it on each link the connection used then shows it sent.
+  QUIC's closing period after it, which only resends the close in answer to
+  the peer's packets, is not waited for;
+- otherwise, it has drained: noq's driver holds the connection until then,
+  so the weak handle dies at that moment. This is the fallback when the
+  close was not seen being sent, and when a link dropped a packet for a
+  full queue while the connection closed (the dropped packet may be the
+  close, and noq is not told).
 
-This close is the idle kind: it ends a link this side dialled, and leaves a
-link the peer dialled to the peer, whose own D3 ends it. Only `close_link`
-and `close_links` drop a link the peer dialled (`DatagramChannel::disconnect`).
-On Linux, dropping it ends the whole link to that address, including a busy
-link this side dialled, so it must stay an explicit request.
+Neither noq nor iroh signals the sent close or the drain, so the hook checks
+both every 10 ms. After a connection ended, a `Connection`, `SendStream` or
+`RecvStream` the application keeps no longer holds the link; before, each
+holds the connection, and so the link, while it is open.
 
-*Outcome.* On hardware the peripheral's release still disconnected the
-central: a served channel dropped after `close()` went through the same
-release as one simply dropped, which disconnects. Android did not end the
-link (`cancelConnection` found no app holding a link the central opened) but
-forgot the central's subscription, so each later write opened a channel
-whose first notify failed, and the next connection never got through. Now a
-served channel closed with `close()` frees the server and keeps the central
-connected and subscribed; dropping one without `close()` still disconnects
-it. Precedent: Apple's `CBPeripheralManager` has no call to disconnect a
-central at all. Test: `closing_a_served_channel_keeps_its_central_for_the_next_one`.
+When every connection using a link has ended, the transport closes it, with
+no delay by default (`link_release_delay` can add one, for every link). A
+connection that has taken the link over by then keeps it. An application
+that wants a link kept for a connection it has yet to open keeps an earlier
+connection open until then. The idle timeout stays as a backstop for a link
+no connection ever used (a peer that dialled and never finished the
+handshake).
 
-*Outcome, the redial yield.* When the peer's release drops a link the peer
-dialled, the accepting side waited the redial yield (30 s) for the peer to
-dial back, but nothing was left to make it. On hardware the phone refused
-the desktop's connection; the desktop's D3 dropped the link, and the phone's
-own connect after the user switched the channel on was held back until it
-timed out. The yield now starts only if a connection the hooks saw on the
-link had not started to close: a closing connection sends nothing (RFC 9000
-§10.2), so only an open one makes the peer re-dial. Without the hooks it
-starts as before. A peer whose handshake is still running when the link
-drops is not seen and could cross; D5 covers that. Test:
-`a_refused_connection_does_not_hold_back_a_dial`.
+How the close ends the link depends on the role:
 
-*Outcome, no wait for the drain.* With the phone as central and the closer,
-it held its link for the whole closing period (13.4 s on hardware, with
-RTTs in seconds), and Android kept the ACL 4 s more after its GATT
-disconnect. The desktop had kept that central (the idle kind of close
-above), and BlueZ aborted its three dials to the phone meanwhile
-(`le-connection-abort-by-local`). Now:
+- **Central** (this side dialled): the link is closed.
+- **Peripheral on Linux**: the central is disconnected. No connection uses
+  the address any more, so the concern that made this an explicit request,
+  dropping a busy link this side dialled to the same address, is covered.
+- **Peripheral on Android**: the central is kept connected and subscribed.
+  `cancelConnection` does not end a link the central opened but forgets its
+  subscription, so each later write opened a channel whose first notify
+  failed. Precedent: Apple's `CBPeripheralManager` has no call to
+  disconnect a central at all. The same holds for a served channel closed
+  with `DatagramChannel::close()`; dropping one without `close()` still
+  disconnects it.
 
-- A connection the peer closed, reset or timed out ends at once: this side
-  is draining and sends nothing more (RFC 9000 §10.2.2).
-- A connection this side closed ends once its CONNECTION_CLOSE has been
-  sent. noq counts the frame (`stats().frame_tx.connection_close`) when it
-  builds the packet, and hands the packet to the transport under the same
-  lock. A barrier queued behind it on each link then shows it sent. The
-  closing period, which only resends the close in answer to the peer's
-  packets, is skipped: a lost close leaves the peer's connection to its
-  idle timeout. If the connection drains first, it ends then, as before.
-  So does one whose link dropped a packet for a full queue while it
-  closed: the dropped packet may be the close, and noq is not told.
-- A release in the peripheral role disconnects the central on Linux, where
-  no connection uses the address any more. On Android it still keeps the
-  central (the outcome above).
+The redial yield (`REDIAL_YIELD`, see the glossary) starts after a link the
+peer dialled drops only while a connection the hooks saw on it had not
+started to close: only an open connection makes the peer dial back. Without
+the hooks it starts as before.
 
-Precedent: `iroh-ble-transport` (AGPL, ideas only) tears its link down as
-soon as a connection's `closed()` fires, in both directions, and drops
-writes still queued. Here the close is sent first, because cutting at
-`closed()` lost the peer's copy on hardware. Tests:
+*History.* The first version waited for the drain: cutting the link at
+`closed()` lost the peer's copy of the close on hardware. Draining takes
+three probe timeouts over all paths (noq-proto `set_close_timer`), seconds
+on BLE: the phone, as central and closer, held its link 13.4 s, Android kept
+the ACL 4 s more, and BlueZ aborted the desktop's three dials to the phone
+meanwhile. The peripheral then kept every central, which on Linux left that
+old link to block the next dial. A refused session showed the yield's gap:
+the phone waited 30 s for a desktop that would never dial back. Precedent
+for not waiting: `iroh-ble-transport` (AGPL, ideas only) tears its link down
+as soon as `closed()` fires, in both directions, and drops queued writes;
+here the close is sent first. Tests:
 `the_closing_side_releases_its_link_once_its_close_is_sent`,
-`the_receiving_peripheral_disconnects_the_central`.
+`the_receiving_peripheral_disconnects_the_central`,
+`a_refused_connection_does_not_hold_back_a_dial`,
+`closing_a_served_channel_keeps_its_central_for_the_next_one`.
 
 **D4 — One link to a peer carries both directions.** A BLE link already does:
 the central writes, the peripheral notifies. When iroh sends to a peer key
@@ -177,6 +163,17 @@ is an application choice; iroh-gossip keeps the newest instead. The mock
 radio does not reproduce BlueZ aborting one of two crossed dials, so
 hardware decides whether Fini can drop its "smaller id dials" rule.
 
+**D6 — A connection that has ended dials nothing.** The hooks remember each
+ended connection per address until it drains. A packet for an address that
+only ended connections use is dropped instead of dialled, unless it is a
+QUIC Initial: a new connection still dials. A closing connection answers
+the peer's late packets with its CONNECTION_CLOSE; dialling to carry that
+brought a link back up right after D3 released it (on the mock radio, about
+1 run in 10 of `the_closing_side_releases_its_link_once_its_close_is_sent`).
+Dropping it reads to QUIC as loss, which a closing connection already
+tolerates: its close is only resent in answer to later packets. Precedent:
+a draining connection sends nothing at all (RFC 9000 §10.2.2).
+
 ## Consequences
 
 - An application must install the hooks to get D1–D4. Without them the
@@ -200,7 +197,9 @@ hardware decides whether Fini can drop its "smaller id dials" rule.
    `a_new_connection_keeps_a_released_link`.
 3. Done, no code: D4 and D5 come from iroh (see their outcomes). Mock test:
    `crossed_connects_both_work_and_their_links_close`.
-4. Hardware run in Fini; Fini removes its own workarounds (the extra
+4. Done: D3 revised (no wait for the drain, peripheral role by platform,
+   redial yield) and D6. Mock tests listed under D3 and D6.
+5. Hardware run in Fini; Fini removes its own workarounds (the extra
    `close_links` calls, then the "smaller id dials" rule) only after a run
    shows they are no longer needed.
 
@@ -208,7 +207,7 @@ hardware decides whether Fini can drop its "smaller id dials" rule.
 
 - Whether BlueZ still aborts one of two dials that cross at the same instant
   once D4 makes them rare. Only hardware shows that.
-- Fini's reuse of the pairing link for the first session
-  (`keep_pairing_link`): with no release delay, the link goes once the
-  pairing connection drains, so Fini keeps that connection open until the
-  session's is up.
+- Fini's reuse of the pairing link for the first session: with no release
+  delay the link goes as soon as the pairing connection ends. Fini accepted
+  that (paired → green 4–6 s, within its 10 s standard) rather than a
+  delay, which would hold every link after each close.

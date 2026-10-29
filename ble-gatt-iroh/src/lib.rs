@@ -194,7 +194,8 @@ impl BleGattTransportBuilder {
     }
 
     /// How long a channel stays up after the last iroh connection on it
-    /// drained; default [`DEFAULT_LINK_RELEASE_DELAY`] (none). Applies only with
+    /// ended (ADR-0008 D3); default [`DEFAULT_LINK_RELEASE_DELAY`] (none),
+    /// and it applies to every link. Applies only with
     /// [`BleGattTransport::hooks`] installed.
     pub fn link_release_delay(mut self, delay: Duration) -> Self {
         self.link_release_delay = Some(delay);
