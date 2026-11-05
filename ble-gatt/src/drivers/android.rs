@@ -63,6 +63,14 @@ const NOTIFY_QUEUE_DEPTH: usize = 256;
 /// error here is expected to retry rather than assume the link is gone.
 const DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long `connect` waits after this side's GATT client to an address
+/// disconnected before dialling it again. Android keeps the radio link up
+/// for its 1 s idle timer after the client goes, and a new client in that
+/// window reuses the old interface: its service discovery queued behind a
+/// command the old one left and never completed (emulator, API 34: 0 of 11
+/// first sessions after pairing; with this wait 5 of 5).
+const REDIAL_GAP: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// Locally-assigned code for "an advertise was cancelled by
 /// `stop_advertising` before Android reported its result". Above the range
 /// Android's `AdvertiseCallback` uses, so it cannot be mistaken for a
@@ -178,6 +186,9 @@ struct Inner {
     /// because the JNI callback arrives on a Binder thread with only the
     /// address to key on.
     att_mtus: StdMutex<HashMap<String, u16>>,
+    /// When this side's GATT client to each address last disconnected; see
+    /// `REDIAL_GAP`.
+    client_disconnected_at: StdMutex<HashMap<String, std::time::Instant>>,
     /// Resolved by `onAdvertiseResult`. Android decides asynchronously
     /// whether an advertisement actually started, so `advertise()` must wait
     /// for it rather than reporting success the moment the JNI call returns.
@@ -422,6 +433,7 @@ impl AndroidDriver {
             scan: StdMutex::new(ScanState::default()),
             server_events_tx,
             att_mtus: StdMutex::new(HashMap::new()),
+            client_disconnected_at: StdMutex::new(HashMap::new()),
             advertise_tx: StdMutex::new(None),
             notify_waiters: StdMutex::new(HashMap::new()),
             next_notify_id: AtomicU64::new(1),
@@ -633,6 +645,13 @@ impl Driver for AndroidDriver {
     }
 
     async fn connect(&self, peer: &PeerAddress) -> Result<Box<dyn GattConnection>> {
+        let since = self.inner.client_disconnected_at.lock().unwrap().get(&peer.0).map(|at| at.elapsed());
+        if let Some(since) = since {
+            if let Some(wait) = REDIAL_GAP.checked_sub(since) {
+                log::info!("connect: {} disconnected {since:?} ago, waiting {wait:?} before dialling", peer.0);
+                tokio::time::sleep(wait).await;
+            }
+        }
         let (connected_tx, connected_rx) = oneshot::channel();
         let session;
         {
@@ -1807,6 +1826,11 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onDisconnected<'local>(
         if !inner.server_sessions.lock().unwrap().contains_key(&address) {
             inner.att_mtus.lock().unwrap().remove(&address);
         }
+        inner
+            .client_disconnected_at
+            .lock()
+            .unwrap()
+            .insert(address.clone(), std::time::Instant::now());
         let mut connections = inner.connections.lock().unwrap();
         if let Some(mut state) = connections.remove(&address) {
             state.live = false;
