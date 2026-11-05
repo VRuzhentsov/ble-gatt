@@ -1,0 +1,133 @@
+name: Release
+
+# Every merge to main releases the next minor version: the highest vX.Y.Z
+# tag plus one minor (v0.2.0 → v0.3.0), or, before the first tag, the
+# version in Cargo.toml plus one minor. CI runs on the merged commit, which
+# is then tagged (annotated, unsigned) and published as a GitHub release, so
+# applications depend on
+# `{ git = "https://github.com/VRuzhentsov/ble-gatt", tag = "vX.Y.Z" }`.
+#
+# The tag is the version. `[workspace.package] version` in Cargo.toml is not
+# bumped: main accepts changes only through pull requests, so this workflow
+# never commits, and Cargo does not check that field for a `tag =` git
+# dependency. The same approach as anothrNick/github-tag-action, which bumps
+# the minor from the last tag.
+#
+# Actions → Release → Run workflow releases main's last commit by hand, e.g.
+# after CI failed on a merge. A commit that already has a release tag is
+# skipped.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One release at a time, in merge order, so two merges never take the same
+# tag. GitHub keeps only the newest waiting run: a merge whose run is dropped
+# is released by the next merge's tag, which contains it.
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Pick the next minor version
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Releases are made from main only (this run is on $GITHUB_REF)." >&2
+            exit 1
+          fi
+          git fetch origin --tags --force
+          released="$(git tag --points-at "$GITHUB_SHA" --list 'v[0-9]*.[0-9]*.[0-9]*' | sed -n 1p)"
+          if [ -n "$released" ]; then
+            echo "$GITHUB_SHA is already released as $released; nothing to do." >> "$GITHUB_STEP_SUMMARY"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          latest="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | sed -n 1p)"
+          if [ -n "$latest" ]; then
+            base="${latest#v}"
+          else
+            # The three crates take `version.workspace = true`.
+            base="$(cargo metadata --no-deps --format-version 1 | jq -r \
+              '[.packages[] | select(.name == "ble-gatt") | .version][0]')"
+          fi
+          if [[ ! "$base" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "Cannot read a MAJOR.MINOR.PATCH version from '$base'." >&2
+            exit 1
+          fi
+          tag="v${BASH_REMATCH[1]}.$((BASH_REMATCH[2] + 1)).0"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          {
+            printf '## Release planned\n\n- Tag: %s\n- Commit: %s\n- Previous tag: %s\n' "$tag" "$GITHUB_SHA" "${latest:-none}"
+            if [ -n "$latest" ]; then
+              printf '\n### Commits\n%s\n' "$(git log --oneline "${latest}..${GITHUB_SHA}")"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  test:
+    name: CI
+    needs: plan
+    if: needs.plan.outputs.tag != ''
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    name: Tag and publish
+    needs: [plan, test]
+    if: needs.plan.outputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Tag the tested commit
+        shell: bash
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "$(git ls-remote --tags origin "refs/tags/$TAG")" ]; then
+            echo "$TAG was created while CI ran; nothing was tagged." >&2
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "$TAG" "$GITHUB_SHA"
+          git push origin "refs/tags/$TAG"
+
+      - name: Publish the GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --verify-tag \
+            --generate-notes
+          {
+            printf '\n## Released %s\n\n' "$TAG"
+            printf 'Depend on it with:\n\n```toml\n'
+            printf 'ble-gatt = { git = "https://github.com/%s", tag = "%s" }\n' "$GITHUB_REPOSITORY" "$TAG"
+            printf '```\n'
+          } >> "$GITHUB_STEP_SUMMARY"
