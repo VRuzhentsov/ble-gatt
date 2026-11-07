@@ -18,8 +18,8 @@ use crate::hal::Driver;
 /// Construct the driver for the platform this binary runs on. Used by
 /// `PeerLink::new`; a consumer using the `Driver` trait directly picks its
 /// own constructor (`linux::LinuxDriver::new`, `android::AndroidDriver::new`,
-/// or `mock::MockDriver::new`).
-#[cfg(any(target_os = "linux", target_os = "android"))]
+/// `windows::WindowsDriver::new`, or `mock::MockDriver::new`).
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
 pub async fn platform() -> Result<std::sync::Arc<dyn Driver>> {
     #[cfg(target_os = "linux")]
     {
@@ -28,5 +28,9 @@ pub async fn platform() -> Result<std::sync::Arc<dyn Driver>> {
     #[cfg(target_os = "android")]
     {
         Ok(std::sync::Arc::new(android::AndroidDriver::new().await?))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Ok(std::sync::Arc::new(windows::WindowsDriver::new().await?))
     }
 }
