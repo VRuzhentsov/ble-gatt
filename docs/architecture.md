@@ -209,7 +209,7 @@ ble-gatt/src/
   drivers/           Frameworks & Drivers   one sub-module per OS, all implementing hal/
     linux/
     android/
-    windows/         (planned)
+    windows/
     apple/           (planned)
     mock/
 ```

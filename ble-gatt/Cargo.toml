@@ -32,6 +32,19 @@ futures = "0.3"
 jni = "0.21"
 ndk-context = "0.1"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+# Microsoft's own WinRT projection (MIT OR Apache-2.0), the crate btleplug
+# and bluest use for their Windows drivers. See docs/adr/0011.
+windows = { version = "0.62", features = [
+    "Devices_Bluetooth",
+    "Devices_Bluetooth_Advertisement",
+    "Devices_Bluetooth_GenericAttributeProfile",
+    "Devices_Radios",
+    "Foundation",
+    "Foundation_Collections",
+    "Storage_Streams",
+] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 # So `hw_peer` can actually show the library's `log` output. Without a

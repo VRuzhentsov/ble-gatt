@@ -139,6 +139,25 @@ A Bluetooth address a phone makes up and changes from time to time so it
 cannot be tracked. Android does this, which is why a peer cannot be
 recognised by its address alone.
 
+### Connectable advertisement
+An advertisement a central can answer by connecting. A non-connectable
+advertisement only carries data. Windows sends two advertisements for one
+served service: a connectable one for the GATT server and a non-connectable
+one for the manufacturer data (ADR-0011 D4).
+
+### Peripheral role support
+Whether a Bluetooth adapter and its driver can run a GATT server and
+advertise it. Not every adapter can. Windows reports it as
+`BluetoothAdapter.IsPeripheralRoleSupported`, Android as
+`isMultipleAdvertisementSupported`; the driver reports it as
+`CapabilityReport::peripheral`.
+
+### Excluded central
+A central that `disconnect_peer` refused but the platform cannot drop.
+Windows has no call that disconnects a central from a GATT server, so the
+Windows driver stops notifying it and refuses its writes until it leaves by
+itself (ADR-0011 D6).
+
 ## This library's concepts
 
 ### Peer
