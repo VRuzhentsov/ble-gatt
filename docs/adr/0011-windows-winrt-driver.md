@@ -4,7 +4,10 @@
 
 Proposed. A first implementation is in `ble-gatt/src/drivers/windows.rs`.
 It builds for `x86_64-pc-windows-msvc`, its unit tests pass, and clippy
-reports no warnings. **It is not verified on a radio.** The bar is the same
+reports no warnings. On the test computer (Intel Wireless Bluetooth,
+driver 23.90.0.8, Windows 11) `capabilities()` reports
+`central: true, peripheral: true` and `radio_status()` reports `On`
+(hardware check 1). **No link is verified yet.** The bar is the same
 as for Android (ADR-0002): a Fini pairing and a sync between a Windows
 computer and an Android phone, in both roles. The checklist is in
 "Hardware verification" below.
