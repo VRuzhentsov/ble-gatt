@@ -333,6 +333,9 @@ pub(super) async fn start_provider_advertising(provider: &GattServiceProvider, s
         }
         provider.StartAdvertisingWithParameters(&parameters).map_err(|err| win_err("StartAdvertising", err))?;
     }
+    // `Aborted` is not final here. On the test computer (Intel adapter,
+    // Windows 11) the provider reports `Aborted` with no error first and
+    // `Started` a moment later, so only the status at the deadline counts.
     let deadline = tokio::time::Instant::now() + ADVERTISE_START_TIMEOUT;
     loop {
         let status = provider.AdvertisementStatus().map_err(|err| win_err("AdvertisementStatus", err))?;
@@ -343,15 +346,14 @@ pub(super) async fn start_provider_advertising(provider: &GattServiceProvider, s
             log::warn!("advertise: started without all advertisement data (the service data did not fit)");
             return Ok(());
         }
-        if status == GattServiceProviderAdvertisementStatus::Aborted {
-            return Err(BleError::Gatt("advertise: Windows aborted the advertisement".into()));
-        }
         if tokio::time::Instant::now() >= deadline {
             let _ = provider.StopAdvertising();
-            return Err(BleError::Gatt(format!(
-                "advertise: not started after {ADVERTISE_START_TIMEOUT:?} (status {})",
-                status.0
-            )));
+            let reason = if status == GattServiceProviderAdvertisementStatus::Aborted {
+                "Windows aborted the advertisement".to_string()
+            } else {
+                format!("not started after {ADVERTISE_START_TIMEOUT:?} (status {})", status.0)
+            };
+            return Err(BleError::Gatt(format!("advertise: {reason}")));
         }
         tokio::time::sleep(STATUS_POLL_INTERVAL).await;
     }
@@ -390,10 +392,12 @@ async fn publisher_started(publisher: &BluetoothLEAdvertisementPublisher) -> Res
         if status == BluetoothLEAdvertisementPublisherStatus::Started {
             return Ok(true);
         }
-        if status == BluetoothLEAdvertisementPublisherStatus::Aborted {
-            return Ok(false);
-        }
+        // Like the provider's, an early `Aborted` may still turn into
+        // `Started`; only the status at the deadline counts.
         if tokio::time::Instant::now() >= deadline {
+            if status == BluetoothLEAdvertisementPublisherStatus::Aborted {
+                return Ok(false);
+            }
             log::warn!("advertise: manufacturer data advertisement still waiting (status {})", status.0);
             return Ok(true);
         }
