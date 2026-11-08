@@ -1625,8 +1625,23 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     /// out-of-date copy of this file will get. v2: added `onRadioState` /
     /// `isRadioEnabled` / this method (ADR-0005). v3: added
     /// `requestConnectionPriority`. v4: added the local-name byte array to
-    /// `startAdvertising`.
-    fun bridgeAbiVersion(): Int = 4
+    /// `startAdvertising`. v5: added `setCharacteristicValue` (ADR-0012).
+    fun bridgeAbiVersion(): Int = 5
+
+    /// Replace what reads of a served characteristic return
+    /// (`Driver::set_characteristic_value`). `onCharacteristicReadRequest`
+    /// answers from `characteristic.value`, so setting it is the whole
+    /// change. Returns false when nothing is served or the characteristic
+    /// is not part of the served service.
+    fun setCharacteristicValue(characteristicUuid: String, value: ByteArray): Boolean {
+        synchronized(this) {
+            if (gattServer == null) return false
+            val characteristic = serverCharacteristics[characteristicUuid] ?: return false
+            @Suppress("DEPRECATION")
+            characteristic.value = value
+            return true
+        }
+    }
 
     /// Whether the adapter is present and switched on. Rust's
     /// `Driver::radio_status()` calls this once at startup, so a `PeerLink`

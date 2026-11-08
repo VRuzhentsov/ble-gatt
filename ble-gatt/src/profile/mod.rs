@@ -3,4 +3,5 @@
 //! as in the Bluetooth specification: a set of GATT services and the rules
 //! for using them for one purpose.
 
+pub mod advertisement;
 pub mod datagram;

@@ -97,7 +97,7 @@ const CALLBACK_CLASS: &str = "dev/blegatt/NativeKt";
 /// `isRadioEnabled` (ADR-0005's adapter-state receiver). v3 added
 /// `requestConnectionPriority`. v4 added the local-name byte array to
 /// `startAdvertising`.
-const BRIDGE_ABI_VERSION: i32 = 4;
+const BRIDGE_ABI_VERSION: i32 = 5;
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 
@@ -878,6 +878,33 @@ impl Driver for AndroidDriver {
 
     fn served_service(&self) -> Option<GattServiceSpec> {
         self.inner.served_service.lock().unwrap().clone()
+    }
+
+    /// `BleGattBridge.setCharacteristicValue`: the Kotlin read handler
+    /// answers from `characteristic.value`, which this replaces.
+    async fn set_characteristic_value(&self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
+        let mut env = self.inner.env()?;
+        let uuid = env
+            .new_string(characteristic.0.to_string())
+            .map_err(|err| BleError::Gatt(err.to_string()))?;
+        let bytes = env.byte_array_from_slice(&value).map_err(|err| BleError::Gatt(err.to_string()))?;
+        let bridge = self.inner.bridge()?;
+        let set = env
+            .call_method(
+                bridge.as_obj(),
+                "setCharacteristicValue",
+                "(Ljava/lang/String;[B)Z",
+                &[JValue::Object(&uuid), JValue::Object(&bytes)],
+            )
+            .and_then(|v| v.z());
+        match set {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(BleError::Gatt(format!(
+                "set_characteristic_value: {} is not served",
+                characteristic.0
+            ))),
+            Err(err) => Err(jni_error(&mut env, "setCharacteristicValue", err)),
+        }
     }
 
     async fn update_advertisement(&self, service: GattServiceSpec) -> Result<()> {

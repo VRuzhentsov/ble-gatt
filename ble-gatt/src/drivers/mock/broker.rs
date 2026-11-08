@@ -168,6 +168,12 @@ async fn dispatch(request: Request, radio: &Arc<LocalRadio>, conn: &Arc<ConnHand
                 Err(e) => Response::Err(e),
             }
         }
+        Request::SetCharacteristicValue { address, characteristic, value } => {
+            match radio.set_characteristic_value(&address, characteristic, value).await {
+                Ok(()) => Response::Unit,
+                Err(e) => Response::Err(e),
+            }
+        }
         Request::StopAdvertising { address } => match radio.stop_advertising(&address).await {
             Ok(()) => Response::Unit,
             Err(e) => Response::Err(e),

@@ -1,33 +1,33 @@
-//! Peripheral role: `GattServiceProvider` serves and sends the connectable
-//! advertisement; a `BluetoothLEAdvertisementPublisher` sends the
-//! manufacturer data the provider cannot (ADR-0011 D4).
+//! Peripheral role: `GattServiceProvider` serves the GATT service and sends
+//! its connectable advertisement.
 //!
 //! btleplug has no peripheral role, so this part is this library's own,
-//! shaped like the GATT servers of the Linux and Android drivers. The
-//! provider-plus-publisher split is the one tinygo-org/bluetooth
-//! (`gatts_windows.go`, `gap_windows.go`) uses. Like tinygo's, the
-//! publisher carries no service data and no name: Windows refuses to start
-//! a publisher with either.
+//! shaped like the GATT servers of the Linux and Android drivers and like
+//! Google Nearby's Windows GATT server (`google/nearby`,
+//! `internal/platform/implementation/windows/ble_gatt_server.cc`).
+//!
+//! The provider's advertisement carries the service UUID and one service
+//! data entry, nothing else. Manufacturer data and a name do not fit
+//! (ADR-0011 D4); they reach scanners through the GATT advertisement
+//! instead (ADR-0012), a readable characteristic whose value
+//! `set_characteristic_value` replaces.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 
 use tokio::sync::mpsc;
 use windows::core::{IInspectable, Ref};
-use windows::Devices::Bluetooth::Advertisement::{
-    BluetoothLEAdvertisementPublisher, BluetoothLEAdvertisementPublisherStatus, BluetoothLEManufacturerData,
-};
 use windows::Devices::Bluetooth::BluetoothError;
 use windows::Devices::Bluetooth::GenericAttributeProfile::{
     GattCharacteristicProperties, GattCommunicationStatus, GattLocalCharacteristic,
-    GattLocalCharacteristicParameters, GattProtectionLevel, GattServiceProvider,
+    GattLocalCharacteristicParameters, GattProtectionLevel, GattReadRequestedEventArgs, GattServiceProvider,
     GattServiceProviderAdvertisementStatus, GattServiceProviderAdvertisingParameters, GattSession,
     GattSessionStatus, GattSessionStatusChangedEventArgs, GattSubscribedClient, GattWriteOption,
     GattWriteRequestedEventArgs,
 };
 use windows::Foundation::TypedEventHandler;
 
-use super::utils::{communication_error, from_buffer, session_address, to_buffer, to_guid, win_err};
+use super::utils::{communication_error, from_buffer, session_address, to_buffer, to_guid, win_buffer, win_err};
 use super::{Inner, ADVERTISE_START_TIMEOUT, STATUS_POLL_INTERVAL};
 use crate::entities::error::{BleError, Result};
 use crate::entities::models::{
@@ -37,6 +37,9 @@ use crate::entities::models::{
 /// ATT error "Write Not Permitted" (Bluetooth Core, Vol 3, Part F, 3.4.1.1):
 /// the reply to a write from a central that `disconnect_peer` excluded.
 const ATT_WRITE_NOT_PERMITTED: u8 = 0x03;
+
+/// ATT error "Invalid Offset": a long read past the end of the value.
+const ATT_INVALID_OFFSET: u8 = 0x07;
 
 /// A central attached to the local GATT server.
 pub(super) struct ServerPeer {
@@ -51,25 +54,33 @@ pub(super) struct ServerPeer {
     pub(super) excluded: bool,
 }
 
-/// The live GATT server and its advertisements.
+/// One inbound request, queued so a single task answers them in order.
+enum ServerRequest {
+    Write(CharacteristicUuid, GattWriteRequestedEventArgs),
+    Read(CharacteristicUuid, GattReadRequestedEventArgs),
+}
+
+/// `(characteristic, ReadRequested, WriteRequested, SubscribedClientsChanged)` tokens.
+type Tokens = (GattLocalCharacteristic, Option<i64>, Option<i64>, Option<i64>);
+
+/// The live GATT server.
 pub(super) struct Server {
     pub(super) provider: GattServiceProvider,
     characteristics: HashMap<CharacteristicUuid, GattLocalCharacteristic>,
-    /// `(characteristic, WriteRequested token, SubscribedClientsChanged token)`.
-    tokens: Vec<(GattLocalCharacteristic, Option<i64>, Option<i64>)>,
-    /// Carries the manufacturer data. `None` when the spec has none.
-    pub(super) publisher: Option<BluetoothLEAdvertisementPublisher>,
-    /// Drains `WriteRequested` in arrival order.
-    write_task: tokio::task::JoinHandle<()>,
+    /// What reads return, per readable characteristic.
+    values: Arc<StdMutex<HashMap<CharacteristicUuid, Vec<u8>>>>,
+    tokens: Vec<Tokens>,
+    /// Answers reads and writes in arrival order.
+    request_task: tokio::task::JoinHandle<()>,
 }
 
 impl Server {
     pub(super) fn shut_down(self) {
-        self.write_task.abort();
-        if let Some(publisher) = &self.publisher {
-            let _ = publisher.Stop();
-        }
-        for (characteristic, write, subscribed) in &self.tokens {
+        self.request_task.abort();
+        for (characteristic, read, write, subscribed) in &self.tokens {
+            if let Some(token) = read {
+                let _ = characteristic.RemoveReadRequested(*token);
+            }
             if let Some(token) = write {
                 let _ = characteristic.RemoveWriteRequested(*token);
             }
@@ -78,6 +89,16 @@ impl Server {
             }
         }
         let _ = self.provider.StopAdvertising();
+    }
+
+    /// `Driver::set_characteristic_value`.
+    pub(super) fn set_value(&self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
+        let mut values = self.values.lock().unwrap();
+        let slot = values
+            .get_mut(&characteristic)
+            .ok_or_else(|| BleError::Gatt(format!("characteristic {} is not served as readable", characteristic.0)))?;
+        *slot = value;
+        Ok(())
     }
 }
 
@@ -201,7 +222,9 @@ impl Inner {
 /// The service data the provider's own advertisement carries under the
 /// served UUID: the name, sent as service data like the Android driver
 /// does, or the caller's service data under that UUID (`validate` forbids
-/// both).
+/// both). With a 128-bit UUID it does not fit and Windows leaves it out
+/// (`StartedWithoutAllAdvertisementData`); the GATT advertisement carries
+/// it then.
 pub(super) fn provider_service_data(spec: &GattServiceSpec) -> Option<Vec<u8>> {
     match &spec.local_name {
         Some(name) => Some(truncate_name(name, NAME_SERVICE_DATA_MAX_LEN).as_bytes().to_vec()),
@@ -220,6 +243,12 @@ fn server_error(context: &str, error: BluetoothError) -> BleError {
 }
 
 pub(super) async fn start_server(inner: &Arc<Inner>, spec: &GattServiceSpec) -> Result<Server> {
+    if !spec.manufacturer_data.is_empty() || spec.service_data.keys().any(|uuid| *uuid != spec.uuid) {
+        log::info!(
+            "advertise: Windows cannot advertise manufacturer data or other service data with a GATT service; \
+             scanners read it from the GATT advertisement (ADR-0012)"
+        );
+    }
     let created = GattServiceProvider::CreateAsync(to_guid(spec.uuid.0))
         .map_err(|err| win_err("GattServiceProvider::CreateAsync", err))?;
     let result = created.await.map_err(|err| win_err("GattServiceProvider::CreateAsync", err))?;
@@ -230,7 +259,8 @@ pub(super) async fn start_server(inner: &Arc<Inner>, spec: &GattServiceSpec) -> 
     let provider = result.ServiceProvider().map_err(|err| win_err("ServiceProvider", err))?;
     let local_service = provider.Service().map_err(|err| win_err("GattServiceProvider::Service", err))?;
 
-    let (writes_tx, writes_rx) = mpsc::unbounded_channel::<(CharacteristicUuid, GattWriteRequestedEventArgs)>();
+    let (requests_tx, requests_rx) = mpsc::unbounded_channel::<ServerRequest>();
+    let values = Arc::new(StdMutex::new(HashMap::new()));
     let mut characteristics = HashMap::new();
     let mut tokens = Vec::new();
     for spec_char in &spec.characteristics {
@@ -253,12 +283,6 @@ pub(super) async fn start_server(inner: &Arc<Inner>, spec: &GattServiceSpec) -> 
             Ok(())
         };
         set().map_err(|err| win_err("CharacteristicParameters", err))?;
-        if spec_char.readable {
-            // Windows answers reads of a static value itself.
-            parameters
-                .SetStaticValue(&to_buffer(&spec_char.initial_value)?)
-                .map_err(|err| win_err("SetStaticValue", err))?;
-        }
         let op = local_service
             .CreateCharacteristicAsync(to_guid(spec_char.uuid.0), &parameters)
             .map_err(|err| win_err("CreateCharacteristicAsync", err))?;
@@ -269,15 +293,30 @@ pub(super) async fn start_server(inner: &Arc<Inner>, spec: &GattServiceSpec) -> 
             return Err(server_error("CreateCharacteristicAsync", error));
         }
         let local = created.Characteristic().map_err(|err| win_err("Characteristic", err))?;
+        let uuid = spec_char.uuid;
 
+        // Answered from `values` rather than a `StaticValue`, so
+        // `set_characteristic_value` can change it while serving.
+        let read_token = if spec_char.readable {
+            values.lock().unwrap().insert(uuid, spec_char.initial_value.clone());
+            let requests_tx = requests_tx.clone();
+            let handler = TypedEventHandler::new(
+                move |_: Ref<GattLocalCharacteristic>, args: Ref<GattReadRequestedEventArgs>| {
+                    let _ = requests_tx.send(ServerRequest::Read(uuid, args.ok()?.clone()));
+                    Ok(())
+                },
+            );
+            Some(local.ReadRequested(&handler).map_err(|err| win_err("ReadRequested", err))?)
+        } else {
+            None
+        };
         let write_token = if spec_char.writable {
-            let writes_tx = writes_tx.clone();
-            let uuid = spec_char.uuid;
+            let requests_tx = requests_tx.clone();
             let handler = TypedEventHandler::new(
                 move |_: Ref<GattLocalCharacteristic>, args: Ref<GattWriteRequestedEventArgs>| {
                     // Queued in arrival order and handled on one task, so
                     // the fragments of a datagram stay in order.
-                    let _ = writes_tx.send((uuid, args.ok()?.clone()));
+                    let _ = requests_tx.send(ServerRequest::Write(uuid, args.ok()?.clone()));
                     Ok(())
                 },
             );
@@ -300,24 +339,17 @@ pub(super) async fn start_server(inner: &Arc<Inner>, spec: &GattServiceSpec) -> 
         } else {
             None
         };
-        tokens.push((local.clone(), write_token, subscribed_token));
-        characteristics.insert(spec_char.uuid, local);
+        tokens.push((local.clone(), read_token, write_token, subscribed_token));
+        characteristics.insert(uuid, local);
     }
-    drop(writes_tx);
+    drop(requests_tx);
 
-    let write_task = tokio::spawn(drain_writes(Arc::downgrade(inner), writes_rx));
-    let mut server = Server { provider: provider.clone(), characteristics, tokens, publisher: None, write_task };
+    let request_task = tokio::spawn(drain_requests(Arc::downgrade(inner), values.clone(), requests_rx));
+    let server = Server { provider: provider.clone(), characteristics, values, tokens, request_task };
 
     if let Err(err) = start_provider_advertising(&provider, spec).await {
         server.shut_down();
         return Err(err);
-    }
-    match start_publisher(spec).await {
-        Ok(publisher) => server.publisher = publisher,
-        Err(err) => {
-            server.shut_down();
-            return Err(err);
-        }
     }
     Ok(server)
 }
@@ -336,6 +368,7 @@ pub(super) async fn start_provider_advertising(provider: &GattServiceProvider, s
     // `Aborted` is not final here. On the test computer (Intel adapter,
     // Windows 11) the provider reports `Aborted` with no error first and
     // `Started` a moment later, so only the status at the deadline counts.
+    // Google Nearby's Windows GATT server waits the same way.
     let deadline = tokio::time::Instant::now() + ADVERTISE_START_TIMEOUT;
     loop {
         let status = provider.AdvertisementStatus().map_err(|err| win_err("AdvertisementStatus", err))?;
@@ -343,7 +376,7 @@ pub(super) async fn start_provider_advertising(provider: &GattServiceProvider, s
             return Ok(());
         }
         if status == GattServiceProviderAdvertisementStatus::StartedWithoutAllAdvertisementData {
-            log::warn!("advertise: started without all advertisement data (the service data did not fit)");
+            log::info!("advertise: started without the service data (it does not fit); the GATT advertisement carries it");
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
@@ -359,97 +392,45 @@ pub(super) async fn start_provider_advertising(provider: &GattServiceProvider, s
     }
 }
 
-/// Build a publisher with the manufacturer data and, when `with_uuid`, the
-/// service UUID too, so scanners that filter on it (every driver of this
-/// library does) receive it.
-fn build_publisher(spec: &GattServiceSpec, with_uuid: bool) -> Result<BluetoothLEAdvertisementPublisher> {
-    let publisher = BluetoothLEAdvertisementPublisher::new().map_err(|err| win_err("AdvertisementPublisher", err))?;
-    let advertisement = publisher.Advertisement().map_err(|err| win_err("Publisher::Advertisement", err))?;
-    if with_uuid {
-        advertisement
-            .ServiceUuids()
-            .and_then(|uuids| uuids.Append(to_guid(spec.uuid.0)))
-            .map_err(|err| win_err("Publisher::ServiceUuids", err))?;
-    }
-    for (company, data) in &spec.manufacturer_data {
-        let entry = BluetoothLEManufacturerData::Create(*company, &to_buffer(data)?)
-            .map_err(|err| win_err("ManufacturerData", err))?;
-        advertisement
-            .ManufacturerData()
-            .and_then(|list| list.Append(&entry))
-            .map_err(|err| win_err("Publisher::ManufacturerData", err))?;
-    }
-    Ok(publisher)
-}
-
-/// Wait until the publisher started (`Ok(true)`), was aborted (`Ok(false)`)
-/// or is still waiting for a free advertising slot at the deadline
-/// (`Ok(true)`: Windows starts it later by itself).
-async fn publisher_started(publisher: &BluetoothLEAdvertisementPublisher) -> Result<bool> {
-    let deadline = tokio::time::Instant::now() + ADVERTISE_START_TIMEOUT;
-    loop {
-        let status = publisher.Status().map_err(|err| win_err("Publisher::Status", err))?;
-        if status == BluetoothLEAdvertisementPublisherStatus::Started {
-            return Ok(true);
-        }
-        // Like the provider's, an early `Aborted` may still turn into
-        // `Started`; only the status at the deadline counts.
-        if tokio::time::Instant::now() >= deadline {
-            if status == BluetoothLEAdvertisementPublisherStatus::Aborted {
-                return Ok(false);
-            }
-            log::warn!("advertise: manufacturer data advertisement still waiting (status {})", status.0);
-            return Ok(true);
-        }
-        tokio::time::sleep(STATUS_POLL_INTERVAL).await;
-    }
-}
-
-/// The non-connectable advertisement with the manufacturer data (ADR-0011
-/// D4). `None` when the spec has none.
-///
-/// Service data under UUIDs other than the served one cannot be advertised
-/// on Windows: the provider sends one entry, and the publisher refuses
-/// service data (tinygo-org/bluetooth found the same). It is logged and
-/// left out.
-pub(super) async fn start_publisher(spec: &GattServiceSpec) -> Result<Option<BluetoothLEAdvertisementPublisher>> {
-    let other_service_data = spec.service_data.keys().filter(|uuid| **uuid != spec.uuid).count();
-    if other_service_data > 0 {
-        log::warn!("advertise: {other_service_data} service data entries under other UUIDs are not sent on Windows");
-    }
-    if spec.manufacturer_data.is_empty() {
-        return Ok(None);
-    }
-    // With the service UUID first; without it if Windows refuses that.
-    for with_uuid in [true, false] {
-        let publisher = build_publisher(spec, with_uuid)?;
-        if let Err(err) = publisher.Start() {
-            log::warn!("advertise: publisher refused (service UUID included: {with_uuid}): {err}");
-            continue;
-        }
-        if publisher_started(&publisher).await? {
-            if !with_uuid {
-                log::warn!("advertise: manufacturer data sent without the service UUID; filtering scanners miss it");
-            }
-            return Ok(Some(publisher));
-        }
-        log::warn!("advertise: publisher aborted (service UUID included: {with_uuid})");
-        let _ = publisher.Stop();
-    }
-    Err(BleError::Gatt("advertise: Windows refused the manufacturer data advertisement".into()))
-}
-
-/// Answers inbound writes in the order they arrived and publishes them as
-/// `CharacteristicWritten`.
-async fn drain_writes(
-    inner: Weak<Inner>, mut writes: mpsc::UnboundedReceiver<(CharacteristicUuid, GattWriteRequestedEventArgs)>,
+/// Answers inbound reads and writes in the order they arrived; writes are
+/// published as `CharacteristicWritten`.
+async fn drain_requests(
+    inner: Weak<Inner>, values: Arc<StdMutex<HashMap<CharacteristicUuid, Vec<u8>>>>,
+    mut requests: mpsc::UnboundedReceiver<ServerRequest>,
 ) {
-    while let Some((characteristic, args)) = writes.recv().await {
+    while let Some(request) = requests.recv().await {
         let Some(inner) = inner.upgrade() else { return };
-        if let Err(err) = handle_write(&inner, characteristic, &args).await {
-            log::warn!("server: write to {} failed: {err}", characteristic.0);
+        let (characteristic, outcome) = match &request {
+            ServerRequest::Write(characteristic, args) => (*characteristic, handle_write(&inner, *characteristic, args).await),
+            ServerRequest::Read(characteristic, args) => (*characteristic, handle_read(&values, *characteristic, args).await),
+        };
+        if let Err(err) = outcome {
+            log::warn!("server: request on {} failed: {err}", characteristic.0);
         }
     }
+}
+
+/// A read, including a long read's later parts (`Offset`), answered from
+/// `values`. A read is not a sign of a datagram peer: a scanner reads the
+/// GATT advertisement and leaves, so no `Connected` is emitted, as on
+/// Android and Linux.
+async fn handle_read(
+    values: &StdMutex<HashMap<CharacteristicUuid, Vec<u8>>>, characteristic: CharacteristicUuid,
+    args: &GattReadRequestedEventArgs,
+) -> windows::core::Result<()> {
+    let deferral = args.GetDeferral()?;
+    let outcome = async {
+        let request = args.GetRequestAsync()?.await?;
+        let offset = request.Offset()? as usize;
+        let value = values.lock().unwrap().get(&characteristic).cloned().unwrap_or_default();
+        if offset > value.len() {
+            return request.RespondWithProtocolError(ATT_INVALID_OFFSET);
+        }
+        request.RespondWithValue(&win_buffer(&value[offset..])?)
+    }
+    .await;
+    deferral.Complete()?;
+    outcome
 }
 
 async fn handle_write(

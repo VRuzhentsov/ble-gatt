@@ -2,12 +2,18 @@
 
 ## Status
 
-Proposed. A first implementation is in `ble-gatt/src/drivers/windows.rs`.
-It builds for `x86_64-pc-windows-msvc`, its unit tests pass, and clippy
+Proposed. The implementation is in `ble-gatt/src/drivers/windows/`.
+**D4 is replaced by ADR-0012**: the Windows driver no longer runs a second
+advertisement; manufacturer data and the name reach scanners through the
+GATT advertisement. D5 still holds where the name fits.
+
+It builds for `x86_64-pc-windows-msvc`, its tests pass, and clippy
 reports no warnings. On the test computer (Intel Wireless Bluetooth,
 driver 23.90.0.8, Windows 11) `capabilities()` reports
 `central: true, peripheral: true` and `radio_status()` reports `On`
-(hardware check 1). **No link is verified yet.** The bar is the same
+(hardware check 1), and the GATT server advertises once the driver waits
+out the early `Aborted` status the provider reports first.
+**No link is verified yet.** The bar is the same
 as for Android (ADR-0002): a Fini pairing and a sync between a Windows
 computer and an Android phone, in both roles. The checklist is in
 "Hardware verification" below.
@@ -131,6 +137,12 @@ the whole id is the address, which still routes `notify_peer` correctly.
 
 ### D4 — Manufacturer data goes in a second advertisement
 
+*Replaced by ADR-0012.* Measured on the test computer: the publisher
+refuses a service UUID list (`E_INVALIDARG`), so scanners that filter on
+the UUID never received it, and with a 128-bit UUID the name did not fit
+in the provider's advertisement either. The text below records the first
+design.
+
 `GattServiceProvider.StartAdvertising` sends a connectable advertisement
 with the service UUID and, from build 19041, one service data entry under
 that UUID. It cannot send manufacturer data. Fini's scanner ignores a peer
@@ -239,8 +251,9 @@ Run on the Windows computer with an Android phone running Fini:
 2. Windows scans and finds the phone with its fingerprint and name.
 3. Windows connects to the phone, writes, subscribes and receives
    notifications (central role).
-4. The phone finds Windows: one `DiscoveredPeer` with both the manufacturer
-   data and the name, at the address it then connects to (D4 risk).
+4. The phone finds Windows through `advertisement::complete`: one
+   `DiscoveredPeer` with the manufacturer data and the name read from the
+   GATT advertisement (ADR-0012).
 5. The phone connects to Windows, writes, and receives notifications
    (peripheral role).
 6. Add Device toggles (`update_advertisement`) while the phone stays

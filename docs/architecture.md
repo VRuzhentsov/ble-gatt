@@ -33,7 +33,7 @@ Use Cases and implement or call those interfaces.
 | Layer (Clean Architecture) | Job | Modules or crates | Never does |
 |---|---|---|---|
 | **Entities** | Data types and rules that hold everywhere | `entities/`: `PeerAddress`, peer identity, connection states, errors, the fragment format | Any I/O, any platform call |
-| **Use Cases** | What the library does | `hal/` (the port traits drivers implement), `roles/` (`Adapter`, `Central`, `Peripheral`, `Advertiser`), `connection/` (one connection's lifecycle), `profile/` (the datagram profile: message channel, peer identity in the advertisement, finding a known peer), `power/` (power profiles) | Call an operating system directly; know about iroh, Tauri or any application |
+| **Use Cases** | What the library does | `hal/` (the port traits drivers implement), `roles/` (`Adapter`, `Central`, `Peripheral`, `Advertiser`), `connection/` (one connection's lifecycle), `profile/` (the datagram profile: message channel, peer identity in the advertisement and the GATT advertisement, finding a known peer), `power/` (power profiles) | Call an operating system directly; know about iroh, Tauri or any application |
 | **Interface Adapters** | Connect the library to a specific outside system | Crates `ble-gatt-iroh` (iroh custom transport) and `tauri-plugin-ble-gatt` (Tauri host integration) | Anything the core needs to work |
 | **Frameworks & Drivers** | Talk to one operating system's Bluetooth API | `drivers/`: Linux (BlueZ via `bluer`), Android (JNI + Kotlin), Windows (WinRT), Apple (CoreBluetooth), mock radio | Policy, retries, protocol framing |
 | *(outside)* Application | Product logic | Which network stack to use, sessions, sync, routing, UI | (lives outside this repository) |
@@ -45,7 +45,7 @@ Use Cases and implement or call those interfaces.
 | `hal/` | Traits a driver implements: scanning, connecting, GATT client and server operations, advertising | `embedded-hal` (traits) and its drivers |
 | `roles/` | The BLE roles as a uniform API, created from the `Adapter` object | GAP roles in the Bluetooth Core Specification; Nordic's `client` / `server` / `advertiser` |
 | `connection/` | Keep a connection to one peer healthy: state machine, one operation queue per device with timeouts, connection-scoped tasks, MTU and connection priority | GAP connection procedures; Kable's and Nordic's `connect()` |
-| `profile/` | The datagram profile: whole messages over a connection (fragmentation, reassembly), peer identity in the advertisement, finding a known peer, deduplicating crossing connections | GATT-based profile in the Bluetooth Core Specification; Nordic's `profile()` |
+| `profile/` | The datagram profile: whole messages over a connection (fragmentation, reassembly), peer identity in the advertisement, the GATT advertisement for platforms that cannot advertise it (`advertisement.rs`, ADR-0012), finding a known peer, deduplicating crossing connections | GATT-based profile in the Bluetooth Core Specification; Nordic's `profile()`; Google Nearby's fast and GATT advertisements |
 | `power/` | Advise how hard the radio should work: inputs (foreground or background, battery level, charging, peers nearby) resolve to a schedule (scan on and off times, connection limit) | bitchat's `PowerManager` |
 
 ## How the layers map onto OSI

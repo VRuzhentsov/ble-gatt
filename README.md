@@ -78,7 +78,7 @@ over a socket instead of sharing an in-process `Arc`.
 |---|---|---|---|
 | Linux (BlueZ) | Yes | Yes | **M1 — implemented**, verified against real BlueZ hardware |
 | Android | Yes | Yes (where the chipset/driver allows — see `CapabilityReport`) | **M1 — implemented, not yet verified as a working bridge.** Individual pieces confirmed on a real emulator (real `capabilities()` returning `{central: true, peripheral: true}`, real GATT-server advertise start), but no device-to-device round trip yet — physical-hardware verification is the real bar, planned for after the next minor patch/release. See ADR-0002. |
-| Windows (WinRT) | Yes | Yes (where the adapter and driver allow — see `CapabilityReport`) | **M2 — first implementation, not yet verified on a radio.** Builds for `x86_64-pc-windows-msvc`; needs Windows 10 2004 or later. See ADR-0011. |
+| Windows (WinRT) | Yes | Yes (where the adapter and driver allow — see `CapabilityReport`) | **M2 — first implementation, not yet verified on a radio.** Builds for `x86_64-pc-windows-msvc`; needs Windows 10 2004 or later. Scanners find it through the GATT advertisement (ADR-0012). See ADR-0011. |
 | macOS / iOS | — | — | M3 — reserved, not implemented |
 
 Capability is always discovered at runtime via `Driver::capabilities()`,

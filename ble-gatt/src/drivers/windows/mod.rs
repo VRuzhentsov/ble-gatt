@@ -279,23 +279,17 @@ impl Driver for WindowsDriver {
         if !served.same_service(&service) {
             return Err(BleError::Gatt("update_advertisement: the spec describes a different service".into()));
         }
-        let (provider, old_publisher) = {
-            let mut server = self.inner.server.lock().unwrap();
-            let server = server.as_mut().ok_or_else(not_advertising)?;
-            (server.provider.clone(), server.publisher.take())
+        let provider = {
+            let server = self.inner.server.lock().unwrap();
+            server.as_ref().ok_or_else(not_advertising)?.provider.clone()
         };
-        if let Some(publisher) = old_publisher {
-            let _ = publisher.Stop();
-        }
         // The provider's advertisement only carries the name (or the service
         // data under the served UUID); restart it only when that changed.
+        // Manufacturer data is not advertised on Windows: the GATT
+        // advertisement carries it (ADR-0012).
         if peripheral::provider_service_data(&served) != peripheral::provider_service_data(&service) {
             let _ = provider.StopAdvertising();
             peripheral::start_provider_advertising(&provider, &service).await?;
-        }
-        let publisher = peripheral::start_publisher(&service).await?;
-        if let Some(server) = self.inner.server.lock().unwrap().as_mut() {
-            server.publisher = publisher;
         }
         *self.inner.served_service.lock().unwrap() = Some(service);
         log::info!("update_advertisement: applied");
@@ -304,6 +298,14 @@ impl Driver for WindowsDriver {
 
     fn served_service(&self) -> Option<GattServiceSpec> {
         self.inner.served_service.lock().unwrap().clone()
+    }
+
+    async fn set_characteristic_value(&self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
+        let server = self.inner.server.lock().unwrap();
+        server
+            .as_ref()
+            .ok_or_else(|| BleError::Gatt("set_characteristic_value: nothing is served".into()))?
+            .set_value(characteristic, value)
     }
 
     async fn stop_advertising(&self) -> Result<()> {

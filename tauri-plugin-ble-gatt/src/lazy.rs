@@ -107,6 +107,10 @@ impl Driver for LazyDriver {
         self.cell.get()?.served_service()
     }
 
+    async fn set_characteristic_value(&self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
+        self.inner().await?.set_characteristic_value(characteristic, value).await
+    }
+
     async fn stop_advertising(&self) -> Result<()> {
         self.inner().await?.stop_advertising().await
     }
