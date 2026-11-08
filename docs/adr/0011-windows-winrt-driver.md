@@ -51,11 +51,28 @@ Options:
    both roles, and the driver maps WinRT types to `crate::entities` itself,
    like the Linux driver does with `bluer`.
 
-**Decided: option 3.** The driver follows btleplug's class choices for the
-central role (`BluetoothLEAdvertisementWatcher`, `BluetoothLEDevice`,
-`GattSession` with `MaintainConnection`) and Microsoft's
-`BluetoothLE` sample for the peripheral role (`GattServiceProvider`,
-`GattLocalCharacteristic`). Version: `windows = "0.62"`, whose async
+**Decided: option 3, with the central half adapted from btleplug's
+code.** btleplug's `src/winrtble/` is BSD-3-Clause, so its code may be
+copied with its notice (`LICENSES/btleplug-BSD-3-Clause.txt`). The driver
+takes btleplug's module split and its central-role fixes, and keeps this
+library's own `Driver` contract and peripheral role on top:
+
+| Module | Job | Source |
+|---|---|---|
+| `drivers/windows/watcher.rs` | Scanning | btleplug `ble/watcher.rs`: active scanning, extended advertisements, scan responses only from addresses that matched, a bounded set of 1024 matched addresses |
+| `drivers/windows/device.rs` | One central link | btleplug `ble/device.rs`, `ble/characteristic.rs`: uncached discovery falls back to the Windows cache after 5 s (btleplug #325: some drivers never answer), link loss from `ConnectionStatusChanged`, Notify or Indicate from the characteristic's properties, one `ValueChanged` handler per characteristic, the status of `RequestPreferredConnectionParameters` checked |
+| `drivers/windows/peripheral.rs` | GATT server, advertising | Own. btleplug has no peripheral role; the provider-plus-publisher split matches tinygo-org/bluetooth (D4) |
+| `drivers/windows/utils.rs` | Conversions | Partly btleplug (`parse_service_data`) |
+| `drivers/windows/mod.rs` | The `Driver` port: sessions, events, radio | Own |
+
+Two choices differ from btleplug and follow bluest instead: the dial uses
+the address type the scan saw (`FromBluetoothAddressWithBluetoothAddressTypeAsync`),
+and the link keeps `GattSession.MaintainConnection = true`.
+
+Using btleplug as a dependency (option 1) stays possible later, once the
+`hal::Driver` port is split by role; that is a separate decision.
+
+Version: `windows = "0.62"`, the version btleplug 0.13 uses. Its async
 operations implement `IntoFuture`, so they `.await` on Tokio with no
 executor bridge.
 
@@ -129,18 +146,28 @@ Options:
    the GATT server.
 3. **Both.** The provider sends the connectable advertisement (UUID and the
    name). A publisher sends a non-connectable advertisement with the UUID and
-   the manufacturer data (and service data under other UUIDs). Example:
+   the manufacturer data. Example:
    `advertisement.ManufacturerData().Append(BluetoothLEManufacturerData::Create(0xFFFF, &buffer)?)`.
    The two are independent WinRT objects, so each can be replaced
-   without touching the other.
+   without touching the other. tinygo-org/bluetooth (`gatts_windows.go`,
+   `gap_windows.go`, BSD-3-Clause) does the same.
 
-**Decided: option 3.** Open risk: a scanner merges the two advertisements
-only if both come from the same address. Windows is expected to send both
-from the adapter's address, because the driver does not ask for an
-anonymous publisher; this is not verified (hardware check 4). BlueZ merges
-advertisement data per device by itself. Whether the Android scanner
-reports the manufacturer data of a non-connectable advertisement together
-with the name is part of the same check.
+**Decided: option 3.** The publisher carries no service data and no name:
+tinygo records that Windows refuses to start a publisher with either.
+Service data under UUIDs other than the served one is therefore not sent
+on Windows (logged). If Windows refuses the publisher with the service
+UUID, the driver starts it with the manufacturer data alone and logs that
+filtering scanners will miss it.
+
+Open risk: a scanner merges the two advertisements only if both come from
+the same address. FlyingCarpet's field guide (GPL-3.0, read for facts only)
+records that `GattServiceProvider` advertises from a static random address;
+which address the publisher uses is not documented. If the two differ, a
+phone sees two devices: one with the fingerprint that cannot be connected,
+and one that can be connected without it. Hardware check 4 settles this.
+The fallback, if needed, is to send Fini's flags and fingerprint in the
+provider's own service data on Windows; that changes the advertisement
+format on every platform and is a separate decision.
 
 `update_advertisement` replaces only the publisher when only the
 manufacturer data changed, which is Fini's Add Device toggle. When the name
@@ -188,9 +215,11 @@ Reads of a readable characteristic are answered by Windows from
 ### D8 — Central links
 
 `connect` opens a `GattSession` with `MaintainConnection = true` and
-discovers every service and characteristic uncached; discovery is where
-WinRT really connects. Link loss is `GattSession.SessionStatusChanged` =
-`Closed`, reported once as `Disconnected { Central }`. `att_mtu` is
+discovers every service and characteristic uncached, falling back to the
+Windows cache after 5 s (D1); discovery is where WinRT really connects.
+Link loss is `BluetoothLEDevice.ConnectionStatusChanged` to `Disconnected`
+(as in btleplug) or `GattSession.SessionStatusChanged` to `Closed`,
+whichever comes first, reported once as `Disconnected { Central }`. `att_mtu` is
 `GattSession.MaxPduSize`. A second `connect` to an address with a live or
 pending link is refused, as on Android.
 
