@@ -260,6 +260,11 @@ impl DatagramConfig {
 
     /// The GATT service this tier expects on the wire. Both roles must agree,
     /// so both derive it from here rather than hand-rolling a spec.
+    ///
+    /// Besides the datagram characteristic it serves the GATT advertisement
+    /// (`profile::advertisement`, ADR-0012): the advertisement data again,
+    /// in a readable characteristic, for scanners of a peer whose platform
+    /// cannot advertise it (Windows, Apple).
     pub fn service_spec(&self) -> GattServiceSpec {
         let mut spec = GattServiceSpec::new(
             self.service,
@@ -273,6 +278,8 @@ impl DatagramConfig {
         );
         spec.manufacturer_data = self.advertised_manufacturer_data.clone();
         spec.local_name = self.advertised_local_name.clone();
+        let gatt_advertisement = crate::profile::advertisement::characteristic_spec(&spec);
+        spec.characteristics.push(gatt_advertisement);
         spec
     }
 }
@@ -1136,7 +1143,15 @@ pub async fn serve(adapter: &Adapter, config: &DatagramConfig) -> Result<BoxStre
 pub async fn update_advertisement(adapter: &Adapter, config: &DatagramConfig) -> Result<()> {
     config.validate()?;
     log::info!("serve: updating the advertisement for {}", config.service.0);
-    adapter.driver().update_advertisement(config.service_spec()).await
+    let spec = config.service_spec();
+    let driver = adapter.driver();
+    driver.update_advertisement(spec.clone()).await?;
+    // The GATT advertisement must say the same as the radio advertisement:
+    // a Windows peer's scanners only see this one (ADR-0012).
+    let value = crate::profile::advertisement::GattAdvertisement::of(&spec).encode();
+    driver
+        .set_characteristic_value(crate::profile::advertisement::GATT_ADVERTISEMENT_CHARACTERISTIC, value)
+        .await
 }
 
 /// Stop a running [`serve`]: its advertisement and its GATT server, which

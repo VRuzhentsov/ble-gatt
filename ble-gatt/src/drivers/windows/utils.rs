@@ -37,10 +37,14 @@ pub(super) fn from_guid(guid: GUID) -> Uuid {
     Uuid::from_u128(guid.to_u128())
 }
 
+pub(super) fn win_buffer(bytes: &[u8]) -> windows::core::Result<IBuffer> {
+    let writer = DataWriter::new()?;
+    writer.WriteBytes(bytes)?;
+    writer.DetachBuffer()
+}
+
 pub(super) fn to_buffer(bytes: &[u8]) -> crate::Result<IBuffer> {
-    let writer = DataWriter::new().map_err(|err| win_err("DataWriter", err))?;
-    writer.WriteBytes(bytes).map_err(|err| win_err("DataWriter::WriteBytes", err))?;
-    writer.DetachBuffer().map_err(|err| win_err("DataWriter::DetachBuffer", err))
+    win_buffer(bytes).map_err(|err| win_err("DataWriter", err))
 }
 
 pub(super) fn from_buffer(buffer: &IBuffer) -> windows::core::Result<Vec<u8>> {

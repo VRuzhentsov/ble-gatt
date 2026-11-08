@@ -2168,6 +2168,18 @@ impl Driver for LinuxDriver {
         self.served_service.lock().unwrap().clone()
     }
 
+    /// The read handler of every served characteristic answers from
+    /// `values`, so replacing the entry is the whole change.
+    async fn set_characteristic_value(&self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
+        let served = self.served_service.lock().unwrap().clone();
+        let served = served.ok_or_else(|| BleError::Gatt("set_characteristic_value: nothing is served".into()))?;
+        if !served.characteristics.iter().any(|c| c.uuid == characteristic) {
+            return Err(BleError::Gatt(format!("characteristic {} is not served", characteristic.0)));
+        }
+        self.values.lock().unwrap().insert(characteristic, value);
+        Ok(())
+    }
+
     async fn update_advertisement(&self, service: GattServiceSpec) -> Result<()> {
         service.validate()?;
         let _serialise = self.advertise_lock.lock().await;

@@ -43,6 +43,7 @@ pub(super) enum Request {
     Connect { central: PeerAddress, peer: PeerAddress },
     Advertise { address: PeerAddress, service: GattServiceSpec },
     UpdateAdvertisement { address: PeerAddress, service: GattServiceSpec },
+    SetCharacteristicValue { address: PeerAddress, characteristic: CharacteristicUuid, value: Vec<u8> },
     StopAdvertising { address: PeerAddress },
     Notify { address: PeerAddress, characteristic: CharacteristicUuid, value: Vec<u8> },
     NotifyPeer {

@@ -202,6 +202,16 @@ impl MockNetwork {
         }
     }
 
+    async fn set_characteristic_value(
+        &self, address: &PeerAddress, characteristic: CharacteristicUuid, value: Vec<u8>,
+    ) -> Result<()> {
+        match &self.0 {
+            Radio::Local(r) => r.set_characteristic_value(address, characteristic, value).await,
+            #[cfg(feature = "mock-broker")]
+            Radio::Remote(r) => r.set_characteristic_value(address, characteristic, value).await,
+        }
+    }
+
     async fn stop_advertising(&self, address: &PeerAddress) -> Result<()> {
         match &self.0 {
             Radio::Local(r) => r.stop_advertising(address).await,
@@ -373,6 +383,10 @@ impl Driver for MockDriver {
 
     fn served_service(&self) -> Option<GattServiceSpec> {
         self.served.lock().unwrap().clone()
+    }
+
+    async fn set_characteristic_value(&self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
+        self.network.set_characteristic_value(&self.address, characteristic, value).await
     }
 
     async fn stop_advertising(&self) -> Result<()> {

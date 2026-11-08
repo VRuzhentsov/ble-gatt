@@ -160,6 +160,18 @@ itself (ADR-0011 D6).
 
 ## This library's concepts
 
+### Fast advertisement
+Advertisement data that travels in the radio advertisement itself, so a
+scanner reads it without connecting. What Android and Linux peers send.
+The name is Google Nearby's (ADR-0012).
+
+### GATT advertisement
+The same advertisement data, served in a readable characteristic
+(`advertisement::GATT_ADVERTISEMENT_CHARACTERISTIC`) of every datagram
+service. A scanner reads it when a peer's radio advertisement carries no
+data, which is how a Windows or Apple peer looks (`advertisement::complete`,
+ADR-0012). Nearby keeps its full advertisement in GATT the same way.
+
 ### Peer
 Another device this library talks to.
 
