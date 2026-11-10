@@ -88,3 +88,29 @@ async fn an_advertisement_update_changes_the_gatt_advertisement() {
     assert_eq!(after.manufacturer_data.get(&COMPANY).map(|v| v[0]), Some(0x01), "the Add Device flag changed");
     assert_eq!(after.local_name.as_deref(), Some("Desktop"));
 }
+
+/// Dropping the completed stream must end the scan it wraps at once. The
+/// Linux driver stops BlueZ discovery only when its scan stream is dropped,
+/// so a forwarding task that waits for the next advertisement first keeps
+/// discovery on until some peer happens to advertise.
+#[tokio::test]
+async fn dropping_the_completed_stream_ends_the_scan_at_once() {
+    let network = MockNetwork::new();
+    let phone = driver(&network, "phone");
+    let config = config(0x01);
+
+    // A scan that never reports a peer, and that says when it is dropped.
+    let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel::<()>();
+    let scan = Box::pin(futures::stream::poll_fn(move |_| {
+        let _held_until_drop = &dropped_tx;
+        std::task::Poll::Pending
+    }));
+
+    let peers = advertisement::complete(phone.clone(), config.service, scan, GattAdvertisementPolicy::default());
+    // Let the forwarding task reach its wait for the next advertisement.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    drop(peers);
+
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx).await;
+    assert!(ended.is_ok(), "the scan was still held after the completed stream was dropped");
+}
