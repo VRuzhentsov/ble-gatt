@@ -346,6 +346,11 @@ pub fn complete(
                         }
                     }
                 }
+                // The caller dropped the stream. Return now, not at the next
+                // advertisement: `scan` holds the driver's scan, and the
+                // Linux driver stops BlueZ discovery only when it is dropped.
+                // Same as the forwarding task in `drivers/linux.rs`.
+                () = tx.closed() => return,
             }
         }
     });
