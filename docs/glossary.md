@@ -332,12 +332,32 @@ One transport address an iroh connection can use to reach the peer
 Both devices dialling each other at the same moment, so two links or two
 connections come up where one was wanted.
 
+### Symmetric initiation
+Either peer may start or reconnect a link, regardless of permanent identity
+ordering. `ble-gatt-iroh::InitiationPolicy::EitherPeer` selects this behaviour;
+core `PeerLink::LinkRole::Symmetric` instead selects a lower-identity dialler.
+These are not synonymous. Neither guarantees simultaneous-role hardware support.
+
+### Initiation policy
+An explicit choice of who may start an outgoing link when no usable queue
+exists. In `ble-gatt-iroh`, `PreviousDialer` preserves the historical redial
+yield, `EitherPeer` removes that yield and `Ordered` is the smaller-endpoint-key
+fallback. It is not peer authentication or an application's session policy.
+
+### Candidate link
+A BLE channel attached to the iroh transport, potentially one of several
+crossed candidates. Older candidates can still receive while the newest queue
+sends. An address with live iroh users remains protected from idle cleanup;
+last-user release closes it when those users end (ADR-0013).
+
 ### Redial yield
 After a link the peer dialled drops, the time (`REDIAL_YIELD`, 30 s) for
 which `ble-gatt-iroh` does not dial that peer, so that the peer, which re-dials
 for its still-open iroh connection, does not cross with it. It starts only
 when such a connection may still be open: not after this side closed the
-link, nor after every connection on it had started to close.
+link, nor after every connection on it had started to close. It applies to
+`InitiationPolicy::PreviousDialer` (the compatibility default), not to
+`EitherPeer` or `Ordered` (ADR-0013).
 
 ### Adapter crate
 A crate that connects `ble-gatt` to something outside it, such as iroh

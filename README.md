@@ -23,7 +23,10 @@ This repo is a Cargo workspace with three crates:
 - **`ble-gatt-iroh`** — an [iroh](https://github.com/n0-computer/iroh)
   custom transport that carries QUIC over `ble-gatt`'s GATT datagram
   channel. The caller decides when the radio scans and advertises. See
-  ADR-0006.
+  ADR-0006. Its explicit either-peer initiation policy, deterministic
+  fallback and lifecycle ownership are described in
+  [ADR-0013](docs/adr/0013-symmetric-iroh-initiation.md); hardware adoption is
+  a separate gate.
 
 ### Using the plugin from a Rust application
 

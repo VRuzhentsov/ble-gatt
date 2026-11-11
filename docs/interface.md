@@ -20,6 +20,45 @@ genuinely wants to drive one channel by hand.
 
 ---
 
+## iroh consumers: use the adapter, not a second `PeerLink`
+
+For QUIC over BLE, `ble-gatt-iroh` already uses the datagram tier directly.
+Install its `hooks()` on the iroh endpoint; supply a dialler, discovered peer
+addresses and incoming channels. Do **not** also run `PeerLink` over those
+channels: that would add another retry/close owner. The `PeerLink` examples
+below describe the generic byte-channel API, not Fini's current integration.
+
+```rust,ignore
+let key = iroh::SecretKey::generate();
+let transport = ble_gatt_iroh::BleGattTransport::builder()
+    .dialer(ble_gatt_iroh::dial_with(adapter.clone(), config.clone()))
+    .initiation_policy(ble_gatt_iroh::InitiationPolicy::EitherPeer)
+    .build();
+let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+    .secret_key(key)
+    .add_custom_transport(Arc::new(transport.clone()))
+    .address_lookup(transport.address_lookup())
+    .hooks(transport.hooks())
+    .bind().await?;
+transport.set_peer_address(remote_endpoint_id, advertised_address);
+// Feed datagram::serve's channels into transport.attach(channel).
+// Either endpoint may call endpoint.connect(remote_endpoint_id, alpn).
+```
+
+Select `EitherPeer` explicitly after verifying crossed-dial support. The
+unchanged default is `PreviousDialer` (30-second yield after an unexpected
+incoming-link loss). If crossed dials are unsafe, configure both peers with
+`InitiationPolicy::Ordered { local_id: key.public() }` before moving `key`
+into the endpoint: only the smaller endpoint key initiates. Individual
+`CapabilityReport.central/peripheral` booleans do not prove concurrent-role
+support. See [ADR-0013](adr/0013-symmetric-iroh-initiation.md).
+
+Fini retains permitted peers, sync settings and application-session policy.
+A losing application candidate closes its own iroh connection, **not** all
+BLE links for that key while another connection uses them. The adapter's
+hooks perform ordinary last-user release. Explicit `close_links` is a force
+close for shutdown/revocation/abandoned connects, not candidate rejection.
+
 ## Tier 1 — raw GATT (`Driver`)
 
 Scan, connect, read, write, subscribe; advertise, notify. You speak in

@@ -76,6 +76,18 @@ Fini's `DataLink` is named after OSI L2 and corresponds to this library's
 | Interface Adapter for Tauri | `tauri-plugin-ble-gatt` (this repository) |
 | Application | The application. Fini decides that Fini uses iroh (Fini ADR-0009); `ble-gatt` takes no such decision. |
 
+### iroh lifecycle ownership
+
+`BleGattTransport` owns the BLE candidate queues and hook-learned key/link
+mapping. iroh owns QUIC connections and path reuse. Core drivers own physical
+GATT state and session-bound cleanup. The application owns permitted peers,
+sync settings and application sessions, not a second BLE retry/close
+controller. Do not place `PeerLink` alongside the adapter on the same channels.
+`PeerLink::Symmetric` still means lower-`LinkId` initiation; the adapter's
+explicit `InitiationPolicy::EitherPeer` is the either-peer path. Its default
+and deterministic platform fallback are documented in
+[ADR-0013](adr/0013-symmetric-iroh-initiation.md).
+
 ## Crates
 
 | Crate | Layers | Depends on |
