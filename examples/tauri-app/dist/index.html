@@ -7,6 +7,8 @@
   <body>
     <h1>ble-gatt example</h1>
     <p id="status">loading…</p>
+    <button id="permissions">request existing Bluetooth permissions</button>
+    <br /><br />
     <button id="capabilities">capabilities()</button>
     <br /><br />
     <button id="advertise">advertise (peripheral role)</button>
@@ -36,6 +38,11 @@
       function show(value) {
         output.textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
       }
+
+      document.getElementById("permissions").addEventListener("click", async () => {
+        try { show(await invoke("request_ble_permissions")); }
+        catch (err) { show("permission error: " + err); }
+      });
 
       document.getElementById("capabilities").addEventListener("click", async () => {
         try {

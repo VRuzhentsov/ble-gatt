@@ -27,6 +27,8 @@ tauri = { version = "2.11.0", features = [] }
 tauri-plugin-log = "2"
 tauri-plugin-ble-gatt = { path = "../../../tauri-plugin-ble-gatt" }
 ble-gatt = { path = "../../../ble-gatt" }
+ble-gatt-iroh = { path = "../../../ble-gatt-iroh" }
+iroh = { version = "1.3", default-features = false, features = ["unstable-custom-transports", "tls-ring"] }
 tokio = { version = "1", features = ["rt", "macros", "time"] }
 tokio-stream = "0.1"
 uuid = "1"
