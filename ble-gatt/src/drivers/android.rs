@@ -96,8 +96,9 @@ const CALLBACK_CLASS: &str = "dev/blegatt/NativeKt";
 /// `AndroidDriver::new`). v2 added `onRadioState` / `bridgeAbiVersion` /
 /// `isRadioEnabled` (ADR-0005's adapter-state receiver). v3 added
 /// `requestConnectionPriority`. v4 added the local-name byte array to
-/// `startAdvertising`.
-const BRIDGE_ABI_VERSION: i32 = 5;
+/// `startAdvertising`. v5 added `setCharacteristicValue` (ADR-0012).
+/// v6 changed `startScan` from a boolean to a scan-start status code.
+const BRIDGE_ABI_VERSION: i32 = 6;
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 
@@ -601,10 +602,10 @@ impl Driver for AndroidDriver {
                 .call_method(
                     bridge.as_obj(),
                     "startScan",
-                    "(Ljava/lang/String;J)Z",
+                    "(Ljava/lang/String;J)I",
                     &[JValue::Object(&uuid), JValue::Long(generation as i64)],
                 )
-                .and_then(|v| v.z());
+                .and_then(|v| v.i());
             match started {
                 // Same exception-clearing contract as `call_void`/`call_bool`:
                 // a `startScan` that throws (a missing runtime Bluetooth
@@ -615,15 +616,9 @@ impl Driver for AndroidDriver {
                     log::error!("scan: startScan threw for service {}", service.0);
                     return Err(jni_error(&mut env, "startScan", err));
                 }
-                // Rejected. The active scan keeps ownership untouched — we
-                // never took it away.
-                Ok(false) => {
-                    log::warn!("scan: refused — a scan is already active");
-                    return Err(BleError::Gatt(
-                        "a scan is already active; concurrent scans are not supported".to_string(),
-                    ));
-                }
-                Ok(true) => {
+                Ok(status) => {
+                    // On refusal the active scan keeps ownership untouched.
+                    super::android_scan_start_result(status)?;
                     log::info!("scan: started for service {} generation={generation}", service.0);
                 }
             }

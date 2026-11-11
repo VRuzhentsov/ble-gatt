@@ -65,6 +65,39 @@ fn every_kotlin_external_fun_has_a_rust_export_and_back() {
     assert_eq!(declared, exported, "Native.kt externs (left) and Rust JNI exports (right) differ");
 }
 
+/// Source-level guard; compiled descriptors can also be checked with `javap`.
+#[test]
+fn scan_start_status_and_abi_match_on_both_sides() {
+    let kotlin = read(&format!("{KOTLIN_DIR}/BleGattBridge.kt"));
+    let rust = read(DRIVER);
+    assert!(kotlin.contains("fun startScan(serviceUuid: String, generation: Long): Int"));
+    assert!(rust.contains("\"(Ljava/lang/String;J)I\""));
+    assert!(rust.contains("super::android_scan_start_result(status)?"));
+    for (name, value) in [
+        ("SCAN_STARTED", 0),
+        ("SCAN_BUSY", 1),
+        ("SCAN_UNAVAILABLE", 2),
+    ] {
+        assert!(kotlin.contains(&format!("private const val {name}: Int = {value}")));
+    }
+    let scan = kotlin
+        .split("fun startScan(")
+        .nth(1)
+        .unwrap()
+        .split("fun stopScan(")
+        .next()
+        .unwrap();
+    assert!(scan.contains("return SCAN_BUSY"));
+    assert!(scan.contains("adapter?.bluetoothLeScanner ?: return SCAN_UNAVAILABLE"));
+    assert!(scan.contains("return SCAN_STARTED"));
+    assert!(
+        !scan.contains("catch ("),
+        "scan permission/platform exceptions must reach JNI"
+    );
+    assert!(rust.contains("const BRIDGE_ABI_VERSION: i32 = 6;"));
+    assert!(kotlin.contains("fun bridgeAbiVersion(): Int = 6"));
+}
+
 #[test]
 fn every_bridge_method_rust_calls_exists_in_kotlin() {
     let kotlin = read(&format!("{KOTLIN_DIR}/BleGattBridge.kt"));
