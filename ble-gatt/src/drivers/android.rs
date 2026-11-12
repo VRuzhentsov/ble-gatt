@@ -425,6 +425,14 @@ impl AndroidDriver {
                 .map_err(|err| BleError::AdapterUnavailable(format!("global ref of Context failed: {err}")))?
         };
 
+        Self::with_context(vm, context).await
+    }
+
+    /// Uses the embedding application's JVM and owned Application context.
+    /// Unlike [`Self::new`], this never reads or initializes `ndk-context`.
+    /// The context must belong to `vm`; use the process-lifetime Application,
+    /// not an Activity whose lifetime ends on configuration changes.
+    pub async fn with_context(vm: JavaVM, context: GlobalRef) -> Result<Self> {
         let (server_events_tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let inner = Arc::new(Inner {
             vm,

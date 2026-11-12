@@ -3,7 +3,7 @@
 use ble_gatt::{
     advertisement,
     datagram::{self, DatagramConfig},
-    Adapter, CharacteristicUuid, ServiceUuid,
+    Adapter, CharacteristicUuid, GattEvent, PeerAddress, Role, ServiceUuid,
 };
 use ble_gatt_iroh::{dial_with, BleGattTransport, Dialer, InitiationPolicy};
 use iroh::{
@@ -22,6 +22,12 @@ use tokio_stream::StreamExt;
 
 const ALPN: &[u8] = b"ble-gatt/example/either-peer/1";
 const COMPANY: u16 = 0xffff;
+
+fn scheduled_delay(start_at: u64, now: Duration) -> Duration {
+    // Keep the fractional part: truncating `now` schedules each peer at
+    // start_at plus its own discovery-time fraction, up to one second apart.
+    Duration::from_secs(start_at).saturating_sub(now)
+}
 
 pub fn mark(line: impl std::fmt::Display) {
     log::info!("EITHERPEER: {line}");
@@ -187,6 +193,76 @@ async fn probe(connection: &Connection, local: EndpointId, round: u8) -> Result<
 
 type Candidates = Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>;
 
+/// Driver lifecycle evidence, not a claim about every OS Bluetooth object.
+/// Subscribe before serving/dialling; a lost event makes the evidence invalid.
+#[derive(Default)]
+struct NativeSessions {
+    active: Vec<(PeerAddress, Role, Option<u64>)>,
+    observed: usize,
+    failure: Option<String>,
+}
+
+impl NativeSessions {
+    fn observe(&mut self, event: GattEvent) {
+        match event {
+            GattEvent::Connected {
+                peer,
+                local_role,
+                session,
+            } => {
+                let key = (peer, local_role, session);
+                if !self.active.contains(&key) {
+                    self.observed += 1;
+                    self.active.push(key);
+                }
+            }
+            GattEvent::Disconnected {
+                peer,
+                local_role,
+                session,
+            } => {
+                // Drivers without disconnect session IDs document address
+                // fallback. A concrete old session must not evict a newer one.
+                self.active.retain(|(address, role, id)| {
+                    address != &peer || role != &local_role || (session.is_some() && id != &session)
+                });
+            }
+            GattEvent::Lagged { dropped } => {
+                self.failure = Some(format!("native lifecycle evidence lost {dropped} events"));
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn wait_for_native_cleanup(
+    sessions: &Mutex<NativeSessions>,
+    timeout: Duration,
+) -> Result<usize, String> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            {
+                let state = sessions.lock().expect("diagnostic native sessions mutex");
+                if let Some(error) = &state.failure {
+                    return Err(error.clone());
+                }
+                if state.observed > 0 && state.active.is_empty() {
+                    return Ok(state.observed);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        let state = sessions.lock().expect("diagnostic native sessions mutex");
+        format!(
+            "native session cleanup timed out before shutdown: observed={} active={:?}",
+            state.observed, state.active
+        )
+    })?
+}
+
 async fn wait_for_cleanup(
     transport: &BleGattTransport,
     candidates: &Candidates,
@@ -216,6 +292,46 @@ async fn wait_for_cleanup(
         transport.linked_peers(),
         candidates.lock().expect("diagnostic candidates mutex").iter().filter(|h| !h.is_finished()).count(),
     ))?
+}
+
+// Shared production finalization seam: candidate cleanup may yield while the
+// independent native observer continues to update its evidence.
+async fn finalize_cleanup<F, Fut, C>(
+    sessions: &Mutex<NativeSessions>,
+    timeout: Duration,
+    mut cleanup: F,
+    candidates_clean: C,
+) -> Result<(usize, usize), String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<usize, String>>,
+    C: Fn() -> bool,
+{
+    tokio::time::timeout(timeout, async {
+        let mut joined = cleanup().await?;
+        loop {
+            wait_for_native_cleanup(sessions, timeout).await?;
+            // Late QUIC close traffic may have produced another candidate
+            // while the native disconnect was in flight. Joining it can yield
+            // and invalidate the native checkpoint: never reuse that snapshot.
+            joined += cleanup().await?;
+            {
+                let state = sessions.lock().expect("diagnostic native sessions mutex");
+                if let Some(error) = &state.failure {
+                    return Err(error.clone());
+                }
+                if state.observed > 0 && state.active.is_empty() && candidates_clean() {
+                    return Ok((joined, state.observed));
+                }
+            }
+            // Retry both checkpoints, bounded by one overall deadline.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        "final native/candidate cleanup checkpoint timed out before shutdown".to_string()
+    })?
 }
 
 /// Bounded run, including shutdown on failure. A PASS requires last-user cleanup
@@ -275,9 +391,24 @@ async fn run_inner(
         .initiation_policy(InitiationPolicy::EitherPeer)
         .link_idle_timeout(Duration::from_secs(2))
         .build();
+    let mut native_events = adapter.driver().events();
     let mut incoming = datagram::serve(&adapter, &config)
         .await
         .map_err(|e| format!("serve: {e}"))?;
+    let native_sessions = Arc::new(Mutex::new(NativeSessions::default()));
+    let watched_sessions = native_sessions.clone();
+    let native_watch = tokio::spawn(async move {
+        while let Some(event) = native_events.next().await {
+            watched_sessions
+                .lock()
+                .expect("diagnostic native sessions mutex")
+                .observe(event);
+        }
+        watched_sessions
+            .lock()
+            .expect("diagnostic native sessions mutex")
+            .failure = Some("native lifecycle event stream ended before cleanup".into());
+    });
     let attach_to = transport.clone();
     let candidates: Candidates = Arc::new(Mutex::new(Vec::new()));
     let incoming_candidates = candidates.clone();
@@ -305,6 +436,7 @@ async fn run_inner(
         Ok(endpoint) => endpoint,
         Err(e) => {
             attach.abort();
+            native_watch.abort();
             let _ = adapter.close().await;
             return Err(format!("bind: {e}"));
         }
@@ -353,11 +485,8 @@ async fn run_inner(
             ));
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map_err(|e| e.to_string())?
-                .as_secs();
-            if options.start_at > now {
-                tokio::time::sleep(Duration::from_secs(options.start_at - now)).await;
-            }
+                .map_err(|e| e.to_string())?;
+            tokio::time::sleep(scheduled_delay(options.start_at, now)).await;
             mark("CONNECT application_attempt=1");
             let first = endpoint
                 .connect(options.peer, ALPN)
@@ -418,7 +547,16 @@ async fn run_inner(
             }
         }
         echo.check()?;
-        let joined = wait_for_cleanup(&transport, &candidates, Duration::from_secs(20)).await?;
+        let (joined, observed) = finalize_cleanup(
+            &native_sessions,
+            Duration::from_secs(20),
+            || wait_for_cleanup(&transport, &candidates, Duration::from_secs(20)),
+            || {
+                let handles = candidates.lock().expect("diagnostic candidates mutex");
+                handles.is_empty() && transport.linked_peers().is_empty()
+            },
+        ).await?;
+        mark(format!("NATIVE_CLEANUP active_sessions=0 observed_sessions={observed} evidence=driver_events final_checkpoint=current before_shutdown=true"));
         echo.check()?;
         mark(format!(
             "CLEANUP address_queues=0 incoming_candidates_joined={joined} before_shutdown=true dial_attempts={} received_rounds_mask={:03b} native_teardown=unverified",
@@ -433,6 +571,8 @@ async fn run_inner(
         transport.close_links(&options.peer);
     }
     let _ = router.shutdown().await;
+    native_watch.abort();
+    let _ = native_watch.await;
     endpoint.close().await;
     attach.abort();
     let _ = attach.await;
@@ -458,6 +598,206 @@ mod tests {
             received: Arc::new(AtomicUsize::new(0)),
             failure: Arc::new(Mutex::new(None)),
         }
+    }
+
+    #[tokio::test]
+    async fn final_cleanup_rechecks_session_arriving_during_late_candidate_wait() {
+        use std::{future::Future, task::Poll};
+        let state = Mutex::new(NativeSessions {
+            observed: 1,
+            ..Default::default()
+        });
+        let calls = AtomicUsize::new(0);
+        let finalization = finalize_cleanup(
+            &state,
+            Duration::from_secs(1),
+            || {
+                let late = calls.fetch_add(1, Ordering::SeqCst) == 1;
+                let state = &state;
+                async move {
+                    if late {
+                        state.lock().unwrap().observe(GattEvent::Connected {
+                            peer: PeerAddress("replacement".into()),
+                            local_role: Role::Peripheral,
+                            session: Some(2),
+                        });
+                        // Deliberately yield within the final candidate wait,
+                        // after the initial native-clean checkpoint succeeded.
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(1)
+                }
+            },
+            || true,
+        );
+        tokio::pin!(finalization);
+        std::future::poll_fn(|cx| {
+            assert!(finalization.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        std::future::poll_fn(|cx| {
+            assert!(
+                finalization.as_mut().poll(cx).is_pending(),
+                "success must not escape while the replacement native session is active"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        state.lock().unwrap().observe(GattEvent::Disconnected {
+            peer: PeerAddress("replacement".into()),
+            local_role: Role::Peripheral,
+            session: Some(2),
+        });
+        assert_eq!(finalization.await.unwrap(), (3, 2));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "recheck candidate queues after native retry"
+        );
+    }
+
+    async fn final_cleanup_lost_evidence(ended: bool) {
+        let state = Mutex::new(NativeSessions {
+            observed: 1,
+            ..Default::default()
+        });
+        let calls = AtomicUsize::new(0);
+        let result = finalize_cleanup(
+            &state,
+            Duration::from_secs(1),
+            || {
+                let late = calls.fetch_add(1, Ordering::SeqCst) == 1;
+                let state = &state;
+                async move {
+                    if late {
+                        tokio::task::yield_now().await;
+                        let mut state = state.lock().unwrap();
+                        if ended {
+                            state.failure =
+                                Some("native lifecycle event stream ended before cleanup".into());
+                        } else {
+                            state.observe(GattEvent::Lagged { dropped: 7 });
+                        }
+                    }
+                    Ok(0)
+                }
+            },
+            || true,
+        )
+        .await;
+        assert!(
+            result.as_ref().is_err_and(|error| error.contains(if ended {
+                "stream ended"
+            } else {
+                "lost 7 events"
+            })),
+            "lost native evidence during the final candidate wait must fail closed: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn final_cleanup_rejects_lag_during_late_candidate_wait() {
+        final_cleanup_lost_evidence(false).await;
+    }
+
+    #[tokio::test]
+    async fn final_cleanup_rejects_ended_stream_during_late_candidate_wait() {
+        final_cleanup_lost_evidence(true).await;
+    }
+
+    #[tokio::test]
+    async fn final_cleanup_accepts_current_clean_evidence() {
+        let state = Mutex::new(NativeSessions {
+            observed: 2,
+            ..Default::default()
+        });
+        let result = finalize_cleanup(
+            &state,
+            Duration::from_secs(1),
+            || async {
+                tokio::task::yield_now().await;
+                Ok(1)
+            },
+            || true,
+        )
+        .await;
+        assert_eq!(result.unwrap(), (2, 2));
+    }
+
+    #[test]
+    fn scheduled_start_preserves_subsecond_deadline() {
+        let now = Duration::from_millis(100_900);
+        assert_eq!(scheduled_delay(101, now), Duration::from_millis(100));
+        assert_eq!(
+            scheduled_delay(101, Duration::from_millis(100_100)),
+            Duration::from_millis(900)
+        );
+        assert_eq!(scheduled_delay(100, now), Duration::ZERO);
+        assert_eq!(scheduled_delay(0, now), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn native_cleanup_waits_for_each_role_and_session_and_rejects_lag() {
+        let state = Arc::new(Mutex::new(NativeSessions::default()));
+        assert!(
+            wait_for_native_cleanup(&state, Duration::from_millis(5))
+                .await
+                .is_err(),
+            "an empty observer with no lifecycle evidence is not teardown proof"
+        );
+        let peer = PeerAddress("native-peer".into());
+        for (local_role, session) in [(Role::Central, 1), (Role::Peripheral, 2)] {
+            state.lock().unwrap().observe(GattEvent::Connected {
+                peer: peer.clone(),
+                local_role,
+                session: Some(session),
+            });
+        }
+        // Duplicate readiness must not invent an additional session.
+        state.lock().unwrap().observe(GattEvent::Connected {
+            peer: peer.clone(),
+            local_role: Role::Peripheral,
+            session: Some(2),
+        });
+        state.lock().unwrap().observe(GattEvent::Disconnected {
+            peer: peer.clone(),
+            local_role: Role::Central,
+            session: Some(1),
+        });
+        let result = wait_for_native_cleanup(&state, Duration::from_millis(10)).await;
+        assert!(
+            result.is_err(),
+            "the peripheral session still exists: {result:?}"
+        );
+        // A stale disconnect cannot release the replacement session.
+        state.lock().unwrap().observe(GattEvent::Disconnected {
+            peer: peer.clone(),
+            local_role: Role::Peripheral,
+            session: Some(1),
+        });
+        assert!(wait_for_native_cleanup(&state, Duration::from_millis(10))
+            .await
+            .is_err());
+        state.lock().unwrap().observe(GattEvent::Disconnected {
+            peer,
+            local_role: Role::Peripheral,
+            session: Some(2),
+        });
+        assert_eq!(
+            wait_for_native_cleanup(&state, Duration::from_millis(100))
+                .await
+                .unwrap(),
+            2
+        );
+        state
+            .lock()
+            .unwrap()
+            .observe(GattEvent::Lagged { dropped: 1 });
+        assert!(wait_for_native_cleanup(&state, Duration::from_millis(100))
+            .await
+            .is_err());
     }
 
     #[test]

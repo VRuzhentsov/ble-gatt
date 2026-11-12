@@ -42,6 +42,14 @@ private const val ALIAS_LEGACY_LOCATION = "bluetoothLegacy"
     ]
 )
 class BleGattPlugin(activity: Activity) : Plugin(activity) {
+    // Tauri supplies the actual app Activity during register_android_plugin.
+    // Retain only its process-lifetime Application, never the Activity.
+    init {
+        initializeContext(activity.applicationContext)
+    }
+
+    private external fun initializeContext(context: android.content.Context)
+
     private fun requiredAlias(): String =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) ALIAS_BLUETOOTH else ALIAS_LEGACY_LOCATION
 

@@ -20,7 +20,6 @@ tokio-stream.workspace = true
 uuid.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
-tao = "0.35"
 ndk-context = "0.1"
 jni = "0.21"
 

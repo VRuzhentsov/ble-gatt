@@ -46,10 +46,19 @@ let adapter = app.ble_gatt().adapter().await; // ble_gatt::Adapter
 let state = app.ble_gatt().request_permissions()?; // PermissionState::Granted, ...
 ```
 
-On Android, an application that also calls Java through `ndk-context`
-calls `tauri_plugin_ble_gatt::android_context::ensure()` first instead of
-initializing `ndk-context` itself; it may only be initialized once per
-process.
+On Android, plugin registration captures an owned Application context through
+JNI. The default driver never reads or initializes `ndk-context`, so it works
+with both older Tauri runtimes and newer runtimes that already own that global,
+without matching the app's Tao version or retaining an Activity.
+
+Applications can call `tauri_plugin_ble_gatt::android_context::get()` after
+plugin registration for their own JNI: it returns a JVM handle and an owned
+Application reference. The legacy `android_context::ensure()` remains available
+for applications on older runtimes which explicitly delegate `ndk-context`
+initialization to this plugin (such as existing Fini consumers). Do not call
+that legacy initializer on a runtime that already initializes `ndk-context`;
+`ndk-context` 0.1 has no non-panicking probe for existing ownership. Use `get()`
+for new code instead.
 
 This library **carries bytes; it does not encrypt them.** Layering your own
 session protocol or end-to-end encryption on top is expected and

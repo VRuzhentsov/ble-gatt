@@ -1,10 +1,9 @@
 //! A driver built on first use rather than at plugin setup.
 //!
-//! - **Android.** `.setup()` runs inside `tao`'s own Android context
-//!   bring-up, before the JNI handles the driver needs exist; reading
-//!   `ndk_context::android_context()` there panics with "android context was
-//!   not initialized" (seen on hardware). The first command runs after the
-//!   Activity is up.
+//! - **Android.** The registered Kotlin plugin installs the Application
+//!   context during setup. Building the driver on first use keeps BLE
+//!   feature probing and bridge construction out of plugin setup, and lets
+//!   callers grant permissions before accessing Bluetooth.
 //! - **Linux.** BlueZ needs a powered adapter. Building on first use means a
 //!   machine with Bluetooth off or missing still starts the app.
 //!

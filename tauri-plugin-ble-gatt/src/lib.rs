@@ -223,8 +223,8 @@ fn default_driver() -> Option<Arc<dyn Driver>> {
 #[cfg(target_os = "android")]
 fn default_driver() -> Option<Arc<dyn Driver>> {
     Some(Arc::new(LazyDriver::new(|| async {
-        android_context::ensure().map_err(ble_gatt::BleError::AdapterUnavailable)?;
-        let driver = ble_gatt::drivers::android::AndroidDriver::new().await?;
+        let (vm, context) = android_context::get().map_err(ble_gatt::BleError::AdapterUnavailable)?;
+        let driver = ble_gatt::drivers::android::AndroidDriver::with_context(vm, context).await?;
         Ok(Arc::new(driver) as Arc<dyn Driver>)
     })))
 }

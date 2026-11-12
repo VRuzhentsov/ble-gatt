@@ -57,7 +57,13 @@ Check the existing permission and location prerequisites before running:
 
 * The plugin already declares legacy Bluetooth/admin and `ACCESS_FINE_LOCATION`
   through API 30, and Bluetooth scan/connect/advertise on API 31+. This diagnostic
-  neither adds location permissions nor silently grants any permission.
+  neither adds location permissions nor silently grants any permission. Its
+  debug manifest asserts `neverForLocation` for scanning: it carries bytes and
+  does not derive physical location. Without that app-owned assertion, API 31+
+  may deliver no scan callbacks despite a Bluetooth grant, since this app does
+  not request fine location above API 30. Android may filter some beacon formats
+  under `neverForLocation`; arbitrary library consumers must choose their own
+  location/scan policy rather than inheriting that assertion from the plugin.
 * Approve the existing plugin permissions using the example's foreground UI
   (`request existing Bluetooth permissions` explicitly invokes the plugin's
   permission API), if needed. Ask the
@@ -159,7 +165,14 @@ the wait and successful round-3 echo. A surviving QUIC handle alone is insuffici
 QUIC can recover over a replacement BLE candidate. Finally both connections end.
 Before endpoint/router/adapter shutdown, software acceptance requires the current
 address-to-queue map to be empty and all retained incoming candidate task handles
-to finish and join normally within the cleanup deadline. Ordinary cleanup never
+to finish and join normally within the cleanup deadline. The runner also
+subscribes to driver lifecycle events **before** serving or dialling, tracks
+address/role/session tuples, and waits for every observed session to disconnect.
+`NATIVE_CLEANUP active_sessions=0 ... evidence=driver_events before_shutdown=true`
+is required before shutdown; missing lifecycle evidence or a lagged event stream
+fails closed. A concrete stale disconnect cannot remove a newer session; drivers
+without disconnect session IDs use the documented address/role fallback. It
+rechecks and joins late candidates after that wait. Ordinary cleanup never
 calls `close_links`; emergency shutdown cannot turn a failed check into success.
 `CLEANUP address_queues=0` does **not** mean every physical/native session is gone:
 outgoing task handles are internal to the adapter, and the serving listener is
@@ -180,9 +193,13 @@ acknowledgement (not remote application processing); a stop code or error fails.
   these with native Android client/server callbacks and native Linux/Android
   session/generation handles, not merely the requested mode. A QUIC outgoing
   connection can reuse a peripheral-role BLE link.
-* `CLEANUP address_queues=0 incoming_candidates_joined=... before_shutdown=true`
-  followed by the runner's `PASS payload-reuse-survivor-cleanup`. This PASS is
-  software evidence only (`native_teardown=unverified`). For a hardware pass,
+* `NATIVE_CLEANUP active_sessions=0 observed_sessions=... evidence=driver_events
+  before_shutdown=true`, then `CLEANUP address_queues=0 incoming_candidates_joined=...
+  before_shutdown=true`, followed by `PASS payload-reuse-survivor-cleanup`. Driver
+  events prove observed ready-session closure, not every OS-level connection:
+  Android's server can report an unsubscribed ACL connection that never became
+  a ready peripheral session. This PASS remains software evidence only
+  (`native_teardown=unverified`). For a hardware pass,
   correlate **all** native candidate/session releases before endpoint/router/
   adapter shutdown. Shutdown-induced teardown is not last-user cleanup proof.
 * Native carrier/session continuity through the surviving transfer is mandatory
@@ -214,7 +231,11 @@ acknowledgement (not remote application processing); a stop code or error fails.
 `linux-initiate` requires the reverse. `both` means both applications connect,
 not a claim that two physical links must form: iroh may reuse the incoming path.
 Use the native attempt timestamps to distinguish truly crossed physical dials
-from successful incoming-path reuse. Repeat after cleanup for reconnect evidence.
+from successful incoming-path reuse. A common scheduled Unix-second start keeps
+the fractional part of each peer's current time when calculating its delay;
+truncating it would add a different discovery-time fraction to each start (up
+to one second of skew). Device clocks must still agree; the schedule alone is
+not simultaneous-native-dial evidence. Repeat after cleanup for reconnect evidence.
 A single run does not establish long-term stability, locked discovery, recovery
 from a radio toggle, or platform mixed-role support. Never toggle a radio as an
 unannounced extension of this test.
