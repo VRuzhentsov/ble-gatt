@@ -1,4 +1,4 @@
-#[path = "../examples/support/either_peer.rs"]
+#[path = "../examples/support/iroh_diagnostic.rs"]
 mod diagnostic;
 
 use ble_gatt::drivers::mock::{MockDriver, MockNetwork};

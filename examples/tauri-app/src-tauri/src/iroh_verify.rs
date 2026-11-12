@@ -1,5 +1,5 @@
 //! Android properties select the same diagnostic used by the Linux example.
-#[path = "../../../../ble-gatt-iroh/examples/support/either_peer.rs"]
+#[path = "../../../../ble-gatt-iroh/examples/support/iroh_diagnostic.rs"]
 mod diagnostic;
 use std::time::Duration;
 use tauri::{AppHandle, Runtime};

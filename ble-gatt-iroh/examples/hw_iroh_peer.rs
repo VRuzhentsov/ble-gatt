@@ -1,5 +1,5 @@
 //! See docs/either-peer-hardware.md. No phone or radio is touched by --keygen.
-#[path = "support/either_peer.rs"]
+#[path = "support/iroh_diagnostic.rs"]
 mod diagnostic;
 use diagnostic::{mark, Options};
 use std::{process::ExitCode, time::Duration};
