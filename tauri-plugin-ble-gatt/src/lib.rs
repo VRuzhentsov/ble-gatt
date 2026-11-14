@@ -210,7 +210,7 @@ impl<R: Runtime, T: Manager<R>> BleGattExt<R> for T {
     }
 }
 
-/// Linux and Android are the implemented drivers (see the README's
+/// Linux, Android and Windows are the implemented drivers (see the README's
 /// platform matrix). Elsewhere the application must inject one.
 #[cfg(target_os = "linux")]
 fn default_driver() -> Option<Arc<dyn Driver>> {
@@ -223,13 +223,21 @@ fn default_driver() -> Option<Arc<dyn Driver>> {
 #[cfg(target_os = "android")]
 fn default_driver() -> Option<Arc<dyn Driver>> {
     Some(Arc::new(LazyDriver::new(|| async {
-        android_context::ensure().map_err(ble_gatt::BleError::AdapterUnavailable)?;
-        let driver = ble_gatt::drivers::android::AndroidDriver::new().await?;
+        let (vm, context) = android_context::get().map_err(ble_gatt::BleError::AdapterUnavailable)?;
+        let driver = ble_gatt::drivers::android::AndroidDriver::with_context(vm, context).await?;
         Ok(Arc::new(driver) as Arc<dyn Driver>)
     })))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(target_os = "windows")]
+fn default_driver() -> Option<Arc<dyn Driver>> {
+    Some(Arc::new(LazyDriver::new(|| async {
+        let driver = ble_gatt::drivers::windows::WindowsDriver::new().await?;
+        Ok(Arc::new(driver) as Arc<dyn Driver>)
+    })))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
 fn default_driver() -> Option<Arc<dyn Driver>> {
     None
 }

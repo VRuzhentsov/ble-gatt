@@ -222,6 +222,12 @@ impl Driver for CountingDriver {
         self.inner.served_service()
     }
 
+    async fn set_characteristic_value(
+        &self, characteristic: CharacteristicUuid, value: Vec<u8>,
+    ) -> ble_gatt::Result<()> {
+        self.inner.set_characteristic_value(characteristic, value).await
+    }
+
     async fn stop_advertising(&self) -> ble_gatt::Result<()> {
         self.inner.stop_advertising().await
     }

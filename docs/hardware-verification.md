@@ -9,6 +9,12 @@ of the library's behaviour is confirmed until two radios exchange bytes.
 
 This document is how that is done.
 
+For the isolated **iroh `InitiationPolicy::EitherPeer`** diagnostic (rather than
+this older datagram-only echo), see [EitherPeer hardware diagnostic](either-peer-hardware.md).
+It reuses the Android example and adds a Linux iroh example, with explicit
+phone-initiate/Linux-initiate/both modes, synthetic payload, reuse and cleanup
+assertions. Radio-free tests and an APK build are not hardware acceptance.
+
 ## Status
 
 **No two-device round trip has passed yet.** What is confirmed so far:

@@ -22,7 +22,7 @@ pub mod roles;
 
 pub use connection::peer_link;
 pub use entities::{error, models};
-pub use profile::datagram;
+pub use profile::{advertisement, datagram};
 
 pub use entities::error::{BleError, Result};
 pub use entities::models::{

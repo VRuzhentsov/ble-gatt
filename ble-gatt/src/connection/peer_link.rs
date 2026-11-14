@@ -276,7 +276,7 @@ impl PeerLink {
     /// Build a `PeerLink` that constructs and owns the platform driver.
     /// Synchronous and infallible: the driver is acquired on the worker
     /// thread and surfaces as `radio()` reporting `Off` / `Unsupported`.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
     pub fn new(config: PeerLinkConfig) -> Arc<Self> {
         Self::spawn(config, None)
     }
@@ -731,11 +731,11 @@ impl Worker {
         if let Some(b) = self.provided_driver.take() {
             return Some(b);
         }
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
         {
             crate::drivers::platform().await.ok()
         }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
         {
             None
         }

@@ -96,8 +96,9 @@ const CALLBACK_CLASS: &str = "dev/blegatt/NativeKt";
 /// `AndroidDriver::new`). v2 added `onRadioState` / `bridgeAbiVersion` /
 /// `isRadioEnabled` (ADR-0005's adapter-state receiver). v3 added
 /// `requestConnectionPriority`. v4 added the local-name byte array to
-/// `startAdvertising`.
-const BRIDGE_ABI_VERSION: i32 = 4;
+/// `startAdvertising`. v5 added `setCharacteristicValue` (ADR-0012).
+/// v6 changed `startScan` from a boolean to a scan-start status code.
+const BRIDGE_ABI_VERSION: i32 = 6;
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 
@@ -424,6 +425,14 @@ impl AndroidDriver {
                 .map_err(|err| BleError::AdapterUnavailable(format!("global ref of Context failed: {err}")))?
         };
 
+        Self::with_context(vm, context).await
+    }
+
+    /// Uses the embedding application's JVM and owned Application context.
+    /// Unlike [`Self::new`], this never reads or initializes `ndk-context`.
+    /// The context must belong to `vm`; use the process-lifetime Application,
+    /// not an Activity whose lifetime ends on configuration changes.
+    pub async fn with_context(vm: JavaVM, context: GlobalRef) -> Result<Self> {
         let (server_events_tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let inner = Arc::new(Inner {
             vm,
@@ -601,10 +610,10 @@ impl Driver for AndroidDriver {
                 .call_method(
                     bridge.as_obj(),
                     "startScan",
-                    "(Ljava/lang/String;J)Z",
+                    "(Ljava/lang/String;J)I",
                     &[JValue::Object(&uuid), JValue::Long(generation as i64)],
                 )
-                .and_then(|v| v.z());
+                .and_then(|v| v.i());
             match started {
                 // Same exception-clearing contract as `call_void`/`call_bool`:
                 // a `startScan` that throws (a missing runtime Bluetooth
@@ -615,15 +624,9 @@ impl Driver for AndroidDriver {
                     log::error!("scan: startScan threw for service {}", service.0);
                     return Err(jni_error(&mut env, "startScan", err));
                 }
-                // Rejected. The active scan keeps ownership untouched — we
-                // never took it away.
-                Ok(false) => {
-                    log::warn!("scan: refused — a scan is already active");
-                    return Err(BleError::Gatt(
-                        "a scan is already active; concurrent scans are not supported".to_string(),
-                    ));
-                }
-                Ok(true) => {
+                Ok(status) => {
+                    // On refusal the active scan keeps ownership untouched.
+                    super::android_scan_start_result(status)?;
                     log::info!("scan: started for service {} generation={generation}", service.0);
                 }
             }
@@ -878,6 +881,33 @@ impl Driver for AndroidDriver {
 
     fn served_service(&self) -> Option<GattServiceSpec> {
         self.inner.served_service.lock().unwrap().clone()
+    }
+
+    /// `BleGattBridge.setCharacteristicValue`: the Kotlin read handler
+    /// answers from `characteristic.value`, which this replaces.
+    async fn set_characteristic_value(&self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
+        let mut env = self.inner.env()?;
+        let uuid = env
+            .new_string(characteristic.0.to_string())
+            .map_err(|err| BleError::Gatt(err.to_string()))?;
+        let bytes = env.byte_array_from_slice(&value).map_err(|err| BleError::Gatt(err.to_string()))?;
+        let bridge = self.inner.bridge()?;
+        let set = env
+            .call_method(
+                bridge.as_obj(),
+                "setCharacteristicValue",
+                "(Ljava/lang/String;[B)Z",
+                &[JValue::Object(&uuid), JValue::Object(&bytes)],
+            )
+            .and_then(|v| v.z());
+        match set {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(BleError::Gatt(format!(
+                "set_characteristic_value: {} is not served",
+                characteristic.0
+            ))),
+            Err(err) => Err(jni_error(&mut env, "setCharacteristicValue", err)),
+        }
     }
 
     async fn update_advertisement(&self, service: GattServiceSpec) -> Result<()> {

@@ -294,6 +294,20 @@ impl LocalRadio {
         Ok(())
     }
 
+    /// Replace what reads of `characteristic` return; subscribers stay.
+    pub(crate) async fn set_characteristic_value(
+        &self, address: &PeerAddress, characteristic: CharacteristicUuid, value: Vec<u8>,
+    ) -> Result<()> {
+        let mut peripherals = self.peripherals.lock().unwrap();
+        let state = peripherals.get_mut(address).ok_or_else(|| BleError::Gatt("not advertising".to_string()))?;
+        let slot = state
+            .values
+            .get_mut(&characteristic)
+            .ok_or_else(|| BleError::Gatt(format!("characteristic {} is not served", characteristic.0)))?;
+        *slot = value;
+        Ok(())
+    }
+
     pub(crate) async fn stop_advertising(&self, address: &PeerAddress) -> Result<()> {
         // Announce every subscribed central as gone before tearing the
         // server down. Both real drivers now do this — neither platform

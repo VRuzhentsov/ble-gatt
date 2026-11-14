@@ -204,6 +204,86 @@ async fn a_channel_routed_by_its_first_datagram_still_carries_quic() {
     assert_eq!(reply, b"routed");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn either_peer_reuses_incoming_and_the_larger_id_can_reconnect() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let network = MockNetwork::new();
+    let mut keys = [SecretKey::generate(), SecretKey::generate()];
+    keys.sort_by_key(|key| key.public());
+    let enabled = Arc::new(AtomicBool::new(true));
+    let higher_dials = Arc::new(AtomicUsize::new(0));
+    let mut sides = Vec::new();
+    for (index, key) in keys.into_iter().enumerate() {
+        let own = PeerAddress(format!("AA:00:00:00:02:0{index}"));
+        let driver = Arc::new(MockDriver::new(own.clone(), network.clone(), CapabilityReport { central: true, peripheral: true }));
+        let adapter = Adapter::new(driver.clone()).await;
+        let base = dial_with(adapter.clone(), config());
+        let enabled = enabled.clone();
+        let higher_dials = higher_dials.clone();
+        let dialer: Dialer = Arc::new(move |peer| {
+            if index == 0 && !enabled.load(Ordering::SeqCst) {
+                return Box::pin(async { Err(ble_gatt::BleError::GattBusy("lower peer is not initiating".into())) });
+            }
+            if index == 1 { higher_dials.fetch_add(1, Ordering::SeqCst); }
+            base(peer)
+        });
+        let transport = BleGattTransport::builder()
+            .dialer(dialer)
+            .initiation_policy(ble_gatt_iroh::InitiationPolicy::EitherPeer)
+            .build();
+        let mut incoming = datagram::serve(&adapter, &config()).await.unwrap();
+        let attached = transport.clone();
+        tokio::spawn(async move {
+            while let Some(channel) = incoming.next().await { attached.attach(channel); }
+        });
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .secret_key(key)
+            .clear_ip_transports()
+            .add_custom_transport(Arc::new(transport.clone()))
+            .address_lookup(transport.address_lookup())
+            .hooks(transport.hooks())
+            .bind().await.unwrap();
+        let router = Router::builder(endpoint.clone()).accept(ECHO_ALPN, Echo).spawn();
+        sides.push((own, driver, transport, endpoint, router));
+    }
+    let (low_address, _, low_transport, low, _low_router) = &sides[0];
+    let (high_address, high_driver, high_transport, high, _high_router) = &sides[1];
+    low_transport.set_peer_address(high.id(), high_address.clone());
+    high_transport.set_peer_address(low.id(), low_address.clone());
+    let first = tokio::time::timeout(TIMEOUT, low.connect(high.id(), ECHO_ALPN)).await.unwrap().unwrap();
+    assert_eq!(echo(&first, b"lower starts").await, b"lower starts");
+    let reused = tokio::time::timeout(TIMEOUT, high.connect(low.id(), ECHO_ALPN)).await.unwrap().unwrap();
+    assert_eq!(echo(&reused, b"incoming reused").await, b"incoming reused");
+    assert_eq!(higher_dials.load(Ordering::SeqCst), 0, "incoming path reused without a second BLE dial");
+
+    // Leave the QUIC connections open: this is an unexpected loss, the
+    // precise case that used to force the former peripheral to wait 30s.
+    enabled.store(false, Ordering::SeqCst);
+    high_driver.simulate_peer_loss(low_address);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while higher_dials.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("larger id initiates recovery without the old redial yield");
+    let reconnected = tokio::time::timeout(Duration::from_secs(5), high.connect(low.id(), ECHO_ALPN))
+        .await.expect("larger id reconnects without the old redial yield").unwrap();
+    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&reconnected, b"larger reconnects")).await.unwrap(), b"larger reconnects");
+    assert!(higher_dials.load(Ordering::SeqCst) > 0);
+    for connection in [first, reused, reconnected] { connection.close(0u32.into(), b"done"); }
+    assert!(until_no_links(low_transport, Duration::from_secs(5)).await);
+    assert!(until_no_links(high_transport, Duration::from_secs(5)).await);
+
+    // No existing BLE path now: the larger key can start a fresh session
+    // while the smaller peer only accepts, not just reuse its old path.
+    let cold = tokio::time::timeout(Duration::from_secs(5), high.connect(low.id(), ECHO_ALPN))
+        .await.expect("larger id starts from no link").unwrap();
+    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&cold, b"larger cold start")).await.unwrap(), b"larger cold start");
+    cold.close(0u32.into(), b"done");
+    assert!(until_no_links(low_transport, Duration::from_secs(5)).await);
+    assert!(until_no_links(high_transport, Duration::from_secs(5)).await);
+}
+
 #[test]
 fn json_never_looks_like_a_quic_initial() {
     assert!(!ble_gatt_iroh::is_quic_initial(br#"{"v":1}"#));
@@ -646,6 +726,64 @@ async fn the_receiving_peripheral_disconnects_the_central() {
     drop(connection);
 }
 
+/// An idle timer is a backstop for unauthenticated/unused candidates, not
+/// permission to close a link still owned by a live iroh connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_timeout_does_not_close_a_live_connection() {
+    #[derive(Debug, Clone)]
+    struct EchoMany;
+    impl ProtocolHandler for EchoMany {
+        async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+            while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+                tokio::io::copy(&mut recv, &mut send).await?;
+                send.finish()?;
+            }
+            Ok(())
+        }
+    }
+    let network = MockNetwork::new();
+    let address = PeerAddress("AA:00:00:00:01:01".into());
+    let server = adapter(&network, &address.0).await;
+    let listener_transport = BleGattTransport::builder()
+        .link_idle_timeout(Duration::from_millis(150))
+        .build();
+    let mut incoming = datagram::serve(&server, &config()).await.unwrap();
+    let attached = listener_transport.clone();
+    tokio::spawn(async move {
+        while let Some(channel) = incoming.next().await {
+            attached.attach(channel);
+        }
+    });
+    let listener = Endpoint::builder(presets::Minimal)
+        .clear_ip_transports()
+        .add_custom_transport(Arc::new(listener_transport.clone()))
+        .hooks(listener_transport.hooks())
+        .bind().await.unwrap();
+    let listener_id = listener.id();
+    let _router = Router::builder(listener).accept(ECHO_ALPN, EchoMany).spawn();
+    let client_transport = BleGattTransport::builder()
+        .dialer(dial_with(adapter(&network, "AA:00:00:00:01:02").await, config()))
+        .link_idle_timeout(Duration::from_millis(150))
+        .build();
+    client_transport.set_peer_address(listener_id, address);
+    let client = Endpoint::builder(presets::Minimal)
+        .clear_ip_transports()
+        .add_custom_transport(Arc::new(client_transport.clone()))
+        .address_lookup(client_transport.address_lookup())
+        .hooks(client_transport.hooks())
+        .bind().await.unwrap();
+    let connection = tokio::time::timeout(TIMEOUT, client.connect(listener_id, ECHO_ALPN))
+        .await.unwrap().unwrap();
+    assert_eq!(echo(&connection, b"before idle").await, b"before idle");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(client_transport.linked_peers().len(), 1, "active central link survives idle");
+    assert_eq!(listener_transport.linked_peers().len(), 1, "active peripheral link survives idle");
+    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&connection, b"after idle")).await.unwrap(), b"after idle");
+    connection.close(0u32.into(), b"done");
+    assert!(until_no_links(&client_transport, Duration::from_secs(5)).await);
+    assert!(until_no_links(&listener_transport, Duration::from_secs(5)).await);
+}
+
 /// A second connection that starts within the release delay keeps the link
 /// (ADR-0008 D3).
 #[tokio::test(flavor = "multi_thread")]
@@ -680,6 +818,8 @@ async fn crossed_connects_both_work_and_their_links_close() {
         let adapter = adapter(&network, &own.0).await;
         let transport = BleGattTransport::builder()
             .dialer(dial_with(adapter.clone(), config()))
+            .initiation_policy(ble_gatt_iroh::InitiationPolicy::EitherPeer)
+            .link_idle_timeout(Duration::from_millis(150))
             .link_release_delay(Duration::from_millis(300))
             .build();
         let incoming = datagram::serve(&adapter, &config()).await.expect("serve");
@@ -717,9 +857,13 @@ async fn crossed_connects_both_work_and_their_links_close() {
     let a_to_b = a_to_b.expect("a connects in time").expect("a connects");
     let b_to_a = b_to_a.expect("b connects in time").expect("b connects");
     assert_eq!(tokio::time::timeout(TIMEOUT, echo(&a_to_b, b"a to b")).await.expect("echo in time"), b"a to b");
+    a_to_b.close(0u32.into(), b"losing application candidate");
+    tokio::time::sleep(Duration::from_millis(650)).await;
+    assert!(b_to_a.close_reason().is_none(), "ending one crossed connection must not close the other");
+    assert!(!a_transport.linked_peers().is_empty());
+    assert!(!b_transport.linked_peers().is_empty());
     assert_eq!(tokio::time::timeout(TIMEOUT, echo(&b_to_a, b"b to a")).await.expect("echo in time"), b"b to a");
 
-    a_to_b.close(0u32.into(), b"done");
     b_to_a.close(0u32.into(), b"done");
     drop((a_to_b, b_to_a));
     assert!(until_no_links(a_transport, Duration::from_secs(5)).await, "a's links close");

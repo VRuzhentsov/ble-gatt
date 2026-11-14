@@ -1,62 +1,95 @@
-//! The Android context `ble-gatt` needs, set up once for the whole process.
+//! Process-lifetime Application context supplied by Tauri's registered
+//! Android plugin, not by a particular version of its windowing runtime.
 //!
-//! `ble-gatt`'s Android driver reads `ndk_context::android_context()`, the
-//! interop point most Android Rust runtimes (`android-activity`, `winit`,
-//! `cargo-apk`) fill in. Tauri's runtime (`tao`) keeps its own context
-//! instead, so it has to be copied across once.
-//! `ndk_context::initialize_android_context` asserts it is only ever called
-//! once, so an application that also calls Java through `ndk-context` (Fini
-//! does, for its own Kotlin classes) must go through [`ensure`] rather than
-//! initializing it again.
+//! `register_android_plugin` constructs `BleGattPlugin` with the app's
+//! Activity. Its constructor passes `activity.applicationContext` through
+//! JNI before registration returns. Keeping a global reference makes this
+//! independent of Activity destruction/recreation and of Tao versions.
 //!
-//! What is copied is the Application context, not `tao`'s Activity. `tao`
-//! deletes its reference to the Activity when the Activity is destroyed
-//! (the app left in the background, say) while the process keeps running,
-//! so a driver built after that read a dead reference and the JVM aborted.
-//! The Application lives as long as the process, and this module holds its
-//! own reference to it. Precedent: `n0-dns-resolver`'s
-//! `install_android_jni_context` takes the application context too, and
-//! Android's guidance is to use it for anything that outlives an Activity.
+//! The default driver uses [`get`] and never initializes `ndk-context`:
+//! recent runtimes already own that global. [`ensure`] is retained only for
+//! legacy applications which explicitly delegate ndk-context ownership to
+//! this plugin; see its precondition before using it in a newer runtime.
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use jni::objects::{GlobalRef, JObject};
-use jni::JavaVM;
+use jni::{JNIEnv, JavaVM};
 
-/// Copies the Application context into `ndk-context`, once per process.
-/// Safe to call from anywhere, any number of times, after the Activity is
-/// up; before that it returns an error and a later call tries again.
+struct Context {
+    vm: JavaVM,
+    application: GlobalRef,
+}
+
+// Owns the JNI reference for the remainder of the process.
+static APPLICATION: OnceLock<Context> = OnceLock::new();
+static LOCK: Mutex<()> = Mutex::new(());
+
+/// Returns owned JNI handles to the registered Application context. Safe
+/// on any thread; a failure before plugin registration is not cached.
+/// This does not read or modify the runtime's ndk-context global.
+pub fn get() -> Result<(JavaVM, GlobalRef), String> {
+    let ctx = APPLICATION.get().ok_or_else(|| {
+        "Android Application context is not initialized; register the ble-gatt plugin first"
+            .to_string()
+    })?;
+    // JavaVM is a non-owning JVM handle. The process JVM outlives this copy.
+    let vm = unsafe { JavaVM::from_raw(ctx.vm.get_java_vm_pointer()) }
+        .map_err(|err| format!("JavaVM handle unavailable: {err}"))?;
+    Ok((vm, ctx.application.clone()))
+}
+
+/// Legacy opt-in: installs this Application into `ndk-context` once.
+///
+/// Only use this when the application/runtime does **not** initialize
+/// ndk-context itself (e.g. older Tauri runtimes). Like the previous API,
+/// all initializers must cooperate through this function. Newer Tao
+/// runtimes already initialize ndk-context: use [`get`] for app JNI instead.
+/// There is no non-panicking `try_get` in ndk-context 0.1, so this function
+/// cannot discover or safely take over an independently owned global.
+/// The plugin's default driver does not call this legacy function.
 pub fn ensure() -> Result<(), String> {
-    // Owns the reference `ndk-context` points at; never dropped.
-    static APPLICATION: OnceLock<GlobalRef> = OnceLock::new();
-    if APPLICATION.get().is_some() {
-        return Ok(());
-    }
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let (vm, application) = get()?;
+    static NDK_CONTEXT: OnceLock<()> = OnceLock::new();
+    NDK_CONTEXT.get_or_init(|| unsafe {
+        ndk_context::initialize_android_context(
+            vm.get_java_vm_pointer().cast(),
+            application.as_obj().as_raw().cast(),
+        );
+    });
+    Ok(())
+}
+
+fn initialize(env: &mut JNIEnv<'_>, context: JObject<'_>) -> Result<(), String> {
     let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if APPLICATION.get().is_some() {
         return Ok(());
     }
-    use tao::platform::android::prelude::main_android_context;
-    let ctx = main_android_context()
-        .ok_or_else(|| "tao's Android context is not available yet".to_string())?;
-    let vm = unsafe { JavaVM::from_raw(ctx.java_vm.cast()) }
-        .map_err(|err| format!("JavaVM::from_raw failed: {err}"))?;
-    let mut env = vm
-        .attach_current_thread_as_daemon()
-        .map_err(|err| format!("JNI attach failed: {err}"))?;
-    let activity = unsafe { JObject::from_raw(ctx.context_jobject.cast()) };
-    let application = env
-        .call_method(&activity, "getApplicationContext", "()Landroid/content/Context;", &[])
-        .and_then(|value| value.l())
-        .and_then(|application| env.new_global_ref(application))
-        .map_err(|err| {
-            let _ = env.exception_clear();
-            format!("getApplicationContext failed: {err}")
-        })?;
-    unsafe {
-        ndk_context::initialize_android_context(ctx.java_vm, application.as_obj().as_raw().cast());
+    if context.is_null() {
+        return Err("Android Application context is null".into());
     }
-    let _ = APPLICATION.set(application);
+    let vm = env
+        .get_java_vm()
+        .map_err(|err| format!("JNI JavaVM unavailable: {err}"))?;
+    let application = env
+        .new_global_ref(context)
+        .map_err(|err| format!("retaining Android Application context failed: {err}"))?;
+    let _ = APPLICATION.set(Context { vm, application });
     Ok(())
+}
+
+/// Called synchronously by the app-owned Kotlin plugin's constructor.
+/// Errors propagate through JNI to Tauri's register_android_plugin result.
+#[no_mangle]
+pub extern "system" fn Java_dev_blegatt_BleGattPlugin_initializeContext(
+    mut env: JNIEnv<'_>,
+    _plugin: JObject<'_>,
+    context: JObject<'_>,
+) {
+    if let Err(err) = initialize(&mut env, context) {
+        // Preserve an existing JVM exception (e.g. an allocation failure).
+        if !env.exception_check().unwrap_or(true) {
+            let _ = env.throw_new("java/lang/IllegalStateException", err);
+        }
+    }
 }

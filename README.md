@@ -23,7 +23,10 @@ This repo is a Cargo workspace with three crates:
 - **`ble-gatt-iroh`** — an [iroh](https://github.com/n0-computer/iroh)
   custom transport that carries QUIC over `ble-gatt`'s GATT datagram
   channel. The caller decides when the radio scans and advertises. See
-  ADR-0006.
+  ADR-0006. Its explicit either-peer initiation policy, deterministic
+  fallback and lifecycle ownership are described in
+  [ADR-0013](docs/adr/0013-symmetric-iroh-initiation.md); hardware adoption is
+  a separate gate.
 
 ### Using the plugin from a Rust application
 
@@ -43,10 +46,19 @@ let adapter = app.ble_gatt().adapter().await; // ble_gatt::Adapter
 let state = app.ble_gatt().request_permissions()?; // PermissionState::Granted, ...
 ```
 
-On Android, an application that also calls Java through `ndk-context`
-calls `tauri_plugin_ble_gatt::android_context::ensure()` first instead of
-initializing `ndk-context` itself; it may only be initialized once per
-process.
+On Android, plugin registration captures an owned Application context through
+JNI. The default driver never reads or initializes `ndk-context`, so it works
+with both older Tauri runtimes and newer runtimes that already own that global,
+without matching the app's Tao version or retaining an Activity.
+
+Applications can call `tauri_plugin_ble_gatt::android_context::get()` after
+plugin registration for their own JNI: it returns a JVM handle and an owned
+Application reference. The legacy `android_context::ensure()` remains available
+for applications on older runtimes which explicitly delegate `ndk-context`
+initialization to this plugin (such as existing Fini consumers). Do not call
+that legacy initializer on a runtime that already initializes `ndk-context`;
+`ndk-context` 0.1 has no non-panicking probe for existing ownership. Use `get()`
+for new code instead.
 
 This library **carries bytes; it does not encrypt them.** Layering your own
 session protocol or end-to-end encryption on top is expected and
@@ -78,7 +90,7 @@ over a socket instead of sharing an in-process `Arc`.
 |---|---|---|---|
 | Linux (BlueZ) | Yes | Yes | **M1 — implemented**, verified against real BlueZ hardware |
 | Android | Yes | Yes (where the chipset/driver allows — see `CapabilityReport`) | **M1 — implemented, not yet verified as a working bridge.** Individual pieces confirmed on a real emulator (real `capabilities()` returning `{central: true, peripheral: true}`, real GATT-server advertise start), but no device-to-device round trip yet — physical-hardware verification is the real bar, planned for after the next minor patch/release. See ADR-0002. |
-| Windows (WinRT) | — | — | M2 — reserved, not implemented |
+| Windows (WinRT) | Yes | Yes (where the adapter and driver allow — see `CapabilityReport`) | **M2 — first implementation, not yet verified on a radio.** Builds for `x86_64-pc-windows-msvc`; needs Windows 10 2004 or later. Scanners find it through the GATT advertisement (ADR-0012). See ADR-0011. |
 | macOS / iOS | — | — | M3 — reserved, not implemented |
 
 Capability is always discovered at runtime via `Driver::capabilities()`,
@@ -96,7 +108,7 @@ ble-gatt/src/
 └── drivers/      Frameworks & Drivers: one Driver per platform
     ├── linux.rs    BlueZ via bluer — central + peripheral       (M1)
     ├── android.rs  raw jni + ndk-context JNI bridge              (M1)
-    ├── windows.rs  reserved                                      (M2)
+    ├── windows/    WinRT; central adapted from btleplug, own peripheral (M2)
     └── mock/       in-process, radio-free — CI-safe protocol tests;
                     optionally a cross-process broker behind the
                     `mock-broker` feature — see ADR-0004

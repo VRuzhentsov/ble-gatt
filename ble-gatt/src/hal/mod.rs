@@ -180,6 +180,21 @@ pub trait Driver: Send + Sync {
     /// forward it, or serving never recovers (ADR-0010).
     fn served_service(&self) -> Option<GattServiceSpec>;
 
+    /// Replace the value a central's read of `characteristic` returns on
+    /// the local GATT server, leaving the server, its centrals and their
+    /// subscriptions untouched. `advertise` sets the first value from
+    /// `GattCharacteristicSpec::initial_value`; this changes it later. It
+    /// does not notify anyone.
+    ///
+    /// The GATT advertisement (ADR-0012) changes this way when the
+    /// advertisement data changes. Errors when nothing is served or the
+    /// characteristic is not part of the served service.
+    ///
+    /// No default, for the reason `served_service` has none: a wrapping
+    /// driver that forgot to forward it would serve a stale value without
+    /// any error.
+    async fn set_characteristic_value(&self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()>;
+
     async fn stop_advertising(&self) -> Result<()>;
 
     /// Release what this process holds on the radio before it exits: stop

@@ -48,7 +48,7 @@ impl Adapter {
     }
 
     /// The adapter of the platform this program runs on.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
     pub async fn platform() -> crate::Result<Self> {
         Ok(Self::new(crate::drivers::platform().await?).await)
     }

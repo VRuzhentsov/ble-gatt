@@ -212,6 +212,16 @@ impl RemoteClient {
         }
     }
 
+    pub(crate) async fn set_characteristic_value(
+        &self, address: &PeerAddress, characteristic: CharacteristicUuid, value: Vec<u8>,
+    ) -> Result<()> {
+        let request = Request::SetCharacteristicValue { address: address.clone(), characteristic, value };
+        match self.call(request).await? {
+            Response::Unit => Ok(()),
+            _ => Err(BleError::Transport("unexpected response to SetCharacteristicValue".to_string())),
+        }
+    }
+
     pub(crate) async fn stop_advertising(&self, address: &PeerAddress) -> Result<()> {
         match self.call(Request::StopAdvertising { address: address.clone() }).await? {
             Response::Unit => Ok(()),
