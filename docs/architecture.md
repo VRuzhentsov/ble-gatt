@@ -1,38 +1,31 @@
 # Architecture: crates, roles and ownership
 
-This is the workspace responsibility map. It separates the **current source**
-from the **provisionally agreed target** in
-[ADR-0014](adr/0014-core-peer-ownership.md). The documentation does not claim
-that the target refactor or its hardware acceptance is complete.
+The shared target design is [ADR-0012](adr/0012-discovery-like-nearby.md).
+[ADR-0011](adr/0011-windows-winrt-driver.md) owns Windows-native choices.
+These are the only two new ADRs in PR #38. The nonce handshake and core/iroh
+migration remain unimplemented; current API examples are not target signatures.
 
-## Read one document per crate
+## Workspace boundaries
 
-- [`ble-gatt`](../ble-gatt/README.md): reusable BLE operations, message profile,
-  native ownership and the target symmetric peer behavior.
-- [`ble-gatt-iroh`](../ble-gatt-iroh/README.md): iroh packet/address adaptation
-  and accounting of iroh users of a BLE carrier.
-- [`tauri-plugin-ble-gatt`](../tauri-plugin-ble-gatt/README.md): Tauri access,
-  permissions, lazy driver construction and Android bridge/context setup.
+- [`ble-gatt`](../ble-gatt/README.md): generic GATT operations, complete messages,
+  core peer coordination, resource ownership and native/mock drivers.
+- [`ble-gatt-iroh`](../ble-gatt-iroh/README.md): custom packet/address adaptation,
+  authenticated iroh key mapping and accounting of iroh users of a BLE carrier.
+- [`tauri-plugin-ble-gatt`](../tauri-plugin-ble-gatt/README.md): host access,
+  permissions, lazy construction and Android bridge/context setup.
+- **External iroh:** authenticated QUIC connections, encryption, streams and paths.
+- **Applications:** eligibility, product pairing, acceptance and application data.
 
-Iroh is an **external library**, not a fourth workspace crate. Applications
-such as Fini are consumers, not another layer implemented by the core.
+The core works without iroh or Tauri. A Tauri app can obtain a shared core
+`Adapter` from the plugin while using the Rust data path directly; packet traffic
+need not cross frontend IPC. Android still needs a compatible native bridge and
+Application context, even in a non-Tauri host.
 
-## Provisional target
+## Target map
 
-An application can use `ble-gatt` directly. An application using iroh adds the
-iroh adapter above the same core. A Tauri application obtains access and host
-initialization through the Tauri adapter; its data need not cross frontend IPC.
-
-**Symmetric initiation is the peer-to-peer contract, not an optional mode.**
-Either eligible peer can initiate or reconnect. One established BLE connection
-carries messages both ways. The core coordinates competing physical attempts
-and reports platform limits; applications do not choose a permanent initiator
-or select between `PreviousDialer`, `EitherPeer` and `Ordered`.
-
-The following graph has 19 component nodes. Boxes group responsibilities;
-arrows show selected caller/provider relationships, not a packet timeline or
-an exhaustive Rust import graph. `Peer coordination` is a target responsibility,
-not the name of a new type or an implemented API.
+This graph has 19 component nodes. Boxes group responsibilities; arrows show
+selected caller/provider dependencies, not an exhaustive call graph. `Peer
+coordination` is a responsibility, not an approved class or new crate.
 
 ```mermaid
 flowchart TB
@@ -48,7 +41,7 @@ flowchart TB
         tauriAdapter["tauri-plugin-ble-gatt: host access/setup"]
     end
     subgraph core["ble-gatt: reusable core and native implementations"]
-        peer["Peer coordination: symmetric contract (target)"]
+        peer["Peer coordination: discovery / handshake / tie-break (target)"]
         adapter["Adapter: radio / capabilities / role access"]
         central["Central: scan / connect / GATT client"]
         peripheral["Peripheral: advertise / serve / notify"]
@@ -92,175 +85,82 @@ flowchart TB
     mock -. "implements" .-> hal
 ```
 
-The driver-to-HAL arrows mean implementation dependencies, not commands from
-hardware into the API. Native callbacks/events return through the same ports.
-Power profiles provide advice, not mandatory radio control. The exact discovery
-schedule and peer-request lifetime remain open; the graph does not decide them.
+Drivers keep native objects/callbacks and session-scoped effects behind the
+ports. Core policy does not replace their ownership guards or serialization.
+Power profiles provide advice rather than mandatory radio control.
 
-## Responsibility boundaries
+## Roles and lifecycle
 
-### Apps
+A central initiates a BLE connection; a peripheral serves GATT. Writes in one
+direction and notifications in the other already provide bidirectional traffic.
+Either eligible application peer can initiate the target protocol. A permanent
+identity-ranked dialler and caller-selected initiation modes are not the target.
+Raw role operations remain available for vendor devices without our handshake.
 
-Choose permitted peers, product pairing, communication intent, sync settings,
-application protocols and user-facing session acceptance. Product eligibility
-is not something a generic BLE driver can decide. Core connection recovery
-must not depend on each application implementing its own BLE controller.
+```text
+advertise / discover -> peer information -> request connection
+    -> acceptance on both sides -> messages -> disconnected
+```
 
-### External iroh
+Metadata completion is an internal discovery procedure, not an accepted message
+connection. Stopping discovery or advertising must preserve active communication
+and the native resources it needs. Finishing a message does not release a healthy
+connection. Explicit disconnect/cancel must not be undone by an independent loop.
 
-Owns authenticated QUIC connections, encryption, streams and path selection.
-A cryptographic peer key identifies who is communicating; a current transport
-address says where packets can be sent. Iroh does not define our BLE role
-policy or native cleanup mechanism.
+The new core tie-break compares per-attempt nonces for the same endpoint. The
+larger wins; equal nonces fail both. The losing outgoing request reports failure;
+the winning incoming request is processed separately. Do not transfer its success
+to the outgoing caller. Closing a loser is not global peer disconnection.
+Endpoint correlation, native session generation and authenticated identity are
+different facts. See ADR-0012 for source references and remaining wire/API gates.
 
-### iroh adapter
+## Current implementation gap
 
-Converts iroh packets and addresses to core messages/destinations. Observes
-which iroh users need a carrier and releases its use when they finish. Current
-versus historical QUIC paths remain different facts. None of this should put
-native Bluetooth coordination or iroh types into the wrong crate.
-
-Iroh's custom-transport interface is explicitly unstable. Dependency upgrades
-can require changes in this adapter. That is a reason to isolate the coupling,
-not evidence that the BLE carrier or encryption is inherently unreliable.
-
-### Tauri adapter
-
-Supplies application access and platform initialization. It is not a second
-network stack. The Rust API returns a shared core `Adapter`; JavaScript uses
-commands and IPC events. Android registration supplies Application context and
-packages the Kotlin bridge. Tauri-specific permission dialogs stay here.
-
-### Central and peripheral
-
-Central initiates a BLE connection and uses GATT client operations. Peripheral
-accepts the connection and serves GATT data. These are connection roles, not
-permanent identities of applications. Central writes and peripheral
-notifications allow traffic in both directions over one connection.
-
-Raw role APIs remain useful for vendor protocols. Symmetric app peers are a
-higher-level core use case, not a requirement imposed on a lamp or sensor.
-
-### Core ownership and drivers
-
-Core connection policy coordinates admission, recovery, competing attempts and
-resource use. Drivers implement the HAL and own platform objects, callbacks,
-operation serialization and session-aware native effects. A shared helper must
-not separate an ownership check from the action it protects.
-
-The profile owns message boundaries, fragment encoding/reassembly and
-advertisement completion. It does not authenticate an application. Discovery
-metadata can select a candidate; it does not prove its identity.
-
-## Current implementation and required transition
-
-The existing iroh path is:
+Today the iroh path is:
 
 ```text
 Application -> external iroh -> BleGattTransport
-            -> datagram::connect / serve -> HAL -> platform driver
+            -> datagram::connect / serve -> HAL -> native driver
 ```
 
-Tauri supplies the shared adapter and Android host setup alongside this path.
-The current adapter owns candidate queues, hook-learned key/address mappings,
-last-user release and `InitiationPolicy`. Its default is `PreviousDialer`.
-`EitherPeer` is explicit; `Ordered` is another current option
-([ADR-0013](adr/0013-symmetric-iroh-initiation.md)).
+The adapter still owns initiation modes and crossed-candidate handling. It
+accounts for current iroh path use separately from historical address mappings.
+Core `PeerLink::Symmetric` still selects a lower-`LinkId` dialler; it is not the
+new protocol or a mandated basis for it. Do not nest independent native
+retry/close owners to simulate the target.
 
-The core already has an owned `Connection`, pure connection-state tables and
-`PeerLink`. However, `PeerLink::LinkRole::Symmetric` uses a lower-`LinkId`
-dialler. Its acceptance, retry and channel contracts differ from the iroh
-adapter. Simply putting that controller under the existing adapter would
-create conflicting owners and would not implement the agreed target.
+Existing core metadata completion is opt-in. Its timer-based refresh is not
+Nearby's exact wire protocol. The datagram server still admits one inbound peer;
+this design does not establish Cluster/M-to-N or universal crossed-dial support.
 
-The next design must reuse or revise those core mechanisms and let the adapter
-consume the result. Remove the public initiation choice only with its actual
-replacement and tests. This documentation change does not remove an API.
+Reuse existing state tables, owned handles, fragment/reassembly code and native
+session guards where their contracts fit. The implementation must make the new
+peer behavior available without integrations and then adapt iroh to it. Current
+API examples remain in [interface.md](interface.md), not in a second draft ADR.
 
-Native Kotlin currently ships under the Tauri plugin while its Rust/JNI driver
-is in the core. A non-Tauri Android host still needs compatible bridge/context
-packaging. Whether to change that packaging is open, not an approved new crate.
+## Layers and validation
 
-## Implemented core module map
-
-```text
-ble-gatt/src/
-  entities/          Models and errors
-  hal/               Driver and GattConnection ports
-  roles/
-    adapter.rs       Radio, capabilities and role access
-    central.rs       Scan and owned outgoing GATT connection
-    peripheral.rs    Serving, notifications and ServerHandle
-  connection/
-    handle.rs        Owned Connection and lifecycle observation
-    link_state.rs    Pure state transitions
-    peer_link.rs     Existing tracked-peer worker
-  profile/
-    advertisement.rs  GATT metadata and scan completion
-    datagram/         Complete-message channel, fragments and reassembly
-  power/             Power-profile advice
-  drivers/
-    linux.rs         BlueZ
-    android.rs       Rust/JNI
-    windows/         WinRT device, peripheral, watcher and byte helpers
-    mock/            Local/remote mock radio and broker
-```
-
-This is the actual layout, not the older proposed `backend/` migration tree.
-There is no implemented `roles/advertiser.rs` or Apple driver in this snapshot.
-The peripheral role includes advertising operations.
-
-## Layers and dependency direction
-
-The layer vocabulary follows
-[Clean Architecture](https://blog.cleancoder.com/uncle-bob/2012/08/13/the-clean-architecture.html)
-and [ADR-0007](adr/0007-layered-architecture.md):
+The layer vocabulary remains that of [ADR-0007](adr/0007-layered-architecture.md):
 
 - **Entities:** reusable data and pure rules; no I/O.
 - **Use Cases:** `hal`, `roles`, `connection`, `profile` and `power`.
 - **Interface Adapters:** the iroh and Tauri crates.
 - **Frameworks & Drivers:** native and mock implementations of the ports.
 
-External SDK/framework types stay behind their interfaces. Core code must not
-need iroh or Tauri in order to provide the agreed peer behavior. The driver
-factory is a convenience; injected drivers remain the test boundary.
+### How the layers map onto OSI
 
-## How the layers map onto OSI
+OSI is an explanatory protocol analogy, not a crate or ownership rule. The
+Bluetooth radio/OS stack supplies physical/link mechanisms; the GATT profile
+adds complete messages. In the iroh composition, QUIC supplies transport streams
+and security above that carrier, and the application supplies its data protocol.
+Tauri setup and power advice are not packet layers. A type named `DataLink`
+does not establish its actual protocol layer.
 
-OSI terms are explanatory protocol analogies, not ownership or crate rules.
-`L` followed by a number refers to OSI, not the software layers above.
+Generic BLE policy must not require iroh/Tauri types. A diagram does not define
+new Rust signatures, protocol encoding or native concurrency guarantees.
 
-- Bluetooth radio and the OS stack provide the physical/link mechanisms.
-- The GATT profile adds complete messages above characteristic operations.
-- In the iroh composition, QUIC provides reliable streams, authentication and
-  encryption above the chosen packet carrier.
-- The application defines its session and data protocol.
-- Power advice and Tauri initialization are not protocol layers.
-
-An application type named `DataLink` does not establish its actual protocol
-layer. Trace composition and ownership instead of inferring them from its name.
-
-## Lifetimes, events and verification
-
-Owned handles expose state/events and keep native work tied to the correct
-connection generation. Explicit async shutdown and best-effort cleanup on Drop
-are not equivalent. In particular, a datagram serve-stream Drop does not stop
-the service; see the [core README](../ble-gatt/README.md).
-
-Report event loss rather than silently treating stale observations as current.
-Keep a native GATT session identifier distinct from a QUIC connection and an
-application session. An empty adapter map does not prove that all candidate
-tasks or native resources have ended.
-
-Keep diagnostics in example/test support. Builds, mock tests, packaged JNI
-execution, native-role/session observations and physical OS teardown are
-separate validation levels. No target diagram is evidence of those results.
-See [hardware verification](hardware-verification.md) and
-[ADR-0014's acceptance requirements](adr/0014-core-peer-ownership.md#migration-and-acceptance-requirements).
-
-## Still open before implementation
-
-Peer-request lifetime, retry budget, discovery/advertising scheduling, the
-exact shared ownership API, platform collision handling and Android packaging
-are listed in [ADR-0014](adr/0014-core-peer-ownership.md#open-design-questions).
-They must be resolved before turning the target into a source refactor.
+Follow [ADR-0012's migration gates](adr/0012-discovery-like-nearby.md#migration-and-verification-gates-for-this-pr).
+Mock checks, JNI bytecode/packaging checks, observed native sessions and physical
+OS teardown are separate evidence levels. Old candidate-model results do not
+certify the new handshake. Procedures and limits live in
+[hardware-verification.md](hardware-verification.md).

@@ -10,7 +10,7 @@ same thing, it is listed as *Also called*. Use the first word in code and
 documents.
 
 Current API descriptions and provisional target requirements are distinct.
-The target in [ADR-0014](adr/0014-core-peer-ownership.md) does not rename or
+The target in [ADR-0012](adr/0012-discovery-like-nearby.md) does not rename or
 change an existing API by documenting a new responsibility boundary.
 
 ## Bluetooth basics
@@ -345,7 +345,7 @@ connections come up where one was wanted.
 
 ### Symmetric initiation
 Either peer may start or reconnect a link, regardless of permanent identity
-ordering. This is the provisional high-level core contract in ADR-0014,
+ordering. This is the high-level core contract under review in ADR-0012,
 independent of iroh and without a caller-selected initiation mode.
 In current code, `ble-gatt-iroh::InitiationPolicy::EitherPeer` selects the
 no-yield behavior, whereas core `PeerLink::LinkRole::Symmetric` selects a
@@ -358,14 +358,15 @@ The current adapter's explicit choice of who may start an outgoing link when no 
 exists. In `ble-gatt-iroh`, `PreviousDialer` preserves the historical redial
 yield, `EitherPeer` removes that yield and `Ordered` is the smaller-endpoint-key
 fallback. It is not peer authentication or an application's session policy.
-ADR-0014 removes this public choice from the target design; it does not merely
+ADR-0012 removes this public choice from the target design; it does not merely
 change the default. Existing enum variants remain implemented until refactored.
 
 ### Candidate link
 A BLE channel attached to the iroh transport, potentially one of several
 crossed candidates. Older candidates can still receive while the newest queue
 sends. An address with live iroh users remains protected from idle cleanup;
-last-user release closes it when those users end (ADR-0013).
+last-user release closes it when those users end (current adapter behavior;
+see ADR-0012's implementation gap).
 
 ### Redial yield
 After a link the peer dialled drops, the time (`REDIAL_YIELD`, 30 s) for
@@ -374,10 +375,32 @@ for its still-open iroh connection, does not cross with it. It starts only
 when such a connection may still be open: not after this side closed the
 link, nor after every connection on it had started to close. It applies to
 `InitiationPolicy::PreviousDialer` (the compatibility default), not to
-`EitherPeer` or `Ordered` (ADR-0013).
+`EitherPeer` or `Ordered` (current implementation, not ADR-0012's target).
 
 ### Adapter crate
 A crate that connects `ble-gatt` to something outside it, such as iroh
 (`ble-gatt-iroh`) or Tauri (`tauri-plugin-ble-gatt`). Layer: Interface
 Adapters. Not to be
 confused with a [Bluetooth adapter](#bluetooth-adapter).
+
+### Core endpoint identifier
+In the ADR-0012 target, the protocol identifier that correlates discovery and
+incoming/outgoing attempts for one peer context. Not an iroh `EndpointId`, a
+native address or proof of authenticated identity. Its representation and exact
+lifetime remain review gates; the handshake is not implemented yet.
+
+### Attempt nonce
+A fresh random value associated with an outgoing connection attempt. Nearby's
+reference uses a signed 32-bit value; the target follows its larger-wins,
+equal-values-fail-both rule. It is not an encryption key or a native generation.
+
+### Attempt outcome
+The result of one establishment attempt, distinct from an established peer's
+connection state. In the ADR-0012 target, an outgoing tie-break loser reports
+failure/rejection while the incoming winner proceeds separately. It is not a
+silent success handoff and does not mean a healthy peer was globally disconnected.
+
+### Control record
+A protocol record for establishment, acceptance or liveness, explicitly distinct
+from application payload. ADR-0012 requires bounded, versioned handling without
+sniffing QUIC or arbitrary payload prefixes; its encoding is not selected yet.

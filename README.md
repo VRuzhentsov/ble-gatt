@@ -24,11 +24,11 @@ This repo is a Cargo workspace with three crates:
   custom transport that carries QUIC over `ble-gatt`'s GATT datagram
   channel. In the current implementation, the caller schedules scanning and
   advertising; the adapter also contains initiation policies described in
-  [ADR-0013](docs/adr/0013-symmetric-iroh-initiation.md).
+  [ADR-0012's current implementation gap](docs/adr/0012-discovery-like-nearby.md#current-implementation-gap).
 
-## Provisional architecture agreement
+## Design under review
 
-The target in [ADR-0014](docs/adr/0014-core-peer-ownership.md) makes symmetric
+The target in [ADR-0012](docs/adr/0012-discovery-like-nearby.md) makes symmetric
 peer communication a core `ble-gatt` capability, independent of iroh. Either
 eligible peer can initiate or reconnect; applications do not select an
 `EitherPeer`, previous-dialler or identity-ordered mode. Raw central/peripheral
@@ -42,6 +42,12 @@ is not another packet layer. iroh itself remains an external library.
 `PeerLink::Symmetric` and adapter initiation APIs do not yet provide that
 single core-owned contract. See the [architecture map](docs/architecture.md)
 and each crate's README for current behavior, target ownership and open questions.
+
+ADR-0011 owns Windows-native choices; ADR-0012 owns the shared Nearby-inspired
+redesign, including discovery, lifecycle and the new core nonce tie-break required
+in this PR. A losing outgoing attempt must report failure while a winning incoming
+attempt proceeds separately. The protocol/API details and implementation remain
+review gates; the new design does not claim Google Nearby wire interoperability.
 
 ### Using the plugin from a Rust application
 
@@ -105,7 +111,7 @@ over a socket instead of sharing an in-process `Arc`.
 |---|---|---|---|
 | Linux (BlueZ) | Yes | Yes | **M1 — implemented**, verified against real BlueZ hardware |
 | Android | Yes | Yes (where the chipset/driver allows — see `CapabilityReport`) | **M1 — implemented.** Source checks, packaged JNI execution and physical device acceptance are separate evidence levels. See ADR-0002 and the hardware verification guides; no blanket crossed-role or locked-device guarantee is implied. |
-| Windows (WinRT) | Yes | Yes (where the adapter and driver allow — see `CapabilityReport`) | **M2 — first implementation, not yet verified on a radio.** Builds for `x86_64-pc-windows-msvc`; needs Windows 10 2004 or later. Scanners find it through the GATT advertisement (ADR-0012). See ADR-0011. |
+| Windows (WinRT) | Yes | Yes (where the adapter and driver allow — see `CapabilityReport`) | **M2 — first implementation; bidirectional cross-device acceptance pending.** Earlier build/capability/advertising observations are not proof of the new peer protocol. Shared metadata completion is described in ADR-0012; native choices and verification are in ADR-0011. |
 | macOS / iOS | — | — | M3 — reserved, not implemented |
 
 Capability is always discovered at runtime via `Driver::capabilities()`,
@@ -179,7 +185,7 @@ picks the tier that fits:
 
 These are current APIs, not three target peer-initiation behaviors. See
 [`docs/interface.md`](docs/interface.md) for their current use and
-[ADR-0014](docs/adr/0014-core-peer-ownership.md) for the pending ownership change.
+[ADR-0012](docs/adr/0012-discovery-like-nearby.md) for the pending ownership change.
 
 ### Load-bearing files
 
@@ -190,15 +196,14 @@ Read the doc next to each before changing it:
 | `ble-gatt/src/connection/link_state.rs` | `RadioState` / `CentralLink` / `PeripheralLink` — pure lifecycle transitions | ADR-0005 |
 | `ble-gatt/src/connection/peer_link.rs` | current tracked-peer API and dedicated worker | `docs/interface.md`, ADR-0005 |
 | `ble-gatt/src/drivers/linux.rs` — `LinuxConnectGuard` / `pending_cleanup` | abandoned-connect cleanup and native ownership | code comments, ADR-0009 |
-| `ble-gatt/src/profile/datagram/mod.rs` | complete messages, serving and channel limits | ADR-0003, ADR-0013 |
+| `ble-gatt/src/profile/datagram/mod.rs` | complete messages, serving and channel limits | ADR-0003, ADR-0012 |
 
 ## Status
 
 Early, under active development. Implemented APIs, the provisional architecture
 and device acceptance are different things. The architecture documentation
 does not certify all drivers, native roles or background scenarios. See
-[hardware verification](docs/hardware-verification.md) and the
-[iroh diagnostic checklist](docs/either-peer-hardware.md).
+[hardware verification and current iroh diagnostic checklist](docs/hardware-verification.md).
 Not yet published to crates.io/npm — consume as a git dependency, pinned to a
 release tag:
 

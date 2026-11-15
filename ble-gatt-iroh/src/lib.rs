@@ -184,7 +184,8 @@ pub enum InitiationPolicy {
     PreviousDialer,
     /// Either peer may initiate and reconnect immediately. Existing incoming
     /// paths are reused by iroh; crossed candidates are retained until unused.
-    /// Select only where the platform tolerates crossed attempts (see ADR-0013).
+    /// Select only where the platform tolerates crossed attempts.
+    /// See ADR-0012's current implementation gap, not its target handshake.
     EitherPeer,
     /// Deterministic fallback for platforms that cannot tolerate crossed
     /// dials: only the smaller endpoint key initiates. Both sides must choose

@@ -4,7 +4,7 @@
 adds fragmentation and message boundaries, but not an application-session
 protocol or end-to-end encryption (ADR-0003).
 
-The [provisional target](adr/0014-core-peer-ownership.md) gives the core one
+The [target under review](adr/0012-discovery-like-nearby.md) gives the core one
 symmetric peer contract, independent of iroh: either peer can initiate or
 reconnect. The public initiation-mode choice is not part of that target.
 The source has not yet been refactored. This page documents current APIs;
@@ -24,8 +24,10 @@ See the [core](../ble-gatt/README.md),
 
 Current iroh consumers use the datagram tier through `ble-gatt-iroh`, not the
 existing `PeerLink` controller. The target must reuse core BLE behavior in both
-cases without duplicating lifecycle ownership. It does not yet select an
-operation-scoped or persistent tracked-peer API.
+cases without duplicating lifecycle ownership. The Nearby lifecycle is the
+baseline; exact request/event/release signatures remain open. Losing outgoing
+attempts report failure, and incoming winners proceed through acceptance
+separately. This page's code examples are still the current implementation.
 
 ---
 
@@ -61,7 +63,7 @@ incoming-link loss). If crossed dials are unsafe, configure both peers with
 `InitiationPolicy::Ordered { local_id: key.public() }` before moving `key`
 into the endpoint: only the smaller endpoint key initiates. Individual
 `CapabilityReport.central/peripheral` booleans do not prove concurrent-role
-support. See [ADR-0013](adr/0013-symmetric-iroh-initiation.md).
+support. See [ADR-0012's current implementation gap](adr/0012-discovery-like-nearby.md#current-implementation-gap).
 
 Fini retains permitted peers, sync settings and application-session policy.
 A losing application candidate closes its own iroh connection, **not** all
@@ -114,7 +116,7 @@ exists, **on top of this**, not replacing it.
 
 This section describes the implemented controller, not the target public
 design. Its `Symmetric` role chooses the lower `LinkId` to dial. That must not
-be confused with either-peer initiation in ADR-0014.
+be confused with the new core protocol in ADR-0012.
 
 You declare **which peers you care about** and **one policy** (who dials). The
 library owns keeping links alive; you consume channels and status.

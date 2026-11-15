@@ -7,7 +7,7 @@ It is not a networking transport and has no iroh dependency.
 
 ## Status: current code and agreed target
 
-The [provisional architecture decision](../docs/adr/0014-core-peer-ownership.md)
+The [shared design under review](../docs/adr/0012-discovery-like-nearby.md)
 keeps BLE peer behavior in the core and Tauri-specific setup here. Most current
 plugin responsibilities already follow that split. This documentation does
 not add a new symmetric-peer JavaScript API or move the Android bridge.

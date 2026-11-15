@@ -366,7 +366,7 @@ impl Driver for WindowsDriver {
     }
 
     /// Excludes the central: WinRT has no call that drops a central from a
-    /// GATT server (ADR-0011 D6).
+    /// GATT server (ADR-0011, native events and cleanup limits).
     async fn disconnect_peer(&self, peer: &PeerAddress, session: Option<u64>) -> Result<()> {
         let mut peers = self.inner.server_peers.lock().unwrap();
         if let Some(current) = peers.get_mut(&peer.0) {

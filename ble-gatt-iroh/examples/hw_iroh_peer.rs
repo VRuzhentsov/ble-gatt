@@ -1,4 +1,4 @@
-//! See docs/either-peer-hardware.md. No phone or radio is touched by --keygen.
+//! See docs/hardware-verification.md. No phone or radio is touched by --keygen.
 #[path = "support/iroh_diagnostic.rs"]
 mod diagnostic;
 use diagnostic::{mark, Options};

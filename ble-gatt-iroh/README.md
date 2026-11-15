@@ -6,7 +6,7 @@ of the three crates in this workspace. iroh itself is not a workspace crate.
 
 ## Status: current code and agreed target
 
-The [provisional architecture decision](../docs/adr/0014-core-peer-ownership.md)
+The [shared design under review](../docs/adr/0012-discovery-like-nearby.md)
 assigns fundamental symmetric BLE behavior to the core. The current adapter
 still contains initiation policies and BLE coordination that need review.
 This document records the boundary; it does not claim that relocation is done.
@@ -23,9 +23,9 @@ users of a carrier. When no iroh user needs the carrier, it releases its use
 through the core's ownership contract. Native connection establishment,
 competing-attempt handling and teardown safety belong in `ble-gatt`.
 
-The adapter must express resource demand without becoming a second native BLE
-retry/close controller. iroh hooks and QUIC candidate bookkeeping may remain
-here where they describe iroh facts, not OS Bluetooth state.
+The adapter requests use/release through the core rather than independently
+dialling, retrying or disconnecting the same native resource. iroh hooks and
+path/user bookkeeping remain here where they describe iroh facts, not OS state.
 
 ## Who owns what
 
@@ -82,9 +82,11 @@ public design:
 
 The target removes that public choice rather than only changing its default.
 The same symmetric behavior must be available to a non-iroh core consumer.
-See [ADR-0013](../docs/adr/0013-symmetric-iroh-initiation.md) for the existing
-implementation and [ADR-0014](../docs/adr/0014-core-peer-ownership.md) for the
-provisional replacement direction.
+See [ADR-0012](../docs/adr/0012-discovery-like-nearby.md) for the target and its
+current implementation gap. The current adapter retains crossed candidates;
+the target core instead arbitrates pending attempts. Its losing outgoing
+request reports failure while an incoming winner proceeds separately.
+Do not turn that outcome into a silent outgoing-to-incoming success handoff.
 
 Do not place the existing `PeerLink` controller under this adapter without a
 contract change. It has a different acceptance policy and a different channel
@@ -130,4 +132,4 @@ closure and exhaustive OS teardown are distinct claims.
 
 See the [architecture map](../docs/architecture.md),
 [usage guide](../docs/interface.md) and
-[hardware acceptance checklist](../docs/either-peer-hardware.md).
+[hardware acceptance checklist](../docs/hardware-verification.md).

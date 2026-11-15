@@ -2,272 +2,150 @@
 
 ## Status
 
-Proposed. The implementation is in `ble-gatt/src/drivers/windows/`.
-**D4 is replaced by ADR-0012**: the Windows driver no longer runs a second
-advertisement; manufacturer data and the name reach scanners through the
-GATT advertisement. D5 still holds where the name fits.
+First Windows driver implementation in PR #38; contract gaps and full
+cross-device acceptance remain pending.
+This ADR owns Windows-native choices. Shared discovery, the new core tie-break
+and their pending interfaces belong in [ADR-0012](0012-discovery-like-nearby.md).
+The PR remains draft; the redesign is not implemented by this document.
 
-It builds for `x86_64-pc-windows-msvc`, its tests pass, and clippy
-reports no warnings. On the test computer (Intel Wireless Bluetooth,
-driver 23.90.0.8, Windows 11) `capabilities()` reports
-`central: true, peripheral: true` and `radio_status()` reports `On`
-(hardware check 1), and the GATT server advertises once the driver waits
-out the early `Aborted` status the provider reports first.
-**No link is verified yet.** The bar is the same
-as for Android (ADR-0002): a Fini pairing and a sync between a Windows
-computer and an Android phone, in both roles. The checklist is in
-"Hardware verification" below.
+## Decision question
 
-## Context
+How does Windows implement the same central/peripheral contracts as Linux,
+Android and mocks without introducing a separate peer protocol or lifecycle?
 
-Fini runs on Windows. Its `src-tauri/Cargo.toml` pulls `ble-gatt` only for
-Linux and Android, and uses a stub on Windows, so a Windows computer cannot
-pair with a phone over Bluetooth. The Windows driver was reserved as M2.
+## Context and constraints
 
-Fini needs both roles on every platform:
+A reusable BLE carrier needs GATT client and server operations, platform
+capabilities, events and correctly scoped cleanup. Platform role support is a
+runtime fact; an OS name does not prove peripheral or crossed-attempt support.
+Applications such as Fini consume this contract but do not define the driver.
 
-- **Central.** Scan for Fini's service UUID, read the manufacturer data
-  (company `0xFFFF`: one flags byte for Add Device mode, then the identity
-  fingerprint) and the name, then connect, write and subscribe.
-- **Peripheral.** Serve the datagram service, advertise it with that
-  manufacturer data and the short name, receive writes and send
-  notifications to one central at a time.
+The earlier provider-plus-manufacturer-publisher proposal was an unmerged draft,
+not a second active design. The current driver uses the GATT provider; shared
+metadata completion handles information omitted from its radio advertisement.
 
-WinRT (`Windows.Devices.Bluetooth`) has both roles. `docs/alternatives.md`
-says to read btleplug's and bluest's WinRT code before writing ours. Both are
-central only.
+## Decision
 
-## Decisions
+### 1. One driver, the existing HAL contracts
 
-### D1 — Use Microsoft's `windows` crate directly
+Use the `windows` crate's WinRT APIs and implement `Driver` / `GattConnection`.
+Keep WinRT types, callback tokens, address conversion and native session state
+behind that boundary. Windows joins the existing platform factory and wrappers.
 
-Options:
+```text
+Shared core operations / Adapter role access
+                    |
+          Driver / GattConnection
+                    |
+       WindowsDriver / WinRT objects
+            /                 \
+central: watcher, device     peripheral: GATT provider
+```
 
-1. **btleplug** (`btleplug::platform::Manager`). Mature Windows central.
-   Example: `adapter.start_scan(ScanFilter { services: vec![uuid] })`, then
-   `peripheral.connect()`. It has no peripheral role, so the peripheral half
-   still needs WinRT directly, and the driver would mix two event models
-   (btleplug's `CentralEvent` stream and WinRT handlers). It also adds its
-   own dependency tree.
-2. **bluest** (`bluest::Adapter::default()`). Same shape, same gap: central
-   only.
-3. **The `windows` crate** (MIT OR Apache-2.0), the WinRT projection that
-   btleplug and bluest are built on. Example:
-   `GattServiceProvider::CreateAsync(guid)?.await?`. One event model for
-   both roles, and the driver maps WinRT types to `crate::entities` itself,
-   like the Linux driver does with `bluer`.
+The current module responsibilities are:
 
-**Decided: option 3, with the central half adapted from btleplug's
-code.** btleplug's `src/winrtble/` is BSD-3-Clause, so its code may be
-copied with its notice (`LICENSES/btleplug-BSD-3-Clause.txt`). The driver
-takes btleplug's module split and its central-role fixes, and keeps this
-library's own `Driver` contract and peripheral role on top:
+- `drivers/windows/watcher.rs`: advertisements and scan filtering/cache.
+- `drivers/windows/device.rs`: outgoing GATT client/session operations.
+- `drivers/windows/peripheral.rs`: server requests, values and advertising.
+- `drivers/windows/utils.rs`: conversions and advertisement byte helpers.
+- `drivers/windows/mod.rs`: HAL implementation, session/event coordination.
 
-| Module | Job | Source |
-|---|---|---|
-| `drivers/windows/watcher.rs` | Scanning | btleplug `ble/watcher.rs`: active scanning, extended advertisements, scan responses only from addresses that matched, a bounded set of 1024 matched addresses |
-| `drivers/windows/device.rs` | One central link | btleplug `ble/device.rs`, `ble/characteristic.rs`: uncached discovery falls back to the Windows cache after 5 s (btleplug #325: some drivers never answer), link loss from `ConnectionStatusChanged`, Notify or Indicate from the characteristic's properties, one `ValueChanged` handler per characteristic, the status of `RequestPreferredConnectionParameters` checked |
-| `drivers/windows/peripheral.rs` | GATT server, advertising | Own. btleplug has no peripheral role; the provider-plus-publisher split matches tinygo-org/bluetooth (D4) |
-| `drivers/windows/utils.rs` | Conversions | Partly btleplug (`parse_service_data`) |
-| `drivers/windows/mod.rs` | The `Driver` port: sessions, events, radio | Own |
+The central implementation adapts btleplug code under BSD-3-Clause. Preserve
+its source notices and [license](../../LICENSES/btleplug-BSD-3-Clause.txt).
+The peripheral implementation uses WinRT directly. Copying an existing central
+library wholesale would still leave the server role and shared HAL integration.
 
-Two choices differ from btleplug and follow bluest instead: the dial uses
-the address type the scan saw (`FromBluetoothAddressWithBluetoothAddressTypeAsync`),
-and the link keeps `GattSession.MaintainConnection = true`.
+### 2. Capabilities and addresses
 
-Using btleplug as a dependency (option 1) stays possible later, once the
-`hal::Driver` port is split by role; that is a separate decision.
+Read the adapter's BLE, central-role and peripheral-role capabilities. Report
+missing radio/support through the existing error and capability vocabulary.
+Keep radio-state observation in the driver. The existing Windows implementation
+targets Windows 10 version 2004 or later; check the actual APIs and device driver
+when validating a supported machine.
 
-Version: `windows = "0.62"`, the version btleplug 0.13 uses. Its async
-operations implement `IntoFuture`, so they `.await` on Tokio with no
-executor bridge.
+Preserve the address type seen during scanning when opening a client connection.
+A native address locates a device; it is not an authenticated identity or the
+core endpoint identifier used for the new tie-break.
 
-### D2 — What the computer must support, and how `CapabilityReport` says it
+Central/peripheral support reported separately does not certify simultaneous
+roles, crossed establishment, background execution or every adapter model.
 
-The driver reads the default `BluetoothAdapter`:
+### 3. Provider advertising and readable metadata
 
-| Field | WinRT source |
-|---|---|
-| `central` | `IsLowEnergySupported && IsCentralRoleSupported` |
-| `peripheral` | `IsLowEnergySupported && IsPeripheralRoleSupported` |
+Use `GattServiceProvider` for connectable service advertising. Do not add an
+independent manufacturer-data publisher to repair profile discovery.
+`ServiceData` is optional when capacity permits; Windows can report
+`StartedWithoutAllAdvertisementData`. This is not a universal prohibition on
+service data or a fixed payload limit for every Windows configuration.[1]
 
-Both are `false` when there is no adapter. `WindowsDriver::new` fails with
-`AdapterUnavailable` when there is no adapter or it has no Bluetooth LE, so
-`PeerLink` reports the radio as unavailable.
+Advertise the fields the chosen API can supply. Shared profile discovery, not
+the Windows driver, determines whether it must fetch readable GATT metadata.
+The driver implements reads and `set_characteristic_value` without replacing a
+live server merely to update its data. See ADR-0012 for format/cache policy.
 
-Requirements:
+### 4. Native events and cleanup limits
 
-- **Radio:** a Bluetooth 4.0 or later adapter with Bluetooth LE.
-- **Driver:** for the peripheral role, a driver that reports
-  `IsPeripheralRoleSupported`. Many older or generic adapters report
-  `false`. Current adapters from the large vendors usually report `true`,
-  but only the adapter can say. The test computer has an Intel Wireless
-  Bluetooth adapter, driver 23.90.0.8; `capabilities()` on it is the first
-  hardware check.
-- **Two advertisements at once** (D4). The controller must run the
-  connectable and the non-connectable advertisement together. Windows
-  interleaves them when the controller has one advertising set; a publisher
-  that stays `Waiting` means it could not. The driver logs that and does not
-  fail.
-- **Windows:** Windows 10 version 2004 (build 19041) or later, for
-  `GattServiceProviderAdvertisingParameters.ServiceData`, the address type in
-  scan results, and extended advertisement scanning. On Windows 11,
-  `request_connection_priority` uses
-  `BluetoothLEDevice.RequestPreferredConnectionParameters`; on Windows 10 it
-  returns `Unsupported`, which callers already treat as a no-op.
-- **Settings:** Bluetooth must be on, and the Windows privacy setting for
-  radios must let apps use the radio. A scan that Windows refuses
-  ends with `AdapterUnavailable`.
+Keep client/session objects alive for the operations that need them. Observe
+native link loss and translate it to role/session-aware events. Serialize
+server request handling so callback concurrency does not reorder fragments.
+Serve readable values from the current value map, not an immutable initial value.
 
-The `RadioChanged` event comes from `Radio.StateChanged`; `radio_status()`
-reads `Radio.State`.
+On the server side, the current implementation can exclude a central: reject
+its writes and omit its notifications until its session ends. This is the
+implementation of peer refusal, not evidence that Windows physically drops the
+remote link. Preserve this distinction in diagnostics and cleanup assertions.
 
-### D3 — Peer addresses
+Core arbitration selects an attempt; the driver must apply effects to the
+correct owned session. A stale completion must not tear down a replacement.
+The exact contract needed for crossed attempts is a gate in ADR-0012, not a
+capability inferred from two role booleans.
 
-`PeerAddress` is `"AA:BB:CC:DD:EE:FF"`, the same form as the other drivers.
-The driver remembers each address's `BluetoothAddressType` from the scan
-and dials with `FromBluetoothAddressWithBluetoothAddressTypeAsync`. Android
-advertises from a random [private address](../glossary.md#private-address);
-dialled as public, it is not found.
+## Alternatives and consequences
 
-A GATT server sees a central only through its `GattSession`. The driver
-takes the remote address from the session's device id
-(`BluetoothLE#BluetoothLE<local>-<remote>`). When the id has another form,
-the whole id is the address, which still routes `notify_peer` correctly.
+- A central-only abstraction leaves the peripheral role to another native path
+  and introduces another event model. The selected direct WinRT implementation
+  covers both halves of the existing HAL.
+- A separate non-connectable metadata advertisement depends on scanners
+  correlating advertisements correctly. Not selected; discovery completion is
+  the shared mechanism in ADR-0012.
+- Returning success as if exclusion were physical disconnection would overstate
+  the native operation. Record the real limit instead.
 
-### D4 — Manufacturer data goes in a second advertisement
+The core and integrations use one shared driver vocabulary. This does not
+implement the new handshake, change a consumer's dependencies or prove hardware
+interoperability. No Windows-only initiation mode is introduced by the target.
 
-*Replaced by ADR-0012.* Measured on the test computer: the publisher
-refuses a service UUID list (`E_INVALIDARG`), so scanners that filter on
-the UUID never received it, and with a 128-bit UUID the name did not fit
-in the provider's advertisement either. The text below records the first
-design.
+## Verification and known limits
 
-`GattServiceProvider.StartAdvertising` sends a connectable advertisement
-with the service UUID and, from build 19041, one service data entry under
-that UUID. It cannot send manufacturer data. Fini's scanner ignores a peer
-with no fingerprint in manufacturer data, so Windows would never be found.
+Source review identifies partial-acquisition cleanup gaps: maintained client
+sessions and notification callback tokens are acquired before awaits without
+complete cancellation guards (`device.rs`); server construction also needs
+ownership protection across advertising startup (`peripheral.rs`). Current
+`close` only stops serving, and peer exclusion does not itself report a terminal
+physical disconnect (`mod.rs`). Callback queue bounds/deferral timing and
+watcher cache/delivery behavior require contract review and native validation.
+These are static findings, not reproduced Windows failures or completed fixes.
 
-Options:
+The earlier branch record reports Windows builds/tests and adapter capability /
+advertising observations. This documentation revision does not rerun those
+native checks or promote them to bidirectional connection acceptance.
 
-1. **Provider only.** Simple, but Fini cannot discover Windows. Changing
-   Fini to read the fingerprint from service data would also move the name
-   (D5) and change every platform.
-2. **Publisher only** (`BluetoothLEAdvertisementPublisher`). Carries any
-   data, but its advertisement is not connectable, so no central can reach
-   the GATT server.
-3. **Both.** The provider sends the connectable advertisement (UUID and the
-   name). A publisher sends a non-connectable advertisement with the UUID and
-   the manufacturer data. Example:
-   `advertisement.ManufacturerData().Append(BluetoothLEManufacturerData::Create(0xFFFF, &buffer)?)`.
-   The two are independent WinRT objects, so each can be replaced
-   without touching the other. tinygo-org/bluetooth (`gatts_windows.go`,
-   `gap_windows.go`, BSD-3-Clause) does the same.
+Before accepting Windows support, verify on an authorized Windows/Android pair:
 
-**Decided: option 3.** The publisher carries no service data and no name:
-tinygo records that Windows refuses to start a publisher with either.
-Service data under UUIDs other than the served one is therefore not sent
-on Windows (logged). If Windows refuses the publisher with the service
-UUID, the driver starts it with the manufacturer data alone and logs that
-filtering scanners will miss it.
+1. Runtime capabilities and radio status; unsupported configurations fail clearly.
+2. Windows scans and completes metadata for the remote peer.
+3. Windows initiates and exchanges complete messages in both directions.
+4. The remote peer discovers Windows, fetches missing metadata and initiates.
+5. Metadata changes while communication/subscriptions remain active.
+6. Disconnect, cancellation, stale events and radio recovery preserve ownership.
+7. An excluded additional central receives no other peer's data; native teardown
+   is reported separately from logical exclusion.
+8. The new core protocol's crossed-attempt outcomes match ADR-0012 on this path.
 
-Open risk: a scanner merges the two advertisements only if both come from
-the same address. FlyingCarpet's field guide (GPL-3.0, read for facts only)
-records that `GattServiceProvider` advertises from a static random address;
-which address the publisher uses is not documented. If the two differ, a
-phone sees two devices: one with the fingerprint that cannot be connected,
-and one that can be connected without it. Hardware check 4 settles this.
-The fallback, if needed, is to send Fini's flags and fingerprint in the
-provider's own service data on Windows; that changes the advertisement
-format on every platform and is a separate decision.
+Builds, mocks, observed native sessions and physical radio/OS teardown are
+separate claims. Use [hardware verification](../hardware-verification.md) for
+procedures; retain pending checks rather than marking them passed from CI.
 
-`update_advertisement` replaces only the publisher when only the
-manufacturer data changed, which is Fini's Add Device toggle. When the name
-changes, it also restarts the provider's advertisement. Whether that keeps
-the connected centrals is hardware check 6.
+## Sources
 
-### D5 — The name travels as service data, like on Android
-
-The provider's advertisement cannot set a local name per advertisement.
-The driver sends `local_name`, cut to `NAME_SERVICE_DATA_MAX_LEN`, as service
-data under the served UUID: the same encoding as the Android driver.
-`advertised_name` already reads it there, so Linux and Android scanners
-show the name with no change. As a scanner, the Windows driver reads both
-forms.
-
-### D6 — `disconnect_peer` excludes a central instead of dropping it
-
-WinRT has no call that disconnects a central from a GATT server. Options:
-
-1. Return `Unsupported`. Honest, but `datagram::serve` then cannot refuse a
-   second central at all.
-2. **Exclude it.** Mark the central as excluded until its `GattSession`
-   closes: `notify` skips it, `notify_peer` refuses it, and its writes get
-   ATT error `0x03` (Write Not Permitted) and are not published.
-
-**Decided: option 2.** The refused central stays connected until it gives
-up, but it receives none of the served peer's data. This keeps the
-guarantee that `disconnect_peer` exists for. It is a glossary
-term: [excluded central](../glossary.md#excluded-central).
-
-### D7 — Server-side order and identity
-
-WinRT raises `WriteRequested` on its thread pool. The handler only queues
-the request; one Tokio task answers the requests in arrival order and
-publishes `CharacteristicWritten`, so the fragments of a datagram stay in
-order. `Connected { Peripheral }` is emitted when a central subscribes
-(`SubscribedClientsChanged`) and before each write, with a session minted at
-first sight, as the Android driver does. `Disconnected { Peripheral }` comes
-from `GattSession.SessionStatusChanged` = `Closed`.
-
-Reads of a readable characteristic are answered by Windows from
-`StaticValue` (`initial_value`). `notify_max_len` is
-`GattSubscribedClient.MaxNotificationSize`.
-
-### D8 — Central links
-
-`connect` opens a `GattSession` with `MaintainConnection = true` and
-discovers every service and characteristic uncached, falling back to the
-Windows cache after 5 s (D1); discovery is where WinRT really connects.
-Link loss is `BluetoothLEDevice.ConnectionStatusChanged` to `Disconnected`
-(as in btleplug) or `GattSession.SessionStatusChanged` to `Closed`,
-whichever comes first, reported once as `Disconnected { Central }`. `att_mtu` is
-`GattSession.MaxPduSize`. A second `connect` to an address with a live or
-pending link is refused, as on Android.
-
-### D9 — Threads and `Send`
-
-WinRT handlers run on WinRT threads, so they capture a `Weak<Inner>` and do
-no blocking work. Some `windows` types are not `Send` (`IBuffer`, event
-handler objects); the driver never holds them across an `.await`, because
-`async_trait` futures must be `Send`.
-
-## Hardware verification
-
-Run on the Windows computer with an Android phone running Fini:
-
-1. `capabilities()` reports `central: true, peripheral: true` on the Intel
-   adapter.
-2. Windows scans and finds the phone with its fingerprint and name.
-3. Windows connects to the phone, writes, subscribes and receives
-   notifications (central role).
-4. The phone finds Windows through `advertisement::complete`: one
-   `DiscoveredPeer` with the manufacturer data and the name read from the
-   GATT advertisement (ADR-0012).
-5. The phone connects to Windows, writes, and receives notifications
-   (peripheral role).
-6. Add Device toggles (`update_advertisement`) while the phone stays
-   connected.
-7. Bluetooth off and on: `RadioChanged` both ways, serving recovers
-   (ADR-0010).
-8. A second central is excluded (D6) and gets none of the first one's data.
-
-## Consequences
-
-- Fini can depend on `ble-gatt` on Windows: add the `ble-gatt` dependencies
-  for `cfg(target_os = "windows")` in `src-tauri/Cargo.toml` and remove the
-  Windows stub in `src-tauri/src/services/mod.rs` (separate Fini change).
-- `drivers::platform()`, `PeerLink::new`, `Adapter::platform` and
-  `tauri-plugin-ble-gatt`'s default driver now include Windows.
-- The driver builds natively with the MSVC toolchain, or from Linux with
-  `cargo xwin build --target x86_64-pc-windows-msvc`.
+[1] https://learn.microsoft.com/en-us/uwp/api/windows.devices.bluetooth.genericattributeprofile.gattserviceprovideradvertisingparameters.servicedata

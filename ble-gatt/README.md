@@ -6,7 +6,7 @@ platform drivers. It has no iroh or Tauri dependency.
 
 ## Status: current code and agreed target
 
-The [provisional architecture decision](../docs/adr/0014-core-peer-ownership.md)
+The [shared design under review](../docs/adr/0012-discovery-like-nearby.md)
 sets the target below. The source has not yet been refactored to meet it.
 Current API names in this document describe implemented code; the target
 contract is not a new API that callers can use today.
@@ -19,6 +19,10 @@ Symmetric peer communication belongs here, independently of a network stack:
 - An established BLE connection carries messages in both directions.
 - The library coordinates competing attempts and protects replacement
   connections from stale callbacks or cleanup.
+- The core performs the new endpoint-ID/nonce tie-break. A losing outgoing
+  request reports failure; the incoming winner is processed separately.
+- Stopping discovery/advertising or completing a message does not close healthy
+  communication. Explicit disconnect/cancellation is respected.
 - Platform backoff, native resource ownership and collision recovery stay
   inside the BLE implementation.
 - The high-level peer API has one symmetric initiation behavior. Applications
@@ -110,8 +114,9 @@ is not an authenticated application session.
 - End-to-end authentication and encryption of the messages it carries.
 
 The application decides who is eligible and when communication is wanted.
-The exact high-level request lifetime, discovery scheduling and retry budget
-remain design questions; they are not settled by the symmetric-initiation rule.
+The request/event/release API, protocol encoding, discovery cache policy and
+retry/liveness timing remain review gates in ADR-0012. The Nearby lifecycle and
+attempt-level outcomes are the baseline, not new caller-selected modes.
 
 ## Validation boundary
 
