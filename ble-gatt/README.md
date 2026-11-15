@@ -6,10 +6,9 @@ platform drivers. It has no iroh or Tauri dependency.
 
 ## Status: current code and agreed target
 
-The [shared design under review](../docs/adr/0012-discovery-like-nearby.md)
-sets the target below. The source has not yet been refactored to meet it.
-Current API names in this document describe implemented code; the target
-contract is not a new API that callers can use today.
+The [shared design](../docs/adr/0012-discovery-like-nearby.md) sets the target
+below. The core handshake and migration are not implemented. Current API names
+describe available code, not target signatures.
 
 ## Target responsibility
 
@@ -36,9 +35,7 @@ a peripheral accepts the connection and exposes the GATT service. One connection
 is sufficient for bidirectional messages. Both roles being available separately
 does not prove that a device supports simultaneous crossed attempts.
 
-Raw role operations remain public for third-party devices such as sensors and
-lamps. Those devices need not implement this library's message profile or the
-symmetric peer contract.
+Raw GATT remains public for vendor devices without this message profile or peer contract.
 
 ## Current public surfaces
 
@@ -77,13 +74,12 @@ src/
     mock/         Local simulation and optional cross-process broker
 ```
 
-Apple drivers are not implemented in this source tree.
+Apple drivers are not implemented.
 
 The Android Kotlin bridge currently ships in
 [`tauri-plugin-ble-gatt/android`](../tauri-plugin-ble-gatt/android).
-An Android host must provide compatible bridge packaging and context; lack of a
-Rust Tauri dependency does not mean those native prerequisites disappear.
-Whether host-neutral packaging needs a later change remains open.
+Android hosts need compatible bridge packaging and context even without Rust
+Tauri dependencies. Host-neutral packaging remains open.
 
 ## Resource and error contracts
 

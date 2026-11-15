@@ -1,8 +1,7 @@
 # ble-gatt
 
-Async, transport-agnostic BLE GATT primitives for Rust — **central and
-peripheral role**, no Tauri dependency in the core crate. Built on top of
-established, widely-used crates rather than reinventing plumbing:
+Async BLE GATT primitives for Rust, with **central and peripheral roles** and
+no core Tauri dependency. Uses
 [`bluer`](https://github.com/bluez/bluer) for BlueZ, [`tokio`](https://github.com/tokio-rs/tokio)
 for async/channels, [`thiserror`](https://github.com/dtolnay/thiserror) and
 [`async-trait`](https://github.com/dtolnay/async-trait) for the trait
@@ -38,10 +37,9 @@ operations remain available for vendor protocols.
 iroh users of a carrier. The Tauri plugin supplies host access and setup; it
 is not another packet layer. iroh itself remains an external library.
 
-**This is the agreed direction, not an implemented refactor.** The current
-`PeerLink::Symmetric` and adapter initiation APIs do not yet provide that
-single core-owned contract. See the [architecture map](docs/architecture.md)
-and each crate's README for current behavior, target ownership and open questions.
+**The core handshake and migration are not implemented.** Current
+`PeerLink::Symmetric` and adapter initiation APIs do not provide that contract.
+See the [architecture map](docs/architecture.md) and crate READMEs for current behavior and target ownership.
 
 ADR-0011 owns Windows-native choices; ADR-0012 owns the shared Nearby-inspired
 redesign, including discovery, lifecycle and the new core nonce tie-break required
@@ -81,11 +79,9 @@ that legacy initializer on a runtime that already initializes `ndk-context`;
 `ndk-context` 0.1 has no non-panicking probe for existing ownership. Use `get()`
 for new code instead.
 
-This library **carries bytes; it does not encrypt them.** Layering your own
-session protocol or end-to-end encryption on top is expected and
-supported — and staying out of the way is deliberate, so that consumers
-talking to third-party device firmware (which will never speak your
-protocol) can use the raw GATT API directly. See ADR-0003.
+This library **carries bytes; it does not encrypt them.** Supply your own session
+protocol and security layer. Raw GATT remains available for vendor firmware
+without this library's message protocol. See ADR-0003.
 
 The layer map (what each layer and module is responsible for, and how
 platform modules are designed) is in
@@ -114,9 +110,8 @@ over a socket instead of sharing an in-process `Arc`.
 | Windows (WinRT) | Yes | Yes (where the adapter and driver allow — see `CapabilityReport`) | **M2 — first implementation; bidirectional cross-device acceptance pending.** Earlier build/capability/advertising observations are not proof of the new peer protocol. Shared metadata completion is described in ADR-0012; native choices and verification are in ADR-0011. |
 | macOS / iOS | — | — | M3 — reserved, not implemented |
 
-Capability is always discovered at runtime via `Driver::capabilities()`,
-never assumed from the target OS — an Android device whose driver can't do
-peripheral mode reports that honestly instead of failing opaquely later.
+Read capabilities at runtime with `Driver::capabilities()`. Do not infer support
+from the OS name.
 
 ## Architecture
 
@@ -200,9 +195,8 @@ Read the doc next to each before changing it:
 
 ## Status
 
-Early, under active development. Implemented APIs, the provisional architecture
-and device acceptance are different things. The architecture documentation
-does not certify all drivers, native roles or background scenarios. See
+Under active development. Implemented APIs, target design and device acceptance
+are separate claims. The architecture does not certify native roles or background scenarios. See
 [hardware verification and current iroh diagnostic checklist](docs/hardware-verification.md).
 Not yet published to crates.io/npm — consume as a git dependency, pinned to a
 release tag:

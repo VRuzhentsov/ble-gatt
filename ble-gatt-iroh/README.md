@@ -6,10 +6,9 @@ of the three crates in this workspace. iroh itself is not a workspace crate.
 
 ## Status: current code and agreed target
 
-The [shared design under review](../docs/adr/0012-discovery-like-nearby.md)
-assigns fundamental symmetric BLE behavior to the core. The current adapter
-still contains initiation policies and BLE coordination that need review.
-This document records the boundary; it does not claim that relocation is done.
+The [shared design](../docs/adr/0012-discovery-like-nearby.md) assigns symmetric
+BLE behavior to the core. The adapter still owns initiation policies and BLE
+coordination. The core handshake and migration are not implemented.
 
 ## Target responsibility
 
@@ -23,9 +22,8 @@ users of a carrier. When no iroh user needs the carrier, it releases its use
 through the core's ownership contract. Native connection establishment,
 competing-attempt handling and teardown safety belong in `ble-gatt`.
 
-The adapter requests use/release through the core rather than independently
-dialling, retrying or disconnecting the same native resource. iroh hooks and
-path/user bookkeeping remain here where they describe iroh facts, not OS state.
+In the target, the adapter requests core use/release instead of independently
+dialing, retrying or disconnecting. iroh hooks and path/user accounting remain here.
 
 ## Who owns what
 
@@ -73,8 +71,7 @@ The current transport does not scan or advertise by itself. Its caller supplies
 scan results and channels from `datagram::serve`. The future discovery/request
 API is not chosen by this documentation change.
 
-Current `InitiationPolicy` variants are implementation history, not the target
-public design:
+Current `InitiationPolicy` variants remain implemented, but are not the target:
 
 - `PreviousDialer` is the current default and can yield after incoming loss.
 - `EitherPeer` is the current explicit no-yield mode.
@@ -99,10 +96,9 @@ The adapter implements iroh's `CustomTransport`, `CustomEndpoint` and
 receives packets with address metadata and sends packets to custom addresses.
 Both endpoints need compatible transport support.
 
-The extension is enabled by `unstable-custom-transports`. This is an upstream
-API-stability warning: an iroh update can require adapter changes. It is not a
-statement that BLE or encryption is inherently unreliable. Keep this coupling
-here, review dependency updates, and test the resolved version.
+`unstable-custom-transports` enables the extension. Upstream API changes can
+require adapter changes; the name does not describe BLE or encryption reliability.
+Keep this dependency here. Review updates and test the resolved version.
 
 The manifest's `iroh = "1.3"` is a compatible version requirement, not an exact
 pin. Consult the resolved lockfile and version-matched API documentation.

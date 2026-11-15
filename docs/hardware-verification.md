@@ -1,9 +1,8 @@
 # Hardware verification
 
-This is the shared verification guide for the existing datagram examples, the
-current iroh diagnostic and the new peer design in
-[ADR-0012](adr/0012-discovery-like-nearby.md). It is a procedure, not a claim
-that every scenario below has passed.
+Verify existing datagram examples, the current iroh diagnostic and the target in
+[ADR-0012](adr/0012-discovery-like-nearby.md) separately. This guide lists required
+checks, not passed scenarios.
 
 ## Status and scope
 
@@ -13,16 +12,14 @@ endpoint-ID/nonce handshake.** Old mock/emulator results must not be relabeled a
 acceptance of that design. Windows acceptance is listed in
 [ADR-0011](adr/0011-windows-winrt-driver.md#verification-and-known-limits).
 
-Historical discovery failures, release-JNI mismatches and crossed-start failures
-are scoped observations, not permanent platform prohibitions. In particular,
-an old emulator run with zero scan callbacks does not prove that all emulator
-configurations cannot discover. Missing native scan results remain a separate
-prerequisite/discovery blocker; arbitration cannot repair them.
+Historical discovery, release-JNI and crossed-start failures describe specific runs,
+not permanent platform limits. Zero scan callbacks in one emulator run do not
+prove universal emulator failure. Missing native scan results block discovery;
+arbitration cannot repair them.
 
-No hardware, phone settings or consumer application are changed by the design
-revision. Device testing requires separate authorization and exact build/input
-provenance. Source checks, mocks, packaged JNI execution, native events and
-physical OS teardown are different evidence levels.
+Device testing requires separate authorization and exact build/input provenance.
+The design revision changes no hardware, phone settings or consumer source.
+Source checks, mocks, packaged JNI, native events and physical teardown prove different things.
 
 ## Software checks for the current implementation
 
@@ -81,7 +78,7 @@ not verified targets. Never install over Fini or another application.
 - Keep generated secrets, full keys, addresses, device identifiers and private logs
   outside tracked source. Retain third-party licensing notices.
 
-The service's 190-second bound does not constitute a five-minute idle test.
+The service's 190-second bound does not prove five-minute idle survival.
 Do not extend a run by silently disabling security or keeping a display awake.
 
 ## Current runner inputs
@@ -106,11 +103,10 @@ Android debug properties:
 - Only after install/run authorization, launch the diagnostic package. Between
   runs, stop only that package; clear only its own debug properties afterward.
 
-Use the built example binary with those Linux environment inputs. The main
-scenario has a 180-second timeout including discovery and scheduled waiting;
-some early returns and final shutdown awaits are outside that bound. Do not
-describe all failure cleanup as already bounded. Start the host promptly after
-the phone, or use separate terminals and a common schedule.
+Use the built binary with those Linux inputs. The main scenario's 180-second
+timeout includes discovery and scheduled waiting. Some early returns and final
+shutdown awaits remain outside it; failure cleanup is not fully bounded.
+Start the host promptly after the phone, or use separate terminals and a common schedule.
 Check clocks read-only. Discovery must complete before the scheduled time for
 truly crossed native attempts; the schedule alone proves nothing about overlap.
 

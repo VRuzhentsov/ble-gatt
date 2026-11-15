@@ -1,12 +1,11 @@
-# 0011 — Windows driver: WinRT central and peripheral
+# 0011: Windows driver, WinRT central and peripheral
 
 ## Status
 
-First Windows driver implementation in PR #38; contract gaps and full
-cross-device acceptance remain pending.
-This ADR owns Windows-native choices. Shared discovery, the new core tie-break
-and their pending interfaces belong in [ADR-0012](0012-discovery-like-nearby.md).
-The PR remains draft; the redesign is not implemented by this document.
+PR #38 contains the first Windows implementation. Contract gaps and cross-device
+acceptance remain pending. This ADR covers Windows-native choices;
+[ADR-0012](0012-discovery-like-nearby.md) covers shared discovery and the unimplemented
+core tie-break. The PR remains draft.
 
 ## Decision question
 
@@ -20,9 +19,8 @@ capabilities, events and correctly scoped cleanup. Platform role support is a
 runtime fact; an OS name does not prove peripheral or crossed-attempt support.
 Applications such as Fini consume this contract but do not define the driver.
 
-The earlier provider-plus-manufacturer-publisher proposal was an unmerged draft,
-not a second active design. The current driver uses the GATT provider; shared
-metadata completion handles information omitted from its radio advertisement.
+Use the GATT provider, not the earlier unmerged manufacturer-publisher proposal.
+Shared metadata completion handles information omitted from radio advertisements.
 
 ## Decision
 
@@ -52,8 +50,7 @@ The current module responsibilities are:
 
 The central implementation adapts btleplug code under BSD-3-Clause. Preserve
 its source notices and [license](../../LICENSES/btleplug-BSD-3-Clause.txt).
-The peripheral implementation uses WinRT directly. Copying an existing central
-library wholesale would still leave the server role and shared HAL integration.
+The peripheral implementation uses WinRT directly.
 
 ### 2. Capabilities and addresses
 
@@ -90,10 +87,9 @@ native link loss and translate it to role/session-aware events. Serialize
 server request handling so callback concurrency does not reorder fragments.
 Serve readable values from the current value map, not an immutable initial value.
 
-On the server side, the current implementation can exclude a central: reject
-its writes and omit its notifications until its session ends. This is the
-implementation of peer refusal, not evidence that Windows physically drops the
-remote link. Preserve this distinction in diagnostics and cleanup assertions.
+The server can exclude a central by rejecting writes and omitting notifications
+until its session ends. Exclusion does not prove physical disconnection.
+Keep diagnostics and cleanup assertions explicit about this limit.
 
 Core arbitration selects an attempt; the driver must apply effects to the
 correct owned session. A stale completion must not tear down a replacement.
@@ -111,9 +107,8 @@ capability inferred from two role booleans.
 - Returning success as if exclusion were physical disconnection would overstate
   the native operation. Record the real limit instead.
 
-The core and integrations use one shared driver vocabulary. This does not
-implement the new handshake, change a consumer's dependencies or prove hardware
-interoperability. No Windows-only initiation mode is introduced by the target.
+The target adds no Windows-only initiation mode. Driver integration alone
+proves neither the new handshake nor hardware interoperability and changes no consumer dependencies.
 
 ## Verification and known limits
 
@@ -126,9 +121,8 @@ physical disconnect (`mod.rs`). Callback queue bounds/deferral timing and
 watcher cache/delivery behavior require contract review and native validation.
 These are static findings, not reproduced Windows failures or completed fixes.
 
-The earlier branch record reports Windows builds/tests and adapter capability /
-advertising observations. This documentation revision does not rerun those
-native checks or promote them to bidirectional connection acceptance.
+Earlier branch records report Windows builds/tests, capabilities and advertising.
+This revision reruns no native checks. Those observations do not prove bidirectional acceptance.
 
 Before accepting Windows support, verify on an authorized Windows/Android pair:
 

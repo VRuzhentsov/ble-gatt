@@ -22,12 +22,10 @@ See the [core](../ble-gatt/README.md),
 | moving whole messages to/from one peer and you want to own the connection yourself | **Tier 2 — datagram** |
 | keeping non-iroh byte channels to a set of peers alive over time | **Tier 3 — current `PeerLink`**, with its existing role policy |
 
-Current iroh consumers use the datagram tier through `ble-gatt-iroh`, not the
-existing `PeerLink` controller. The target must reuse core BLE behavior in both
-cases without duplicating lifecycle ownership. The Nearby lifecycle is the
-baseline; exact request/event/release signatures remain open. Losing outgoing
-attempts report failure, and incoming winners proceed through acceptance
-separately. This page's code examples are still the current implementation.
+Current iroh consumers use datagrams through `ble-gatt-iroh`, not `PeerLink`.
+The target must serve both without duplicate lifecycle owners. Request/event/release
+signatures remain open. Losing outgoing attempts fail; incoming winners proceed
+separately through acceptance. Examples below use current APIs.
 
 ---
 
@@ -73,10 +71,8 @@ close for shutdown/revocation/abandoned connects, not candidate rejection.
 
 ## Tier 1 — raw GATT (`Driver`)
 
-Scan, connect, read, write, subscribe; advertise, notify. You speak in
-characteristics and MTUs. This tier imposes nothing — it exists for the
-app-to-device case (a vendor sensor with its own command framing, CRC, and
-challenge/response) where any layer the library added would be dead weight.
+Use characteristics and MTUs directly for vendor protocols. Raw GATT adds no
+message framing, CRC or authentication exchange.
 
 ```rust
 let mut conn = driver.connect(&peer).await?;
@@ -91,10 +87,9 @@ You own everything: when to reconnect, what the bytes mean, how to frame them.
 
 ## Tier 2 — datagram (`datagram::connect` / `datagram::serve`)
 
-An opaque-bytes **message pipe** to one peer. Messages are subject to the
-configured size and reassembly bounds. Fragmentation against the negotiated
-MTU and reassembly are handled inside; boundaries are preserved so you can
-layer encryption on top without implementing GATT fragmentation yourself.
+A channel carries complete opaque messages to one peer, within configured size
+and reassembly bounds. It fragments messages for the negotiated MTU and restores
+boundaries before delivery. Encryption remains outside the channel.
 
 ```rust
 let mut channel = datagram::connect(&adapter, &peer, &config).await?;
@@ -102,13 +97,9 @@ channel.send(encrypted_message).await?;
 let incoming = channel.recv().await?;
 ```
 
-**You still own the connection lifecycle**: deciding to dial, redialing after a
-drop, choosing usable channels, resolving simultaneous-dial glare, recovering
-from an adapter power-cycle. You supply an `Adapter` and run on your own
-runtime — the `DatagramChannel` here holds the `GattConnection` directly. For a
-one-shot transfer or a test that is fine. For a long-lived app-to-app
-relationship it is a lot of machinery to get right — which is why Tier 3
-exists, **on top of this**, not replacing it.
+**You own the lifecycle:** dialing, retry, channel selection, crossed attempts
+and radio recovery. Supply an `Adapter` and runtime. `DatagramChannel` holds its
+`GattConnection` directly. Current `PeerLink` adds lifecycle control above this tier.
 
 ---
 
@@ -137,35 +128,21 @@ let link: Arc<PeerLink> = PeerLink::new(PeerLinkConfig {
 let link = PeerLink::with_driver(driver, config);
 ```
 
-**`PeerLink::new` is synchronous, infallible, and needs no ambient runtime.**
-It returns a handle immediately. Internally it spawns **one dedicated OS thread
-hosting its own Tokio runtime** — the worker, the platform driver, and all
-per-peer machinery live there. So `new()` works in any binary, including one
-with no `#[tokio::main]` (a CLI entry point). Adapter acquisition happens on
-that thread, asynchronously, and may fail or be slow — that shows up as
-`radio()` reporting `Off` or `Unsupported`, not a construction error. "A handle
-exists, the radio may not" is a cleaner story than "the handle may not exist
-yet," and "one call, works anywhere" beats "one call, but only from async
-context" — a requirement a sync signature does not advertise.
+**`PeerLink::new` is synchronous, infallible and needs no ambient runtime.**
+It returns immediately and starts one OS thread with its own Tokio runtime.
+The worker owns the driver and per-peer operations. Asynchronous adapter
+acquisition failures appear through `radio()` as `Off` or `Unsupported`, not constructor errors.
 
-Because the worker owns its own runtime, the `PeerChannel` handed out by
-`PeerLinkEvent::Up` is a **message-passing handle** — `send` / `recv` move bytes
-across a channel to the worker thread, which does the GATT work. It is usable
-from any context (the consumer's runtime, or none). This differs from Tier 2's
-`DatagramChannel`, which holds the `GattConnection` directly and runs on the
-caller's runtime.
+`PeerLinkEvent::Up` supplies a `PeerChannel` message-passing handle. Its `send` /
+`recv` cross to the worker for GATT operations, independently of the consumer's
+runtime. Tier 2 instead runs its owned `GattConnection` on the caller's runtime.
 
 The handle's contract across that hop:
 
-- **`send` returns the real `BleError`, not a flattened string.** In particular
-  `BleError::GattBusy` (a transient GATT rejection worth retrying) stays
-  distinguishable from a permanent refusal — the crossing must not collapse
-  them, or the caller-side retry that replaced the removed internal one
-  (`docs/adr/0005` context) silently becomes retry-everything or retry-nothing.
-- **`recv()` returns `None` when the link is closed** — and worker-thread death
-  maps to `None`, never a hang. A handle whose far end is gone reads as closed.
-- **A full internal send queue surfaces as `BleError::GattBusy`**, not as
-  backpressure indistinguishable from a stall — so it slots into the same retry.
+- **`send` preserves typed `BleError` values.** Keep retryable `BleError::GattBusy`
+  distinct from permanent refusal across the worker boundary (ADR-0005).
+- **`recv()` returns `None` after link closure or worker death**, rather than hanging.
+- **A full send queue returns `BleError::GattBusy`**, so callers can apply the same retry policy.
 - **`request_connection_priority` follows the same crossing rules.** It asks
   the platform for a latency/power trade-off on the live link
   (`ConnectionPriority::LowPower` while idle, `High` while traffic is expected)
@@ -184,12 +161,9 @@ requires a stable identity for its ordering rule. This is existing API behavior,
 not a target requirement for the caller to choose an initiator.
 `retry_budget` and `max_links` have defaults.
 
-`max_links` caps how many peers hold a live link at once, because a BLE central
-has a hard concurrent-link limit (commonly ~7 on Android, higher on BlueZ). You
-may `track()` more peers than that — the extra ones report
-`PeerStatus::Queued` and are promoted when a slot frees (a tracked peer
-disconnects or is `untrack()`ed). The default is conservative (4); raise it if
-you know your platform allows more.
+`max_links` caps live peers. Additional tracked peers report `PeerStatus::Queued`
+until disconnect or `untrack()` frees a slot. The default is 4; increase it only
+when the platform permits more concurrent links.
 
 | `LinkRole` | Behaviour |
 |---|---|
@@ -248,17 +222,11 @@ Waiting                          // a previous attempt failed; backing off befor
 GaveUp                           // the retry budget is spent; left by retry() or an inbound link
 ```
 
-A projection of the library's internal state — you never see the state machine.
+A public view of internal state, not the state machine itself.
 
-**`GaveUp` is reachable in *both* roles.** The dialer reaches it by exhausting
-its redial budget. The acceptor — the side that is *not* the designated dialer
-for a pair — reaches it when no inbound link arrives within the same budget.
-Without the second path an acceptor's row would sit on `Connecting` forever
-(a real past defect in Fini's `accepting_side_unconnected_since` /
-`check_accepting_side_exhaustion`). `GaveUp` is deliberately observable, not
-swallowed: a consumer rendering a "gave up — tap to retry" row needs to *see*
-it and needs `retry(peer)` to restart. `retry_budget` therefore covers both
-"how many redials" and "how long to wait for an inbound link."
+**Both roles can reach `GaveUp`.** Dialers exhaust the redial budget; acceptors
+exhaust the inbound wait budget. Both report exhaustion instead of remaining
+`Connecting` indefinitely. Consumers display `GaveUp` and use `retry(peer)` to restart.
 
 **`RadioStatus::Unsupported`** is reported when the platform has no usable BLE
 adapter for the configured `role` at all (as opposed to `Off`, a toggle). This
@@ -281,22 +249,16 @@ replaces a consumer polling `capabilities()` to guess.
 
 - **which** addresses to `track` (discovery is untrusted; you choose)
 - the **identity** used for the dial tiebreak (`local_id`)
-- **every precondition the library is not** — network availability, a stored
-  address from the consumer's own pairing flow, a per-pair enable/opt-out
-  setting, OS-bond checks the consumer does for its own auth gate. `PeerLink`
-  reports exactly one precondition: the radio. A consumer whose own state
-  machine spans several transports (Fini's is keyed `(peer, transport)` and
-  also serves a network transport) must keep the rest, because `ble-gatt`
-  cannot own preconditions for a transport it is not.
+- **non-radio preconditions:** network availability, paired addresses, per-pair
+  settings and application OS-bond checks. `PeerLink` reports radio state, not
+  eligibility for other transports.
 - everything **above the byte boundary**: authentication, encryption, and any
   app-level liveness proof. The library carries bytes; it cannot know your
   peer's app has stopped answering, only that the BLE link exists.
 
 ### Multiple peers
 
-`PeerLink` is multi-peer from the start — `track()` per peer, `status()` and
-events per peer. Three guarantees make N peers safe rather than N times the
-risk:
+`track()`, `status()` and events operate per peer:
 
 - **Per-peer isolation.** One unresponsive peer does not stall the others. The
   per-peer state machines are independent. The current Linux driver uses
@@ -306,9 +268,8 @@ risk:
 - **The link cap is visible.** More tracked peers than `max_links` → the extra
   ones are `Queued`, not an indistinguishable `Connecting`, and promote when a
   slot frees.
-- **Retry budgets are independent and do not coordinate.** N peers back off on
-  their own ladders against the shared radio; that is deliberate — the only
-  cross-peer arbitration is the `max_links` slot queue.
+- **Retry budgets are independent.** Each peer backs off separately against the
+  shared radio. Only the `max_links` slot queue coordinates peers.
 
 ---
 
@@ -325,14 +286,10 @@ not a description of Fini's current iroh integration. The seam:
 | "Link nominally up but peer silent" | not visible — a dead BLE link is just `Down` | its own `Fading` state |
 | "Gave up retrying" | owned here; exposed as `GaveUp` + `retry()` | *rendered* from that, not tracked |
 
-`PeerLinkEvent::Up` starts the consumer's auth exchange; `Down` ends its
-session. The consumer *renders* `GaveUp` and calls `retry()` on the user's tap,
-but does not track exhaustion itself. What moves out of the consumer entirely:
-the dial loop, backoff maps, and glare/exhaustion apparatus (in Fini's case,
-`dial` / `dial_with_backoff` / `spawn_dial_loop` / `should_dial_peer` wiring and
-four process-global maps whose comments document repeated past P1 fixes). What
-stays: Fini's own pairing-protocol frames over the datagram tier, add-mode UX,
-DB-backed eligibility, and the non-radio preconditions above.
+`PeerLinkEvent::Up` starts application authentication; `Down` ends the session.
+The consumer displays `GaveUp` and calls `retry()` on request. It does not
+duplicate exhaustion tracking, dial loops, backoff maps or crossed-attempt control.
+Pairing frames, pairing UI, stored eligibility and non-radio preconditions remain application concerns.
 
 ---
 

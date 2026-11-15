@@ -2,8 +2,8 @@
 
 The shared target design is [ADR-0012](adr/0012-discovery-like-nearby.md).
 [ADR-0011](adr/0011-windows-winrt-driver.md) owns Windows-native choices.
-These are the only two new ADRs in PR #38. The nonce handshake and core/iroh
-migration remain unimplemented; current API examples are not target signatures.
+The nonce handshake and core/iroh migration are not implemented.
+Current API examples do not define target signatures.
 
 ## Workspace boundaries
 
@@ -23,9 +23,8 @@ Application context, even in a non-Tauri host.
 
 ## Target map
 
-This graph has 19 component nodes. Boxes group responsibilities; arrows show
-selected caller/provider dependencies, not an exhaustive call graph. `Peer
-coordination` is a responsibility, not an approved class or new crate.
+Boxes group responsibilities; arrows show selected caller/provider dependencies,
+not every call. `Peer coordination` does not name an approved class or new crate.
 
 ```mermaid
 flowchart TB
@@ -133,10 +132,9 @@ Existing core metadata completion is opt-in. Its timer-based refresh is not
 Nearby's exact wire protocol. The datagram server still admits one inbound peer;
 this design does not establish Cluster/M-to-N or universal crossed-dial support.
 
-Reuse existing state tables, owned handles, fragment/reassembly code and native
-session guards where their contracts fit. The implementation must make the new
-peer behavior available without integrations and then adapt iroh to it. Current
-API examples remain in [interface.md](interface.md), not in a second draft ADR.
+Reuse state tables, owned handles, fragmentation/reassembly and native guards
+where their contracts fit. Implement peer behavior without integrations, then
+adapt iroh. See [current API examples](interface.md).
 
 ## Layers and validation
 
@@ -155,9 +153,6 @@ adds complete messages. In the iroh composition, QUIC supplies transport streams
 and security above that carrier, and the application supplies its data protocol.
 Tauri setup and power advice are not packet layers. A type named `DataLink`
 does not establish its actual protocol layer.
-
-Generic BLE policy must not require iroh/Tauri types. A diagram does not define
-new Rust signatures, protocol encoding or native concurrency guarantees.
 
 Follow [ADR-0012's migration gates](adr/0012-discovery-like-nearby.md#migration-and-verification-gates-for-this-pr).
 Mock checks, JNI bytecode/packaging checks, observed native sessions and physical

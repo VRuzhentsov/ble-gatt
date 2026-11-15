@@ -1,9 +1,8 @@
 # Glossary
 
-What the words in `ble-gatt` mean. This library is meant for many projects and
-developers, and Bluetooth words are used loosely across the industry, so this
-file fixes one meaning for each. When the code or a document disagrees with
-this file, this file wins.
+This file separates writing rules from the project's technical vocabulary.
+Use one term for each concept. Report conflicts between definitions and code;
+a definition does not change implemented behavior.
 
 **Synonyms.** Where another library or platform uses a different word for the
 same thing, it is listed as *Also called*. Use the first word in code and
@@ -12,6 +11,28 @@ documents.
 Current API descriptions and provisional target requirements are distinct.
 The target in [ADR-0012](adr/0012-discovery-like-nearby.md) does not rename or
 change an existing API by documenting a new responsibility boundary.
+
+## Writing and naming rules
+
+Apply these STE-based rules to new or touched names, comments, logs, documents
+and pull request text. The technical terms below form the company glossary;
+they define meaning, not sentence structure.
+
+- Use active voice, American English and complete words. Do not use contractions.
+- Give one instruction per sentence. Aim for at most 20 words in procedures
+  and 25 words in descriptions. Use lists for complex conditions.
+- Remove repetition. State the decision, owner, contract and evidence limit.
+- Split a proposed name into words. Use established English and glossary terms
+  with one meaning. Explain new technical terms before adding them below.
+- Keep existing Rust/module naming conventions. Do not import another application's
+  role suffixes or directory layout.
+- Preserve public APIs, protocol fields, foreign names, quoted errors and source
+  identifiers. A writing pass does not authorize compatibility changes.
+- Separate current behavior, target requirements and verification. Preserve
+  accepted historical ADRs and third-party attribution.
+
+These are local writing rules, not verified ASD-STE100 dictionary compliance or
+certification. Do not copy the copyrighted ASD dictionary into this repository.
 
 ## Bluetooth basics
 
@@ -148,7 +169,7 @@ An advertisement a central can answer by connecting. A non-connectable
 advertisement only carries data. The current Windows driver uses its GATT
 provider advertisement and a readable GATT advertisement characteristic; it
 does not publish a second manufacturer-data radio advertisement. ADR-0012
-replaced the earlier ADR-0011 D4 design.
+defines shared discovery; ADR-0011 defines Windows-native behavior.
 
 ### Peripheral role support
 Whether a Bluetooth adapter and its driver can run a GATT server and
@@ -161,21 +182,22 @@ advertise it. Not every adapter can. Windows reports it as
 A central that `disconnect_peer` refused but the platform cannot drop.
 Windows has no call that disconnects a central from a GATT server, so the
 Windows driver stops notifying it and refuses its writes until it leaves by
-itself (ADR-0011 D6).
+itself (ADR-0011, native events and cleanup limits).
 
 ## This library's concepts
 
 ### Fast advertisement
 Advertisement data that travels in the radio advertisement itself, so a
-scanner reads it without connecting. What Android and Linux peers send.
-The name is Google Nearby's (ADR-0012).
+scanner reads it without connecting. Android and Linux peers can send it.
+The term comes from Google Nearby (ADR-0012).
 
 ### GATT advertisement
 The same advertisement data, served in a readable characteristic
 (`advertisement::GATT_ADVERTISEMENT_CHARACTERISTIC`) of every datagram
 service. A scanner reads it when a peer's radio advertisement carries no
-data, which is how a Windows or Apple peer looks (`advertisement::complete`,
-ADR-0012). Nearby keeps its full advertisement in GATT the same way.
+profile data (`advertisement::complete`, ADR-0012). Select completion from received
+information, not the OS name. Nearby also retrieves full metadata through GATT;
+this library does not implement its exact header/hash protocol.
 
 ### Peer
 Another device this library talks to.

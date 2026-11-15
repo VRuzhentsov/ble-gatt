@@ -1,96 +1,75 @@
-# 0012 — Nearby-inspired BLE peer communication
+# 0012: Nearby-inspired BLE peer communication
 
 ## Status
 
-Design under review in PR #38. The responsibility boundaries, Nearby lifecycle
-and attempt-level tie-break outcomes were agreed in chat. The exact Rust API,
-control-message encoding and remaining platform contracts still need review.
+Design under review in PR #38. The agreed contracts include responsibility
+boundaries, the Nearby lifecycle and attempt-level tie-break outcomes.
+Rust interfaces, control encoding and remaining platform contracts need review.
 The core nonce handshake and adapter migration are **not implemented**.
+They are completion requirements of **this PR**, not follow-up work.
 
-This is the single new shared-design ADR for this PR. Windows-specific native
-operations belong in [ADR-0011](0011-windows-winrt-driver.md). The other new,
-unmerged design drafts are consolidated here, not retained as superseding ADRs.
-Earlier accepted ADRs remain records of their implemented contracts.
-
-The new core tie-break is a completion requirement of **this PR**, not merely
-a possible follow-up. Publishing this design does not complete that requirement.
-
-## Decision question
-
-How can the reusable core provide equal-peer discovery, connection establishment
-and messages across platform drivers, following Google Nearby's mechanisms,
-without making iroh or Tauri the owner of generic BLE behavior?
-
-## Context and constraints
-
-One BLE connection already carries traffic both ways: central writes and
-peripheral notifications. Symmetric establishment is a different problem:
-either eligible peer must be able to initiate without a permanent device ranking.
-
-We follow Nearby's behavior and selected mechanisms while retaining our own BLE
-protocol. This is not Google Nearby SDK or wire-protocol interoperability.
-Raw GATT remains available for devices that speak a vendor protocol.
-
-The architecture diagram is in [architecture.md](../architecture.md). Its boxes
-are responsibilities, not approval of new class names or another crate.
+This ADR consolidates the shared design. [ADR-0011](0011-windows-winrt-driver.md)
+covers Windows-native choices. Earlier accepted ADRs retain their historical contracts.
 
 ## Decision
 
-### 1. Responsibility boundaries
+Provide discovery, connection establishment and messages in the reusable core,
+without requiring iroh or Tauri. Follow selected Google Nearby mechanisms with
+our own BLE protocol, not Google SDK or wire-protocol interoperability.
+Keep raw GATT available for vendor protocols.
 
-- **Core `ble-gatt`:** discovery completion, peer establishment and acceptance,
-  competing-attempt arbitration, complete messages, liveness and ownership of
-  native connection use. This must work without iroh or Tauri.
-- **Drivers:** implement `Driver` / `GattConnection`; own OS objects, callbacks,
-  serialized native operations and generation-aware effects. Report platform
-  limits instead of pretending a requested native action succeeded.
-- **`ble-gatt-iroh`:** translate packets/addresses and account for iroh users of
-  a core carrier. Keep authenticated-key mapping and QUIC path facts here.
+### 1. Responsibilities
+
+- **Core `ble-gatt`:** discovery completion, establishment, acceptance, competing
+  attempts, complete messages, liveness and ownership of native connection use.
+- **Drivers:** implement `Driver` / `GattConnection`. Own OS objects, callbacks,
+  serialized native operations and generation-aware effects. Report native limits.
+- **`ble-gatt-iroh`:** translate packets/addresses and account for iroh carrier
+  users. Retain authenticated-key mappings and QUIC path facts.
 - **External iroh:** QUIC authentication, encryption, streams and path selection.
-- **Tauri plugin:** application access, permissions, lazy construction and Android
-  host context/bridge setup. It is not an obligatory packet-processing hop.
-- **Applications:** permitted peers, product pairing, acceptance policy and their
-  data/session protocol. Acceptance may be automated; no dialog is mandated.
+- **Tauri plugin:** host access, permissions, lazy construction and Android
+  context/bridge setup. Packet traffic need not pass through it.
+- **Applications:** permitted peers, product pairing, acceptance policy and
+  application data/session protocols. Acceptance can be automatic; no dialog is required.
 
-Core `Adapter` means local radio access. An integration adapter means a crate
-that translates another stack's contract. Central/peripheral are roles of a
-particular BLE connection, not permanent identities assigned to applications.
+Core `Adapter` provides local radio access. An integration adapter translates
+another stack's contract. Central/peripheral are connection roles, not permanent
+application identities. One BLE connection already carries traffic both ways
+through central writes and peripheral notifications.
 
-Two independent retry/close loops must not control the same native resource.
-Adapters request use/release through the core; drivers perform scoped native
-operations. This does not prohibit complementary central and peripheral roles.
+Do not give two independent retry/close loops control of one native resource.
+Adapters request use/release through the core; drivers perform scoped effects.
+Complementary central and peripheral roles remain possible.
+The [architecture map](../architecture.md) groups responsibilities, not approved new types or crates.
 
 ### 2. Discovery and metadata
 
-**Reference.** Nearby separates advertising/discovery from requesting a
-connection.[5][9] Its BLE tracker supports full information fetched through
-GATT, successful-read caching and retry decisions.[2] The inspected Windows
-implementation also recognizes an alternate-UUID-only advertisement and
-constructs an internal header to trigger GATT retrieval.[3]
+**Reference.** Nearby separates advertising/discovery from connection requests.[5][9]
+Its BLE tracker fetches full information through GATT, caches successful reads
+and selects retries.[2] Its Windows implementation can use an alternate-UUID-only
+advertisement to construct an internal header and trigger GATT retrieval.[3]
 
-**Core contract.** Radio metadata sufficient for the profile takes the fast
-path. Otherwise discovery obtains the missing metadata through GATT and emits
-the same discovered-peer information. A metadata read is not an established
-message connection. Its cleanup releases only resources it owns.
+**Core contract.** Use radio metadata when it satisfies the profile. Otherwise,
+fetch missing metadata through GATT and emit the same discovered-peer information.
+A metadata read does not establish a message connection. Release only resources
+owned by that read.
 
-The decision depends on received information and advertised profile support,
-not `if Windows`. Shared code owns parsing, cache/retry policy and cancellation;
-drivers report advertisements and implement reads/value updates.
+Select this behavior from received information and profile support, not `if Windows`.
+Shared code owns parsing, cache/retry policy and cancellation. Drivers report
+advertisements and implement reads/value updates.
 
-**Platform boundary.** WinRT `ServiceData` is included only when space is
-available; `StartedWithoutAllAdvertisementData` can report partial inclusion.
-Extended-advertisement capacity is platform-dependent.[1] This is not a blanket
-claim that Windows cannot advertise service data or exchange the metadata.
+WinRT includes `ServiceData` when space permits and can report
+`StartedWithoutAllAdvertisementData`. Extended-advertisement capacity depends on
+the platform.[1] Windows is not universally unable to advertise service data or exchange metadata.
 
-**Difference to resolve.** Today's helper uses timer-based refresh and an
-opt-in completion stream. That is not Nearby's exact header/hash protocol.
-Select cache freshness, bounded retry and cancellation rules before migration;
-do not invent Windows-only lifecycle rules or require Google's assigned UUID.
+Today's opt-in helper uses timer-based refresh, not Nearby's exact header/hash
+protocol. Select cache freshness, bounded retry and cancellation before migration.
+Do not require Google's assigned UUID or invent a Windows-only lifecycle.
 
 ### 3. Connection lifecycle
 
-**Reference.** After a request, both sides receive initiation information and
-must accept before the connection is established. Either can reject.[5]
+**Reference.** After a request, both sides receive initiation information.
+Both must accept before establishment; either can reject.[5]
 
 ```text
 advertise / discover -> discovered peer -> request
@@ -98,210 +77,181 @@ advertise / discover -> discovered peer -> request
     -> established bidirectional messages -> disconnected
 ```
 
-**Core contract.** Discovery does not automatically establish a message
-connection to every peer. Both eligible peers may request communication;
-the core coordinates those attempts. There is one symmetric peer behavior,
-not public `PreviousDialer`, `EitherPeer` or identity-ordered modes.
+**Core contract.** Discovery does not connect every peer automatically. Either
+eligible peer can request communication. The core coordinates attempts through
+one symmetric behavior, without public `PreviousDialer`, `EitherPeer` or identity-ordered modes.
 
-Stopping discovery or advertising preserves established communication, as in
-Nearby's documented API.[10] Keep native objects required by active channels.
-A raw server-stop operation is not the same action as stopping discoverability.
+Stopping discovery or advertising preserves established communication, as Nearby
+documents.[10] Retain required native objects. Stopping a raw server is a different operation.
 
-Message completion does not release a healthy connection. Nearby's endpoint
-workers include keep-alive/loss detection independent of payloads.[11] Liveness
-belongs in the core with driver events; exact wire messages/timing remain open.
+Completing a message preserves a healthy connection. Core liveness uses driver
+events independently of payloads. Nearby's endpoint workers provide keep-alive/loss
+detection; exact core wire messages and timing remain open.[11]
 
-Explicit disconnect ends communication and outstanding transfers; cancellation
-can also stop establishment.[10] Do not undo it with an independent reconnect
-loop. A losing candidate or a single iroh user ending is not global disconnect.
+Explicit disconnect ends communication and outstanding transfers. Cancellation
+can also stop establishment.[10] An independent loop must not undo either action.
+A losing candidate or one iroh user ending is not a global disconnect.
 
-Nearby's inspected workers can continue on an available replacement channel;
-without one, they discard the endpoint and notify disconnection.[11] Internal
-channel recovery and a new request after terminal disconnection are distinct.
-This does not add Wi-Fi upgrades or promise indefinite automatic reconnection.
+Nearby workers can use an available replacement channel. Without one, they
+discard the endpoint and report disconnection.[11] Internal recovery differs from
+a new request after terminal disconnection. This design adds neither Wi-Fi upgrades
+nor indefinite automatic reconnection.
 
-### 4. Endpoint correlation and the new tie-break
+### 4. Endpoint correlation and tie-break
 
-**Reference.** Nearby's request includes an endpoint ID and a random signed
-32-bit nonce generated for each outgoing attempt.[4][13] Endpoint IDs are
-managed separately and can be retained while connections are ongoing.[12]
+**Reference.** Nearby outgoing requests contain an endpoint ID and a fresh random
+signed 32-bit nonce.[4][13] It manages endpoint IDs separately and can retain them
+during ongoing connections.[12]
 
-**Core contract.** Correlate competing incoming/outgoing requests using a
-core protocol endpoint identifier, not an iroh key, display name or ordered
-native address. Discovery and handshake must describe the same endpoint.
-Distinguish that endpoint, a connection attempt and a native session generation.
-None of these values alone authenticates the remote party.
+**Core contract.** Correlate incoming/outgoing requests with a core endpoint
+identifier, not an iroh key, display name or ordered native address. Discovery
+and handshake must identify the same endpoint. Keep endpoint, attempt and native
+session generation distinct. None alone authenticates the remote party.
 
 Follow the reference's attempt-level arbitration:[4]
 
-- Outgoing nonce greater than incoming: retain outgoing, close incoming attempt.
-- Incoming nonce greater than outgoing: close outgoing, continue incoming attempt.
-- Equal nonces: fail both attempts; any fresh attempt gets a fresh nonce.
-- An already-established endpoint is not re-arbitrated by an ordinary duplicate
-  incoming request. A duplicate local request must not spawn another native dial.
+- Outgoing nonce greater than incoming: retain outgoing; close incoming.
+- Incoming nonce greater than outgoing: close outgoing; continue incoming.
+- Equal nonces: fail both; use a fresh nonce for each fresh attempt.
+- An ordinary duplicate incoming request does not re-arbitrate an established endpoint.
+- A duplicate local request must not start another native dial.
 
-**Observable outcome.** Preserve Nearby's attempt-level behavior: the losing
-outgoing request reports failure/rejection, while the winning incoming request
-is processed separately through acceptance.[4] Do not silently fulfill the
-outgoing request with the incoming survivor. Attempt failure and established
-peer disconnection are different events.
+The losing outgoing request reports failure/rejection. Process the winning incoming
+request separately through acceptance.[4] **Do not silently fulfill the outgoing
+request with the incoming survivor.** Attempt failure differs from established-peer disconnection.
 
-These are BLE establishment outcomes, not a rule that one outgoing QUIC
-connection must fail. Multiple authenticated iroh connections may share the
-winning carrier. Preserve that distinction in adapter migration and tests.
+These are BLE outcomes, not a requirement to fail an outgoing QUIC connection.
+Multiple authenticated iroh connections can share the winning carrier.
 
-**Ownership.** Close only the losing attempt. Stale completion/cancellation must
-not close its replacement or remove its queue. Native generation protection
-and operation serialization stay around the actual effects, not just in a
-separate policy check. WinRT exclusion is not proof of physical disconnection.
+Close only the losing attempt. Stale completion/cancellation must not close its
+replacement or remove its queue. Apply generation guards and serialization around
+native effects, not only in a separate policy check. WinRT exclusion does not
+prove physical disconnection.
 
-Arbitration requires delivery of the initial requests. A nonce cannot repair
-an OS attempt rejected before that exchange. Separate role capabilities do not
-prove simultaneous-role or crossed-attempt support.
+Requests must arrive before arbitration can run. A nonce cannot repair an OS
+rejection before that exchange. Separate role capabilities do not prove simultaneous-role or crossed-attempt support.
 
-### 5. Protocol and security effects
+### 5. Protocol and security
 
-The peer profile needs explicit version/capability detection and bounded
-control-message handling. Older peers must not be silently assumed to support
-arbitration. Specify compatibility behavior before replacing current callers.
+Require explicit version/capability detection and bounded control handling.
+Define compatibility before replacing callers; older peers might not support arbitration.
 
-Keep control records distinct from application payloads. Reuse bounded datagram
-fragmentation/reassembly without interpreting QUIC or guessing from arbitrary
-payload prefixes. Exact encoding, endpoint representation and numeric comparison
-encoding must be fixed together; different peers must select the same attempt.
+Separate control records from application payloads. Reuse bounded datagram
+fragmentation/reassembly without interpreting QUIC or guessing from payload prefixes.
+Fix control encoding, endpoint representation and numeric comparison together.
+Both peers must select the same attempt.
 
-Do not inject this handshake into generic raw GATT operations. The existing
-carrier-not-crypto boundary in [ADR-0003](0003-carrier-not-crypto-and-the-two-api-tiers.md)
-remains: correlation/acceptance is not authentication or encryption. iroh supplies
-those properties for its composition; a non-iroh consumer needs its own security
-layer. Borrowing arbitration does not give our profile Nearby's complete
-security guarantees. Document threat assumptions before implementation.
+Keep the handshake out of raw GATT. [ADR-0003](0003-carrier-not-crypto-and-the-two-api-tiers.md)
+still applies: correlation and acceptance provide neither authentication nor
+encryption. iroh supplies security in its composition; other consumers need their
+own layer. Borrowing arbitration does not provide Nearby's complete security guarantees.
+Document threat assumptions before implementation.
 
 ## Current implementation gap
 
-This section describes current code, not a second target design:
+Current code differs from the target:
 
-- Windows implements the common native ports; shared metadata completion and
-  `set_characteristic_value` already cross native/mock/wrapper boundaries.
-- `advertisement::complete` is opt-in. Its timer-based refresh, cancellation and
-  failure-budget behavior need review; raw scans do not inherit completion.
-- `datagram::connect` and `serve` remain separate. There is no shared core
-  endpoint-ID/nonce establishment contract.
-- The iroh adapter still implements `InitiationPolicy`, defaulting to
-  `PreviousDialer`. `EitherPeer` and `Ordered` remain current API variants.
-- It retains crossed candidates, protects current iroh users from idle release,
-  reconciles path snapshots and separates current use from address history.
-  These are not tests of the new core tie-break. Preserve necessary iroh usage
-  accounting without retaining independent native arbitration.
-- Existing `PeerLink::Symmetric` chooses a lower-`LinkId` dialler. It is not the
-  target or an approved class to place under the adapter. Reuse suitable state
-  tables, handles and guards only after their contracts are checked.
-- The datagram server still admits one inbound peer. This design does not claim
-  Nearby Cluster/M-to-N support merely because it adopts equal-peer initiation.
-- Android's Rust driver needs a compatible native bridge/context. Kotlin lives
-  in the Tauri plugin today; host-neutral packaging is not decided here.
+- Windows implements common native ports. Shared metadata completion and
+  `set_characteristic_value` cross native, mock and wrapper boundaries.
+- `advertisement::complete` is opt-in and uses timer refresh. Raw scans do not
+  inherit completion. Cache freshness and safe reads during active communication remain open.
+- `datagram::connect` and `serve` are separate. No shared core endpoint-ID/nonce contract exists.
+- The iroh adapter still exposes `InitiationPolicy`: `PreviousDialer` is the
+  default; `EitherPeer` and `Ordered` remain implemented.
+- It retains crossed candidates, protects current users from idle release and
+  reconciles path snapshots separately from address history. Preserve iroh usage
+  accounting, not independent native arbitration. These tests do not verify the new tie-break.
+- Existing `PeerLink::Symmetric` selects a lower-`LinkId` dialler. It is not the
+  target controller. Check contracts before reusing state tables, handles or guards.
+- The datagram server admits one inbound peer. Equal-peer initiation does not establish Cluster/M-to-N support.
+- Android needs a compatible native bridge/context. Kotlin currently lives in
+  the Tauri plugin; host-neutral packaging remains open.
 
-Whole-PR source review also identifies these concrete contract gaps. They are
-static findings, not reproduced native failures or fixes made by this design:
+The following distinguishes software fixes from remaining source findings. Native behavior remains unverified:
 
-- Visibility and serving are bundled: current `stop_advertising` /
-  `stop_serving` can destroy serving and active communication. Separate these
-  intents in the generic contract before claiming Nearby stop semantics.
-- [Metadata completion](../../ble-gatt/src/profile/advertisement.rs) has no
-  cancellation-safe disconnect guard across its read; exhausted entries can be
-  recreated with a fresh budget. Preserve bounded failure state, interruptible
-  scan ownership and explicit completeness under repeated sightings.
-- [Metadata publication](../../ble-gatt/src/profile/datagram/mod.rs) updates
-  radio data and readable values separately. Define coherent generations,
-  setter eligibility and partial-failure recovery rather than calling it atomic.
+- Current `stop_advertising` / `stop_serving` can destroy serving and active
+  communication. Separate visibility from serving before claiming Nearby stop semantics.
+- [Metadata completion](../../ble-gatt/src/profile/advertisement.rs) now reuses
+  `Connection` cleanup and retains exhausted budgets in a bounded table.
+  Regression tests cover timeout, output cancellation and repeated sightings.
+  Cleanup after an acquired connection is dropped remains asynchronous and needs
+  a running Tokio runtime. Native teardown and cancellation during acquisition remain unverified.
+- [Metadata publication](../../ble-gatt/src/profile/datagram/mod.rs) updates radio
+  data and readable values separately. Define coherent generations, setter
+  eligibility and partial-failure recovery; do not call it atomic.
 - Windows acquisition/subscription cleanup and close/exclusion reporting need
-  contract work; see ADR-0011. [Watcher](../../ble-gatt/src/drivers/windows/watcher.rs)
-  delivery overflow/cache expiry must not permanently hide a discovered peer.
-- Android scan-start exception rollback needs a regression: assigning callback
-  ownership before a throwing native start can leave later starts busy. Preserve
-  a genuinely active scan while rolling back only the failed acquisition.
-- The diagnostic's main timeout does not bound every early return or final
-  shutdown await. The sample is a separate workspace; root checks do not prove
-  its packaging, compiled JNI descriptors or native execution.
+  contract changes; see ADR-0011. [Watcher](../../ble-gatt/src/drivers/windows/watcher.rs)
+  overflow/cache expiry must not permanently hide a discovered peer.
+- Android needs a scan-start exception rollback regression. A throwing native
+  start can leave assigned callback ownership busy. Roll back only failed
+  acquisition; preserve a genuinely active scan.
+- The diagnostic's 180-second main timeout excludes some early returns and final
+  shutdown awaits. The sample is a separate workspace. Root checks prove neither
+  its packaging, compiled JNI descriptors nor native execution.
 
-Current API examples remain in [interface.md](../interface.md). Diagnostic
-instructions are in [hardware-verification.md](../hardware-verification.md).
+See [current APIs](../interface.md) and [diagnostic procedures](../hardware-verification.md).
 
 ## Alternatives and consequences
 
-Keeping the three initiation modes, or merely making `EitherPeer` the default,
-would leave fundamental behavior in an optional integration. Not selected.
-A permanent identity-ranked initiator would violate either-peer establishment.
-Nesting independent controllers would duplicate native retry/teardown ownership.
+- Keeping initiation modes, or defaulting to `EitherPeer`, leaves core behavior
+  in an optional integration. Permanent identity ranking prevents either-peer initiation.
+- Nesting controllers duplicates native retry/teardown ownership.
+- The full Nearby SDK/protocol exceeds the selected mechanisms and own-protocol scope.
+- Returning the incoming winner as outgoing success changes the chosen attempt-level semantics.
 
-Using the full Nearby protocol/SDK would change scope beyond selected mechanisms
-and our own protocol. Not selected. Returning the incoming winner as success to
-the outgoing caller would simplify some consumers but change the chosen
-attempt-level semantics. Not selected.
-
-The selected design requires a versioned protocol and a real core/adapter
-refactor. Windows support and old candidate tests cannot substitute for it.
-Existing consumers need an explicit migration, not a dependency update alone.
+The selected design needs a versioned protocol, core/adapter refactor and explicit
+consumer migration. Windows support and old candidate tests do not satisfy it.
 
 ## Remaining interface decisions before implementation
 
-- Rust request/event/accept/reject/cancel/close interfaces, duplicate-request
-  errors and awaited release semantics for shared users.
-- Endpoint-ID representation and lifetime; bounded control encoding, version
-  negotiation and compatibility with the current metadata/datagram formats.
-- Handshake deadlines, liveness timing, retry/backoff after failure/equal nonces
-  and the terminal point at which the application receives disconnection.
-- Atomic session-scoped cleanup across each driver, including busy operations,
-  native role collisions and WinRT's exclusion versus physical disconnect.
-- Discovery cache freshness, retry budget and cancellation under an active link;
-  non-Tauri Android bridge/context packaging if its current path is insufficient.
+- Request/event/accept/reject/cancel/close APIs, duplicate-request errors and awaited shared-user release.
+- Endpoint representation/lifetime, bounded encoding, version negotiation and metadata/datagram compatibility.
+- Handshake deadlines, liveness, failure/equal-nonce backoff and terminal disconnection reporting.
+- Atomic session-scoped cleanup across drivers, busy operations, native role
+  collisions and WinRT exclusion versus physical disconnect.
+- Discovery freshness, retry budget, cancellation under active use and non-Tauri Android packaging where needed.
 
-These are explicit review gates, not approved public types or hidden defaults.
-Do not create more ADRs to decide sections of this same unmerged design.
+Keep these gates in this consolidated design. They do not approve public types or defaults.
 
 ## Migration and verification gates for this PR
 
-1. Fix the remaining contracts and legal-reuse scope before source changes.
-2. Implement establishment/arbitration in the core and test without iroh/Tauri:
-   either initiator, crossed attempts, equal nonces, rejection, attempt-specific
-   outcomes, duplicate requests and healthy-connection preservation.
-3. Exercise metadata reads, cancellation at each acquisition boundary, bounded
+1. Resolve remaining contracts and legal-reuse scope before implementation.
+2. Implement core establishment/arbitration without iroh/Tauri. Test either
+   initiator, crossed attempts, equal nonces, rejection, attempt outcomes,
+   duplicate requests and healthy-connection preservation.
+3. Test metadata reads, cancellation at each acquisition boundary, bounded
    failures, stale callbacks, stop-discovery/advertising during communication,
    idle liveness and explicit disconnect without unintended reconnect.
-4. Adapt iroh to the core; retain key/path/user accounting. Prove that one QUIC
-   connection ending does not release another user's carrier. Retire old public
-   initiation modes and candidate-specific assertions only with replacements.
-5. Verify every native driver, mock/broker forwarding, JNI/context and Tauri
-   wrapper touched by a contract change. Preserve generic raw GATT behavior.
-6. Run core and integration software checks, then separately authorized native
-   and physical acceptance for Windows/Linux/Android and actual consumer use.
-
-The existing diagnostic tests the current iroh candidate model. Mock results,
-packaged JNI execution, observed native sessions and exhaustive physical teardown
-are different evidence levels. Old results do not certify the new handshake.
+4. Adapt iroh; retain key/path/user accounting. Prove that ending one QUIC
+   connection preserves another user's carrier. Replace old modes and candidate
+   assertions only when replacement tests exist.
+5. Verify affected native drivers, mock/broker forwarding, JNI/context and Tauri
+   wrappers. Preserve raw GATT behavior.
+6. Run software checks. Require separate authorization for native/physical
+   Windows/Linux/Android acceptance and actual consumer checks.
 
 Retain busy/private-address safety, idle survival, stale-generation protection,
-current-versus-historical iroh paths and multi-user release tests. Replace public
-mode-specific and no-tie-break carrier expectations with core arbitration tests;
-do not replace valid multiple-QUIC-user expectations. Keep source-level JNI
-guards, and separately require bytecode/packaging/runtime checks where needed.
+current-versus-historical paths and multi-user release tests. Replace mode-specific
+and no-tie-break carrier expectations with core arbitration tests, not multiple-QUIC-user expectations.
+Keep source JNI guards separate from bytecode, packaging and runtime checks.
 
-A scan delivering no native results remains a discovery blocker, not evidence
-against arbitration. No device settings or consumer source change in this
-revision. Keep PR #38 draft until its implementation/acceptance gates are met.
+The current diagnostic tests the old candidate model. Mocks, packaged JNI,
+observed native sessions and exhaustive physical teardown prove different things.
+Old results do not certify the new handshake. Missing native scan results block
+discovery, not arbitration. This revision changes no device settings or consumer source.
+Keep PR #38 draft until implementation and acceptance gates pass.
 
 ## Reuse and licensing
 
-Nearby's inspected implementation is Apache-2.0 licensed.[7] The license permits
-adaptation subject to its conditions, including distributed license/notices,
-modified-file notices and applicable `NOTICE` attribution.[8] Its patent grant
-is scoped and it does not generally grant trademark rights.[8]
+Nearby's inspected implementation uses Apache-2.0.[7] Adaptation must meet license
+conditions, including distributed license/notices, modified-file notices and
+applicable `NOTICE` attribution. Its patent grant is scoped; it does not generally
+grant trademark rights.[8]
 
-This design revision copies no implementation code. Before a port, inspect the
-specific file headers, applicable notices and dependencies; preserve their
-attribution/license requirements. This is not blanket legal clearance for a
-complete interoperable implementation or permission to replace existing notices.
-The existing btleplug BSD notice remains attached to Windows code.
+This design revision copies no implementation code. Before a port, inspect file
+headers, notices and dependencies. Preserve their attribution/license requirements.
+This is not blanket clearance for an interoperable implementation or replacement notices.
+Keep the existing btleplug BSD notice with the Windows code.
 
 ## Sources
 

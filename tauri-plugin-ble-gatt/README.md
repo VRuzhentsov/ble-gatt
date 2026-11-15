@@ -7,10 +7,9 @@ It is not a networking transport and has no iroh dependency.
 
 ## Status: current code and agreed target
 
-The [shared design under review](../docs/adr/0012-discovery-like-nearby.md)
-keeps BLE peer behavior in the core and Tauri-specific setup here. Most current
-plugin responsibilities already follow that split. This documentation does
-not add a new symmetric-peer JavaScript API or move the Android bridge.
+The [shared design](../docs/adr/0012-discovery-like-nearby.md) keeps BLE peer
+behavior in the core and Tauri setup here. The core handshake is not implemented.
+No symmetric-peer JavaScript API or Android bridge relocation is implemented here.
 
 ## Responsibilities
 
@@ -39,12 +38,10 @@ Tauri Rust application -- shared Adapter ---+
 Tauri Rust application --> iroh --> ble-gatt-iroh --> ble-gatt
 ```
 
-The second path uses the same core adapter supplied by the plugin. It does not
-require QUIC packets to cross JavaScript IPC. The plugin is a setup/access path,
-not an additional packet layer between `ble-gatt-iroh` and the core.
-A non-Tauri application can use the core without this plugin's Rust API.
-On Android it still needs the native bridge/context prerequisites described
-below.
+The second path uses the plugin's shared core adapter without sending QUIC
+packets through JavaScript IPC. The plugin supplies setup/access, not another
+packet layer. Non-Tauri hosts can use the core directly; Android still needs
+the bridge/context prerequisites below.
 
 ## Current entrypoints
 
@@ -91,9 +88,8 @@ blocking task rather than the UI thread. Permission grants do not by themselves
 prove that background discovery or a locked-device scenario works.
 
 The Kotlin implementation currently lives in this crate's [`android/`](android)
-directory even though the Rust driver is in the core. Host-neutral packaging
-for a non-Tauri Android application remains an explicit follow-up question;
-no new crate or bridge relocation is selected here.
+directory, while the Rust driver lives in the core. Host-neutral packaging
+remains open; no new crate or bridge relocation is selected.
 
 ## Modules and acceptance
 
