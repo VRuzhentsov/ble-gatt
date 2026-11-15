@@ -42,7 +42,8 @@ use async_trait::async_trait;
 use jni::objects::{GlobalRef, JByteArray, JClass, JIntArray, JObject, JObjectArray, JString, JValue};
 use jni::sys::{jboolean, jint, jlong};
 use jni::{JNIEnv, JavaVM};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
+use crate::drivers::event_bus::EventBus;
 use tokio_stream::wrappers::ReceiverStream;
 
 /// Scan results buffered before the oldest are dropped. Advertisements are
@@ -98,7 +99,8 @@ const CALLBACK_CLASS: &str = "dev/blegatt/NativeKt";
 /// `requestConnectionPriority`. v4 added the local-name byte array to
 /// `startAdvertising`. v5 added `setCharacteristicValue` (ADR-0012).
 /// v6 changed `startScan` from a boolean to a scan-start status code.
-const BRIDGE_ABI_VERSION: i32 = 6;
+/// v7 added visibility-only `setAdvertisingEnabled`.
+const BRIDGE_ABI_VERSION: i32 = 7;
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 
@@ -166,6 +168,10 @@ struct ScanState {
     service: Option<ServiceUuid>,
 }
 
+#[path = "advertisement_outcome.rs"]
+mod advertisement_outcome;
+use advertisement_outcome::PendingAdvertisement;
+
 struct Inner {
     vm: JavaVM,
     context: GlobalRef,
@@ -181,7 +187,7 @@ struct Inner {
     /// Named `server_events_tx` historically, but now carries both roles'
     /// lifecycle events — including central-side link loss. See
     /// `Driver::events`.
-    server_events_tx: broadcast::Sender<GattEvent>,
+    server_events_tx: EventBus,
     /// Negotiated ATT MTU per peer address, populated from
     /// `onMtuChanged`. Shared rather than held per-`AndroidGattConnection`
     /// because the JNI callback arrives on a Binder thread with only the
@@ -193,7 +199,7 @@ struct Inner {
     /// Resolved by `onAdvertiseResult`. Android decides asynchronously
     /// whether an advertisement actually started, so `advertise()` must wait
     /// for it rather than reporting success the moment the JNI call returns.
-    advertise_tx: StdMutex<Option<oneshot::Sender<std::result::Result<(), i32>>>>,
+    advertise_tx: StdMutex<Option<PendingAdvertisement<GattServiceSpec>>>,
     /// Outstanding server notifications, keyed by request id. Android
     /// reports the real send status on `onNotificationSent`, so `notify`
     /// must wait for it rather than trusting the initiating call.
@@ -433,7 +439,7 @@ impl AndroidDriver {
     /// The context must belong to `vm`; use the process-lifetime Application,
     /// not an Activity whose lifetime ends on configuration changes.
     pub async fn with_context(vm: JavaVM, context: GlobalRef) -> Result<Self> {
-        let (server_events_tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let server_events_tx = EventBus::new(EVENT_CHANNEL_CAPACITY);
         let inner = Arc::new(Inner {
             vm,
             context,
@@ -807,8 +813,10 @@ impl Driver for AndroidDriver {
 
         let ad = AdvertisementArgs::new(&mut env, &service)?;
 
+        let bridge = self.inner.bridge()?;
+        let _monitor = env.lock_obj(bridge.as_obj()).map_err(|err| BleError::Gatt(err.to_string()))?;
         let (tx, rx) = oneshot::channel();
-        *self.inner.advertise_tx.lock().unwrap() = Some(tx);
+        *self.inner.advertise_tx.lock().unwrap() = Some(PendingAdvertisement { sender: tx, service: None });
         self.inner.call_void(
             &mut env,
             "startAdvertising",
@@ -883,8 +891,8 @@ impl Driver for AndroidDriver {
         self.inner.served_service.lock().unwrap().clone()
     }
 
-    /// `BleGattBridge.setCharacteristicValue`: the Kotlin read handler
-    /// answers from `characteristic.value`, which this replaces.
+    /// Replace `characteristic.value` through `BleGattBridge.setCharacteristicValue`.
+    /// The Kotlin read handler returns this stored value.
     async fn set_characteristic_value(&self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
         let mut env = self.inner.env()?;
         let uuid = env
@@ -892,7 +900,7 @@ impl Driver for AndroidDriver {
             .map_err(|err| BleError::Gatt(err.to_string()))?;
         let bytes = env.byte_array_from_slice(&value).map_err(|err| BleError::Gatt(err.to_string()))?;
         let bridge = self.inner.bridge()?;
-        let set = env
+        let update_result = env
             .call_method(
                 bridge.as_obj(),
                 "setCharacteristicValue",
@@ -900,7 +908,7 @@ impl Driver for AndroidDriver {
                 &[JValue::Object(&uuid), JValue::Object(&bytes)],
             )
             .and_then(|v| v.z());
-        match set {
+        match update_result {
             Ok(true) => Ok(()),
             Ok(false) => Err(BleError::Gatt(format!(
                 "set_characteristic_value: {} is not served",
@@ -935,9 +943,11 @@ impl Driver for AndroidDriver {
                 .new_string(service.uuid.0.to_string())
                 .map_err(|err| BleError::Gatt(err.to_string()))?;
             let ad = AdvertisementArgs::new(&mut env, &service)?;
+            let bridge = self.inner.bridge()?;
+            let _monitor = env.lock_obj(bridge.as_obj()).map_err(|err| BleError::Gatt(err.to_string()))?;
             let (tx, rx) = oneshot::channel();
-            *self.inner.advertise_tx.lock().unwrap() = Some(tx);
-            self.inner.call_void(
+            *self.inner.advertise_tx.lock().unwrap() = Some(PendingAdvertisement { sender: tx, service: Some(service) });
+            let result = self.inner.call_void(
                 &mut env,
                 "updateAdvertising",
                 "(Ljava/lang/String;[I[[B[Ljava/lang/String;[[B[B)V",
@@ -949,16 +959,17 @@ impl Driver for AndroidDriver {
                     JValue::Object(&ad.service_data_values),
                     JValue::Object(&ad.scan_response_name),
                 ],
-            )?;
+            );
+            if let Err(error) = result {
+                self.inner.advertise_tx.lock().unwrap().take();
+                return Err(error);
+            }
             rx
         };
-        // No guard as in `advertise`: if this future is dropped, the server
-        // the caller already owns is still served, and at worst the new
-        // advertisement starts with nobody waiting for it.
+        // The native callback owns snapshot commit, including after this waiter is cancelled.
         match rx.await {
             Ok(Ok(())) => {
                 log::info!("advertise: advertisement updated, GATT server kept");
-                *self.inner.served_service.lock().unwrap() = Some(service);
                 Ok(())
             }
             Ok(Err(code)) => {
@@ -971,6 +982,35 @@ impl Driver for AndroidDriver {
         }
     }
 
+    async fn set_advertising_enabled(&self, enabled: bool) -> Result<()> {
+        let _serialise = self.inner.advertise_lock.lock().await;
+        if self.inner.served_service.lock().unwrap().is_none() {
+            return Err(BleError::Gatt("advertising visibility: nothing is served".into()));
+        }
+        let rx = {
+            let mut env = self.inner.env()?;
+            if self.inner.call_int(&mut env, "bridgeAbiVersion", "()I")? != BRIDGE_ABI_VERSION {
+                return Err(BleError::Unsupported("advertising visibility requires Android bridge ABI 7".into()));
+            }
+            let bridge = self.inner.bridge()?;
+            let _monitor = env.lock_obj(bridge.as_obj()).map_err(|err| BleError::Gatt(err.to_string()))?;
+            let (tx, rx) = oneshot::channel();
+            *self.inner.advertise_tx.lock().unwrap() = Some(PendingAdvertisement { sender: tx, service: None });
+            if let Err(err) = self.inner.call_void(
+                &mut env, "setAdvertisingEnabled", "(Z)V", &[JValue::Bool(enabled as jboolean)],
+            ) {
+                self.inner.advertise_tx.lock().unwrap().take();
+                return Err(err);
+            }
+            rx
+        };
+        match rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(code)) => Err(BleError::Gatt(format!("Android refused advertising visibility (error {code})"))),
+            Err(_) => Err(BleError::Gatt("advertising visibility outcome was not reported".into())),
+        }
+    }
+
     async fn stop_advertising(&self) -> Result<()> {
         // Same lock `advertise` holds across its platform call. Without it a
         // stop could land between an attempt installing its sender and
@@ -980,6 +1020,9 @@ impl Driver for AndroidDriver {
         // observed an outcome, its guard is disarmed and nothing cleans it
         // up.
         let _serialise = self.inner.advertise_lock.lock().await;
+        let mut env = self.inner.env()?;
+        let bridge = self.inner.bridge()?;
+        let _monitor = env.lock_obj(bridge.as_obj()).map_err(|err| BleError::Gatt(err.to_string()))?;
         *self.inner.served_service.lock().unwrap() = None;
         // Resolve any advertise still waiting on Android's asynchronous
         // start result. Kotlin invalidates the server generation, so that
@@ -990,7 +1033,6 @@ impl Driver for AndroidDriver {
             let _ = pending.send(Err(ADVERTISE_ERROR_STOPPED));
         }
         log::info!("advertise: stopping");
-        let mut env = self.inner.env()?;
         self.inner.call_void(&mut env, "stopAdvertising", "()V", &[])
     }
 
@@ -1125,6 +1167,10 @@ impl Driver for AndroidDriver {
         )
     }
 
+    fn lifecycle_events(&self) -> BoxStream<GattEvent> {
+        self.inner.server_events_tx.lifecycle_events()
+    }
+
     fn events(&self) -> BoxStream<GattEvent> {
         let rx = self.inner.server_events_tx.subscribe();
         Box::pin(tokio_stream::wrappers::BroadcastStream::new(rx).map(|item| match item {
@@ -1231,11 +1277,7 @@ impl tokio_stream::Stream for NotifyStream {
         mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         if self.overflow.swap(false, Ordering::SeqCst) {
-            return std::task::Poll::Ready(Some(Err(BleError::Gatt(
-                "notification queue overflowed: payloads were dropped and at least one \
-                 message is lost"
-                    .to_string(),
-            ))));
+            return std::task::Poll::Ready(Some(Err(crate::drivers::notification_receive_gap())));
         }
         std::pin::Pin::new(&mut self.rx).poll_next(cx).map(|item| item.map(Ok))
     }
@@ -1728,8 +1770,8 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onAdvertiseResult<'local>(
         log::error!("jni onAdvertiseResult: advertising failed, error_code={error_code}");
     }
     let pending = inner.advertise_tx.lock().unwrap().take();
-    if let Some(tx) = pending {
-        let _ = tx.send(if success != 0 { Ok(()) } else { Err(error_code) });
+    if let Some(pending) = pending {
+        pending.complete(if success != 0 { Ok(()) } else { Err(error_code) }, &inner.served_service);
     } else {
         log::warn!("jni onAdvertiseResult: no pending advertise request to complete");
     }

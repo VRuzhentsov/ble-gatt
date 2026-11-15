@@ -1,126 +1,98 @@
 # ble-gatt: reusable BLE communication
 
-`ble-gatt` is the core Rust library in the [workspace](../README.md). It
-provides GATT operations, complete-message channels, connection ownership and
-platform drivers. It has no iroh or Tauri dependency.
+`ble-gatt` provides raw GATT, complete-message channels, managed peer communication
+and platform drivers. It has no iroh or Tauri dependency. A standalone Rust CLI
+can use the [managed example](../docs/interface.md#minimal-outgoing-use) directly.
 
-## Status: current code and agreed target
+## Working-tree status
 
-The [shared design](../docs/adr/0012-discovery-like-nearby.md) sets the target
-below. The core handshake and migration are not implemented. Current API names
-describe available code, not target signatures.
+[ADR-0012](../docs/adr/0012-discovery-like-nearby.md) is implemented in the current
+working tree: explicit requests, mutual acceptance, endpoint/nonce arbitration,
+scoped channels and keepalive records. Final integrated verification remains
+pending. This refactor is not published or hardware-accepted.
 
-## Target responsibility
+## Public surfaces
 
-Symmetric peer communication belongs here, independently of a network stack:
+- `Adapter`: shared driver, radio state, capabilities and role access.
+- `Central` / `Peripheral`: raw scan, GATT client and GATT server operations.
+- `datagram`: bounded fragmentation and reassembly without managed establishment.
+- `advertisement`: readable GATT metadata and opt-in raw scan completion.
+- `PeerLink`: one managed core coordinator with a dedicated worker runtime.
+- `power`: advice about scan schedules, connection limits and priority, not radio control.
 
-- Either peer can initiate communication or reconnect.
-- An established BLE connection carries messages in both directions.
-- The library coordinates competing attempts and protects replacement
-  connections from stale callbacks or cleanup.
-- The core performs the new endpoint-ID/nonce tie-break. A losing outgoing
-  request reports failure; the incoming winner is processed separately.
-- Stopping discovery/advertising or completing a message does not close healthy
-  communication. Explicit disconnect/cancellation is respected.
-- Platform backoff, native resource ownership and collision recovery stay
-  inside the BLE implementation.
-- The high-level peer API has one symmetric initiation behavior. Applications
-  do not select a previous dialler or an identity-ordered initiator.
-- A platform limitation is reported explicitly. It is not hidden behind a
-  different peer-to-peer contract.
+Raw central/peripheral and datagram operations remain independent. Use them for
+vendor protocols or caller-owned channels. They do not acquire the managed handshake.
 
-Central and peripheral are roles of a particular BLE connection, not permanent
-application roles. A central initiates and performs GATT client operations;
-a peripheral accepts the connection and exposes the GATT service. One connection
-is sufficient for bidirectional messages. Both roles being available separately
-does not prove that a device supports simultaneous crossed attempts.
+## Managed communication
 
-Raw GATT remains public for vendor devices without this message profile or peer contract.
+Construct `PeerLink::new(PeerLinkConfig::new(datagram_config))`, or inject a driver
+with `with_driver`. The configuration contains `datagram` and `max_links`.
+Construction starts the worker; it does not certify radio availability.
 
-## Current public surfaces
+Claim `incoming()` once. Use `set_advertising(true).await` for managed serving
+and `discover().await` for a stream of endpoint IDs and discovered peers.
+`request(&address).await` returns `ConnectionRequest`. Both sides must call
+`accept().await` before either obtains `PeerChannel`; either side can reject.
+Dropping the request cancels its attempt.
 
-- `Adapter`: a shared driver, radio state, capabilities and role access.
-- `Central`: raw scanning and an owned `Connection` for GATT operations.
-- `Peripheral`: GATT serving, notifications and per-peer disconnect operations.
-- `datagram`: complete messages with bounded fragmentation and reassembly.
-- `advertisement`: readable GATT metadata and opt-in scan completion.
-- `PeerLink`: an existing tracked-peer controller with its own worker runtime.
-- `power`: advice about scan schedules, connection limits and priority. It
-  does not operate the radio itself.
+Either peer can initiate. The larger signed attempt nonce wins crossed requests;
+equal nonces fail both. The outgoing loser fails independently of the incoming
+winner. No public role-ranking, tracking or retry-policy mode remains.
+The existing worker was refactored; there is no second manager beside it.
 
-The current `PeerLink::LinkRole::Symmetric` chooses a lower-`LinkId` dialler.
-It does **not** implement the target symmetric-initiation contract. A refactor
-must evaluate its existing state tables and ownership mechanisms; the target
-is not permission to add another controller beside it.
+Channels carry bidirectional complete messages. Clones share a receive queue.
+`release().await` releases scoped use and retires the last use.
+`disconnect().await` invalidates that channel generation; the link-level
+`disconnect(endpoint).await` ends current communication for that endpoint.
+`close_reason()` distinguishes terminal disconnect from unexpected link loss.
+A terminal request does not restart automatically.
 
-Current iroh callers use `DatagramChannel` directly through `ble-gatt-iroh`.
-Running the existing `PeerLink` and that adapter as independent owners of the
-same channels is not a supported way to reach the target.
+Application receive pressure waits in that generation's existing transport task,
+not the shared worker. The wait is bounded and cancellable; it does not invent
+payload loss. Known `ReceiveGap` differs from terminal lifecycle loss. Native/mock
+`Driver::lifecycle_events()` isolates payload traffic; the third-party default
+only filters legacy events. See [event-stream limits](../docs/interface.md#driver-event-streams-and-receive-loss).
+
+Dropping discovery or disabling advertising preserves established communication.
+Visibility control retains the native server and subscriptions. Raw server stop
+is destructive. Finishing a message does not close a healthy channel.
 
 ## Modules and drivers
 
 ```text
 src/
-  entities/       Types, errors, addresses and role/session events
+  entities/       Types, typed outcomes and role/session events
   hal/            Driver and GattConnection ports
   roles/          Adapter, Central and Peripheral
-  connection/     Owned Connection, pure state tables and PeerLink
-  profile/        Datagram framing/reassembly and advertisement completion
+  connection/     Owned Connection, PeerLink worker and managed codec
+  profile/        Datagram framing and advertisement completion
   power/          Power-profile advice
-  drivers/
-    linux.rs      BlueZ through bluer and D-Bus
-    android.rs    Rust/JNI driver
-    windows/      WinRT device, server, watcher and byte helpers
-    mock/         Local simulation and optional cross-process broker
+  drivers/        Linux/BlueZ, Android/JNI, Windows/WinRT and mock/broker
 ```
 
-Apple drivers are not implemented.
+The unused crate-private `connection/link_state.rs` implementation is retired.
+Historical ADR-0005 remains unchanged. Apple drivers are not implemented.
 
-The Android Kotlin bridge currently ships in
-[`tauri-plugin-ble-gatt/android`](../tauri-plugin-ble-gatt/android).
-Android hosts need compatible bridge packaging and context even without Rust
-Tauri dependencies. Host-neutral packaging remains open.
+Android needs compatible native packaging and Application context. The Kotlin
+bridge currently ships in [the Tauri plugin](../tauri-plugin-ble-gatt/android).
+Rust/JNI and Kotlin require bridge ABI 7. Host-neutral packaging remains open.
 
-## Resource and error contracts
+## Ownership and validation limits
 
-Native operations use the `hal` ports. Drivers keep OS objects, callback tokens,
-JNI references and connection-generation checks local. Shared policy must not
-remove the ownership checks around native effects.
+Drivers own OS objects, callbacks, serialized native effects and session-generation
+guards. Core coordination does not replace these protections.
+Raw `Connection` Drop cleanup is asynchronous and needs a Tokio runtime.
+Await explicit cleanup when completion matters.
 
-Current public lifetimes differ:
+Applications own permitted peers, acceptance, pairing and data protocols.
+iroh supplies authentication, encryption, streams and paths in its composition.
+The iroh adapter translates packets and accounts for users of the same core
+carrier; it does not independently arbitrate native connections.
 
-- Dropping a raw scan stream releases that scan.
-- `Central::connect` returns an owned `Connection`; its Drop schedules cleanup
-  when a Tokio runtime is available. Explicit disconnect can be awaited.
-- `Peripheral::serve` returns `ServerHandle`; `stop` awaits shutdown, whereas
-  Drop requests it in the background.
-- Dropping the stream returned by `datagram::serve` stops handing out new
-  channels. Existing channels continue receiving, and the served service
-  does **not** stop. Use `datagram::stop_serving` to stop it.
+Mock checks, host builds, packaged JNI execution, native-session observations
+and physical teardown are separate evidence. Role capability booleans do not
+prove simultaneous-role hardware support. The datagram server still admits one
+inbound peer; `MaxLinks` does not remove that limit.
 
-These are existing contracts, not a blanket synchronous teardown guarantee.
-Report typed errors and event loss. A driver connection-generation identifier
-is not an authenticated application session.
-
-## What stays outside the core
-
-- iroh `EndpointId`, custom addresses, QUIC packets and path hooks.
-- Tauri commands, frontend IPC and application permission dialogs.
-- Product pairing, permitted peers, sync settings and application data formats.
-- End-to-end authentication and encryption of the messages it carries.
-
-The application decides who is eligible and when communication is wanted.
-The request/event/release API, protocol encoding, discovery cache policy and
-retry/liveness timing remain review gates in ADR-0012. The Nearby lifecycle and
-attempt-level outcomes are the baseline, not new caller-selected modes.
-
-## Validation boundary
-
-Mock contracts, host builds, packaged JNI execution, native-role observations
-and physical device behavior are separate evidence levels. The target requires
-non-iroh tests as well as integration tests. It is not satisfied solely by a
-passing iroh diagnostic or a central/peripheral capability report.
-
-See the [architecture map](../docs/architecture.md),
-[current usage guide](../docs/interface.md), [glossary](../docs/glossary.md)
-and [hardware verification guide](../docs/hardware-verification.md).
+See [API usage](../docs/interface.md), [architecture](../docs/architecture.md),
+[glossary](../docs/glossary.md) and [hardware verification](../docs/hardware-verification.md).

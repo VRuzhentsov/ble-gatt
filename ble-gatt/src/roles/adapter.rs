@@ -35,7 +35,7 @@ impl Adapter {
     pub async fn new(driver: Arc<dyn Driver>) -> Self {
         // Subscribe before reading the current status, so a change between
         // the two is not lost.
-        let events = driver.events();
+        let events = driver.lifecycle_events();
         let (status_tx, status) = watch::channel(driver.radio_status().await);
         let watcher = tokio::spawn(publish_status(events, status_tx));
         Self {

@@ -2,10 +2,10 @@
 
 ## Status
 
-PR #38 contains the first Windows implementation. Contract gaps and cross-device
-acceptance remain pending. This ADR covers Windows-native choices;
-[ADR-0012](0012-discovery-like-nearby.md) covers shared discovery and the unimplemented
-core tie-break. The PR remains draft.
+PR #38 contains the first Windows implementation and working-tree native fixes.
+Final integrated verification and cross-device acceptance remain pending.
+This ADR covers Windows-native choices; [ADR-0012](0012-discovery-like-nearby.md)
+covers the implemented core protocol. The refactor is not published; the PR remains draft.
 
 ## Decision question
 
@@ -80,6 +80,11 @@ the Windows driver, determines whether it must fetch readable GATT metadata.
 The driver implements reads and `set_characteristic_value` without replacing a
 live server merely to update its data. See ADR-0012 for format/cache policy.
 
+`set_advertising_enabled(false)` stops provider visibility without destroying the
+server, sessions or subscriptions. Re-enabling uses the retained provider.
+`stop_advertising` remains destructive. Startup ownership guards stop an issued
+native start if confirmation fails or its future is cancelled.
+
 ### 4. Native events and cleanup limits
 
 Keep client/session objects alive for the operations that need them. Observe
@@ -87,14 +92,18 @@ native link loss and translate it to role/session-aware events. Serialize
 server request handling so callback concurrency does not reorder fragments.
 Serve readable values from the current value map, not an immutable initial value.
 
+Publish `Driver::lifecycle_events()` separately from characteristic writes.
+Its bounded storage can still report critical `Lagged`. The legacy `events()`
+stream remains available. Known notification loss uses `BleError::ReceiveGap`;
+it does not establish that a native session ended.
+
 The server can exclude a central by rejecting writes and omitting notifications
 until its session ends. Exclusion does not prove physical disconnection.
 Keep diagnostics and cleanup assertions explicit about this limit.
 
 Core arbitration selects an attempt; the driver must apply effects to the
 correct owned session. A stale completion must not tear down a replacement.
-The exact contract needed for crossed attempts is a gate in ADR-0012, not a
-capability inferred from two role booleans.
+Native crossed-attempt behavior still needs acceptance. Two role booleans do not prove it.
 
 ## Alternatives and consequences
 
@@ -112,14 +121,19 @@ proves neither the new handshake nor hardware interoperability and changes no co
 
 ## Verification and known limits
 
-Source review identifies partial-acquisition cleanup gaps: maintained client
-sessions and notification callback tokens are acquired before awaits without
-complete cancellation guards (`device.rs`); server construction also needs
-ownership protection across advertising startup (`peripheral.rs`). Current
-`close` only stops serving, and peer exclusion does not itself report a terminal
-physical disconnect (`mod.rs`). Callback queue bounds/deferral timing and
-watcher cache/delivery behavior require contract review and native validation.
-These are static findings, not reproduced Windows failures or completed fixes.
+Working-tree source now guards client acquisition, subscription registration and
+server startup. `close` also drains owned central cleanup, rather than only
+stopping serving. Session/generation checks protect replacement objects.
+Logical exclusion remains distinct from physical peripheral disconnect.
+
+Linux and Android also separate visibility from server ownership. Android's
+Rust/JNI and Kotlin bridge require ABI 7. Scan-start exceptions roll back only
+the failed callback ownership. Source guards do not prove compiled descriptors,
+APK packaging, callback timing or native execution.
+
+Review watcher cache capacity, expiry and overflow delivery, callback queue bounds,
+deferral timing, cancellation at each acquisition boundary and metadata partial
+failure. Keep these review/native gates separate from implemented ownership fixes.
 
 Earlier branch records report Windows builds/tests, capabilities and advertising.
 This revision reruns no native checks. Those observations do not prove bidirectional acceptance.

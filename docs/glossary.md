@@ -8,15 +8,13 @@ a definition does not change implemented behavior.
 same thing, it is listed as *Also called*. Use the first word in code and
 documents.
 
-Current API descriptions and provisional target requirements are distinct.
-The target in [ADR-0012](adr/0012-discovery-like-nearby.md) does not rename or
-change an existing API by documenting a new responsibility boundary.
+The working-tree API follows [ADR-0012](adr/0012-discovery-like-nearby.md).
+Implementation, integrated verification and hardware acceptance are separate claims.
 
 ## Writing and naming rules
 
 Apply these STE-based rules to new or touched names, comments, logs, documents
-and pull request text. The technical terms below form the company glossary;
-they define meaning, not sentence structure.
+and pull request text. The technical terms below define meaning, not sentence structure.
 
 - Use active voice, American English and complete words. Do not use contractions.
 - Give one instruction per sentence. Aim for at most 20 words in procedures
@@ -212,10 +210,10 @@ What recognises a peer across address changes: a fingerprint the peer puts in
 its advertisement.
 
 ### Link
-This library's handle on one connection, which tracks whether it is
-connecting, connected or gone (`PeerLink`, ADR-0005). The code still uses
-the word; its current module is `connection/peer_link.rs`. *Not the
-same as* OSI L2 (data link) or the BLE link layer.
+A managed communication relationship coordinated by `PeerLink`.
+`PeerChannel` is a scoped use of one established generation, not the coordinator.
+The unused crate-private `link_state` implementation is retired; ADR-0005 records
+its historical design. *Not the same as* OSI L2 or the BLE link layer.
 
 ### Driver session
 The optional connection-generation identifier in `GattEvent` and
@@ -335,7 +333,19 @@ idea.
 ### Broadcast stream
 Pub/sub for a *sequence of events* (`tokio::sync::broadcast` behind a
 stream), where every subscriber receives every event published after it
-subscribed.
+subscribed, unless its bounded buffer overflows. `GattEvent::Lagged` reports
+discarded events; it does not identify which transitions were lost.
+
+### Lifecycle event stream
+`Driver::lifecycle_events()`: connection/radio events without characteristic writes.
+Native/mock drivers isolate its bounded storage from payload traffic. The default
+third-party implementation only filters the legacy stream and retains unknown lag.
+Critical loss must not be treated as recoverable payload loss.
+
+### Receive gap
+`BleError::ReceiveGap`: known loss on a payload receive path. A channel can
+report a gap and then deliver later complete messages. Managed application queue
+pressure alone pauses that generation; it does not create a gap.
 
 ### Cancellation token
 `tokio_util::sync::CancellationToken`: a one-shot signal that tasks can wait
@@ -366,38 +376,23 @@ Both devices dialling each other at the same moment, so two links or two
 connections come up where one was wanted.
 
 ### Symmetric initiation
-Either peer may start or reconnect a link, regardless of permanent identity
-ordering. This is the high-level core contract under review in ADR-0012,
-independent of iroh and without a caller-selected initiation mode.
-In current code, `ble-gatt-iroh::InitiationPolicy::EitherPeer` selects the
-no-yield behavior, whereas core `PeerLink::LinkRole::Symmetric` selects a
-lower-identity dialler. The names are not synonymous, and neither capability
-declaration proves simultaneous-role hardware support. The target refactor
-has not happened yet.
+Either peer can request communication without permanent identity ordering.
+Core `PeerLink` implements one behavior, independent of iroh. Both sides must
+accept. Role capabilities do not prove simultaneous-role hardware support.
 
 ### Initiation policy
-The current adapter's explicit choice of who may start an outgoing link when no usable queue
-exists. In `ble-gatt-iroh`, `PreviousDialer` preserves the historical redial
-yield, `EitherPeer` removes that yield and `Ordered` is the smaller-endpoint-key
-fallback. It is not peer authentication or an application's session policy.
-ADR-0012 removes this public choice from the target design; it does not merely
-change the default. Existing enum variants remain implemented until refactored.
+A retired caller-selected initiator mode. The managed API has no
+`InitiationPolicy`, `LinkRole` or identity-ranking switch. Application acceptance
+and authenticated identity remain separate concerns.
 
 ### Candidate link
-A BLE channel attached to the iroh transport, potentially one of several
-crossed candidates. Older candidates can still receive while the newest queue
-sends. An address with live iroh users remains protected from idle cleanup;
-last-user release closes it when those users end (current adapter behavior;
-see ADR-0012's implementation gap).
+One possible BLE attempt before core arbitration selects the survivor.
+The iroh adapter no longer retains competing native candidates. Multiple QUIC
+users can share the established core carrier; ending one user preserves others.
 
 ### Redial yield
-After a link the peer dialled drops, the time (`REDIAL_YIELD`, 30 s) for
-which `ble-gatt-iroh` does not dial that peer, so that the peer, which re-dials
-for its still-open iroh connection, does not cross with it. It starts only
-when such a connection may still be open: not after this side closed the
-link, nor after every connection on it had started to close. It applies to
-`InitiationPolicy::PreviousDialer` (the compatibility default), not to
-`EitherPeer` or `Ordered` (current implementation, not ADR-0012's target).
+The retired adapter delay that gave the previous initiator time to redial.
+Managed communication uses core attempt arbitration, not a public yield mode.
 
 ### Adapter crate
 A crate that connects `ble-gatt` to something outside it, such as iroh
@@ -406,23 +401,33 @@ Adapters. Not to be
 confused with a [Bluetooth adapter](#bluetooth-adapter).
 
 ### Core endpoint identifier
-In the ADR-0012 target, the protocol identifier that correlates discovery and
-incoming/outgoing attempts for one peer context. Not an iroh `EndpointId`, a
-native address or proof of authenticated identity. Its representation and exact
-lifetime remain review gates; the handshake is not implemented yet.
+`ble_gatt::EndpointId`: a fresh 128-bit identifier for one worker lifetime.
+It correlates discovery and incoming/outgoing attempts. It is not an iroh
+`EndpointId`, native address or authenticated identity.
 
 ### Attempt nonce
-A fresh random value associated with an outgoing connection attempt. Nearby's
-reference uses a signed 32-bit value; the target follows its larger-wins,
-equal-values-fail-both rule. It is not an encryption key or a native generation.
+A fresh signed 32-bit value for one outgoing request. Core arbitration compares
+it numerically: larger wins; equal values fail both. It is not an encryption
+key, endpoint identifier or native session generation.
 
 ### Attempt outcome
 The result of one establishment attempt, distinct from an established peer's
-connection state. In the ADR-0012 target, an outgoing tie-break loser reports
-failure/rejection while the incoming winner proceeds separately. It is not a
-silent success handoff and does not mean a healthy peer was globally disconnected.
+connection state. `BleError::Attempt(AttemptError)` reports typed failures.
+An outgoing loser fails while the incoming winner proceeds separately.
+An attempt failure is not global disconnection of a healthy channel.
 
 ### Control record
-A protocol record for establishment, acceptance or liveness, explicitly distinct
-from application payload. ADR-0012 requires bounded, versioned handling without
-sniffing QUIC or arbitrary payload prefixes; its encoding is not selected yet.
+A tagged managed record for establishment, acceptance, disconnect or liveness.
+Application data has a separate tag. The bounded encoding is defined in
+`connection/managed_codec.rs` and ADR-0012, without QUIC or payload-prefix guessing.
+
+### Scoped channel use
+One `PeerChannel` handle. Clones share a receive queue. `release` releases one
+use; the last use retires the generation. Explicit disconnect invalidates all
+uses of that generation, not a later replacement.
+
+### Channel close reason
+`PeerChannelCloseReason`, set before receive ends. It distinguishes explicit
+local/peer disconnect, unexpected loss, protocol failure, release and shutdown.
+The iroh adapter blocks automatic acquisition after terminal closure until a
+fresh application action authorizes replacement. Old packets do not authorize it.

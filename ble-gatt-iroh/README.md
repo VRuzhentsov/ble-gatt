@@ -1,131 +1,118 @@
-# ble-gatt-iroh: iroh over BLE messages
+# ble-gatt-iroh: iroh over managed BLE messages
 
-`ble-gatt-iroh` adapts [`ble-gatt`](../ble-gatt/README.md) to the external
-[iroh](https://docs.iroh.computer/concepts/endpoints) network stack. It is one
-of the three crates in this workspace. iroh itself is not a workspace crate.
+`ble-gatt-iroh` carries iroh QUIC packets over core `PeerChannel` messages.
+iroh authenticates public keys with TLS and supplies encryption, streams and paths.
+The adapter does not authenticate a Bluetooth address or core endpoint identifier.
 
-## Status: current code and agreed target
+## Ownership
 
-The [shared design](../docs/adr/0012-discovery-like-nearby.md) assigns symmetric
-BLE behavior to the core. The adapter still owns initiation policies and BLE
-coordination. The core handshake and migration are not implemented.
+- Applications choose discovery, advertising, permitted peers and incoming acceptance.
+- Core `PeerLink` owns managed metadata, establishment, crossed attempts, liveness and native cleanup.
+- This adapter translates packets and addresses. It tracks authenticated QUIC users and their current paths.
+- iroh owns QUIC connections. Several QUIC connections can share one core carrier.
 
-## Target responsibility
+Raw GATT and raw datagram services remain separate. Do not pass their channels to this adapter.
+Both peers need the managed core protocol. There is no legacy downgrade or initiation-policy switch.
 
-This crate translates between two interfaces:
+## Setup
 
-- The core's BLE connections and complete-message channels.
-- iroh's custom addresses and QUIC packet send/receive interfaces.
+Create one shared core worker for the driver and managed service configuration:
 
-It associates authenticated iroh peers with BLE destinations and tracks iroh
-users of a carrier. When no iroh user needs the carrier, it releases its use
-through the core's ownership contract. Native connection establishment,
-competing-attempt handling and teardown safety belong in `ble-gatt`.
+```rust,ignore
+let peer_link = PeerLink::with_driver(driver, PeerLinkConfig::new(datagram_config));
+let mut incoming = peer_link.incoming()?;
+peer_link.set_advertising(true).await?;
 
-In the target, the adapter requests core use/release instead of independently
-dialing, retrying or disconnecting. iroh hooks and path/user accounting remain here.
+let transport = BleGattTransport::builder()
+    .dialer(dial_with(peer_link.clone()))
+    .build();
+let attached = transport.clone();
+tokio::spawn(async move {
+    while let Some(request) = incoming.next().await {
+        // Apply the application's acceptance policy here.
+        match request.accept().await {
+            Ok(channel) => { attached.attach(channel); }
+            Err(error) => log::debug!("incoming BLE attempt failed: {error}"),
+        }
+    }
+});
 
-## Who owns what
-
-- **Application:** permitted peers, discovery intent, pairing, ALPN protocols,
-  sync settings and application-session acceptance.
-- **iroh:** authenticated QUIC connections, encryption, streams and paths.
-- **This adapter:** custom packet/address translation and iroh-specific carrier
-  usage accounting.
-- **Core `ble-gatt`:** generic BLE peer behavior, complete messages, connection
-  ownership and native drivers.
-
-A peer key is authenticated identity. A BLE address is a current destination.
-A short advertisement fingerprint is a discovery hint, not authentication.
-
-## Packet flow
-
-```text
-Application protocol
-        |
-iroh streams / QUIC + TLS
-        |
-BleGattTransport: custom packets and addresses
-        |
-ble-gatt: complete messages and BLE ownership
-        |
-GATT operations / platform driver
+let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+    .clear_ip_transports()
+    .add_custom_transport(Arc::new(transport.clone()))
+    .address_lookup(transport.address_lookup())
+    .hooks(transport.hooks())
+    .bind().await?;
 ```
 
-One QUIC datagram is carried as one complete BLE message. The core can fragment
-that message into smaller GATT values and reassemble it before delivery.
-The adapter does not implement a second QUIC handshake or application protocol.
+Use `peer_link.discover()` to find managed peers. Record a permitted iroh key's
+current destination with `transport.set_peer_address(key, peer.address)`.
+A discovery hint does not prove the key. TLS verifies that key during the QUIC handshake.
+Stopping discovery or advertising does not release established channel use.
 
-## Current API and migration gap
+`dial_with(Arc<PeerLink>)` first acquires an existing channel. Otherwise, it requests
+communication and accepts its outgoing attempt. The remote application must also accept.
+An outgoing BLE loser returns an error. The application accepts and attaches an
+incoming winner separately. The adapter does not report that winner as outgoing success.
+Queued packets can use the independently attached carrier. QUIC retransmits lost packets.
+A BLE attempt failure does not force a legitimate QUIC connection to fail.
 
-Implemented entrypoints in [`src/lib.rs`](src/lib.rs) include:
+## Packet and user lifetimes
 
-- `BleGattTransport::builder` and `dial_with` for an outgoing datagram channel.
-- `attach` and `attach_after` for incoming channels, including a saved first
-  packet supplied by an application router.
-- `set_peer_address` for discovered destinations.
-- `address_lookup` and `hooks` for iroh identity/path integration.
-- `close_link` and `close_links` for explicit force-close operations.
+One QUIC packet becomes one complete core message. Core fragmentation handles smaller GATT values.
+Queues are bounded. Overflow remains packet loss, which QUIC can recover.
+Only one packet task reads an address's channel. A replacement waits for the old receiver to stop.
+The adapter does not retain competing native candidates or choose their winner.
 
-The current transport does not scan or advertise by itself. Its caller supplies
-scan results and channels from `datagram::serve`. The future discovery/request
-API is not chosen by this documentation change.
+Install `hooks()` on the endpoint. Hooks use weak connection handles and reconcile
+current path snapshots. Historical addresses remain available for close barriers and
+late-packet suppression. History alone does not retain idle channel use.
+A current QUIC user protects the shared carrier from the adapter's idle timer.
+Ending one user preserves other current users.
 
-Current `InitiationPolicy` variants remain implemented, but are not the target:
+For local QUIC close, release follows the queued close-frame barrier.
+Queue loss or a failed barrier cannot prove that the close frame was sent.
+The last legitimate user releases the adapter's scoped core use with `PeerChannel::release`.
+It never directly disconnects a native channel. Other core users remain valid.
+`close_link` and `close_links` release this transport's use and cancel its pending requests.
+Use the core's explicit disconnect API when the application intends a global disconnect.
 
-- `PreviousDialer` is the current default and can yield after incoming loss.
-- `EitherPeer` is the current explicit no-yield mode.
-- `Ordered` restricts initiation by endpoint-key order.
+### Terminal disconnect and a new application user
 
-The target removes that public choice rather than only changing its default.
-The same symmetric behavior must be available to a non-iroh core consumer.
-See [ADR-0012](../docs/adr/0012-discovery-like-nearby.md) for the target and its
-current implementation gap. The current adapter retains crossed candidates;
-the target core instead arbitrates pending attempts. Its losing outgoing
-request reports failure while an incoming winner proceeds separately.
-Do not turn that outcome into a silent outgoing-to-incoming success handoff.
+The adapter reads `PeerChannel::close_reason()` before it closes the matching packet queue.
+`LocalDisconnect`, `PeerDisconnect`, `ProtocolError`, and `Shutdown` suppress automatic acquisition for that authorization generation.
+Existing QUIC packets cannot authorize another generation, regardless of their contents.
+`LinkLost` remains recoverable. Scoped release is not a global disconnect.
 
-Do not place the existing `PeerLink` controller under this adapter without a
-contract change. It has a different acceptance policy and a different channel
-type. Reusing existing core mechanisms requires integration, not nested owners.
+A fresh application core request, or independently accepted incoming request, can establish a channel.
+Pass that live channel to `attach` to authorize its replacement packet generation.
+With hooks installed, a new explicit `Endpoint::connect` after terminal closure also authorizes acquisition.
+Retransmissions do not invoke `before_connect`. Adding a user to a healthy carrier does not reset its generation.
+Without hooks, use explicit core acquisition and attachment to resume after terminal closure.
 
-## Custom-transport contract
+This is the existing authorization contract, not a new recovery mode.
+Integrated proof of the idle-close/new-authorization race remains pending.
 
-The adapter implements iroh's `CustomTransport`, `CustomEndpoint` and
-`CustomSender` traits. It binds a packet endpoint, reports local addresses,
-receives packets with address metadata and sends packets to custom addresses.
-Both endpoints need compatible transport support.
+Authorization is shared by users of the address, not inferred from packet headers.
+Once the application authorizes a replacement, existing users may also send through it.
+Stale packet-task cleanup cannot suppress or remove that replacement.
+No initiation mode or independent native retry controller is involved.
 
-`unstable-custom-transports` enables the extension. Upstream API changes can
-require adapter changes; the name does not describe BLE or encryption reliability.
-Keep this dependency here. Review updates and test the resolved version.
+## Examples and checks
 
-The manifest's `iroh = "1.3"` is a compatible version requirement, not an exact
-pin. Consult the resolved lockfile and version-matched API documentation.
-The packet carrier must support QUIC's minimum 1,200-byte datagram; native GATT
-writes may be smaller because the core supplies fragmentation.
+`examples/hw_iroh_peer.rs` uses the shared diagnostic in
+`examples/support/iroh_diagnostic.rs`. It uses managed discovery and independent
+incoming acceptance. `tests/hardware_diagnostic.rs` runs this diagnostic over the mock radio.
+These software tests do not establish physical radio or OS teardown behavior.
 
-Upstream references:
+Run:
 
-- [CustomTransport](https://docs.rs/iroh/1.4.1/iroh/endpoint/transports/trait.CustomTransport.html)
-- [CustomEndpoint](https://docs.rs/iroh/1.4.1/iroh/endpoint/transports/trait.CustomEndpoint.html)
-- [CustomSender](https://docs.rs/iroh/1.4.1/iroh/endpoint/transports/trait.CustomSender.html)
-- [Custom transport packet requirements](https://www.iroh.computer/blog/tor-custom-transport)
+```sh
+cargo test -p ble-gatt-iroh --all-targets
+cargo clippy -p ble-gatt-iroh --all-targets -- -D warnings
+```
 
-## Lifetimes and validation
-
-A QUIC connection, its current path, a historical address mapping and a BLE
-candidate task have different lifetimes. An application rejecting one QUIC
-connection must not force-close another user's shared carrier. Current hooks
-separate current use from history; history alone must not retain idle BLE use.
-
-The shared diagnostic in
-[`examples/support/iroh_diagnostic.rs`](examples/support/iroh_diagnostic.rs)
-is used by the Linux entrypoint, the Tauri sample and mock integration tests.
-It is example/test support, not part of the production transport API.
-An empty linked-peer map, joined candidate tasks, reported native-session
-closure and exhaustive OS teardown are distinct claims.
-
-See the [architecture map](../docs/architecture.md),
-[usage guide](../docs/interface.md) and
-[hardware acceptance checklist](../docs/hardware-verification.md).
+The crate implements iroh's unstable custom-transport interface. Its compatible
+version requirement is not an exact pin. Check the resolved lockfile when updating iroh.
+See [ADR-0012](../docs/adr/0012-discovery-like-nearby.md) for shared responsibilities
+and the [hardware checklist](../docs/hardware-verification.md) for native acceptance limits.

@@ -45,6 +45,7 @@ pub(super) enum Request {
     UpdateAdvertisement { address: PeerAddress, service: GattServiceSpec },
     SetCharacteristicValue { address: PeerAddress, characteristic: CharacteristicUuid, value: Vec<u8> },
     StopAdvertising { address: PeerAddress },
+    SetAdvertisingEnabled { address: PeerAddress, enabled: bool },
     Notify { address: PeerAddress, characteristic: CharacteristicUuid, value: Vec<u8> },
     NotifyPeer {
         address: PeerAddress, peer: PeerAddress, session: Option<u64>,
@@ -81,6 +82,7 @@ pub(super) enum Response {
 #[derive(Serialize, Deserialize)]
 pub(super) enum Push {
     Event { address: PeerAddress, event: GattEvent },
+    LifecycleEvent { address: PeerAddress, event: GattEvent },
     NotifyItem { subscription_id: u64, item: std::result::Result<Vec<u8>, BleError> },
 }
 

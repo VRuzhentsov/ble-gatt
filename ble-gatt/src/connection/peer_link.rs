@@ -1,1234 +1,713 @@
-//! Tier 3: `PeerLink` — keep app-to-app links to a set of peers alive.
-//!
-//! **Read `docs/interface.md` for when to use this instead of the raw
-//! `Driver` or the `datagram` tier, and `docs/adr/0005` for the state
-//! machines underneath.**
-//!
-//! The consumer declares which peers it cares about (`track`) and one policy
-//! (`role` — who dials). This module owns dialing, the redial ladder and
-//! giving up, one link per peer, and tearing everything down on radio-off /
-//! re-establishing on radio-on. The consumer consumes a channel and a
-//! per-peer status; it never sees the state machines.
-//!
-//! Everything BLE happens on one dedicated OS thread with its own Tokio
-//! runtime (spawned by `new`), so `new` is synchronous, infallible, and
-//! works in a binary with no async runtime of its own. The [`PeerChannel`]
-//! handed out on [`PeerLinkEvent::Up`] is a message-passing handle to that
-//! thread.
-
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
-
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
-use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::StreamExt;
-
-use crate::connection::link_state::{
-    CentralEvent, CentralLink, PeripheralEvent, PeripheralLink, RadioEvent, RadioState,
+//! Managed symmetric establishment. Raw GATT and datagram paths remain independent.
+//! Identifiers correlate attempts. They do not authenticate or encrypt traffic.
+use super::{
+    managed_codec::Record,
+    managed_worker::{Command, TransportCommand, Worker},
 };
-use crate::hal::{Driver, BoxStream};
-use crate::profile::datagram::{self, DatagramChannel, DatagramConfig};
-use crate::entities::error::{BleError, Result};
-use crate::entities::models::{ConnectionPriority, GattEvent, PeerAddress, RadioStatus, Role};
+use crate::datagram::DatagramConfig;
+use crate::{BleError, BoxStream, ConnectionPriority, DiscoveredPeer, Driver, PeerAddress, Result};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, Weak};
+use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 
-const EVENT_CHANNEL_CAPACITY: usize = 128;
-const TICK_INTERVAL: Duration = Duration::from_secs(1);
-/// Backoff before restarting the inbound server after a transient
-/// serve/advertise failure.
-const SERVE_RETRY_DELAY: Duration = Duration::from_secs(2);
-const CHANNEL_SEND_QUEUE: usize = 16;
-const CHANNEL_RECV_QUEUE: usize = 64;
-/// Priority requests are rare (a UI state change), so a small queue only
-/// guards against a caller spamming them while a slow `send` holds the pump.
-const CHANNEL_PRIORITY_QUEUE: usize = 4;
-const DISCOVER_WINDOW: Duration = Duration::from_secs(3);
-
-/// A stable identity the two peers of a pair compare the same way, to decide
-/// which side dials (glare — see `docs/adr/0003`'s revision). This is the
-/// *application's* to establish (node ids exchanged during its own
-/// handshake); `PeerAddress` is opaque and unordered and cannot be the
-/// basis. Only consulted in [`LinkRole::Symmetric`].
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LinkId(pub String);
-
-impl From<String> for LinkId {
-    fn from(s: String) -> Self {
-        LinkId(s)
+/// Random identifier for one worker lifetime. This is not an authenticated identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EndpointId(pub(crate) [u8; 16]);
+impl EndpointId {
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
     }
 }
-impl From<&str> for LinkId {
-    fn from(s: &str) -> Self {
-        LinkId(s.to_owned())
-    }
-}
-
-/// Who dials, for a pair that can both see each other.
-#[derive(Debug, Clone)]
-pub enum LinkRole {
-    /// Dials tracked peers *and* accepts inbound. For each peer, whichever
-    /// side has the lower `LinkId` dials.
-    Symmetric { local_id: LinkId },
-    /// Only ever dials tracked peers.
-    DialOnly,
-    /// Only ever advertises and accepts; never dials.
-    AcceptOnly,
-}
-
-/// Redial ladder for the dialer, and inbound-link deadline for the acceptor.
-/// Both sides reach [`PeerStatus::GaveUp`] when the budget is spent.
-#[derive(Debug, Clone)]
-pub struct RetryBudget {
-    /// Backoff before each successive redial. The last entry repeats.
-    /// Empty = do not redial (an inbound link is still accepted).
-    pub backoff: Vec<Duration>,
-    /// Total time from the first failed attempt before the dialer gives up.
-    pub give_up_after: Duration,
-    /// How long the acceptor waits for an inbound link before giving up.
-    pub acceptor_deadline: Duration,
-}
-
-impl Default for RetryBudget {
-    fn default() -> Self {
-        RetryBudget {
-            backoff: vec![
-                Duration::from_secs(1),
-                Duration::from_secs(2),
-                Duration::from_secs(4),
-                Duration::from_secs(8),
-                Duration::from_secs(30),
-            ],
-            give_up_after: Duration::from_secs(60),
-            acceptor_deadline: Duration::from_secs(60),
-        }
-    }
-}
-
-/// How many peers hold a live link at once. A BLE central has a hard
-/// concurrent-link limit; tracking more peers than this queues the extra
-/// ones as [`PeerStatus::Queued`].
 #[derive(Debug, Clone, Copy)]
 pub struct MaxLinks(pub usize);
-
 impl Default for MaxLinks {
     fn default() -> Self {
-        MaxLinks(4)
+        Self(4)
     }
 }
-
-/// Configure a [`PeerLink`]. See `docs/interface.md`.
 pub struct PeerLinkConfig {
-    /// The wire contract and datagram bounds. `datagram.service` /
-    /// `datagram.characteristic` are the service and characteristic to use.
     pub datagram: DatagramConfig,
-    pub role: LinkRole,
-    pub retry_budget: RetryBudget,
     pub max_links: MaxLinks,
 }
-
-/// One tracked peer's coarse status — a projection of the internal state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PeerStatus {
-    Untracked,
-    /// Radio off / unsupported.
-    Unavailable,
-    /// Tracked, but `max_links` is full — waiting for a slot.
-    Queued,
-    /// Trying — dialing, or waiting for an inbound link.
-    Connecting,
-    Connected,
-    /// A previous attempt failed; backing off before the next.
-    Waiting,
-    /// The retry budget is spent. Left by `retry()` or an inbound link.
-    GaveUp,
-}
-
-/// What the consumer reacts to. Delivered on [`PeerLink::events`], a
-/// broadcast — each call is an independent subscription.
-#[derive(Debug, Clone)]
-pub enum PeerLinkEvent {
-    /// A link to `peer` is up; the channel is valid until `Down` for this
-    /// peer. A redial after a drop delivers a fresh `Up`.
-    Up {
-        peer: PeerAddress,
-        max_message_len: usize,
-        channel: Arc<PeerChannel>,
-    },
-    /// The link is gone; the channel from `Up` is dead.
-    Down { peer: PeerAddress },
-    /// Coarse status changed. No channel.
-    Status { peer: PeerAddress, status: PeerStatus },
-    /// The radio's usability changed.
-    RadioChanged { status: RadioStatus },
-}
-
-/// Message-passing handle to one peer's live link. `send` / `recv` cross to
-/// the worker thread, which does the GATT work. Contract (see
-/// `docs/interface.md`): `send` returns the real `BleError`
-/// (`GattBusy` stays distinguishable); `recv` → `None` on close, including
-/// the worker being gone; a full send queue → `BleError::GattBusy`.
-pub struct PeerChannel {
-    peer: PeerAddress,
-    max_message_len: usize,
-    send_tx: mpsc::Sender<(Vec<u8>, oneshot::Sender<Result<()>>)>,
-    priority_tx: mpsc::Sender<(ConnectionPriority, oneshot::Sender<Result<()>>)>,
-    recv_rx: AsyncMutex<mpsc::Receiver<Result<Vec<u8>>>>,
-}
-
-impl std::fmt::Debug for PeerChannel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PeerChannel")
-            .field("peer", &self.peer)
-            .field("max_message_len", &self.max_message_len)
-            .finish_non_exhaustive()
+impl PeerLinkConfig {
+    pub fn new(datagram: DatagramConfig) -> Self {
+        Self {
+            datagram,
+            max_links: MaxLinks::default(),
+        }
     }
 }
+pub(super) type Reply<T> = oneshot::Sender<Result<T>>;
+pub(super) type ChannelTable = Arc<Mutex<HashMap<PeerAddress, Weak<ChannelState>>>>;
 
-impl PeerChannel {
-    pub fn peer(&self) -> PeerAddress {
-        self.peer.clone()
-    }
-
-    pub fn max_message_len(&self) -> usize {
-        self.max_message_len
-    }
-
-    pub async fn send(&self, payload: Vec<u8>) -> Result<()> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.send_tx
-            .try_send((payload, reply_tx))
-            .map_err(|err| match err {
-                mpsc::error::TrySendError::Full(_) => {
-                    BleError::GattBusy(format!("send queue full for {}", self.peer.0))
-                }
-                mpsc::error::TrySendError::Closed(_) => BleError::NotConnected(self.peer.0.clone()),
-            })?;
-        reply_rx
-            .await
-            .map_err(|_| BleError::NotConnected(self.peer.0.clone()))?
-    }
-
-    pub async fn recv(&self) -> Option<Result<Vec<u8>>> {
-        self.recv_rx.lock().await.recv().await
-    }
-
-    /// See [`GattConnection::request_connection_priority`]: Android only,
-    /// and only on a link this side dialled — otherwise
-    /// [`BleError::Unsupported`]. Same crossing contract as `send`: the real
-    /// error comes back, a full queue is `GattBusy`, a closed link is
-    /// `NotConnected`. A reconnect starts at the platform default again, so
-    /// re-request after each `PeerLinkEvent::Up`.
-    ///
-    /// [`GattConnection::request_connection_priority`]: crate::GattConnection::request_connection_priority
-    pub async fn request_connection_priority(&self, priority: ConnectionPriority) -> Result<()> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.priority_tx
-            .try_send((priority, reply_tx))
-            .map_err(|err| match err {
-                mpsc::error::TrySendError::Full(_) => {
-                    BleError::GattBusy(format!("priority queue full for {}", self.peer.0))
-                }
-                mpsc::error::TrySendError::Closed(_) => BleError::NotConnected(self.peer.0.clone()),
-            })?;
-        reply_rx
-            .await
-            .map_err(|_| BleError::NotConnected(self.peer.0.clone()))?
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The handle
-// ---------------------------------------------------------------------------
-
-enum Command {
-    Track { peer: PeerAddress, peer_id: LinkId },
-    Untrack(PeerAddress),
-    Retry(PeerAddress),
-    Discover(oneshot::Sender<Result<Vec<PeerAddress>>>),
-}
-
-/// See the module docs and `docs/interface.md`.
 pub struct PeerLink {
-    cmd_tx: mpsc::UnboundedSender<Command>,
-    events_tx: broadcast::Sender<PeerLinkEvent>,
-    status: Arc<StdMutex<HashMap<PeerAddress, PeerStatus>>>,
-    radio: Arc<StdMutex<RadioStatus>>,
-    _worker: WorkerHandle,
+    endpoint: EndpointId,
+    commands: mpsc::Sender<Command>,
+    incoming: Mutex<Option<mpsc::Receiver<ConnectionRequest>>>,
+    channels: ChannelTable,
+    shutdown: CancellationToken,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
-
-struct WorkerHandle {
-    shutdown: Option<oneshot::Sender<()>>,
-    join: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Drop for WorkerHandle {
+impl Drop for PeerLink {
     fn drop(&mut self) {
-        if let Some(tx) = self.shutdown.take() {
-            let _ = tx.send(());
-        }
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
+        self.shutdown.cancel();
+        if let Some(worker) = self.worker.lock().unwrap().take() {
+            let _ = worker.join();
         }
     }
 }
-
 impl PeerLink {
-    /// Build a `PeerLink` that constructs and owns the platform driver.
-    /// Synchronous and infallible: the driver is acquired on the worker
-    /// thread and surfaces as `radio()` reporting `Off` / `Unsupported`.
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
     pub fn new(config: PeerLinkConfig) -> Arc<Self> {
-        Self::spawn(config, None)
+        Self::spawn(None, config)
     }
-
-    /// Build a `PeerLink` over an already-constructed driver — for tests and
-    /// the mock.
     pub fn with_driver(driver: Arc<dyn Driver>, config: PeerLinkConfig) -> Arc<Self> {
-        Self::spawn(config, Some(driver))
+        Self::spawn(Some(driver), config)
     }
-
-    fn spawn(config: PeerLinkConfig, driver: Option<Arc<dyn Driver>>) -> Arc<Self> {
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let (events_tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let status = Arc::new(StdMutex::new(HashMap::new()));
-        let radio = Arc::new(StdMutex::new(RadioStatus::Off));
-
-        let worker = Worker {
+    fn spawn(driver: Option<Arc<dyn Driver>>, config: PeerLinkConfig) -> Arc<Self> {
+        let endpoint = EndpointId(*uuid::Uuid::new_v4().as_bytes());
+        let (commands, receiver) = mpsc::channel(64);
+        let (incoming, incoming_receiver) =
+            mpsc::channel(config.datagram.accept_queue_depth.max(1));
+        let channels = Arc::new(Mutex::new(HashMap::new()));
+        let shutdown = CancellationToken::new();
+        let worker = Worker::new(
+            endpoint,
             config,
-            provided_driver: driver,
-            cmd_rx,
-            events_tx: events_tx.clone(),
-            status: status.clone(),
-            radio: radio.clone(),
-            next_link_gen: std::cell::Cell::new(0),
-        };
+            driver,
+            commands.clone(),
+            receiver,
+            incoming,
+            channels.clone(),
+            shutdown.clone(),
+        );
         let join = std::thread::Builder::new()
             .name("ble-gatt-peerlink".into())
             .spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
+                let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .expect("PeerLink worker runtime");
-                rt.block_on(worker.run(shutdown_rx));
+                    .expect("PeerLink runtime");
+                runtime.block_on(worker.run());
             })
-            .expect("spawn PeerLink worker thread");
-
-        Arc::new(PeerLink {
-            cmd_tx,
-            events_tx,
-            status,
-            radio,
-            _worker: WorkerHandle { shutdown: Some(shutdown_tx), join: Some(join) },
+            .expect("PeerLink thread");
+        Arc::new(Self {
+            endpoint,
+            commands,
+            incoming: Mutex::new(Some(incoming_receiver)),
+            channels,
+            shutdown,
+            worker: Mutex::new(Some(join)),
         })
     }
-
-    /// Keep a link to this peer alive. `peer_id` is only consulted for
-    /// [`LinkRole::Symmetric`].
-    pub fn track(&self, peer: PeerAddress, peer_id: LinkId) {
-        let _ = self.cmd_tx.send(Command::Track { peer, peer_id });
+    pub fn endpoint_id(&self) -> EndpointId {
+        self.endpoint
     }
-
-    /// Stop: drop the channel, disconnect, forget the peer.
-    pub fn untrack(&self, peer: PeerAddress) {
-        let _ = self.cmd_tx.send(Command::Untrack(peer));
+    pub fn incoming(&self) -> Result<BoxStream<ConnectionRequest>> {
+        let receiver = self
+            .incoming
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| BleError::AdapterBusy("incoming already claimed".into()))?;
+        Ok(Box::pin(ReceiverStream::new(receiver)))
     }
-
-    /// A tracked peer that gave up: try again now.
-    pub fn retry(&self, peer: PeerAddress) {
-        let _ = self.cmd_tx.send(Command::Retry(peer));
+    pub async fn request(&self, peer: &PeerAddress) -> Result<ConnectionRequest> {
+        let cancellation = CancellationToken::new();
+        let mut guard = CancelOnDrop(Some(cancellation.clone()));
+        let (reply, receiver) = oneshot::channel();
+        self.submit(Command::Request {
+            peer: peer.clone(),
+            cancellation,
+            reply,
+        })?;
+        let result = receiver.await.map_err(|_| closed())?;
+        if result.is_ok() {
+            guard.0.take();
+        }
+        result
     }
-
-    /// Peers advertising the configured service — a bounded snapshot.
-    /// Untrusted metadata; the consumer decides which to `track`.
-    pub async fn discover(&self) -> Result<Vec<PeerAddress>> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(Command::Discover(tx))
-            .map_err(|_| BleError::AdapterUnavailable("PeerLink worker is gone".into()))?;
-        rx.await
-            .map_err(|_| BleError::AdapterUnavailable("PeerLink worker is gone".into()))?
-    }
-
-    /// Subscribe to the event stream. Each call is an independent
-    /// subscription.
-    pub fn events(&self) -> BoxStream<PeerLinkEvent> {
-        Box::pin(BroadcastStream::new(self.events_tx.subscribe()).filter_map(|item| item.ok()))
-    }
-
-    /// One peer's status without waiting for an event.
-    pub fn status(&self, peer: &PeerAddress) -> PeerStatus {
-        self.status
+    pub fn channel(&self, peer: &PeerAddress) -> Option<PeerChannel> {
+        self.channels
             .lock()
             .unwrap()
             .get(peer)
-            .copied()
-            .unwrap_or(PeerStatus::Untracked)
+            .and_then(Weak::upgrade)
+            .filter(|state| !state.ended.is_cancelled())
+            .map(|state| PeerChannel { state })
     }
-
-    /// Radio usability without waiting for an event.
-    pub fn radio(&self) -> RadioStatus {
-        *self.radio.lock().unwrap()
+    pub async fn set_advertising(&self, enabled: bool) -> Result<()> {
+        let (reply, receiver) = oneshot::channel();
+        self.submit(Command::Advertising(enabled, reply))?;
+        receiver.await.map_err(|_| closed())?
+    }
+    pub async fn disconnect(&self, endpoint: EndpointId) -> Result<()> {
+        let (reply, receiver) = oneshot::channel();
+        self.submit(Command::Disconnect(endpoint, reply))?;
+        receiver.await.map_err(|_| closed())?
+    }
+    pub async fn close(&self) -> Result<()> {
+        let (reply, receiver) = oneshot::channel();
+        self.submit(Command::Close(reply))?;
+        receiver.await.map_err(|_| closed())?
+    }
+    pub async fn discover(&self) -> Result<BoxStream<Result<(EndpointId, DiscoveredPeer)>>> {
+        let (reply, receiver) = oneshot::channel();
+        self.submit(Command::Discover(reply))?;
+        receiver.await.map_err(|_| closed())?
+    }
+    fn submit(&self, command: Command) -> Result<()> {
+        self.commands
+            .try_send(command)
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => {
+                    BleError::GattBusy("worker queue full".into())
+                }
+                mpsc::error::TrySendError::Closed(_) => closed(),
+            })
     }
 }
 
-// ---------------------------------------------------------------------------
-// The worker — runs on the dedicated thread's runtime.
-// ---------------------------------------------------------------------------
-
-struct Worker {
-    config: PeerLinkConfig,
-    provided_driver: Option<Arc<dyn Driver>>,
-    cmd_rx: mpsc::UnboundedReceiver<Command>,
-    events_tx: broadcast::Sender<PeerLinkEvent>,
-    status: Arc<StdMutex<HashMap<PeerAddress, PeerStatus>>>,
-    radio: Arc<StdMutex<RadioStatus>>,
-    /// Source of `LiveLink` generations. Deliberately not a `Peer` field: a
-    /// `Peer` is discarded on `Untrack` and rebuilt from scratch on the next
-    /// `Track`, so a per-`Peer` counter would restart at the same values a
-    /// just-discarded pump's queued `linkgone` still carries — letting that
-    /// stale notification tear down the replacement's first link. The worker
-    /// runs on one task (see `run`'s `select!` loop), so a `Cell` is enough.
-    next_link_gen: std::cell::Cell<u64>,
-}
-
-/// Per-tracked-peer state the worker owns.
-struct Peer {
-    central: CentralLink,
-    peripheral: PeripheralLink,
-    /// `true` when this side is the designated dialer for the pair. The
-    /// other side accepts an inbound link instead.
-    dials: bool,
-    /// When the current run of attempts started, for the give-up clocks.
-    trying_since: Option<Instant>,
-    attempts: usize,
-    /// Set while backing off: no dial before this instant.
-    retry_at: Option<Instant>,
-    gave_up: bool,
-    link: Option<LiveLink>,
-    /// The in-flight `datagram::connect` task, while `central` is `Dialing`.
-    /// Aborted when the state leaves `Dialing` (deadline, radio loss,
-    /// untrack) so the abandoned attempt does not keep the driver's
-    /// connection slot while `pump_dials` starts another.
-    dial_task: Option<tokio::task::AbortHandle>,
-}
-
-struct LiveLink {
-    gen: u64,
-    pump: tokio::task::AbortHandle,
-    /// Held so the pump task's `teardown` receiver stays open; dropping this
-    /// (on `tear_down`) tells the pump to drop the `DatagramChannel`.
-    _teardown: oneshot::Sender<()>,
-}
-
-impl Worker {
-    async fn run(mut self, mut shutdown: oneshot::Receiver<()>) {
-        let driver = match self.acquire_driver().await {
-            Some(b) => b,
-            None => {
-                self.set_radio(RadioStatus::Unsupported);
-                let _ = self
-                    .events_tx
-                    .send(PeerLinkEvent::RadioChanged { status: RadioStatus::Unsupported });
-                self.idle_until_shutdown(shutdown).await;
-                return;
-            }
-        };
-        // Radio state first, capability classification only once it is on.
-        // On Android `capabilities()` reads `bluetoothLeScanner` /
-        // `bluetoothLeAdvertiser`, both null while the adapter is *off* — so
-        // checking capabilities first would turn a recoverable `Off` into a
-        // permanent `Unsupported` that ignores the later `On` broadcast.
-        // `Off` is recoverable; `Unsupported` is not, so it must only be
-        // concluded against a usable radio.
-        let mut events = driver.events();
-        let initial = self.assess_radio(&driver).await;
-        self.set_radio(initial);
-        let _ = self
-            .events_tx
-            .send(PeerLinkEvent::RadioChanged { status: initial });
-
-        let mut radio = match initial {
-            RadioStatus::On => RadioState::On,
-            RadioStatus::Off => RadioState::Off,
-            RadioStatus::Unsupported => RadioState::Unsupported,
-        };
-        let mut peers: HashMap<PeerAddress, Peer> = HashMap::new();
-        let (conn_tx, mut conn_rx) =
-            mpsc::unbounded_channel::<(PeerAddress, u64, Result<DatagramChannel>)>();
-        let (linkgone_tx, mut linkgone_rx) = mpsc::unbounded_channel::<(PeerAddress, u64)>();
-        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<DatagramChannel>();
-        // The inbound server: a task, plus when to (re)start it. `serve`
-        // exits on a transient advertise/setup failure, so the worker must
-        // notice and restart it rather than sitting without a server until
-        // the radio next toggles.
-        let mut serve: Option<tokio::task::JoinHandle<()>> = None;
-        let mut serve_retry_at: Option<Instant> = None;
-        let mut tick = tokio::time::interval(TICK_INTERVAL);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        if self.accepts() && radio.usable() {
-            serve = Some(self.spawn_serve(&driver, &inbound_tx));
+pub(super) struct CancelOnDrop(pub Option<CancellationToken>);
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if let Some(token) = &self.0 {
+            token.cancel();
         }
+    }
+}
+/// One attempt. Dropping this value cancels only this attempt.
+pub struct ConnectionRequest {
+    pub(super) endpoint: EndpointId,
+    pub(super) peer: PeerAddress,
+    pub(super) generation: u64,
+    pub(super) commands: mpsc::Sender<Command>,
+    pub(super) cancellation: CancelOnDrop,
+    pub(super) outcome: Arc<Mutex<Option<crate::AttemptError>>>,
+}
+impl std::fmt::Debug for ConnectionRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionRequest")
+            .field("endpoint", &self.endpoint)
+            .field("peer", &self.peer)
+            .finish()
+    }
+}
+impl ConnectionRequest {
+    pub fn endpoint_id(&self) -> EndpointId {
+        self.endpoint
+    }
+    pub fn peer(&self) -> PeerAddress {
+        self.peer.clone()
+    }
+    pub async fn accept(mut self) -> Result<PeerChannel> {
+        let (reply, receiver) = oneshot::channel();
+        self.commands
+            .send(Command::Accept(self.generation, reply))
+            .await
+            .map_err(|_| closed())?;
+        let result = receiver.await.map_err(|_| closed())?.map_err(|error| {
+            self.outcome
+                .lock()
+                .unwrap()
+                .map_or(error, BleError::Attempt)
+        });
+        if result.is_ok() {
+            self.cancellation.0.take();
+        }
+        result
+    }
+    pub async fn reject(self) -> Result<()> {
+        let (reply, receiver) = oneshot::channel();
+        self.commands
+            .send(Command::Reject(self.generation, reply))
+            .await
+            .map_err(|_| closed())?;
+        receiver.await.map_err(|_| closed())?
+    }
+}
 
+/// Why this channel generation ended. This value is set before receive closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerChannelCloseReason {
+    LocalDisconnect,
+    PeerDisconnect,
+    LinkLost,
+    ProtocolError,
+    Released,
+    Shutdown,
+}
+
+pub(super) struct ChannelState {
+    pub endpoint: EndpointId,
+    pub peer: PeerAddress,
+    pub generation: u64,
+    pub maximum: usize,
+    pub transport: mpsc::Sender<TransportCommand>,
+    pub received: AsyncMutex<mpsc::Receiver<Result<Vec<u8>>>>,
+    pub overflow: Arc<crate::datagram::OverflowSignal>,
+    pub ended: CancellationToken,
+    pub released: CancellationToken,
+    pub commands: mpsc::Sender<Command>,
+    pub attempt: u64,
+    pub channels: ChannelTable,
+    pub close_reason: Mutex<Option<PeerChannelCloseReason>>,
+}
+impl Drop for ChannelState {
+    fn drop(&mut self) {
+        self.released.cancel();
+    }
+}
+/// A scoped use of one generation. Clones share a receive queue, not a broadcast.
+#[derive(Clone)]
+pub struct PeerChannel {
+    pub(super) state: Arc<ChannelState>,
+}
+impl std::fmt::Debug for PeerChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerChannel")
+            .field("endpoint", &self.state.endpoint)
+            .finish()
+    }
+}
+impl PeerChannel {
+    pub fn endpoint_id(&self) -> EndpointId {
+        self.state.endpoint
+    }
+    pub fn peer(&self) -> PeerAddress {
+        self.state.peer.clone()
+    }
+    pub fn max_message_len(&self) -> usize {
+        self.state.maximum
+    }
+    pub fn close_reason(&self) -> Option<PeerChannelCloseReason> {
+        *self.state.close_reason.lock().unwrap()
+    }
+    pub async fn send(&self, payload: Vec<u8>) -> Result<()> {
+        if self.state.ended.is_cancelled() {
+            return Err(closed());
+        }
+        if payload.len() > self.state.maximum {
+            return Err(BleError::Protocol(
+                "managed message exceeds channel bound".into(),
+            ));
+        }
+        let (reply, receiver) = oneshot::channel();
+        self.state
+            .transport
+            .try_send(TransportCommand::Send(
+                Record::Data {
+                    attempt: self.state.attempt,
+                    payload,
+                },
+                Some(reply),
+            ))
+            .map_err(|_| BleError::GattBusy("channel queue full or closed".into()))?;
+        receiver.await.map_err(|_| closed())?
+    }
+    pub async fn recv(&self) -> Option<Result<Vec<u8>>> {
+        // Hold the receive lock across flag checks and wakeups too: clones
+        // consume one shared queue and one shared gap report, never broadcast.
+        let mut received = self.state.received.lock().await;
         loop {
-            // (Re)start the inbound server when it is wanted, absent, and off
-            // any backoff.
-            if self.accepts()
-                && radio.usable()
-                && serve.is_none()
-                && serve_retry_at.is_none_or(|at| Instant::now() >= at)
+            if self.state.ended.is_cancelled() {
+                return None;
+            }
+            if self.state.overflow.take() {
+                return Some(Err(BleError::ReceiveGap(
+                    "managed inbound payload was lost".into(),
+                )));
+            }
+            tokio::select! { biased;
+                _ = self.state.ended.cancelled() => return None,
+                _ = self.state.overflow.notified() => continue,
+                item = received.recv() => return item,
+            }
+        }
+    }
+    pub async fn request_connection_priority(&self, priority: ConnectionPriority) -> Result<()> {
+        if self.state.ended.is_cancelled() {
+            return Err(closed());
+        }
+        let (reply, receiver) = oneshot::channel();
+        self.state
+            .transport
+            .try_send(TransportCommand::Priority(priority, reply))
+            .map_err(|_| BleError::GattBusy("priority queue full or closed".into()))?;
+        receiver.await.map_err(|_| closed())?
+    }
+    pub async fn disconnect(&self) -> Result<()> {
+        let (reply, receiver) = oneshot::channel();
+        self.state
+            .commands
+            .send(Command::DisconnectGeneration(self.state.generation, reply))
+            .await
+            .map_err(|_| closed())?;
+        receiver.await.map_err(|_| closed())?
+    }
+    pub async fn release(self) -> Result<()> {
+        let generation = self.state.generation;
+        let commands = self.state.commands.clone();
+        // Serialize last-use retirement with weak acquisition and other releases.
+        // No new use can appear between the count check and removal from the table.
+        let table = self.state.channels.clone();
+        let last = {
+            let mut channels = table.lock().unwrap();
+            let last = Arc::strong_count(&self.state) == 1;
+            if last
+                && channels
+                    .get(&self.state.peer)
+                    .is_some_and(|state| state.ptr_eq(&Arc::downgrade(&self.state)))
             {
-                serve = Some(self.spawn_serve(&driver, &inbound_tx));
-                serve_retry_at = None;
+                channels.remove(&self.state.peer);
             }
-
-            // Wake at the earliest per-peer deadline (a backoff expiring, a
-            // give-up clock running out) rather than only on the 1s tick —
-            // with a short retry budget the tick alone lets a peer give up
-            // before its own retry_at fires.
-            let wake = self
-                .next_wake(&peers, radio, serve_retry_at)
-                .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
-
-            tokio::select! {
-                _ = &mut shutdown => break,
-
-                _ = tokio::time::sleep_until(wake) => {
-                    self.on_tick(&mut peers, radio);
-                }
-
-                Some(()) = async {
-                    match serve.as_mut() {
-                        Some(h) => { let _ = h.await; Some(()) }
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    // The server task ended — a transient serve/advertise
-                    // failure. Back off, then the top of the loop restarts it.
-                    serve = None;
-                    serve_retry_at = Some(Instant::now() + SERVE_RETRY_DELAY);
-                }
-
-                cmd = self.cmd_rx.recv() => match cmd {
-                    None => break,
-                    Some(Command::Track { peer, peer_id }) => {
-                        self.on_track(&mut peers, peer, peer_id, radio);
-                    }
-                    Some(Command::Untrack(peer)) => {
-                        if let Some(mut p) = peers.remove(&peer) {
-                            let had_link = p.link.is_some();
-                            self.tear_down(&mut p);
-                            if had_link {
-                                let _ = self.events_tx.send(PeerLinkEvent::Down { peer: peer.clone() });
-                            }
-                        }
-                        self.publish_status(&peer, PeerStatus::Untracked);
-                    }
-                    Some(Command::Retry(peer)) => {
-                        if let Some(p) = peers.get_mut(&peer) {
-                            p.gave_up = false;
-                            p.attempts = 0;
-                            p.retry_at = None;
-                            // Same rule as `track` / `RadioLost`: a dialer's
-                            // clock starts when it actually dials, so a retry
-                            // issued while every slot is full is not charged
-                            // for the wait.
-                            p.trying_since = if p.dials { None } else { Some(Instant::now()) };
-                        }
-                    }
-                    Some(Command::Discover(reply)) => {
-                        let _ = reply.send(self.discover_now(&driver).await);
-                    }
-                },
-
-                Some(ev) = events.next() => {
-                    let was_usable = radio.usable();
-                    // A `RadioChanged { On }` from a driver that cannot do
-                    // this role (Android reporting the adapter back but
-                    // still no advertiser for `AcceptOnly`) becomes
-                    // `Unsupported` — the capability check that could not run
-                    // while the adapter was off runs now.
-                    let ev = match ev {
-                        GattEvent::RadioChanged { status: RadioStatus::On } => {
-                            GattEvent::RadioChanged { status: self.assess_radio(&driver).await }
-                        }
-                        other => other,
-                    };
-                    self.on_driver_event(&mut peers, &mut radio, ev);
-                    // Stop the inbound server when the radio goes down; the
-                    // top of the loop restarts it when the radio is back.
-                    if self.accepts() && was_usable && !radio.usable() {
-                        if let Some(h) = serve.take() {
-                            h.abort();
-                        }
-                        serve_retry_at = None;
-                    }
-                }
-
-                Some((peer, session, result)) = conn_rx.recv() => {
-                    self.on_dial_result(&mut peers, peer, session, result, &linkgone_tx);
-                }
-
-                Some(channel) = inbound_rx.recv() => {
-                    self.on_inbound(&mut peers, channel, radio, &linkgone_tx);
-                }
-
-                Some((peer, gen)) = linkgone_rx.recv() => {
-                    self.on_link_gone(&mut peers, peer, gen);
-                }
-
-                _ = tick.tick() => {
-                    self.on_tick(&mut peers, radio);
-                }
-            }
-            self.pump_dials(&driver, &mut peers, radio, &conn_tx);
-            self.refresh_all_status(&peers, radio);
-        }
-
-        if let Some(h) = serve.take() {
-            h.abort();
-        }
-        for (_, mut p) in peers.drain() {
-            self.tear_down(&mut p);
-        }
-    }
-
-    /// Whether this role ever accepts an inbound link.
-    fn accepts(&self) -> bool {
-        !matches!(self.config.role, LinkRole::DialOnly)
-    }
-
-    /// The radio's status *and* whether the driver can do the configured
-    /// role. `Off` (recoverable) is decided from the radio alone; the
-    /// permanent `Unsupported` is only concluded against a usable radio,
-    /// since `capabilities()` under-reports while the adapter is off.
-    async fn assess_radio(&self, driver: &Arc<dyn Driver>) -> RadioStatus {
-        match driver.radio_status().await {
-            RadioStatus::On => {
-                let caps = driver.capabilities().await;
-                let ok = match self.config.role {
-                    LinkRole::DialOnly => caps.central,
-                    LinkRole::AcceptOnly => caps.peripheral,
-                    // Symmetric needs central to dial at all; accepting is a
-                    // bonus it degrades to giving up on without peripheral.
-                    LinkRole::Symmetric { .. } => caps.central,
-                };
-                if ok {
-                    RadioStatus::On
-                } else {
-                    RadioStatus::Unsupported
-                }
-            }
-            other => other,
-        }
-    }
-
-    /// The earliest instant the worker needs to wake — a backoff expiring, a
-    /// give-up clock running out, or the inbound server's restart backoff.
-    fn next_wake(
-        &self, peers: &HashMap<PeerAddress, Peer>, radio: RadioState,
-        serve_retry_at: Option<Instant>,
-    ) -> Option<tokio::time::Instant> {
-        let now = Instant::now();
-        let base = tokio::time::Instant::now();
-        let mut earliest: Option<Duration> = None;
-        let mut consider = |d: Duration| {
-            earliest = Some(earliest.map_or(d, |e| e.min(d)));
+            drop(self);
+            last
         };
-        for p in peers.values() {
-            if p.link.is_some() || p.gave_up {
-                continue;
-            }
-            if let Some(at) = p.retry_at {
-                consider(at.saturating_duration_since(now));
-            }
-            // The give-up clock only counts while the radio is usable (see
-            // `on_tick`); scheduling a wake for an already-expired deadline
-            // during an outage would just spin the loop.
-            if radio.usable() {
-                if let Some(since) = p.trying_since {
-                    let deadline = if p.dials {
-                        self.config.retry_budget.give_up_after
-                    } else {
-                        self.config.retry_budget.acceptor_deadline
-                    };
-                    consider((since + deadline).saturating_duration_since(now));
-                }
-            }
+        if last {
+            let (reply, receiver) = oneshot::channel();
+            commands
+                .send(Command::Retire(generation, reply))
+                .await
+                .map_err(|_| closed())?;
+            receiver.await.map_err(|_| closed())?
+        } else {
+            Ok(())
         }
-        if let Some(at) = serve_retry_at {
-            consider(at.saturating_duration_since(now));
-        }
-        earliest.map(|d| base + d)
-    }
-
-    fn spawn_serve(
-        &self, driver: &Arc<dyn Driver>, inbound_tx: &mpsc::UnboundedSender<DatagramChannel>,
-    ) -> tokio::task::JoinHandle<()> {
-        let driver = driver.clone();
-        let cfg = self.config.datagram.clone();
-        let inbound_tx = inbound_tx.clone();
-        tokio::spawn(async move {
-            match datagram::serve_driver(driver, &cfg).await {
-                Ok(mut stream) => {
-                    while let Some(channel) = stream.next().await {
-                        if inbound_tx.send(channel).is_err() {
-                            break;
-                        }
-                    }
-                }
-                Err(err) => log::warn!("peer_link: serve failed: {err}"),
-            }
-        })
-    }
-
-    fn on_inbound(
-        &self, peers: &mut HashMap<PeerAddress, Peer>, channel: DatagramChannel, radio: RadioState,
-        linkgone_tx: &mpsc::UnboundedSender<(PeerAddress, u64)>,
-    ) {
-        let peer = channel.peer();
-        // `datagram::serve` already serves one central at a time (its wire
-        // shape — notify is a broadcast that cannot be addressed), so the
-        // acceptor side of `PeerLink` holds at most one inbound link. A
-        // second tracked acceptor peer stays `Connecting` until the slot
-        // frees or it gives up. Beyond that, honour `max_links` across both
-        // directions so a `Symmetric` instance at its outbound cap does not
-        // exceed it on an inbound link.
-        let over_cap = Self::committed(peers) >= self.config.max_links.0;
-        let Some(p) = peers.get_mut(&peer) else {
-            // Not a tracked peer — do not serve a stranger. Dropping the
-            // channel disconnects it.
-            return;
-        };
-        // If we are the designated dialer for this pair, already linked, over
-        // the link cap, or the radio is not usable, this inbound connection
-        // loses: drop it (which disconnects it).
-        if p.dials || p.link.is_some() || over_cap || !radio.usable() {
-            return;
-        }
-        let now = Instant::now();
-        let session = now.elapsed().as_nanos() as u64;
-        let (pl, _) = p.peripheral.apply(PeripheralEvent::CentralConnected { session }, now);
-        p.peripheral = pl;
-        let (pl, _) = p.peripheral.apply(PeripheralEvent::CentralSubscribed, now);
-        p.peripheral = pl;
-        p.gave_up = false;
-        p.trying_since = None;
-        p.retry_at = None;
-        let gen = self.alloc_link_gen();
-        let max_len = channel.max_message_len();
-        let (link, handle) = self.start_pump(channel, peer.clone(), gen, linkgone_tx.clone());
-        p.link = Some(link);
-        let _ = self.events_tx.send(PeerLinkEvent::Up {
-            peer,
-            max_message_len: max_len,
-            channel: handle,
-        });
-    }
-
-    async fn acquire_driver(&mut self) -> Option<Arc<dyn Driver>> {
-        if let Some(b) = self.provided_driver.take() {
-            return Some(b);
-        }
-        #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
-        {
-            crate::drivers::platform().await.ok()
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
-        {
-            None
-        }
-    }
-
-    async fn idle_until_shutdown(&mut self, mut shutdown: oneshot::Receiver<()>) {
-        loop {
-            tokio::select! {
-                _ = &mut shutdown => return,
-                cmd = self.cmd_rx.recv() => match cmd {
-                    None => return,
-                    Some(Command::Discover(reply)) => {
-                        let _ = reply.send(Err(BleError::AdapterUnavailable("no BLE adapter".into())));
-                    }
-                    Some(Command::Track { peer, .. }) => {
-                        self.publish_status(&peer, PeerStatus::Unavailable);
-                    }
-                    Some(_) => {}
-                },
-            }
-        }
-    }
-
-    async fn discover_now(&self, driver: &Arc<dyn Driver>) -> Result<Vec<PeerAddress>> {
-        let mut stream = driver.scan(self.config.datagram.service).await?;
-        let mut out = Vec::new();
-        let deadline = tokio::time::Instant::now() + DISCOVER_WINDOW;
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep_until(deadline) => break,
-                item = stream.next() => match item {
-                    Some(Ok(peer)) => out.push(peer.address),
-                    Some(Err(err)) => return Err(err),
-                    None => break,
-                },
-            }
-        }
-        Ok(out)
-    }
-
-    fn on_track(
-        &self, peers: &mut HashMap<PeerAddress, Peer>, peer: PeerAddress, peer_id: LinkId,
-        radio: RadioState,
-    ) {
-        let dials = match &self.config.role {
-            LinkRole::DialOnly => true,
-            LinkRole::AcceptOnly => false,
-            LinkRole::Symmetric { local_id } => *local_id < peer_id,
-        };
-        peers.entry(peer.clone()).or_insert_with(|| Peer {
-            central: CentralLink::new(),
-            peripheral: PeripheralLink::new(),
-            dials,
-            // The give-up clock starts when the peer actually starts trying —
-            // for the acceptor that is now (it is waiting for an inbound
-            // link); for the dialer it is when it gets a slot and its first
-            // dial fires (`pump_dials`), so a peer sitting `Queued` behind a
-            // full `max_links` is not ticked to `GaveUp` while it never had a
-            // chance.
-            trying_since: if dials { None } else { Some(Instant::now()) },
-            attempts: 0,
-            retry_at: None,
-            gave_up: false,
-            link: None,
-            dial_task: None,
-        });
-        self.refresh_status(peers, &peer, radio);
-    }
-
-    fn pump_dials(
-        &self, driver: &Arc<dyn Driver>, peers: &mut HashMap<PeerAddress, Peer>,
-        radio: RadioState,
-        conn_tx: &mpsc::UnboundedSender<(PeerAddress, u64, Result<DatagramChannel>)>,
-    ) {
-        if !radio.usable() {
-            return;
-        }
-        let now = Instant::now();
-        // A dial in flight reserves a slot too — otherwise with max_links = 1
-        // a stalled dial for one peer lets a second dial start, and both can
-        // land, exceeding the cap.
-        let committed = peers
-            .values()
-            .filter(|p| p.link.is_some() || matches!(p.central, CentralLink::Dialing { .. }))
-            .count();
-        let mut budget = self.config.max_links.0.saturating_sub(committed);
-
-        let mut candidates: Vec<PeerAddress> = peers.keys().cloned().collect();
-        candidates.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let mut next_session: u64 = now.elapsed().as_nanos() as u64;
-        for peer in candidates {
-            let p = peers.get_mut(&peer).unwrap();
-            if p.link.is_some() || p.gave_up || !p.dials || !p.central.may_dial() {
-                continue;
-            }
-            if p.retry_at.is_some_and(|at| now < at) {
-                continue;
-            }
-            if budget == 0 {
-                continue; // status projected as Queued by `refresh_status`
-            }
-            budget -= 1;
-            next_session = next_session.wrapping_add(1);
-            let (next, _) = p.central.apply(CentralEvent::DialStarted { session: next_session }, now);
-            p.central = next;
-            p.attempts += 1;
-            // The give-up clock starts here, on the first real attempt — not
-            // at `track()` — so a peer that queued behind a full cap is not
-            // charged for the wait.
-            p.trying_since.get_or_insert(now);
-
-            let driver = driver.clone();
-            let cfg = self.config.datagram.clone();
-            let conn_tx = conn_tx.clone();
-            let peer2 = peer.clone();
-            let session = next_session;
-            let task = tokio::spawn(async move {
-                let result = datagram::connect_driver(driver, &peer2, &cfg).await;
-                let _ = conn_tx.send((peer2, session, result));
-            });
-            p.dial_task = Some(task.abort_handle());
-        }
-    }
-
-    /// Abort a peer's in-flight dial task if the state has left `Dialing` —
-    /// aborting drops `datagram::connect`'s future, whose `PendingConnection`
-    /// guard disconnects the half-open link.
-    fn clear_stale_dial(p: &mut Peer) {
-        if !matches!(p.central, CentralLink::Dialing { .. }) {
-            if let Some(h) = p.dial_task.take() {
-                h.abort();
-            }
-        }
-    }
-
-    fn on_dial_result(
-        &self, peers: &mut HashMap<PeerAddress, Peer>, peer: PeerAddress, session: u64,
-        result: Result<DatagramChannel>, linkgone_tx: &mpsc::UnboundedSender<(PeerAddress, u64)>,
-    ) {
-        let Some(p) = peers.get_mut(&peer) else {
-            return;
-        };
-        // A queued result can outlive its own attempt: a dial-window
-        // timeout, a radio bounce, or an untrack+retrack can all put this
-        // peer back in `Dialing` under a *new* session before this task's
-        // result is selected. Matching only by peer address, this result
-        // would then be misapplied to that new attempt -- an old success
-        // installing an obsolete channel as the new attempt's link, or an
-        // old failure knocking the new attempt out of `Dialing` and (via
-        // the `dial_task = None` below) erasing the only handle able to
-        // abort it. Every attempt is tagged with the session `pump_dials`
-        // put it in `Dialing` under, so a session that no longer matches
-        // this peer's current one is simply not this task's problem.
-        if p.central.session() != Some(session) {
-            if let Ok(channel) = result {
-                drop(channel); // Stale success: its Drop disconnects.
-            }
-            return;
-        }
-        // This task has delivered its result; it is no longer in flight.
-        p.dial_task = None;
-        let now = Instant::now();
-        match result {
-            Ok(channel) => {
-                let (next, _) = p.central.apply(CentralEvent::DialSucceeded, now);
-                p.central = next;
-                // The state may have moved past `Dialing` while this dial ran
-                // — a radio-off, an untrack/retrack, the dial deadline. If so
-                // `apply(DialSucceeded)` was a no-op and this result is stale:
-                // drop the channel (its `Drop` disconnects) rather than
-                // installing a link nothing is expecting.
-                if !matches!(p.central, CentralLink::Connected { .. }) {
-                    drop(channel);
-                    return;
-                }
-                p.attempts = 0;
-                p.trying_since = None;
-                p.retry_at = None;
-                let gen = self.alloc_link_gen();
-                let max_len = channel.max_message_len();
-                let (link, handle) = self.start_pump(channel, peer.clone(), gen, linkgone_tx.clone());
-                p.link = Some(link);
-                let _ = self.events_tx.send(PeerLinkEvent::Up {
-                    peer,
-                    max_message_len: max_len,
-                    channel: handle,
-                });
-            }
-            Err(_err) => {
-                let (next, _) = p.central.apply(CentralEvent::DialFailed, now);
-                p.central = next;
-                self.apply_backoff(p, now);
-            }
-        }
-    }
-
-    fn on_link_gone(&self, peers: &mut HashMap<PeerAddress, Peer>, peer: PeerAddress, gen: u64) {
-        if let Some(p) = peers.get_mut(&peer) {
-            // Ignore a `linkgone` from a superseded pump: an untrack/track +
-            // fast reconnect for the same address can install a replacement
-            // link before the old pump's queued notification is processed.
-            if p.link.as_ref().is_none_or(|l| l.gen != gen) {
-                return;
-            }
-            p.link = None;
-            let now = Instant::now();
-            // One of the two applies; the other is a no-op from its current
-            // state.
-            let (c, _) = p.central.apply(CentralEvent::LinkDropped, now);
-            p.central = c;
-            let (pl, _) = p.peripheral.apply(PeripheralEvent::CentralDropped, now);
-            p.peripheral = pl;
-            p.trying_since = Some(now);
-            p.attempts = 0;
-            p.retry_at = None;
-            let _ = self.events_tx.send(PeerLinkEvent::Down { peer });
-        }
-    }
-
-    fn apply_backoff(&self, p: &mut Peer, now: Instant) {
-        let since = *p.trying_since.get_or_insert(now);
-        if now.duration_since(since) >= self.config.retry_budget.give_up_after {
-            p.gave_up = true;
-            p.retry_at = None;
-            return;
-        }
-        let backoff = &self.config.retry_budget.backoff;
-        if backoff.is_empty() {
-            p.gave_up = true;
-            return;
-        }
-        let idx = p.attempts.saturating_sub(1).min(backoff.len() - 1);
-        p.retry_at = Some(now + backoff[idx]);
-    }
-
-    /// The next `LiveLink` generation, unique for the worker's whole
-    /// lifetime -- not just for one `Peer`'s. See `Worker::next_link_gen`'s
-    /// doc comment for why this must not reset on `Untrack`.
-    fn alloc_link_gen(&self) -> u64 {
-        let gen = self.next_link_gen.get() + 1;
-        self.next_link_gen.set(gen);
-        gen
-    }
-
-    fn start_pump(
-        &self, mut channel: DatagramChannel, peer: PeerAddress, gen: u64,
-        linkgone_tx: mpsc::UnboundedSender<(PeerAddress, u64)>,
-    ) -> (LiveLink, Arc<PeerChannel>) {
-        let max_message_len = channel.max_message_len();
-        let (send_tx, mut send_rx) =
-            mpsc::channel::<(Vec<u8>, oneshot::Sender<Result<()>>)>(CHANNEL_SEND_QUEUE);
-        let (recv_tx, recv_rx) = mpsc::channel::<Result<Vec<u8>>>(CHANNEL_RECV_QUEUE);
-        let (priority_tx, mut priority_rx) =
-            mpsc::channel::<(ConnectionPriority, oneshot::Sender<Result<()>>)>(CHANNEL_PRIORITY_QUEUE);
-        let (teardown_tx, mut teardown_rx) = oneshot::channel::<()>();
-
-        let peer2 = peer.clone();
-        let task = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = &mut teardown_rx => break,
-                    req = send_rx.recv() => match req {
-                        None => break,
-                        Some((bytes, reply)) => {
-                            let _ = reply.send(channel.send(bytes).await);
-                        }
-                    },
-                    // `Some` only: the handle holds `priority_tx` for as long
-                    // as it holds `send_tx`, and `send_rx` above already ends
-                    // the loop when the handle is gone.
-                    Some((priority, reply)) = priority_rx.recv() => {
-                        let _ = reply.send(channel.request_connection_priority(priority).await);
-                    },
-                    item = channel.recv() => match item {
-                        Some(msg) => {
-                            // Non-blocking: a consumer that stops calling
-                            // `recv()` must only lose messages, not wedge
-                            // this whole select loop. A blocking send here
-                            // would also stall `teardown_rx` and
-                            // `send_rx`, so `untrack()`'s drop of `LiveLink`
-                            // and outbound sends would hang right along
-                            // with it, and a physical disconnect would
-                            // never reach `linkgone_tx` -- silently pinning
-                            // a `max_links` slot to a link nothing is
-                            // draining.
-                            if let Err(err) = recv_tx.try_send(msg) {
-                                match err {
-                                    mpsc::error::TrySendError::Closed(_) => break,
-                                    mpsc::error::TrySendError::Full(_) => {
-                                        log::warn!(
-                                            "peer_link: {} recv queue full, dropping a message",
-                                            peer2.0
-                                        );
-                                        // Best-effort lag signal, mirroring
-                                        // `PeerChannel::send`'s Full ->
-                                        // GattBusy. If even this doesn't
-                                        // fit, the consumer will find out
-                                        // it's behind on its next `recv()`
-                                        // regardless.
-                                        let _ = recv_tx.try_send(Err(BleError::GattBusy(
-                                            format!("recv queue full for {}", peer2.0),
-                                        )));
-                                    }
-                                }
-                            }
-                        }
-                        None => break,
-                    },
-                }
-            }
-            drop(channel); // Drop disconnects the underlying link.
-            let _ = linkgone_tx.send((peer2, gen));
-        });
-
-        let handle = Arc::new(PeerChannel {
-            peer,
-            max_message_len,
-            send_tx,
-            priority_tx,
-            recv_rx: AsyncMutex::new(recv_rx),
-        });
-        (LiveLink { gen, pump: task.abort_handle(), _teardown: teardown_tx }, handle)
-    }
-
-    fn on_driver_event(
-        &self, peers: &mut HashMap<PeerAddress, Peer>, radio: &mut RadioState, ev: GattEvent,
-    ) {
-        match ev {
-            GattEvent::RadioChanged { status } => {
-                let event = match status {
-                    RadioStatus::On => RadioEvent::PoweredOn,
-                    RadioStatus::Off => RadioEvent::PoweredOff,
-                    RadioStatus::Unsupported => RadioEvent::NoAdapter,
-                };
-                let (next, effects) = radio.apply(event, Instant::now());
-                *radio = next;
-                self.set_radio(status);
-                let _ = self.events_tx.send(PeerLinkEvent::RadioChanged { status });
-
-                if !effects.is_empty() {
-                    let now = Instant::now();
-                    for (peer, p) in peers.iter_mut() {
-                        let (c, _) = p.central.apply(CentralEvent::RadioLost, now);
-                        p.central = c;
-                        let (pl, _) = p.peripheral.apply(PeripheralEvent::RadioLost, now);
-                        p.peripheral = pl;
-                        Self::clear_stale_dial(p);
-                        if let Some(link) = p.link.take() {
-                            link.pump.abort();
-                            let _ = self.events_tx.send(PeerLinkEvent::Down { peer: peer.clone() });
-                        }
-                        p.gave_up = false;
-                        p.attempts = 0;
-                        p.retry_at = None;
-                        // Same rule as `track`: the dialer's clock restarts
-                        // when it next actually dials; the acceptor's runs
-                        // from now (it will be waiting for an inbound link
-                        // once the radio is back).
-                        p.trying_since = if p.dials { None } else { Some(now) };
-                    }
-                }
-                if radio.usable() {
-                    let now = Instant::now();
-                    for p in peers.values_mut() {
-                        let (c, _) = p.central.apply(CentralEvent::RadioBack, now);
-                        p.central = c;
-                        let (pl, _) = p.peripheral.apply(PeripheralEvent::RadioBack, now);
-                        p.peripheral = pl;
-                    }
-                }
-            }
-            GattEvent::Disconnected { peer, local_role: Role::Central, .. } => {
-                if let Some(p) = peers.get_mut(&peer) {
-                    if p.link.is_none() {
-                        let now = Instant::now();
-                        let (c, _) = p.central.apply(CentralEvent::LinkDropped, now);
-                        p.central = c;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn on_tick(&self, peers: &mut HashMap<PeerAddress, Peer>, radio: RadioState) {
-        let now = Instant::now();
-        for p in peers.values_mut() {
-            let (c, _) = p.central.apply(CentralEvent::Tick, now);
-            p.central = c;
-            // A dial that timed out (`Dialing` -> `Idle` on `Tick`) leaves a
-            // `datagram::connect` task still holding the driver's slot —
-            // abort it before `pump_dials` starts a fresh attempt Android
-            // would reject as already in progress.
-            Self::clear_stale_dial(p);
-
-            // The give-up clock only runs while there is actually a chance of
-            // connecting. With the radio off, nothing is being attempted —
-            // ticking a peer to `gave_up` here would make `RadioBack` leave
-            // it permanently skipped (`RadioLost` already reset `trying_since`,
-            // so without this the deadline would still elapse against a dead
-            // radio).
-            if !radio.usable() || p.link.is_some() || p.gave_up {
-                continue;
-            }
-            let deadline = if p.dials {
-                self.config.retry_budget.give_up_after
-            } else {
-                self.config.retry_budget.acceptor_deadline
-            };
-            if let Some(since) = p.trying_since {
-                if now.duration_since(since) >= deadline {
-                    p.gave_up = true;
-                    p.retry_at = None;
-                }
-            }
-        }
-    }
-
-    fn tear_down(&self, p: &mut Peer) {
-        if let Some(link) = p.link.take() {
-            link.pump.abort();
-            drop(link);
-        }
-        if let Some(h) = p.dial_task.take() {
-            h.abort();
-        }
-        // Reset both machines to their start state; the dropped channel /
-        // aborted dial has already done the platform teardown.
-        p.central = CentralLink::new();
-        p.peripheral = PeripheralLink::new();
-    }
-
-    // ---- status projection ------------------------------------------------
-
-    fn committed(peers: &HashMap<PeerAddress, Peer>) -> usize {
-        peers
-            .values()
-            .filter(|p| p.link.is_some() || matches!(p.central, CentralLink::Dialing { .. }))
-            .count()
-    }
-
-    fn refresh_all_status(&self, peers: &HashMap<PeerAddress, Peer>, radio: RadioState) {
-        let over_cap = Self::committed(peers) >= self.config.max_links.0;
-        for (peer, p) in peers {
-            self.publish_status(peer, project(p, radio, over_cap));
-        }
-    }
-
-    fn refresh_status(
-        &self, peers: &HashMap<PeerAddress, Peer>, peer: &PeerAddress, radio: RadioState,
-    ) {
-        if let Some(p) = peers.get(peer) {
-            let over_cap = Self::committed(peers) >= self.config.max_links.0;
-            self.publish_status(peer, project(p, radio, over_cap));
-        }
-    }
-
-    fn publish_status(&self, peer: &PeerAddress, status: PeerStatus) {
-        let changed = {
-            let mut map = self.status.lock().unwrap();
-            match status {
-                PeerStatus::Untracked => map.remove(peer).is_some(),
-                _ => map.insert(peer.clone(), status) != Some(status),
-            }
-        };
-        if changed {
-            let _ = self
-                .events_tx
-                .send(PeerLinkEvent::Status { peer: peer.clone(), status });
-        }
-    }
-
-    fn set_radio(&self, status: RadioStatus) {
-        *self.radio.lock().unwrap() = status;
     }
 }
+pub(super) fn closed() -> BleError {
+    BleError::NotConnected("managed peer".into())
+}
+pub(super) fn failed(reason: &str) -> BleError {
+    BleError::Protocol(reason.into())
+}
 
-fn project(p: &Peer, radio: RadioState, over_cap: bool) -> PeerStatus {
-    if !radio.usable() {
-        return PeerStatus::Unavailable;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::drivers::mock::{MockDriver, MockNetwork};
+    use crate::{CapabilityReport, CharacteristicUuid, ServiceUuid};
+    use std::time::Duration;
+    use tokio_stream::StreamExt;
+
+    fn pair() -> (Arc<PeerLink>, Arc<PeerLink>) {
+        let network = MockNetwork::new();
+        let make = |address: &str| {
+            PeerLink::with_driver(
+                Arc::new(MockDriver::new(
+                    PeerAddress(address.into()),
+                    network.clone(),
+                    CapabilityReport {
+                        central: true,
+                        peripheral: true,
+                    },
+                )),
+                PeerLinkConfig::new(DatagramConfig::new(
+                    ServiceUuid(uuid::Uuid::from_u128(11)),
+                    CharacteristicUuid(uuid::Uuid::from_u128(12)),
+                )),
+            )
+        };
+        (make("a"), make("b"))
     }
-    if p.link.is_some() {
-        return PeerStatus::Connected;
+    async fn nonce(link: &PeerLink, value: i32) {
+        let (reply, receiver) = oneshot::channel();
+        link.submit(Command::SetNonce(value, reply)).unwrap();
+        receiver.await.unwrap().unwrap();
     }
-    if p.gave_up {
-        return PeerStatus::GaveUp;
+    #[tokio::test]
+    async fn inbound_admission_obeys_managed_link_bound() {
+        let network = MockNetwork::new();
+        let caps = CapabilityReport {
+            central: true,
+            peripheral: true,
+        };
+        let config = DatagramConfig::new(
+            ServiceUuid(uuid::Uuid::from_u128(11)),
+            CharacteristicUuid(uuid::Uuid::from_u128(12)),
+        );
+        let raw_driver = Arc::new(MockDriver::new(
+            PeerAddress("raw".into()),
+            network.clone(),
+            caps,
+        ));
+        let mut managed_config = PeerLinkConfig::new(config.clone());
+        managed_config.max_links = MaxLinks(0);
+        let managed = PeerLink::with_driver(
+            Arc::new(MockDriver::new(
+                PeerAddress("managed".into()),
+                network,
+                caps,
+            )),
+            managed_config,
+        );
+        let mut incoming = managed.incoming().unwrap();
+        managed.set_advertising(true).await.unwrap();
+        let mut raw =
+            crate::datagram::connect_driver(raw_driver, &PeerAddress("managed".into()), &config)
+                .await
+                .unwrap();
+        let _ = raw
+            .send(
+                Record::Request {
+                    sender: EndpointId([1; 16]),
+                    target: managed.endpoint_id(),
+                    attempt: 19,
+                    nonce: 7,
+                }
+                .encode(),
+            )
+            .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), incoming.next())
+                .await
+                .is_err(),
+            "inbound limit bypassed"
+        );
+        managed.close().await.unwrap();
     }
-    if p.retry_at.is_some() {
-        return PeerStatus::Waiting;
+
+    #[tokio::test]
+    async fn reject_sends_explicit_decision_before_retiring_attempt() {
+        let network = MockNetwork::new();
+        let caps = CapabilityReport {
+            central: true,
+            peripheral: true,
+        };
+        let config = DatagramConfig::new(
+            ServiceUuid(uuid::Uuid::from_u128(11)),
+            CharacteristicUuid(uuid::Uuid::from_u128(12)),
+        );
+        let raw = Arc::new(MockDriver::new(
+            PeerAddress("raw".into()),
+            network.clone(),
+            caps,
+        ));
+        let managed = PeerLink::with_driver(
+            Arc::new(MockDriver::new(
+                PeerAddress("managed".into()),
+                network,
+                caps,
+            )),
+            PeerLinkConfig::new(config.clone()),
+        );
+        let mut incoming = managed.incoming().unwrap();
+        managed.set_advertising(true).await.unwrap();
+        let mut raw = crate::datagram::connect_driver(raw, &PeerAddress("managed".into()), &config)
+            .await
+            .unwrap();
+        raw.send(
+            Record::Request {
+                sender: EndpointId([1; 16]),
+                target: managed.endpoint_id(),
+                attempt: 19,
+                nonce: 7,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+        let _response = raw.recv().await.unwrap().unwrap();
+        incoming.next().await.unwrap().reject().await.unwrap();
+        let decision = tokio::time::timeout(Duration::from_secs(1), raw.recv())
+            .await
+            .unwrap();
+        assert_eq!(
+            Record::decode(
+                &decision.expect("explicit rejection record").unwrap(),
+                config.max_message_len
+            )
+            .unwrap(),
+            Record::Decision {
+                attempt: 19,
+                action: 1
+            }
+        );
+        managed.close().await.unwrap();
     }
-    if over_cap && p.dials {
-        return PeerStatus::Queued;
+
+    #[tokio::test]
+    async fn established_idle_peer_receives_keepalive_control() {
+        let network = MockNetwork::new();
+        let caps = CapabilityReport {
+            central: true,
+            peripheral: true,
+        };
+        let config = DatagramConfig::new(
+            ServiceUuid(uuid::Uuid::from_u128(11)),
+            CharacteristicUuid(uuid::Uuid::from_u128(12)),
+        );
+        let raw = Arc::new(MockDriver::new(
+            PeerAddress("raw".into()),
+            network.clone(),
+            caps,
+        ));
+        let managed = PeerLink::with_driver(
+            Arc::new(MockDriver::new(
+                PeerAddress("managed".into()),
+                network,
+                caps,
+            )),
+            PeerLinkConfig::new(config.clone()),
+        );
+        let mut incoming = managed.incoming().unwrap();
+        managed.set_advertising(true).await.unwrap();
+        let mut raw = crate::datagram::connect_driver(raw, &PeerAddress("managed".into()), &config)
+            .await
+            .unwrap();
+        raw.send(
+            Record::Request {
+                sender: EndpointId([1; 16]),
+                target: managed.endpoint_id(),
+                attempt: 17,
+                nonce: -7,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+        let _response = raw.recv().await.unwrap().unwrap();
+        let request = incoming.next().await.unwrap();
+        raw.send(
+            Record::Decision {
+                attempt: 17,
+                action: 0,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+        let channel = request.accept().await.unwrap();
+        assert_eq!(
+            Record::decode(&raw.recv().await.unwrap().unwrap(), config.max_message_len).unwrap(),
+            Record::Decision {
+                attempt: 17,
+                action: 0
+            }
+        );
+        let ping = tokio::time::timeout(Duration::from_secs(7), raw.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            Record::decode(&ping, config.max_message_len).unwrap(),
+            Record::Ping { attempt: 17 }
+        );
+        raw.send(Record::Pong { attempt: 17 }.encode())
+            .await
+            .unwrap();
+        channel.send(b"healthy idle".to_vec()).await.unwrap();
+        assert!(matches!(
+            Record::decode(&raw.recv().await.unwrap().unwrap(), config.max_message_len).unwrap(),
+            Record::Data { .. }
+        ));
+        managed.close().await.unwrap();
     }
-    PeerStatus::Connecting
+
+    #[tokio::test]
+    async fn positive_nonce_beats_negative_when_other_peer_initiates_winner() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (a, b) = pair();
+            let mut incoming_a = a.incoming().unwrap();
+            let _incoming_b = b.incoming().unwrap();
+            a.set_advertising(true).await.unwrap();
+            b.set_advertising(true).await.unwrap();
+            nonce(&a, i32::MIN).await;
+            nonce(&b, i32::MAX).await;
+            let address_a = PeerAddress("a".into());
+            let address_b = PeerAddress("b".into());
+            let (loser, winner) = tokio::join!(a.request(&address_b), b.request(&address_a));
+            let incoming = incoming_a.next().await.unwrap();
+            let (left, right) = tokio::join!(incoming.accept(), winner.unwrap().accept());
+            let left = left.unwrap();
+            let right = right.unwrap();
+            if let Ok(loser) = loser {
+                assert!(loser.accept().await.is_err());
+            }
+            right.send(b"positive winner".to_vec()).await.unwrap();
+            assert_eq!(left.recv().await.unwrap().unwrap(), b"positive winner");
+            a.close().await.unwrap();
+            b.close().await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn equal_nonces_fail_both_attempts_with_typed_outcomes() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (a, b) = pair();
+            let _incoming_a = a.incoming().unwrap();
+            let _incoming_b = b.incoming().unwrap();
+            a.set_advertising(true).await.unwrap();
+            b.set_advertising(true).await.unwrap();
+            nonce(&a, i32::MIN).await;
+            nonce(&b, i32::MIN).await;
+            let address_a = PeerAddress("a".into());
+            let address_b = PeerAddress("b".into());
+            let (left, right) = tokio::join!(a.request(&address_b), b.request(&address_a));
+            for result in [left, right] {
+                let result = match result {
+                    Ok(request) => request.accept().await.map(|_| ()),
+                    Err(error) => Err(error),
+                };
+                assert!(
+                    matches!(
+                        result,
+                        Err(crate::BleError::Attempt(crate::AttemptError::EqualNonce))
+                    ),
+                    "{result:?}"
+                );
+            }
+            assert!(a.channel(&address_b).is_none());
+            assert!(b.channel(&address_a).is_none());
+            a.close().await.unwrap();
+            b.close().await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn crossed_signed_nonces_fail_outgoing_separately_from_incoming_winner() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (a, b) = pair();
+            let mut incoming_a = a.incoming().unwrap();
+            let mut incoming_b = b.incoming().unwrap();
+            a.set_advertising(true).await.unwrap();
+            b.set_advertising(true).await.unwrap();
+            nonce(&a, -1).await;
+            nonce(&b, i32::MIN).await;
+            let address_a = PeerAddress("a".into());
+            let address_b = PeerAddress("b".into());
+            let (outgoing_a, outgoing_b) =
+                tokio::join!(a.request(&address_b), b.request(&address_a));
+            let outgoing_a = outgoing_a.unwrap();
+            let winner_b = incoming_b.next().await.unwrap();
+            let (accepted_a, accepted_b) = tokio::join!(outgoing_a.accept(), winner_b.accept());
+            let channel_a = accepted_a.unwrap();
+            let channel_b = accepted_b.unwrap();
+            if let Ok(loser) = outgoing_b {
+                assert!(loser.accept().await.is_err());
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), incoming_a.next())
+                    .await
+                    .is_err()
+            );
+            channel_b.send(b"winner".to_vec()).await.unwrap();
+            assert_eq!(channel_a.recv().await.unwrap().unwrap(), b"winner");
+            a.close().await.unwrap();
+            b.close().await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
 }

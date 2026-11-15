@@ -59,8 +59,8 @@ pub(super) fn from_buffer(buffer: &IBuffer) -> windows::core::Result<Vec<u8>> {
 /// `0x112233445566` → `"11:22:33:44:55:66"`, the form the Linux and Android
 /// drivers report.
 pub(super) fn format_address(address: u64) -> String {
-    let b = address.to_be_bytes();
-    format!("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}", b[2], b[3], b[4], b[5], b[6], b[7])
+    let bytes = address.to_be_bytes();
+    format!("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}", bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7])
 }
 
 pub(super) fn parse_address(address: &str) -> Option<u64> {
@@ -94,15 +94,15 @@ pub(super) fn session_address(session: &GattSession) -> windows::core::Result<St
 /// One service data AD structure: its UUID (little-endian, 16, 32 or 128
 /// bits) and the bytes after it. `None` for other AD types.
 pub(super) fn parse_service_data(data_type: u8, data: &[u8]) -> Option<(ServiceUuid, Vec<u8>)> {
-    let short = |value: u32| Uuid::from_u128(BLUETOOTH_BASE_UUID | ((value as u128) << 96));
+    let expand_short_uuid = |value: u32| Uuid::from_u128(BLUETOOTH_BASE_UUID | ((value as u128) << 96));
     let (uuid, rest) = match data_type {
         AD_SERVICE_DATA_16 => {
             let (bytes, rest) = data.split_first_chunk::<2>()?;
-            (short(u16::from_le_bytes(*bytes) as u32), rest)
+            (expand_short_uuid(u16::from_le_bytes(*bytes) as u32), rest)
         }
         AD_SERVICE_DATA_32 => {
             let (bytes, rest) = data.split_first_chunk::<4>()?;
-            (short(u32::from_le_bytes(*bytes)), rest)
+            (expand_short_uuid(u32::from_le_bytes(*bytes)), rest)
         }
         AD_SERVICE_DATA_128 => {
             let (bytes, rest) = data.split_first_chunk::<16>()?;

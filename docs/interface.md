@@ -1,353 +1,192 @@
-# Current APIs and the target peer contract
+# BLE APIs and peer ownership
 
-`ble-gatt` is a **carrier**. It moves bytes over BLE GATT. The datagram profile
-adds fragmentation and message boundaries, but not an application-session
-protocol or end-to-end encryption (ADR-0003).
+`ble-gatt` carries bytes. It does not authenticate or encrypt them.
+[ADR-0012](adr/0012-discovery-like-nearby.md) describes the managed protocol now
+implemented in the working tree. Integrated acceptance remains pending; this
+refactor is not published or hardware-accepted.
 
-The [target under review](adr/0012-discovery-like-nearby.md) gives the core one
-symmetric peer contract, independent of iroh: either peer can initiate or
-reconnect. The public initiation-mode choice is not part of that target.
-The source has not yet been refactored. This page documents current APIs;
-examples using `LinkRole` or `InitiationPolicy` are not the proposed new API.
+## Choose an API
 
-See the [core](../ble-gatt/README.md),
-[iroh adapter](../ble-gatt-iroh/README.md) and
-[Tauri adapter](../tauri-plugin-ble-gatt/README.md) for the ownership boundaries.
-
-## Choosing a current API
-
-| You are… | Use |
-|---|---|
-| talking to third-party hardware that speaks its own GATT protocol | **Tier 1 — raw GATT** |
-| moving whole messages to/from one peer and you want to own the connection yourself | **Tier 2 — datagram** |
-| keeping non-iroh byte channels to a set of peers alive over time | **Tier 3 — current `PeerLink`**, with its existing role policy |
-
-Current iroh consumers use datagrams through `ble-gatt-iroh`, not `PeerLink`.
-The target must serve both without duplicate lifecycle owners. Request/event/release
-signatures remain open. Losing outgoing attempts fail; incoming winners proceed
-separately through acceptance. Examples below use current APIs.
-
----
-
-## iroh consumers: use the adapter, not a second `PeerLink`
-
-For QUIC over BLE, `ble-gatt-iroh` already uses the datagram tier directly.
-Install its `hooks()` on the iroh endpoint; supply a dialler, discovered peer
-addresses and incoming channels. Do **not** also run `PeerLink` over those
-channels: that would add another retry/close owner. The `PeerLink` examples
-below describe the generic byte-channel API, not Fini's current integration.
-
-```rust,ignore
-let key = iroh::SecretKey::generate();
-let transport = ble_gatt_iroh::BleGattTransport::builder()
-    .dialer(ble_gatt_iroh::dial_with(adapter.clone(), config.clone()))
-    .initiation_policy(ble_gatt_iroh::InitiationPolicy::EitherPeer)
-    .build();
-let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
-    .secret_key(key)
-    .add_custom_transport(Arc::new(transport.clone()))
-    .address_lookup(transport.address_lookup())
-    .hooks(transport.hooks())
-    .bind().await?;
-transport.set_peer_address(remote_endpoint_id, advertised_address);
-// Feed datagram::serve's channels into transport.attach(channel).
-// Either endpoint may call endpoint.connect(remote_endpoint_id, alpn).
-```
-
-This is a current-API example, not the target design. Today callers select
-`EitherPeer` explicitly after verifying crossed-dial support. The
-unchanged default is `PreviousDialer` (30-second yield after an unexpected
-incoming-link loss). If crossed dials are unsafe, configure both peers with
-`InitiationPolicy::Ordered { local_id: key.public() }` before moving `key`
-into the endpoint: only the smaller endpoint key initiates. Individual
-`CapabilityReport.central/peripheral` booleans do not prove concurrent-role
-support. See [ADR-0012's current implementation gap](adr/0012-discovery-like-nearby.md#current-implementation-gap).
-
-Fini retains permitted peers, sync settings and application-session policy.
-A losing application candidate closes its own iroh connection, **not** all
-BLE links for that key while another connection uses them. The adapter's
-hooks perform ordinary last-user release. Explicit `close_links` is a force
-close for shutdown/revocation/abandoned connects, not candidate rejection.
-
-## Tier 1 — raw GATT (`Driver`)
-
-Use characteristics and MTUs directly for vendor protocols. Raw GATT adds no
-message framing, CRC or authentication exchange.
-
-```rust
-let mut conn = driver.connect(&peer).await?;
-let value = conn.read(SENSOR_CHAR).await?;
-conn.write(COMMAND_CHAR, cmd_bytes).await?;
-let mut notifications = conn.subscribe(TELEMETRY_CHAR).await?;
-```
-
-You own everything: when to reconnect, what the bytes mean, how to frame them.
-
----
-
-## Tier 2 — datagram (`datagram::connect` / `datagram::serve`)
-
-A channel carries complete opaque messages to one peer, within configured size
-and reassembly bounds. It fragments messages for the negotiated MTU and restores
-boundaries before delivery. Encryption remains outside the channel.
-
-```rust
-let mut channel = datagram::connect(&adapter, &peer, &config).await?;
-channel.send(encrypted_message).await?;
-let incoming = channel.recv().await?;
-```
-
-**You own the lifecycle:** dialing, retry, channel selection, crossed attempts
-and radio recovery. Supply an `Adapter` and runtime. `DatagramChannel` holds its
-`GattConnection` directly. Current `PeerLink` adds lifecycle control above this tier.
-
----
-
-## Tier 3 — `PeerLink` (current tracked-peer API)
-
-This section describes the implemented controller, not the target public
-design. Its `Symmetric` role chooses the lower `LinkId` to dial. That must not
-be confused with the new core protocol in ADR-0012.
-
-You declare **which peers you care about** and **one policy** (who dials). The
-library owns keeping links alive; you consume channels and status.
-
-### Configure once
-
-```rust
-// Normal case: PeerLink builds and owns the platform driver.
-let link: Arc<PeerLink> = PeerLink::new(PeerLinkConfig {
-    // service + characteristic + fragmentation bounds all live here
-    datagram:     DatagramConfig::new(MY_SERVICE, MY_CHARACTERISTIC),
-    role:         LinkRole::Symmetric { local_id: my_node_id.into() },
-    retry_budget: RetryBudget::default(),
-    max_links:    MaxLinks::default(),   // concurrent-link cap; conservative default
-});
-
-// Tests / advanced: inject an already-built driver (e.g. a MockDriver).
-let link = PeerLink::with_driver(driver, config);
-```
-
-**`PeerLink::new` is synchronous, infallible and needs no ambient runtime.**
-It returns immediately and starts one OS thread with its own Tokio runtime.
-The worker owns the driver and per-peer operations. Asynchronous adapter
-acquisition failures appear through `radio()` as `Off` or `Unsupported`, not constructor errors.
-
-`PeerLinkEvent::Up` supplies a `PeerChannel` message-passing handle. Its `send` /
-`recv` cross to the worker for GATT operations, independently of the consumer's
-runtime. Tier 2 instead runs its owned `GattConnection` on the caller's runtime.
-
-The handle's contract across that hop:
-
-- **`send` preserves typed `BleError` values.** Keep retryable `BleError::GattBusy`
-  distinct from permanent refusal across the worker boundary (ADR-0005).
-- **`recv()` returns `None` after link closure or worker death**, rather than hanging.
-- **A full send queue returns `BleError::GattBusy`**, so callers can apply the same retry policy.
-- **`request_connection_priority` follows the same crossing rules.** It asks
-  the platform for a latency/power trade-off on the live link
-  (`ConnectionPriority::LowPower` while idle, `High` while traffic is expected)
-  and can be called any number of times. Android only, and only on a link this
-  side dialled — the Linux driver and accepted links return
-  `BleError::Unsupported`, which a cross-platform caller treats as a no-op. A
-  request, not a guarantee: `Ok` means the platform accepted it. The first
-  explicit request replaces the Android driver's automatic bootstrap priority
-  (HIGH at connect, BALANCED once bootstrap ends) for that connection; a
-  reconnect starts over, so re-request after each `Up`. Also on
-  `GattConnection` (Tier 1) and `DatagramChannel` (Tier 2).
-
-Fields. `datagram` carries the wire contract (service + characteristic) and
-fragmentation bounds. The current `role` field selects who dials; `Symmetric`
-requires a stable identity for its ordering rule. This is existing API behavior,
-not a target requirement for the caller to choose an initiator.
-`retry_budget` and `max_links` have defaults.
-
-`max_links` caps live peers. Additional tracked peers report `PeerStatus::Queued`
-until disconnect or `untrack()` frees a slot. The default is 4; increase it only
-when the platform permits more concurrent links.
-
-| `LinkRole` | Behaviour |
-|---|---|
-| `Symmetric { local_id }` | dials tracked peers *and* accepts inbound; `local_id` breaks the dial tie |
-| `DialOnly` | only ever dials (central-only platform, a hub) |
-| `AcceptOnly` | only ever advertises and accepts (a peripheral) |
-
-**The accepting side currently holds one inbound datagram channel at a time.**
-The HAL already has per-peer notification operations, but the datagram serving
-implementation still enforces a single inbound channel. A second tracked peer
-must wait until that channel is released or its budget expires. `max_links > 1`
-does not remove this cap. Multi-inbound serving needs a separate design and
-tests; it is not included in the symmetric-initiation agreement.
-
-### Declare interest
-
-```rust
-// peer_id is the identity for the dial tiebreak — only consulted for
-// LinkRole::Symmetric; pass anything comparable for the other roles.
-link.track(peer_address, peer_id);   // keep a link to this peer alive
-link.untrack(peer_address);          // stop; drop the channel, disconnect, forget
-link.retry(peer_address);            // a tracked peer that gave up: try again now
-
-let found: Vec<PeerAddress> = link.discover().await?;   // a bounded snapshot
-// discovery is untrusted metadata — you decide which to track()
-```
-
-### Consume the event stream
-
-```rust
-// Each call is an independent subscription — events() is a broadcast, so a
-// second consumer is an addition, not a breaking change.
-let mut events = link.events();
-while let Some(ev) = events.next().await {
-    match ev {
-        PeerLinkEvent::Up { peer, max_message_len, channel } => { /* a PeerChannel, valid until Down */ }
-        PeerLinkEvent::Down { peer }              => { /* the channel is dead */ }
-        PeerLinkEvent::Status { peer, status }    => { /* Connecting / Connected / Waiting / GaveUp / … */ }
-        PeerLinkEvent::RadioChanged { status }    => { /* On | Off | Unsupported */ }
-    }
-}
-
-let s = link.status(&peer);           // snapshot for a UI row, without waiting
-let r = link.radio();                 // On | Off | Unsupported, without waiting
-```
-
-`PeerStatus`:
-
-```
-Untracked
-Unavailable                      // radio Off / Unsupported
-Queued                           // tracked, but max_links is full — waiting for a slot
-Connecting                       // trying — dialing, or waiting for an inbound link
-Connected
-Waiting                          // a previous attempt failed; backing off before the next
-GaveUp                           // the retry budget is spent; left by retry() or an inbound link
-```
-
-A public view of internal state, not the state machine itself.
-
-**Both roles can reach `GaveUp`.** Dialers exhaust the redial budget; acceptors
-exhaust the inbound wait budget. Both report exhaustion instead of remaining
-`Connecting` indefinitely. Consumers display `GaveUp` and use `retry(peer)` to restart.
-
-**`RadioStatus::Unsupported`** is reported when the platform has no usable BLE
-adapter for the configured `role` at all (as opposed to `Off`, a toggle). This
-replaces a consumer polling `capabilities()` to guess.
-
-### The library owns
-
-- building and owning the platform driver (Tier 3 consumers never touch `Driver`)
-- dialing tracked peers (when `role` and the tiebreak allow)
-- the retry budget on *both* sides — redials for the dialer, an inbound-link
-  deadline for the acceptor — and giving up (observable as `GaveUp`)
-- accepting inbound links
-- exactly one link per peer; resolving glare via `role`
-- tearing everything down on radio-off and re-establishing on radio-on
-- reporting radio state (`On` / `Off` / `Unsupported`), so the consumer stops
-  polling `capabilities()` to guess whether an adapter exists
-- surfacing an honest per-peer status
-
-### The consumer still owns
-
-- **which** addresses to `track` (discovery is untrusted; you choose)
-- the **identity** used for the dial tiebreak (`local_id`)
-- **non-radio preconditions:** network availability, paired addresses, per-pair
-  settings and application OS-bond checks. `PeerLink` reports radio state, not
-  eligibility for other transports.
-- everything **above the byte boundary**: authentication, encryption, and any
-  app-level liveness proof. The library carries bytes; it cannot know your
-  peer's app has stopped answering, only that the BLE link exists.
-
-### Multiple peers
-
-`track()`, `status()` and events operate per peer:
-
-- **Per-peer isolation.** One unresponsive peer does not stall the others. The
-  per-peer state machines are independent. The current Linux driver uses
-  address-keyed dial/teardown locks rather than one driver-wide dial lock.
-  The mock isolation test checks that a wedged peer leaves other peers able
-  to connect; that test does not certify native hardware behavior.
-- **The link cap is visible.** More tracked peers than `max_links` → the extra
-  ones are `Queued`, not an indistinguishable `Connecting`, and promote when a
-  slot frees.
-- **Retry budgets are independent.** Each peer backs off separately against the
-  shared radio. Only the `max_links` slot queue coordinates peers.
-
----
-
-## Current `PeerLink` and a non-iroh consumer's state machine
-
-A non-iroh consumer can run its own session state machine on top (auth, an
-encrypted channel, a ping/ack liveness proof). This is a generic composition,
-not a description of Fini's current iroh integration. The seam:
-
-| | `ble-gatt` (`PeerLink`) | non-iroh consumer |
+| Requirement | API | Lifecycle owner |
 |---|---|---|
-| Owns | transport: dial, connect, drop, redial ladder + give-up, radio | session: auth, proof, fade; preconditions the library is not |
-| Driven by | platform callbacks | `PeerLinkEvent` + its own ping ticks |
-| "Link nominally up but peer silent" | not visible — a dead BLE link is just `Down` | its own `Fading` state |
-| "Gave up retrying" | owned here; exposed as `GaveUp` + `retry()` | *rendered* from that, not tracked |
+| Vendor-specific characteristics | `Adapter::central` / `peripheral`, `Driver` | Caller |
+| Complete messages without managed establishment | `datagram::connect` / `serve` | Caller |
+| Discovery, mutual acceptance and scoped messages | `PeerLink` | One core worker |
+| QUIC over managed messages | `ble-gatt-iroh` | Core worker; adapter accounts for QUIC users |
 
-`PeerLinkEvent::Up` starts application authentication; `Down` ends the session.
-The consumer displays `GaveUp` and calls `retry()` on request. It does not
-duplicate exhaustion tracking, dial loops, backoff maps or crossed-attempt control.
-Pairing frames, pairing UI, stored eligibility and non-radio preconditions remain application concerns.
+Raw GATT and datagram APIs remain independent. They do not add the managed
+handshake. Do not run another lifecycle controller over the same native service.
+The core works in a standalone CLI without iroh or Tauri; see the
+[core crate](../ble-gatt/README.md). Android still needs bridge packaging and context.
 
----
+## Managed peer communication
 
-## Illustrative non-iroh application (current API)
+`PeerLink::new(PeerLinkConfig::new(config))` starts one dedicated worker thread
+with its own Tokio runtime. `with_driver(driver, config)` injects a driver.
+Construction does not wait for platform acquisition and does not prove radio
+availability. The worker coordinates attempts and reuses datagram fragmentation.
+It replaces the old tracking/ranking worker contract, not another manager beside it.
 
-This schematic example uses the current `PeerLink` types. Product-specific
-authentication and UI functions are illustrative. It is not Fini's current
-implementation and does not demonstrate the target API.
+`PeerLinkConfig` contains `datagram` and `max_links` (`MaxLinks`, default 4).
+There are no public tracking, retry-budget or initiation-policy modes.
+`PeerLink` is the retained implementation name, not an application naming requirement.
+
+### Minimal outgoing use
+
+This function uses the current API. The caller supplies a discovered address
+and profile configuration. The remote application must accept through `incoming()`.
 
 ```rust
-// Built where DeviceConnectionState is built — sync, infallible, no await.
-let link = PeerLink::new(PeerLinkConfig {
-    datagram: DatagramConfig::new(FINI_SERVICE, FINI_CHAR),
-    role: LinkRole::Symmetric { local_id: my_node_id.into() },
-    retry_budget: RetryBudget::default(),
-    max_links: MaxLinks::default(),
-});
+use ble_gatt::{datagram::DatagramConfig, PeerAddress, PeerLink, PeerLinkConfig};
 
-link.track(device.ble_address, device.node_id.into());   // when a paired device is known
-
-let mut events = link.events();
-while let Some(ev) = events.next().await {
-    match ev {
-        PeerLinkEvent::Up { peer, channel, .. } => {
-            let session = secure_channel::authenticate(channel).await?;
-            sessions.insert(peer, session);
-        }
-        PeerLinkEvent::Down { peer } => { sessions.remove(&peer); }
-        PeerLinkEvent::Status { peer, status } => { device_rows.update(peer, project(status)); }
-        PeerLinkEvent::RadioChanged { status } => { device_rows.set_radio(status); }
+async fn send_once(config: DatagramConfig, peer: PeerAddress) -> ble_gatt::Result<()> {
+    let link = PeerLink::new(PeerLinkConfig::new(config));
+    let result = async {
+        let request = link.request(&peer).await?;
+        let channel = request.accept().await?;
+        channel.send(b"hello".to_vec()).await?;
+        channel.release().await
     }
+    .await;
+    let cleanup = link.close().await;
+    result.and(cleanup)
 }
 ```
 
-In this composition, the consumer delegates transport retry and radio recovery
-to `PeerLink`. That does not prove any particular application has adopted it.
-For the current iroh integration, use the adapter section above instead.
+`PeerLink::new` is available on Linux, Android and Windows. Use `with_driver`
+for radio-free tests. The function is a usage example, not an executed device test.
 
----
+### Discovery and incoming requests
 
-## Pointers
+- `set_advertising(true).await` starts managed serving and publishes endpoint metadata.
+- `discover().await` returns a stream of `Result<(EndpointId, DiscoveredPeer)>`.
+  Drop the stream to stop discovery. Only one managed discovery stream can be active.
+- `request(&peer).await` returns outgoing initiation information, not an established channel.
+- `incoming()` returns the bounded `ConnectionRequest` stream. Claim it once,
+  before serving; another call returns `AdapterBusy`.
+- `ConnectionRequest::endpoint_id()` and `peer()` report correlation information,
+  not authenticated identity. Apply application eligibility and acceptance here.
+- `accept(self).await` waits for both sides to accept and returns `PeerChannel`.
+  `reject(self).await` rejects that attempt. Dropping a request cancels only its attempt.
 
-- **`docs/adr/0003`** — why the library is a carrier, not a crypto library; the
-  two original tiers.
-- **`docs/adr/0005`** — the owned link-state machine that makes `PeerLink`
-  possible, and the "connected but isn't" bug class it removes.
-- [`profile/datagram/mod.rs`](../ble-gatt/src/profile/datagram/mod.rs) — the
-  fragmentation primitive and current channel limits.
+Consume incoming requests with `tokio_stream::StreamExt::next`. Accept a winning
+incoming request independently when a crossed outgoing request fails. Never
+report the incoming winner as success for the losing outgoing attempt.
 
-## Current `PeerLink` API details, not target decisions
+Managed discovery completes missing profile metadata through GATT. It reuses
+known metadata for an owned attempt rather than opening a replacement session.
+Each discovery allows one bounded probe per address, up to 64 addresses.
+A fresh discovery resets that probe set. Raw scans do not inherit completion.
 
-- **Track model:** explicit `track()` only. Discovery is untrusted; a consumer
-  that wants "connect to everything advertising the service" writes a loop over
-  `discover()`.
-- **`RetryBudget`:** `default()` (redial ladder 1/2/4/8s cap 30s, give up after
-  ~60s total, acceptor inbound deadline ~60s), fully overridable.
-- **`Up` carries the peer's `max_message_len`** — a consumer sizing its own
-  payloads needs it.
-- **Construction:** `new(config)` builds the driver internally (a Tier-3
-  consumer never touches `Driver`); `with_driver(driver, config)` injects
-  one, for tests and the mock.
+### Messages and closure
+
+`PeerChannel` provides `send(Vec<u8>)`, `recv()`, `max_message_len()`, `peer()`
+and `endpoint_id()`. `recv().await` returns `Option<Result<Vec<u8>>>`.
+Clones share one receive queue; they are not broadcast subscriptions.
+`PeerLink::channel(&peer)` acquires an existing live scoped use without dialing.
+A full send queue reports `BleError::GattBusy`; oversize messages fail validation.
+
+A full application receive queue pauses that generation's transport task, not
+the shared worker. Other peers, native sends and control commands remain responsive.
+The task retains at most one pending record outside the existing bounded queues.
+Queue pressure alone does not report loss. Admission retains the existing
+five-second I/O bound; expiry ends the generation. Native end or generation
+cancellation interrupts pending admission without waiting for application capacity.
+Clones still share one receiver and one receive-gap signal.
+
+- `release(self).await` releases one scoped use. The last use awaits retirement.
+  Dropping the last handle requests asynchronous retirement instead.
+- `channel.disconnect().await` invalidates that channel generation, including
+  its other handles. It cannot disconnect a later replacement generation.
+- `link.disconnect(endpoint).await` ends current attempts/channels for that core endpoint.
+- `set_advertising(false).await` hides the advertisement but retains serving,
+  established sessions and subscriptions. It is not destructive server stop.
+- `close().await` ends worker communication and stops serving.
+
+`close_reason()` is set before receive ends. Reasons are `LocalDisconnect`,
+`PeerDisconnect`, `LinkLost`, `ProtocolError`, `Released` and `Shutdown`.
+Attempt failures use `BleError::Attempt(AttemptError)`, including rejection,
+cancellation, supersession, equal nonces, timeout and peer loss. Native errors
+and malformed-profile `BleError::Protocol` remain distinct.
+
+Establishment has a 30-second deadline, including acceptance. Established links
+send five-second keepalive probes and detect loss after 30 seconds without valid
+traffic. A finished message does not close a healthy channel. A terminal attempt
+does not restart automatically. New communication requires a new request.
+
+`request_connection_priority` forwards a platform request on a live channel.
+Unsupported platforms or roles return `BleError::Unsupported`; success is not a
+latency guarantee.
+
+## iroh integration
+
+Use one shared `PeerLink` with `ble_gatt_iroh::dial_with(link.clone())`.
+Accept incoming requests separately and pass established channels to
+`BleGattTransport::attach`. Install the transport's `hooks()` on the iroh endpoint.
+See the [adapter setup](../ble-gatt-iroh/README.md#setup) for the full composition.
+
+The adapter translates packets and addresses. It retains authenticated key,
+current-path and multi-user accounting, not a second native arbitration loop.
+Ending one QUIC user releases only its use. Other users keep the carrier.
+
+The adapter reads the core close reason before retiring its packet queue.
+Explicit local/peer disconnect, protocol failure and shutdown block automatic
+acquisition for that authorization generation. Old QUIC retransmissions cannot
+authorize replacement. Unexpected `LinkLost` remains recoverable.
+A fresh explicit iroh connect with hooks, or a separately acquired and attached
+core channel, authorizes a replacement. Scoped release is not global disconnect.
+This is the existing authorization contract, not a new recovery mode.
+Integrated proof of the idle-close/new-authorization race remains pending.
+
+## Raw APIs and lifetime limits
+
+Raw `Central::connect` returns an owned `Connection` for `read`, `write` and
+`subscribe`. Its Drop schedules cleanup when a Tokio runtime is available;
+explicit disconnect can be awaited. `Peripheral::serve` returns `ServerHandle`:
+`stop` awaits shutdown, while Drop requests background shutdown.
+
+`datagram::connect(&adapter, &peer, &config).await` returns `DatagramChannel`.
+Its `send` and `recv` preserve complete message boundaries. The caller owns
+dialing, retries, selection and recovery. Dropping the `datagram::serve` output
+stream stops channel delivery, not the service or existing channels.
+Use `datagram::stop_serving` for destructive shutdown.
+
+### Driver event streams and receive loss
+
+Subscribe to `Driver::lifecycle_events()` before acquiring a session.
+Linux, Android, Windows and mock drivers isolate this bounded stream from
+characteristic writes at publication. The mock broker preserves the source stream;
+`ManagedDriver` and Tauri's lazy driver forward it separately.
+
+`Driver::events()` and `Adapter::events()` retain the legacy all-events stream:
+radio/connection events and inbound characteristic writes. Repeated `Connected`
+reports remain possible. Client notifications use `GattConnection::subscribe`, not
+this stream. The isolated stream suppresses known duplicate session reports.
+
+Third-party drivers inherit a default that filters writes from `events()`.
+That fallback does not isolate storage. Its unknown `GattEvent::Lagged` must
+remain critical; filtering cannot prove that only payloads were lost.
+
+Raw datagram serving reads lifecycle and payload streams separately. Known payload
+loss reports `BleError::ReceiveGap`; later complete messages can still arrive.
+Critical `Lagged` or lifecycle-stream end terminates the affected raw channel;
+it is not recoverable payload loss. Broker transport loss also reports critical loss.
+Bounded lifecycle storage can overflow; payload isolation does not promise lossless lifecycle delivery.
+
+Logical retirement, reported native session closure and physical OS/radio teardown
+are separate evidence. WinRT peripheral exclusion cannot prove physical disconnect.
+See [hardware verification](hardware-verification.md) and
+[ADR-0011](adr/0011-windows-winrt-driver.md) before making platform claims.
+
+## Source references
+
+- [Public exports](../ble-gatt/src/lib.rs)
+- [Driver event ports](../ble-gatt/src/hal/mod.rs)
+- [Bounded native/mock event publication](../ble-gatt/src/drivers/event_bus.rs)
+- [Requests and scoped channels](../ble-gatt/src/connection/peer_link.rs)
+- [Worker and attempt ownership](../ble-gatt/src/connection/managed_worker.rs)
+- [Managed record codec](../ble-gatt/src/connection/managed_codec.rs)
+- [Raw datagram profile](../ble-gatt/src/profile/datagram/mod.rs)
+
+ADR-0005 remains a historical record. Its unused crate-private `link_state`
+implementation is retired; it is not the managed worker's live state machine.

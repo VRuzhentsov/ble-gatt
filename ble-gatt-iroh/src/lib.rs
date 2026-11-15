@@ -9,27 +9,25 @@
 //! is the application's decision (battery), so the application:
 //!
 //! - accepts inbound channels however it likes (typically
-//!   [`ble_gatt::datagram::serve`] while it wants to be reachable) and hands
+//!   [`PeerLink::incoming`] while it wants to be reachable) and hands
 //!   each one to [`BleGattTransport::attach`];
 //! - tells the transport where a peer can be reached with
 //!   [`BleGattTransport::set_peer_address`], for instance after its own scan
 //!   heard the peer;
 //! - supplies a [`Dialer`] the transport uses to open a channel the first time
 //!   iroh sends to an address with no channel yet ([`dial_with`] wraps
-//!   [`ble_gatt::datagram::connect`]);
+//!   [`PeerLink::request`]);
 //! - installs [`BleGattTransport::hooks`], so the transport learns from iroh
 //!   which endpoint each link carries (ADR-0008).
 //!
-//! Select [`InitiationPolicy::EitherPeer`] explicitly to let either peer
-//! reconnect without the previous dialler's yield. The compatibility default
-//! is [`InitiationPolicy::PreviousDialer`]; [`InitiationPolicy::Ordered`] is
-//! the deterministic fallback where crossed physical dials are unsafe.
-//! Individual central/peripheral capabilities do not establish concurrency
-//! support. Do not run a second `PeerLink` lifecycle on these channels.
+//! The shared [`PeerLink`] owns establishment, crossed BLE attempts and native
+//! cleanup. Accept incoming requests separately and pass their channels to
+//! [`BleGattTransport::attach`]. A failed outgoing attempt does not fail QUIC;
+//! QUIC can retransmit over an independently accepted surviving carrier.
 //!
 //! ```ignore
 //! let transport = BleGattTransport::builder()
-//!     .dialer(dial_with(adapter.clone(), config.clone()))
+//!     .dialer(dial_with(peer_link.clone()))
 //!     .build();
 //! let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
 //!     .clear_ip_transports()
@@ -52,16 +50,18 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use ble_gatt::datagram::{DatagramChannel, DatagramConfig};
-use ble_gatt::{Adapter, ConnectionPriority, PeerAddress, Role};
+use ble_gatt::{ConnectionPriority, PeerAddress, PeerChannel, PeerChannelCloseReason, PeerLink};
 use iroh::address_lookup::{self, AddressLookup, EndpointData, EndpointInfo, Item};
-use iroh::endpoint::{
-    AfterHandshakeOutcome, Connection, ConnectionError, EndpointHooks, WeakConnectionHandle,
+use iroh::endpoint::transports::{
+    CustomEndpoint, CustomSender, CustomTransport, RecvInfo, Transmit,
 };
-use iroh::endpoint::transports::{CustomEndpoint, CustomSender, CustomTransport, RecvInfo, Transmit};
+use iroh::endpoint::{
+    AfterHandshakeOutcome, BeforeConnectOutcome, Connection, ConnectionError, EndpointHooks,
+    WeakConnectionHandle,
+};
 use iroh_base::{CustomAddr, EndpointId, TransportAddr};
 use n0_future::StreamExt;
-use tokio::sync::{mpsc, oneshot, watch, Notify};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 /// The custom address id of this transport ("BLEG"). iroh keeps a registry of
 /// transport ids in its `TRANSPORTS.md`; this one is private to `ble-gatt`.
@@ -79,22 +79,6 @@ const INBOUND_QUEUE_DEPTH: usize = 256;
 /// With endpoint hooks installed, live iroh users protect it from idle close;
 /// their last-user release owns its lifetime instead.
 pub const DEFAULT_LINK_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// After a link the peer dialled (we were the peripheral) ends, how long this
-/// side leaves reconnecting to the peer instead of dialling it too — for an
-/// address the caller set with `set_peer_address`; an address only ever seen
-/// as the source of the peer's connection is not dialled at all. Both sides
-/// re-dialling at once crossed on hardware: two links to one peer, each
-/// tearing the other down. The dialler re-dials within a second or two (a
-/// dial times out at 20s), so this only has to outlast one dial attempt.
-/// Not started when no open connection is left to make the peer re-dial;
-/// see `run_link`.
-const REDIAL_YIELD: Duration = Duration::from_secs(30);
-
-/// How long a dial waits for links to the same endpoint's other addresses
-/// to finish closing; see `Sender::send`. A BlueZ disconnect took about 2s
-/// on hardware.
-const CLOSE_WAIT_LIMIT: Duration = Duration::from_secs(5);
 
 /// How long a link stays up after the last iroh connection on it has ended
 /// (ADR-0008 D3). None: the closing side waits for its CONNECTION_CLOSE to
@@ -119,13 +103,13 @@ enum Outgoing {
 }
 
 /// A future opening a datagram channel to a peer.
-pub type DialFuture = Pin<Box<dyn Future<Output = ble_gatt::Result<DatagramChannel>> + Send>>;
+pub type DialFuture = Pin<Box<dyn Future<Output = ble_gatt::Result<PeerChannel>> + Send>>;
 
 /// Opens a datagram channel to the given address. Called the first time iroh
 /// sends to an address that has no channel.
 pub type Dialer = Arc<dyn Fn(PeerAddress) -> DialFuture + Send + Sync>;
 
-/// A [`Dialer`] that opens channels with [`ble_gatt::datagram::connect`].
+/// A [`Dialer`] that acquires scoped use from a shared core worker.
 ///
 /// Each new link asks for [`ConnectionPriority::High`]: QUIC needs many
 /// connection events, and on the default interval a busy radio (a combo
@@ -133,14 +117,22 @@ pub type Dialer = Arc<dyn Fn(PeerAddress) -> DialFuture + Send + Sync>;
 /// supervision timeout within seconds. The request is best-effort; Linux has
 /// no such control, and the channel is used either way. Links close when idle,
 /// so the higher power draw lasts only while there is traffic.
-pub fn dial_with(adapter: Adapter, config: DatagramConfig) -> Dialer {
+pub fn dial_with(link: Arc<PeerLink>) -> Dialer {
     Arc::new(move |peer: PeerAddress| {
-        let adapter = adapter.clone();
-        let config = config.clone();
+        let link = link.clone();
         Box::pin(async move {
-            let mut channel = ble_gatt::datagram::connect(&adapter, &peer, &config).await?;
-            if let Err(err) = channel.request_connection_priority(ConnectionPriority::High).await {
-                log::debug!("link to {}: high connection priority not applied: {err}", peer.0);
+            let channel = match link.channel(&peer) {
+                Some(channel) => channel,
+                None => link.request(&peer).await?.accept().await?,
+            };
+            if let Err(err) = channel
+                .request_connection_priority(ConnectionPriority::High)
+                .await
+            {
+                log::debug!(
+                    "link to {}: high connection priority not applied: {err}",
+                    peer.0
+                );
             }
             Ok(channel)
         })
@@ -157,7 +149,9 @@ pub fn peer_address(addr: &CustomAddr) -> Option<PeerAddress> {
     if addr.id() != TRANSPORT_ID {
         return None;
     }
-    String::from_utf8(addr.data().to_vec()).ok().map(PeerAddress)
+    String::from_utf8(addr.data().to_vec())
+        .ok()
+        .map(PeerAddress)
 }
 
 /// Routing heuristic for the first datagram on a new channel: QUIC Initials
@@ -170,35 +164,9 @@ pub fn is_quic_initial(packet: &[u8]) -> bool {
     packet.first().is_some_and(|byte| byte & 0x80 != 0)
 }
 
-/// Who may start an outgoing BLE link when iroh needs a path.
-///
-/// This is transport policy, not authentication or application-session
-/// arbitration. Incoming channels are still supplied with `attach` and iroh
-/// owns QUIC connections. All modes retain the guard against dialling a
-/// private source address never advertised by the caller.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum InitiationPolicy {
-    /// Compatibility default: either peer can start, but after an unexpected
-    /// incoming-link loss let its previous dialler retry for 30 seconds.
-    #[default]
-    PreviousDialer,
-    /// Either peer may initiate and reconnect immediately. Existing incoming
-    /// paths are reused by iroh; crossed candidates are retained until unused.
-    /// Select only where the platform tolerates crossed attempts.
-    /// See ADR-0012's current implementation gap, not its target handshake.
-    EitherPeer,
-    /// Deterministic fallback for platforms that cannot tolerate crossed
-    /// dials: only the smaller endpoint key initiates. Both sides must choose
-    /// this policy with their own endpoint's key and record destinations via
-    /// `set_peer_address`. Unknown destinations are not dialled. Incoming
-    /// paths still work in either direction; this never closes a live link.
-    Ordered { local_id: EndpointId },
-}
-
 /// Builder for [`BleGattTransport`].
 #[derive(Default)]
 pub struct BleGattTransportBuilder {
-    initiation_policy: InitiationPolicy,
     dialer: Option<Dialer>,
     local_address: Option<PeerAddress>,
     link_idle_timeout: Option<Duration>,
@@ -206,14 +174,6 @@ pub struct BleGattTransportBuilder {
 }
 
 impl BleGattTransportBuilder {
-    /// Select initiation/reconnect policy explicitly. The compatibility
-    /// default is [`InitiationPolicy::PreviousDialer`], not a claim about
-    /// concurrent-role hardware support. This does not start discovery.
-    pub fn initiation_policy(mut self, policy: InitiationPolicy) -> Self {
-        self.initiation_policy = policy;
-        self
-    }
-
     /// How to open a channel to a peer. Without one, the transport only sends
     /// over channels handed to it with [`BleGattTransport::attach`].
     pub fn dialer(mut self, dialer: Dialer) -> Self {
@@ -251,22 +211,31 @@ impl BleGattTransportBuilder {
         BleGattTransport {
             inner: Arc::new(Inner {
                 links: Mutex::new(HashMap::new()),
+                carriers: Mutex::new(HashMap::new()),
+                acquisition: Mutex::new(HashMap::new()),
                 dropped: Mutex::new(HashMap::new()),
                 peers: Mutex::new(HashMap::new()),
                 retired: Mutex::new(HashMap::new()),
                 closers: Mutex::new(HashMap::new()),
-                closing: Mutex::new(HashMap::new()),
+                #[cfg(test)]
+                published: Mutex::new(None),
+                #[cfg(test)]
+                retiring: Mutex::new(None),
+                #[cfg(test)]
+                terminating: Mutex::new(None),
+
                 learned: Mutex::new(HashMap::new()),
                 releasers: Mutex::new(HashMap::new()),
                 next_connection: AtomicU64::new(0),
                 inbound_tx,
                 inbound_rx: Mutex::new(Some(inbound_rx)),
-                answered: Mutex::new(HashMap::new()),
-                initiation_policy: self.initiation_policy,
+                incoming_addresses: Mutex::new(HashSet::new()),
                 dialer: self.dialer,
                 local: n0_watcher::Watchable::new(local),
                 link_idle_timeout: self.link_idle_timeout.unwrap_or(DEFAULT_LINK_IDLE_TIMEOUT),
-                link_release_delay: self.link_release_delay.unwrap_or(DEFAULT_LINK_RELEASE_DELAY),
+                link_release_delay: self
+                    .link_release_delay
+                    .unwrap_or(DEFAULT_LINK_RELEASE_DELAY),
             }),
         }
     }
@@ -282,6 +251,11 @@ pub struct BleGattTransport {
 struct Inner {
     /// One outbound queue per peer with a channel (open or being dialled).
     links: Mutex<HashMap<PeerAddress, mpsc::Sender<Outgoing>>>,
+    /// One packet receiver per attached core channel. Core owns native attempts.
+    carriers: Mutex<HashMap<PeerAddress, PacketCarrier>>,
+    /// Explicit application users authorize acquisition generations. Old QUIC
+    /// traffic cannot reset a terminal generation; it has no hook invocation.
+    acquisition: Mutex<HashMap<PeerAddress, Acquisition>>,
     /// When a link to each address last dropped a packet for a full queue;
     /// see `close_sent`.
     dropped: Mutex<HashMap<PeerAddress, Instant>>,
@@ -294,9 +268,13 @@ struct Inner {
     /// A close signal per running link, replaced ones included; see
     /// [`BleGattTransport::close_link`].
     closers: Mutex<HashMap<PeerAddress, Vec<Arc<Notify>>>>,
-    /// Links still disconnecting, by address. Each sender drops when its
-    /// disconnect ends.
-    closing: Mutex<HashMap<PeerAddress, Vec<watch::Receiver<()>>>>,
+    #[cfg(test)]
+    published: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    retiring: Mutex<Option<(oneshot::Sender<()>, Arc<Notify>)>>,
+    #[cfg(test)]
+    terminating: Mutex<Option<(oneshot::Sender<()>, Arc<Notify>)>>,
+
     /// Historical key/address associations plus separate current-path users,
     /// in either role (ADR-0008 D1). History survives path closure for close
     /// barriers and ended-packet suppression; it alone cannot defeat idle.
@@ -308,16 +286,35 @@ struct Inner {
     inbound_tx: mpsc::Sender<Inbound>,
     /// Taken by the one endpoint that binds this transport.
     inbound_rx: Mutex<Option<mpsc::Receiver<Inbound>>>,
-    /// Addresses whose last link was one the peer dialled, with when it
-    /// dropped, or `None` if it closed idle (nobody re-dials then); see
-    /// [`REDIAL_YIELD`] and `Sender::send`. Cleared when we dial the address
-    /// successfully.
-    answered: Mutex<HashMap<PeerAddress, Option<Instant>>>,
-    initiation_policy: InitiationPolicy,
+    /// Incoming source addresses are not necessarily connectable addresses.
+    incoming_addresses: Mutex<HashSet<PeerAddress>>,
     dialer: Option<Dialer>,
     local: n0_watcher::Watchable<Vec<CustomAddr>>,
     link_idle_timeout: Duration,
     link_release_delay: Duration,
+}
+
+/// Packet-task ownership, separate from the core's native generation.
+struct PacketCarrier {
+    queue: mpsc::Sender<Outgoing>,
+    close: Arc<Notify>,
+    /// Observe core closure before the packet task publishes suppression.
+    /// Removed before scoped release so this clone cannot keep idle use alive.
+    channel: PeerChannel,
+}
+
+#[derive(Default)]
+struct Acquisition {
+    generation: u64,
+    terminal: bool,
+}
+
+fn authorize_acquisition(inner: &Inner, peer: &PeerAddress) -> u64 {
+    let mut acquisitions = inner.acquisition.lock().expect("poisoned");
+    let acquisition = acquisitions.entry(peer.clone()).or_default();
+    acquisition.generation += 1;
+    acquisition.terminal = false;
+    acquisition.generation
 }
 
 /// One address's owner, as iroh's connections over it showed.
@@ -328,8 +325,7 @@ struct Learned {
     connections: HashSet<u64>,
     /// Connections whose current path snapshot includes this address.
     current: HashSet<u64>,
-    /// Those of them not closing yet: a closing connection sends nothing,
-    /// so it never makes the peer dial back; see `REDIAL_YIELD`.
+    /// Historical users that have not started closing.
     open: HashSet<u64>,
     /// Connections that used the address and have ended (their close sent
     /// or received) but not drained yet; see `Sender::send`.
@@ -350,42 +346,76 @@ impl BleGattTransport {
         BleGattTransportBuilder::default()
     }
 
-    /// Carries iroh traffic over `channel`, an open datagram channel in either
-    /// role. iroh's packets for the peer go to the newest channel. One
-    /// already attached for it keeps delivering what it receives until it
-    /// closes idle or the peer drops it: when both sides dial at once, the
-    /// peer may still be sending on it.
+    /// Carries packets over an accepted core channel. The core selects the
+    /// BLE attempt. Attach an incoming winner separately from an outgoing loser.
+    /// Replacement waits until the old packet receiver stops. Scoped core
+    /// release protects the replacement even when it belongs to another generation.
     ///
     /// The returned handle completes when the channel closes: the peer went
     /// away, it carried nothing for the idle timeout, or
     /// [`close_link`](Self::close_link) closed it.
-    pub fn attach(&self, channel: DatagramChannel) -> tokio::task::JoinHandle<()> {
-        self.attach_candidate(channel, None)
+    pub fn attach(&self, channel: PeerChannel) -> tokio::task::JoinHandle<()> {
+        self.attach_channel(channel, None)
     }
 
-    fn attach_candidate(&self, channel: DatagramChannel, first: Option<Vec<u8>>) -> tokio::task::JoinHandle<()> {
+    fn attach_channel(
+        &self,
+        channel: PeerChannel,
+        first: Option<Vec<u8>>,
+    ) -> tokio::task::JoinHandle<()> {
         let peer = channel.peer();
         let (tx, rx) = mpsc::channel(LINK_QUEUE_DEPTH);
-        self.inner.answered.lock().expect("poisoned").remove(&peer);
+        let close = add_closer(&self.inner, &peer);
         self.inner
-            .links
+            .incoming_addresses
             .lock()
             .expect("poisoned")
-            .insert(peer.clone(), tx.clone());
-        let close = add_closer(&self.inner, &peer);
-        tokio::spawn(run_link(self.inner.clone(), peer, channel, rx, tx, close, first))
+            .insert(peer.clone());
+        let mut links = self.inner.links.lock().expect("poisoned");
+        let mut carriers = self.inner.carriers.lock().expect("poisoned");
+        let generation = if channel.close_reason().is_none() {
+            authorize_acquisition(&self.inner, &peer)
+        } else {
+            self.inner
+                .acquisition
+                .lock()
+                .expect("poisoned")
+                .entry(peer.clone())
+                .or_default()
+                .generation
+        };
+        links.insert(peer.clone(), tx.clone());
+        let previous = carriers.insert(
+            peer.clone(),
+            PacketCarrier {
+                queue: tx.clone(),
+                close: close.clone(),
+                channel: channel.clone(),
+            },
+        );
+        drop(carriers);
+        drop(links);
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            if let Some(previous) = previous {
+                previous.close.notify_one();
+                previous.queue.closed().await;
+            }
+            run_link(inner, peer, channel, rx, (tx, generation), close, first).await;
+        })
     }
 
-    /// Closes every channel to `peer`, including one a newer channel
-    /// replaced, and cancels a dial to it still running. Unlike an idle
-    /// close, a channel the peer dialled is disconnected too
-    /// ([`DatagramChannel::disconnect`]). Dropping iroh's connect future does not reach the dial,
-    /// which runs on its own: call this when giving up on a connect. For an application that knows it is done with
-    /// a peer before the idle timeout: on hardware, a lingering channel to a
-    /// phone's old address made BlueZ abort every dial to its new one
-    /// (`le-connection-abort-by-local`).
+    /// Releases this transport's scoped channel use and cancels its pending request.
+    /// Other core users remain valid. For global disconnect, use `PeerLink`.
+    /// Dropping an iroh connect future does not cancel this transport's task.
     pub fn close_link(&self, peer: &PeerAddress) {
-        let closers = self.inner.closers.lock().expect("poisoned").get(peer).cloned();
+        let closers = self
+            .inner
+            .closers
+            .lock()
+            .expect("poisoned")
+            .get(peer)
+            .cloned();
         for close in closers.into_iter().flatten() {
             // Stores a permit when the link is not waiting yet.
             close.notify_one();
@@ -420,23 +450,28 @@ impl BleGattTransport {
     /// [`link_release_delay`](BleGattTransportBuilder::link_release_delay),
     /// instead of after the idle timeout. A connection the peer closed ends
     /// at once; one this side closed, once its CONNECTION_CLOSE was sent.
-    /// Neither waits out QUIC's closing or draining period. In the
-    /// peripheral role that close disconnects the central, except on
-    /// Android (ADR-0008 D3).
+    /// Neither waits out QUIC's closing or draining period. The core decides
+    /// whether releasing this use retires the native generation.
     ///
     /// A connection that was not closed holds the link while any
     /// `Connection` clone, `SendStream` or `RecvStream` the application
     /// keeps is alive, since a lost connection ends only when those go.
     pub fn hooks(&self) -> BleGattHooks {
-        BleGattHooks { inner: self.inner.clone() }
+        BleGattHooks {
+            inner: self.inner.clone(),
+        }
     }
 
     /// Like [`attach`](Self::attach), for a channel whose first datagram
     /// the caller already read, typically to tell QUIC from its own traffic
     /// with [`is_quic_initial`]. `first` is handed to iroh before anything
     /// else from the channel.
-    pub fn attach_after(&self, channel: DatagramChannel, first: Vec<u8>) -> tokio::task::JoinHandle<()> {
-        self.attach_candidate(channel, Some(first))
+    pub fn attach_after(
+        &self,
+        channel: PeerChannel,
+        first: Vec<u8>,
+    ) -> tokio::task::JoinHandle<()> {
+        self.attach_channel(channel, Some(first))
     }
 
     /// Records where `endpoint` can be reached, for iroh's address lookup.
@@ -464,7 +499,11 @@ impl BleGattTransport {
         let mut peers = self.inner.peers.lock().expect("poisoned");
         if let Some(old) = peers.remove(endpoint) {
             if !peers.values().any(|current| *current == old) {
-                self.inner.retired.lock().expect("poisoned").insert(old, *endpoint);
+                self.inner
+                    .retired
+                    .lock()
+                    .expect("poisoned")
+                    .insert(old, *endpoint);
             }
         }
     }
@@ -498,20 +537,20 @@ impl BleGattTransport {
 async fn run_link(
     inner: Arc<Inner>,
     peer: PeerAddress,
-    mut channel: DatagramChannel,
+    channel: PeerChannel,
     mut outbound: mpsc::Receiver<Outgoing>,
-    link: mpsc::Sender<Outgoing>,
+    ownership: (mpsc::Sender<Outgoing>, u64),
     close: Arc<Notify>,
     mut first: Option<Vec<u8>>,
 ) {
+    let (link, generation) = ownership;
     log::debug!("link to {} up", peer.0);
-    let role = channel.local_role();
-    // An outgoing candidate was deliberately opened for a new Initial.
-    // Incoming candidates must first demonstrate a new handshake; late
-    // short-header traffic from ended connections must not recreate a link.
-    let mut establishing = role == Role::Central;
+
+    // A new Initial can establish another QUIC user. Late short-header
+    // traffic must not retain a released address without a legitimate user.
+    let mut establishing = false;
     let (to_send, mut sending) = mpsc::channel::<Outgoing>(LINK_QUEUE_DEPTH);
-    let sender = channel.sender();
+    let sender = channel.clone();
     let send_peer = peer.clone();
     let mut send_task = tokio::spawn(async move {
         while let Some(outgoing) = sending.recv().await {
@@ -536,24 +575,17 @@ async fn run_link(
     let released = tokio::time::sleep(Duration::MAX);
     tokio::pin!(released);
     let mut release_armed = false;
-    // Closed by this side (idle, released or `close_link`), not dropped by
-    // the peer.
-    let mut closed_here = false;
-    let mut closed_by_application = false;
-    let mut released_here = false;
+
+    let mut sender_finished = false;
     loop {
         tokio::select! {
             () = &mut idle => {
-                // With hooks installed, iroh owns the lifetime. Silence is
-                // not proof that a connection (or a crossed candidate sharing
-                // its address) is unused. In particular a central disconnect
-                // on BlueZ can also end the other role's active link.
+                // Current QUIC users protect this transport's scoped use.
                 if in_use(&inner, &peer) {
                     idle.as_mut().reset(tokio::time::Instant::now() + inner.link_idle_timeout);
                     continue;
                 }
                 log::debug!("link to {}: idle, closing", peer.0);
-                closed_here = true;
                 break;
             }
             () = release.notified() => {
@@ -568,17 +600,13 @@ async fn run_link(
                     continue;
                 }
                 log::debug!("link to {}: no iroh connection left on it, closing", peer.0);
-                closed_here = true;
-                released_here = true;
                 break;
             }
             () = close.notified() => {
                 log::debug!("link to {}: closed by the application", peer.0);
-                closed_here = true;
-                closed_by_application = true;
                 break;
             }
-            _ = &mut send_task => break,
+            _ = &mut send_task => { sender_finished = true; break },
             packet = outbound.recv() => {
                 idle.as_mut().reset(tokio::time::Instant::now() + inner.link_idle_timeout);
                 let Some(packet) = packet else { break };
@@ -587,8 +615,7 @@ async fn run_link(
                     // A barrier is never dropped: it waits for room, behind
                     // the packets queued before it.
                     Err(mpsc::error::TrySendError::Full(barrier @ Outgoing::Barrier(_))) => {
-                        let to_send = to_send.clone();
-                        tokio::spawn(async move { to_send.send(barrier).await });
+                        if to_send.send(barrier).await.is_err() { break; }
                     }
                     // Like a full socket buffer: drop, QUIC recovers.
                     Err(mpsc::error::TrySendError::Full(Outgoing::Packet(_))) => {
@@ -608,9 +635,7 @@ async fn run_link(
                 Some(Ok(packet)) => {
                     establishing |= is_quic_initial(&packet);
                     if !establishing && only_ended(&inner, &peer) {
-                        log::debug!("link to {}: late traffic for ended connections, closing candidate", peer.0);
-                        closed_here = true;
-                        released_here = true;
+                        log::debug!("link to {}: late traffic for ended connections, closing carrier", peer.0);
                         break;
                     }
                     idle.as_mut().reset(tokio::time::Instant::now() + inner.link_idle_timeout);
@@ -627,62 +652,89 @@ async fn run_link(
             },
         }
     }
-    send_task.abort();
-    remove_closer(&inner, &peer, &close);
-    remove_releaser(&inner, &peer, &release);
-    let (_closed, closing) = watch::channel(());
-    inner
-        .closing
-        .lock()
-        .expect("poisoned")
-        .entry(peer.clone())
-        .or_default()
-        .push(closing.clone());
-    // `close_link` ends a link the peer dialled too. An idle close leaves
-    // that to the peer: on Linux dropping it would also drop a busy link
-    // this side dialled to the same address. A release ends it on Linux:
-    // no connection uses the address any more, and a central the
-    // peripheral kept made BlueZ abort the next dial to the phone on
-    // hardware. Not on Android, where disconnecting a central that dialled
-    // in does not end the link but forgets its subscription (ADR-0008 D3).
-    let disconnect_central = released_here && role == Role::Peripheral && !cfg!(target_os = "android");
-    if closed_by_application || disconnect_central {
-        let _ = channel.disconnect().await;
-    } else {
-        let _ = channel.close().await;
+    if !sender_finished {
+        // An in-flight core send may have been cancelled before completion.
+        inner
+            .dropped
+            .lock()
+            .expect("poisoned")
+            .insert(peer.clone(), Instant::now());
+        send_task.abort();
+        let _ = send_task.await;
     }
+    #[cfg(test)]
     {
-        let mut all = inner.closing.lock().expect("poisoned");
-        if let Some(list) = all.get_mut(&peer) {
-            list.retain(|other| !other.same_channel(&closing));
-            if list.is_empty() {
-                all.remove(&peer);
-            }
+        let terminating = inner.terminating.lock().expect("poisoned").take();
+        if let Some((reached, resume)) = terminating {
+            let _ = reached.send(());
+            resume.notified().await;
         }
     }
-    // Only while this link still owns the peer: an old inbound link ending
-    // after a newer one was attached would otherwise mark the peer as having
-    // dialled us, and the yield would then hold back dials the newer link's
-    // side is entitled to make. A close by this side starts no yield: no
-    // QUIC connection is left to resend, so the peer will not dial back, and
-    // on hardware this side's next connect timed out waiting for it. Nor
-    // does a drop after every connection the hooks saw on the link had
-    // started to close (a refused session, say): a closing connection
-    // sends nothing (RFC 9000 §10.2), so again nothing makes the peer dial
-    // back. Without the hooks nothing is known, and the yield starts.
+    // Publish terminal suppression before closing the queue. Sender holds
+    // links while testing it, so it cannot observe a gap and start a request.
+    // A stale receiver cannot suppress an explicitly attached replacement.
+    {
+        let links = inner.links.lock().expect("poisoned");
+        if links
+            .get(&peer)
+            .is_some_and(|current| current.same_channel(&link))
+            && matches!(
+                channel.close_reason(),
+                Some(
+                    PeerChannelCloseReason::LocalDisconnect
+                        | PeerChannelCloseReason::PeerDisconnect
+                        | PeerChannelCloseReason::ProtocolError
+                        | PeerChannelCloseReason::Shutdown
+                )
+            )
+        {
+            let mut acquisitions = inner.acquisition.lock().expect("poisoned");
+            let acquisition = acquisitions.entry(peer.clone()).or_default();
+            if acquisition.generation == generation {
+                acquisition.terminal = true;
+            }
+        }
+        outbound.close();
+    }
+    if !outbound.is_empty() || !to_send.is_closed() {
+        inner
+            .dropped
+            .lock()
+            .expect("poisoned")
+            .insert(peer.clone(), Instant::now());
+    }
+    remove_closer(&inner, &peer, &close);
+    remove_releaser(&inner, &peer, &release);
+
+    #[cfg(test)]
+    {
+        let retiring = inner.retiring.lock().expect("poisoned").take();
+        if let Some((reached, resume)) = retiring {
+            let _ = reached.send(());
+            resume.notified().await;
+        }
+    }
+    // Drop the observation clone before scoped release. A stale task cannot
+    // remove the current carrier (or keep its own otherwise-last use alive).
+    {
+        let mut carriers = inner.carriers.lock().expect("poisoned");
+        if carriers
+            .get(&peer)
+            .is_some_and(|current| current.queue.same_channel(&link))
+        {
+            carriers.remove(&peer);
+        }
+    }
+    // Core release preserves other scoped channel users.
+    let _ = channel.release().await;
+
+    // A retired task cannot remove a replacement queue or its user history.
     {
         let mut links = inner.links.lock().expect("poisoned");
-        if links.get(&peer).is_some_and(|current| current.same_channel(&link)) {
-            if role == Role::Peripheral {
-                let all_closing = inner
-                    .learned
-                    .lock()
-                    .expect("poisoned")
-                    .get(&peer)
-                    .is_some_and(|learned| learned.open.is_empty());
-                let dropped = (!closed_here && !all_closing).then(Instant::now);
-                inner.answered.lock().expect("poisoned").insert(peer.clone(), dropped);
-            }
+        if links
+            .get(&peer)
+            .is_some_and(|current| current.same_channel(&link))
+        {
             links.remove(&peer);
             // No link is left at the address. A connection still using it
             // keeps the entry, for `close_links` and a link that replaces it.
@@ -711,31 +763,6 @@ fn add_closer(inner: &Inner, peer: &PeerAddress) -> Arc<Notify> {
     close
 }
 
-/// Closes still running on the other addresses of the endpoint `peer` is
-/// the current address of.
-fn closing_for_same_endpoint(inner: &Inner, peer: &PeerAddress) -> Vec<watch::Receiver<()>> {
-    let endpoints: Vec<EndpointId> = inner
-        .peers
-        .lock()
-        .expect("poisoned")
-        .iter()
-        .filter(|(_, address)| *address == peer)
-        .map(|(endpoint, _)| *endpoint)
-        .collect();
-    let addresses: HashSet<PeerAddress> = endpoints
-        .iter()
-        .flat_map(|endpoint| addresses_of(inner, endpoint))
-        .filter(|address| address != peer)
-        .collect();
-    let closing = inner.closing.lock().expect("poisoned");
-    addresses
-        .iter()
-        .filter_map(|address| closing.get(address))
-        .flatten()
-        .cloned()
-        .collect()
-}
-
 /// Every address known for `endpoint`: the one `set_peer_address` set, the
 /// ones it replaced, and the ones iroh's connections to it came over.
 fn addresses_of(inner: &Inner, endpoint: &EndpointId) -> Vec<PeerAddress> {
@@ -758,8 +785,12 @@ fn addresses_of(inner: &Inner, endpoint: &EndpointId) -> Vec<PeerAddress> {
 
 /// Records that iroh connection `connection` to `endpoint` uses `addr`.
 fn learn(inner: &Inner, endpoint: EndpointId, connection: u64, addr: &TransportAddr) {
-    let TransportAddr::Custom(addr) = addr else { return };
-    let Some(address) = peer_address(addr) else { return };
+    let TransportAddr::Custom(addr) = addr else {
+        return;
+    };
+    let Some(address) = peer_address(addr) else {
+        return;
+    };
     let mut learned = inner.learned.lock().expect("poisoned");
     let entry = learned.entry(address.clone()).or_insert_with(|| Learned {
         endpoint,
@@ -785,7 +816,12 @@ fn learn(inner: &Inner, endpoint: EndpointId, connection: u64, addr: &TransportA
 
 /// Reconciles one connection's current path snapshot. Events are wakeups,
 /// not a delta log: snapshots also recover missed events.
-fn reconcile_paths(inner: &Inner, endpoint: EndpointId, connection: u64, paths: impl IntoIterator<Item = TransportAddr>) {
+fn reconcile_paths(
+    inner: &Inner,
+    endpoint: EndpointId,
+    connection: u64,
+    paths: impl IntoIterator<Item = TransportAddr>,
+) {
     let mut current = HashSet::new();
     for addr in paths {
         learn(inner, endpoint, connection, &addr);
@@ -843,10 +879,16 @@ fn forget_connection(inner: &Inner, connection: u64) {
 fn connection_drained(inner: &Inner, connection: u64) {
     // `links` before `learned`, as in `run_link`.
     let links = inner.links.lock().expect("poisoned");
-    inner.learned.lock().expect("poisoned").retain(|address, learned| {
-        learned.ended.remove(&connection);
-        !learned.connections.is_empty() || !learned.ended.is_empty() || links.contains_key(address)
-    });
+    inner
+        .learned
+        .lock()
+        .expect("poisoned")
+        .retain(|address, learned| {
+            learned.ended.remove(&connection);
+            !learned.connections.is_empty()
+                || !learned.ended.is_empty()
+                || links.contains_key(address)
+        });
 }
 
 /// Whether only connections that have ended use `peer`.
@@ -867,7 +909,13 @@ fn in_use(inner: &Inner, peer: &PeerAddress) -> bool {
         .lock()
         .expect("poisoned")
         .get(peer)
-        .is_some_and(|learned| !learned.current.is_empty() || learned.connections.iter().any(|id| !learned.open.contains(id)))
+        .is_some_and(|learned| {
+            !learned.current.is_empty()
+                || learned
+                    .connections
+                    .iter()
+                    .any(|id| !learned.open.contains(id))
+        })
 }
 
 /// Endpoint hooks from [`BleGattTransport::hooks`].
@@ -883,6 +931,50 @@ impl fmt::Debug for BleGattHooks {
 }
 
 impl EndpointHooks for BleGattHooks {
+    async fn before_connect<'a>(
+        &'a self,
+        remote: &'a iroh::EndpointAddr,
+        _alpn: &'a [u8],
+    ) -> BeforeConnectOutcome {
+        // This callback represents a new application connect, never a QUIC
+        // retransmission. Authorize its generation without inspecting packets.
+        let _links = self.inner.links.lock().expect("poisoned");
+        let mut addresses: HashSet<_> = addresses_of(&self.inner, &remote.id).into_iter().collect();
+        // Caller destinations authorize this application action, but are not
+        // authenticated key/address associations. Only after_handshake learns
+        // those. Sender still rejects retired and unknown incoming addresses.
+        addresses.extend(remote.addrs.iter().filter_map(|addr| match addr {
+            TransportAddr::Custom(addr) => peer_address(addr),
+            _ => None,
+        }));
+        for peer in addresses {
+            // Sharing a healthy carrier does not change its authorization:
+            // a later terminal close must suppress every existing QUIC user.
+            let terminal = self
+                .inner
+                .acquisition
+                .lock()
+                .expect("poisoned")
+                .get(&peer)
+                .is_some_and(|acquisition| acquisition.terminal);
+            // Core publishes closure before waking the packet task. A new
+            // application connect in that interval must not inherit the old
+            // generation just because its queue is not closed yet. Healthy
+            // shared carriers still keep all existing users in one generation.
+            let core_closed = self
+                .inner
+                .carriers
+                .lock()
+                .expect("poisoned")
+                .get(&peer)
+                .is_some_and(|carrier| carrier.channel.close_reason().is_some());
+            if terminal || core_closed {
+                authorize_acquisition(&self.inner, &peer);
+            }
+        }
+        BeforeConnectOutcome::Accept
+    }
+
     async fn after_handshake<'a>(&'a self, conn: &'a Connection) -> AfterHandshakeOutcome {
         let endpoint = conn.remote_id();
         let connection = self.inner.next_connection.fetch_add(1, Ordering::Relaxed);
@@ -891,7 +983,12 @@ impl EndpointHooks for BleGattHooks {
         // Lagged) triggers a fresh snapshot, so queued older Opened events
         // cannot resurrect ownership after that path has already closed.
         let mut events = conn.path_events();
-        reconcile_paths(&self.inner, endpoint, connection, conn.paths().iter().map(|path| path.remote_addr().clone()));
+        reconcile_paths(
+            &self.inner,
+            endpoint,
+            connection,
+            conn.paths().iter().map(|path| path.remote_addr().clone()),
+        );
         let weak = conn.weak_handle();
         let closed = weak.closed();
         let inner = self.inner.clone();
@@ -951,7 +1048,11 @@ impl EndpointHooks for BleGattHooks {
                     log::debug!(
                         "connection {connection} to {}: {} after {:?}",
                         endpoint.fmt_short(),
-                        if sent { "CONNECTION_CLOSE sent" } else { "drained" },
+                        if sent {
+                            "CONNECTION_CLOSE sent"
+                        } else {
+                            "drained"
+                        },
                         closing.elapsed()
                     );
                 }
@@ -980,7 +1081,12 @@ impl EndpointHooks for BleGattHooks {
 /// dropped one since the close started (`closing`, when the hooks saw it,
 /// less one check interval for the wake-up between the two), the close may
 /// be the one lost, and this waits for the drain, as before.
-async fn close_sent(inner: &Inner, weak: &WeakConnectionHandle, connection: u64, closing: Instant) -> bool {
+async fn close_sent(
+    inner: &Inner,
+    weak: &WeakConnectionHandle,
+    connection: u64,
+    closing: Instant,
+) -> bool {
     loop {
         // Dropped before the sleep: a kept `Connection` would hold the
         // drain off.
@@ -1005,16 +1111,19 @@ async fn close_sent(inner: &Inner, weak: &WeakConnectionHandle, connection: u64,
         .collect();
     let links: Vec<mpsc::Sender<Outgoing>> = {
         let links = inner.links.lock().expect("poisoned");
-        addresses.iter().filter_map(|address| links.get(address).cloned()).collect()
+        addresses
+            .iter()
+            .filter_map(|address| links.get(address).cloned())
+            .collect()
     };
     let sent = async {
         for link in links {
             let (reached, barrier) = oneshot::channel();
-            if link.send(Outgoing::Barrier(reached)).await.is_ok() {
-                // An error: the link ended, and the packet with it.
-                let _ = barrier.await;
+            if link.send(Outgoing::Barrier(reached)).await.is_err() || barrier.await.is_err() {
+                return false;
             }
         }
+        true
     };
     let drained = async {
         while weak.upgrade().is_some() {
@@ -1023,13 +1132,19 @@ async fn close_sent(inner: &Inner, weak: &WeakConnectionHandle, connection: u64,
     };
     tokio::pin!(drained);
     tokio::select! {
-        () = sent => {}
+        sent = sent => {
+            if !sent { drained.await; return false; }
+        }
         () = &mut drained => return false,
     }
-    let since = closing.checked_sub(DRAINED_CHECK_INTERVAL).unwrap_or(closing);
+    let since = closing
+        .checked_sub(DRAINED_CHECK_INTERVAL)
+        .unwrap_or(closing);
     let lost = {
         let dropped = inner.dropped.lock().expect("poisoned");
-        addresses.iter().any(|address| dropped.get(address).is_some_and(|at| *at >= since))
+        addresses
+            .iter()
+            .any(|address| dropped.get(address).is_some_and(|at| *at >= since))
     };
     if lost {
         log::debug!("connection {connection}: a packet was dropped while it closed, waiting for it to drain");
@@ -1071,11 +1186,38 @@ fn remove_closer(inner: &Inner, peer: &PeerAddress, close: &Arc<Notify>) {
     }
 }
 
+/// Moves a failed attempt's queued packets to a separately attached carrier.
+/// Queue overflow remains packet loss. QUIC can retransmit those packets.
+fn forward_pending(inner: &Inner, peer: &PeerAddress, pending: &mut mpsc::Receiver<Outgoing>) {
+    pending.close();
+    let selected = inner
+        .carriers
+        .lock()
+        .expect("poisoned")
+        .get(peer)
+        .map(|carrier| carrier.queue.clone());
+    while let Ok(packet) = pending.try_recv() {
+        if selected
+            .as_ref()
+            .is_none_or(|selected| selected.try_send(packet).is_err())
+        {
+            inner
+                .dropped
+                .lock()
+                .expect("poisoned")
+                .insert(peer.clone(), Instant::now());
+        }
+    }
+}
+
 /// Removes `peer`'s link only if it is still `link`: a replacement attached
 /// meanwhile stays.
 fn remove_link(inner: &Inner, peer: &PeerAddress, link: &mpsc::Sender<Outgoing>) {
     let mut links = inner.links.lock().expect("poisoned");
-    if links.get(peer).is_some_and(|current| current.same_channel(link)) {
+    if links
+        .get(peer)
+        .is_some_and(|current| current.same_channel(link))
+    {
         links.remove(peer);
     }
 }
@@ -1126,7 +1268,11 @@ impl CustomEndpoint for Endpoint {
         recv_infos: &mut [RecvInfo],
     ) -> Poll<io::Result<usize>> {
         assert_eq!(bufs.len(), metas.len(), "bufs and metas differ in length");
-        assert_eq!(bufs.len(), recv_infos.len(), "bufs and recv_infos differ in length");
+        assert_eq!(
+            bufs.len(),
+            recv_infos.len(),
+            "bufs and recv_infos differ in length"
+        );
         if bufs.is_empty() {
             return Poll::Ready(Ok(0));
         }
@@ -1140,7 +1286,11 @@ impl CustomEndpoint for Endpoint {
             };
             let buf = &mut bufs[filled];
             if buf.len() < packet.len() {
-                log::debug!("dropping a {} byte packet from {}: too large", packet.len(), peer.0);
+                log::debug!(
+                    "dropping a {} byte packet from {}: too large",
+                    packet.len(),
+                    peer.0
+                );
                 continue;
             }
             buf[..packet.len()].copy_from_slice(&packet);
@@ -1182,7 +1332,10 @@ impl CustomSender for Sender {
         let Some(peer) = peer_address(dst) else {
             return Poll::Ready(Err(io::Error::other("not a ble-gatt address")));
         };
-        let segment = transmit.segment_size.unwrap_or(transmit.contents.len()).max(1);
+        let segment = transmit
+            .segment_size
+            .unwrap_or(transmit.contents.len())
+            .max(1);
         Poll::Ready(
             transmit
                 .contents
@@ -1201,7 +1354,11 @@ impl Sender {
             Some(link) => match link.try_send(Outgoing::Packet(packet)) {
                 Ok(()) => return Ok(()),
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    self.inner.dropped.lock().expect("poisoned").insert(peer.clone(), Instant::now());
+                    self.inner
+                        .dropped
+                        .lock()
+                        .expect("poisoned")
+                        .insert(peer.clone(), Instant::now());
                     return Ok(());
                 }
                 // The link ended; dial again below.
@@ -1214,7 +1371,23 @@ impl Sender {
         };
         // An address the caller replaced; see `set_peer_address`. Dropped
         // like any packet with no link: QUIC uses its other paths.
-        if self.inner.retired.lock().expect("poisoned").contains_key(peer) {
+        if self
+            .inner
+            .acquisition
+            .lock()
+            .expect("poisoned")
+            .get(peer)
+            .is_some_and(|acquisition| acquisition.terminal)
+        {
+            return Ok(());
+        }
+        if self
+            .inner
+            .retired
+            .lock()
+            .expect("poisoned")
+            .contains_key(peer)
+        {
             log::debug!("not dialling {}: replaced by set_peer_address", peer.0);
             return Ok(());
         }
@@ -1224,41 +1397,39 @@ impl Sender {
         // release. A new connection starts with an Initial, which dials.
         if let Outgoing::Packet(bytes) = &packet {
             if !is_quic_initial(bytes) && only_ended(&self.inner, peer) {
-                log::debug!("not dialling {}: only connections that have ended use it", peer.0);
+                log::debug!(
+                    "not dialling {}: only connections that have ended use it",
+                    peer.0
+                );
                 return Ok(());
             }
         }
         // The last link with this address was one the peer dialled. Dropping
         // the packet reads to QUIC as loss, and it resends once a link exists.
-        let answered = self.inner.answered.lock().expect("poisoned").get(peer).copied();
-        if let Some(dropped) = answered {
+        let incoming = self
+            .inner
+            .incoming_addresses
+            .lock()
+            .expect("poisoned")
+            .contains(peer);
+        if incoming {
             // Seen only as the source of the peer's own connection: iroh
             // remembers it as a path, but a phone dials from a private
             // address it never accepts connections on and soon drops, so
             // dialling it hung 20s on hardware while the address the caller
             // set went unused. Only an address the caller set is dialled.
-            let set_by_caller = self.inner.peers.lock().expect("poisoned").values().any(|address| address == peer);
+            let set_by_caller = self
+                .inner
+                .peers
+                .lock()
+                .expect("poisoned")
+                .values()
+                .any(|address| address == peer);
             if !set_by_caller {
-                log::debug!("not dialling {}: only known as the source of its own connection", peer.0);
-                return Ok(());
-            }
-            // An address the caller set: the peer re-dials after a drop, and
-            // dialling it too would cross. Wait for it, for a while.
-            if self.inner.initiation_policy == InitiationPolicy::PreviousDialer
-                && dropped.is_some_and(|dropped| dropped.elapsed() < REDIAL_YIELD)
-            {
-                log::debug!("not dialling {}: waiting for it to dial back", peer.0);
-                return Ok(());
-            }
-        }
-        // Ordered is an explicit platform fallback, not symmetric
-        // initiation. Apply it only when opening a link, never when sending
-        // over an existing incoming path. Require a unique known identity:
-        // private/unknown addresses cannot establish a stable ordering.
-        if let InitiationPolicy::Ordered { local_id } = self.inner.initiation_policy {
-            let peers = self.inner.peers.lock().expect("poisoned");
-            let mut owners = peers.iter().filter(|(_, address)| *address == peer).map(|(id, _)| *id);
-            if owners.next().is_none_or(|remote| local_id >= remote) || owners.next().is_some() {
+                log::debug!(
+                    "not dialling {}: only known as the source of its own connection",
+                    peer.0
+                );
                 return Ok(());
             }
         }
@@ -1270,55 +1441,79 @@ impl Sender {
         };
         // Packets sent while the dial runs wait in the queue, so the QUIC
         // handshake does not have to wait for a retransmission.
-        let (tx, rx) = mpsc::channel(LINK_QUEUE_DEPTH);
+        let (tx, mut rx) = mpsc::channel(LINK_QUEUE_DEPTH);
         let _ = tx.try_send(packet);
+        // Lock order: links, then closers. Observers cannot see a queue
+        // until its cancellation signal is registered.
+        let close = add_closer(&self.inner, peer);
+        let generation = self
+            .inner
+            .acquisition
+            .lock()
+            .expect("poisoned")
+            .entry(peer.clone())
+            .or_default()
+            .generation;
         links.insert(peer.clone(), tx.clone());
         drop(links);
-        // Registered before dialling, so `close_link` during the dial closes
-        // the channel as soon as it is up.
-        let close = add_closer(&self.inner, peer);
-        let earlier = closing_for_same_endpoint(&self.inner, peer);
+        #[cfg(test)]
+        if let Some(published) = self.inner.published.lock().expect("poisoned").take() {
+            published();
+        }
         let inner = self.inner.clone();
         let peer = peer.clone();
         tokio::spawn(async move {
-            // A dial while a link to the same endpoint's old address was
-            // still disconnecting was aborted by BlueZ on hardware
-            // (`le-connection-abort-by-local`), and the redial cost ~5s.
-            let dial = async {
-                if !earlier.is_empty() {
-                    log::debug!("dial to {}: waiting for the endpoint's other links to close", peer.0);
-                    let _ = tokio::time::timeout(CLOSE_WAIT_LIMIT, async {
-                        for mut closing in earlier {
-                            // Ends with an error once the close is done.
-                            let _ = closing.changed().await;
-                        }
-                    })
-                    .await;
-                }
-                log::debug!("dialling {}", peer.0);
-                dialer(peer.clone()).await
-            };
             // `close_link` cancels the dial: dropping the dialer's future
             // drops the connect under it, which on Linux cancels BlueZ's
             // pending Connect. Waiting for the dial instead kept BlueZ
             // busy, unable to scan or advertise, until its 20s timeout.
             let dialled = tokio::select! {
-                dialled = dial => dialled,
+                biased;
                 () = close.notified() => {
                     log::debug!("dial to {}: cancelled by the application", peer.0);
                     remove_closer(&inner, &peer, &close);
                     remove_link(&inner, &peer, &tx);
                     return;
                 }
+                dialled = async { dialer(peer.clone()).await } => dialled,
             };
             match dialled {
                 Ok(channel) => {
+                    let owns_queue = {
+                        let links = inner.links.lock().expect("poisoned");
+                        let owns = links
+                            .get(&peer)
+                            .is_some_and(|current| current.same_channel(&tx));
+                        if owns {
+                            inner.carriers.lock().expect("poisoned").insert(
+                                peer.clone(),
+                                PacketCarrier {
+                                    queue: tx.clone(),
+                                    close: close.clone(),
+                                    channel: channel.clone(),
+                                },
+                            );
+                        }
+                        owns
+                    };
+                    if !owns_queue {
+                        forward_pending(&inner, &peer, &mut rx);
+                        remove_closer(&inner, &peer, &close);
+                        let _ = channel.release().await;
+                        return;
+                    }
                     // Reachable by dialling after all: no longer inbound-only.
-                    inner.answered.lock().expect("poisoned").remove(&peer);
-                    run_link(inner, peer, channel, rx, tx, close, None).await
+                    inner
+                        .incoming_addresses
+                        .lock()
+                        .expect("poisoned")
+                        .remove(&peer);
+                    run_link(inner, peer, channel, rx, (tx, generation), close, None).await
                 }
                 Err(err) => {
                     log::debug!("dial to {} failed: {err}", peer.0);
+                    // Attempt failure does not fail a legitimate QUIC user.
+                    forward_pending(&inner, &peer, &mut rx);
                     remove_closer(&inner, &peer, &close);
                     remove_link(&inner, &peer, &tx);
                 }
@@ -1346,18 +1541,68 @@ impl AddressLookup for BleGattAddressLookup {
         &self,
         endpoint_id: EndpointId,
     ) -> Option<n0_future::stream::Boxed<Result<Item, address_lookup::Error>>> {
-        let peer = self.inner.peers.lock().expect("poisoned").get(&endpoint_id)?.clone();
+        let peer = self
+            .inner
+            .peers
+            .lock()
+            .expect("poisoned")
+            .get(&endpoint_id)?
+            .clone();
         let info = EndpointInfo {
             endpoint_id,
             data: EndpointData::from_iter([TransportAddr::Custom(custom_addr(&peer))]),
         };
-        Some(Box::pin(n0_future::stream::once(Ok(Item::new(info, "ble-gatt", None)))))
+        Some(Box::pin(n0_future::stream::once(Ok(Item::new(
+            info, "ble-gatt", None,
+        )))))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ble_gatt::datagram::DatagramConfig;
+    use ble_gatt::drivers::mock::{MockDriver, MockNetwork};
+    use ble_gatt::{CapabilityReport, CharacteristicUuid, PeerLinkConfig, ServiceUuid};
+
+    fn managed_peer(
+        network: &Arc<MockNetwork>,
+        address: &str,
+        config: &DatagramConfig,
+    ) -> Arc<PeerLink> {
+        PeerLink::with_driver(
+            Arc::new(MockDriver::new(
+                PeerAddress(address.into()),
+                network.clone(),
+                CapabilityReport {
+                    central: true,
+                    peripheral: true,
+                },
+            )),
+            PeerLinkConfig::new(config.clone()),
+        )
+    }
+
+    async fn managed_pair(
+        server: &Arc<PeerLink>,
+        client: &Arc<PeerLink>,
+        address: &PeerAddress,
+    ) -> (PeerChannel, PeerChannel) {
+        let mut incoming = server.incoming().unwrap();
+        server.set_advertising(true).await.unwrap();
+        tokio::join!(
+            async {
+                client
+                    .request(address)
+                    .await
+                    .unwrap()
+                    .accept()
+                    .await
+                    .unwrap()
+            },
+            async { incoming.next().await.unwrap().accept().await.unwrap() },
+        )
+    }
 
     #[test]
     fn an_address_round_trips_through_its_custom_form() {
@@ -1368,116 +1613,153 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordered_fallback_does_not_dial_from_the_larger_id() {
+    async fn either_authenticated_key_can_request_a_carrier() {
         use std::sync::atomic::AtomicUsize;
-        let mut keys = [iroh::SecretKey::generate().public(), iroh::SecretKey::generate().public()];
+        let mut keys = [
+            iroh::SecretKey::generate().public(),
+            iroh::SecretKey::generate().public(),
+        ];
         keys.sort();
         let attempts = Arc::new(AtomicUsize::new(0));
         let counted = attempts.clone();
         let dialer: Dialer = Arc::new(move |_| {
             counted.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Err(ble_gatt::BleError::GattBusy("busy is not unavailable".into())) })
+            Box::pin(async {
+                Err(ble_gatt::BleError::GattBusy(
+                    "busy is not unavailable".into(),
+                ))
+            })
         });
-        let transport = BleGattTransport::builder()
-            .dialer(dialer)
-            .initiation_policy(InitiationPolicy::Ordered { local_id: keys[1] })
-            .build();
+        let transport = BleGattTransport::builder().dialer(dialer).build();
         let peer = PeerAddress("remote".into());
         transport.set_peer_address(keys[0], peer.clone());
-        let sender = Sender { inner: transport.inner.clone() };
+        let sender = Sender {
+            inner: transport.inner.clone(),
+        };
         sender.send(&peer, vec![0xc0]).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(attempts.load(Ordering::SeqCst), 0, "larger ID waits for incoming under ordered fallback");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "an authenticated key does not control BLE initiation"
+        );
     }
 
     #[tokio::test]
-    async fn initiation_policy_keeps_busy_retryable_and_unknown_sources_undialled() {
-        let mut keys = [iroh::SecretKey::generate().public(), iroh::SecretKey::generate().public()];
-        keys.sort();
-        for (policy, known, answered, expected) in [
-            (InitiationPolicy::Ordered { local_id: keys[0] }, true, false, true),
-            (InitiationPolicy::Ordered { local_id: keys[0] }, false, false, false),
-            (InitiationPolicy::PreviousDialer, true, true, false),
-            (InitiationPolicy::EitherPeer, true, true, true),
-            (InitiationPolicy::EitherPeer, false, true, false),
-        ] {
+    async fn busy_is_retryable_but_unknown_incoming_sources_are_not_dialled() {
+        for known in [false, true] {
             let (called, mut calls) = mpsc::unbounded_channel();
             let dialer: Dialer = Arc::new(move |_| {
                 called.send(()).unwrap();
                 Box::pin(async { Err(ble_gatt::BleError::GattBusy("transient contention".into())) })
             });
-            let transport = BleGattTransport::builder().dialer(dialer).initiation_policy(policy).build();
+            let transport = BleGattTransport::builder().dialer(dialer).build();
             let peer = PeerAddress("remote".into());
-            if known { transport.set_peer_address(keys[1], peer.clone()); }
-            if answered { transport.inner.answered.lock().unwrap().insert(peer.clone(), Some(Instant::now())); }
-            let sender = Sender { inner: transport.inner.clone() };
+            if known {
+                transport.set_peer_address(iroh::SecretKey::generate().public(), peer.clone());
+            }
+            transport
+                .inner
+                .incoming_addresses
+                .lock()
+                .unwrap()
+                .insert(peer.clone());
+            let sender = Sender {
+                inner: transport.inner.clone(),
+            };
             sender.send(&peer, vec![0xc0]).unwrap();
             let result = tokio::time::timeout(Duration::from_millis(50), calls.recv()).await;
-            assert_eq!(result.is_ok(), expected, "{policy:?}, known={known}, answered={answered}");
-            if expected {
-                // A busy refusal removes only its candidate. It must not
-                // latch the transport unavailable or suppress the next dial.
+            assert_eq!(result.is_ok(), known);
+            if known {
                 tokio::task::yield_now().await;
                 sender.send(&peer, vec![0xc0]).unwrap();
-                tokio::time::timeout(Duration::from_secs(1), calls.recv()).await.unwrap().unwrap();
+                tokio::time::timeout(Duration::from_secs(1), calls.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
             }
         }
     }
 
     #[tokio::test]
-    async fn stale_candidate_cleanup_cannot_remove_the_replacement() {
+    async fn stale_carrier_cleanup_cannot_remove_the_replacement() {
         let transport = BleGattTransport::builder().build();
         let peer = PeerAddress("remote".into());
         let (stale, _stale_rx) = mpsc::channel(1);
         let (current, mut current_rx) = mpsc::channel(1);
-        transport.inner.links.lock().unwrap().insert(peer.clone(), current.clone());
+        transport
+            .inner
+            .links
+            .lock()
+            .unwrap()
+            .insert(peer.clone(), current.clone());
         remove_link(&transport.inner, &peer, &stale);
-        let sender = Sender { inner: transport.inner.clone() };
+        let sender = Sender {
+            inner: transport.inner.clone(),
+        };
         sender.send(&peer, vec![0xc0]).unwrap();
-        assert!(matches!(current_rx.recv().await, Some(Outgoing::Packet(packet)) if packet == vec![0xc0]));
+        assert!(
+            matches!(current_rx.recv().await, Some(Outgoing::Packet(packet)) if packet == vec![0xc0])
+        );
         remove_link(&transport.inner, &peer, &current);
         assert!(transport.linked_peers().is_empty());
     }
 
     #[tokio::test]
-    async fn late_packets_do_not_resurrect_a_released_incoming_candidate() {
-        use ble_gatt::drivers::mock::{MockDriver, MockNetwork};
-        use ble_gatt::{CapabilityReport, CharacteristicUuid, ServiceUuid};
-        for (initial, routed, active) in [(false, false, false), (false, true, false), (true, false, false), (true, true, false), (false, false, true)] {
+    async fn late_packets_do_not_resurrect_a_released_incoming_carrier() {
+        for (initial, routed, active) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (true, true, false),
+            (false, false, true),
+        ] {
             let network = MockNetwork::new();
             let server_address = PeerAddress("server".into());
             let client_address = PeerAddress("client".into());
-            let caps = CapabilityReport { central: true, peripheral: true };
-            let server = Adapter::new(Arc::new(MockDriver::new(server_address.clone(), network.clone(), caps))).await;
-            let client = Adapter::new(Arc::new(MockDriver::new(client_address.clone(), network, caps))).await;
-            let config = DatagramConfig::new(ServiceUuid(uuid::Uuid::new_v4()), CharacteristicUuid(uuid::Uuid::new_v4()));
-            let mut incoming = ble_gatt::datagram::serve(&server, &config).await.unwrap();
-            let mut channel = ble_gatt::datagram::connect(&client, &server_address, &config).await.unwrap();
+            let config = DatagramConfig::new(
+                ServiceUuid(uuid::Uuid::new_v4()),
+                CharacteristicUuid(uuid::Uuid::new_v4()),
+            );
+            let server = managed_peer(&network, &server_address.0, &config);
+            let client = managed_peer(&network, &client_address.0, &config);
+            let (channel, carrier) = managed_pair(&server, &client, &server_address).await;
             let transport = BleGattTransport::builder().build();
             let id = iroh::SecretKey::generate().public();
             let addr = TransportAddr::Custom(custom_addr(&client_address));
             learn(&transport.inner, id, 0, &addr);
             forget_connection(&transport.inner, 0);
-            if active { learn(&transport.inner, id, 1, &addr); }
-            let mut candidate = incoming.next().await.unwrap();
+            if active {
+                learn(&transport.inner, id, 1, &addr);
+            }
+
             let packet = vec![if initial { 0xc0 } else { 0x40 }, 1, 2, 3];
             let mut task = if routed {
                 channel.send(packet).await.unwrap();
-                let first = candidate.recv().await.unwrap().unwrap();
-                transport.attach_after(candidate, first)
+                let first = carrier.recv().await.unwrap().unwrap();
+                transport.attach_after(carrier, first)
             } else {
-                let task = transport.attach(candidate);
+                let task = transport.attach(carrier);
                 channel.send(packet).await.unwrap();
                 task
             };
             if !initial && !active {
                 tokio::time::timeout(Duration::from_millis(300), &mut task)
-                    .await.expect("late non-Initial traffic cannot keep a released address alive").unwrap();
+                    .await
+                    .expect("late non-Initial traffic cannot keep a released address alive")
+                    .unwrap();
             } else {
-                assert!(tokio::time::timeout(Duration::from_millis(100), &mut task).await.is_err(),
-                    "a new Initial or another active user protects its candidate");
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), &mut task)
+                        .await
+                        .is_err(),
+                    "a new Initial or another active user protects its carrier"
+                );
                 transport.close_link(&client_address);
-                tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
+                tokio::time::timeout(Duration::from_secs(1), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
             }
             assert!(transport.linked_peers().is_empty());
         }
@@ -1485,53 +1767,87 @@ mod tests {
 
     #[tokio::test]
     async fn pending_dial_completion_does_not_remove_an_incoming_replacement() {
-        use ble_gatt::drivers::mock::{MockDriver, MockNetwork};
-        use ble_gatt::{CapabilityReport, CharacteristicUuid, ServiceUuid};
         for success in [false, true] {
             let network = MockNetwork::new();
-            let caps = CapabilityReport { central: true, peripheral: true };
             let local = PeerAddress("local".into());
             let remote = PeerAddress("remote".into());
-            let a = Adapter::new(Arc::new(MockDriver::new(local.clone(), network.clone(), caps))).await;
-            let b = Adapter::new(Arc::new(MockDriver::new(remote.clone(), network, caps))).await;
-            let config = DatagramConfig::new(ServiceUuid(uuid::Uuid::new_v4()), CharacteristicUuid(uuid::Uuid::new_v4()));
-            let mut a_incoming = ble_gatt::datagram::serve(&a, &config).await.unwrap();
-            let mut b_incoming = ble_gatt::datagram::serve(&b, &config).await.unwrap();
-            let (complete, completion) = oneshot::channel::<ble_gatt::Result<DatagramChannel>>();
+            let config = DatagramConfig::new(
+                ServiceUuid(uuid::Uuid::new_v4()),
+                CharacteristicUuid(uuid::Uuid::new_v4()),
+            );
+            let a = managed_peer(&network, &local.0, &config);
+            let b = managed_peer(&network, &remote.0, &config);
+            let (complete, completion) = oneshot::channel::<ble_gatt::Result<PeerChannel>>();
             let completion = Arc::new(Mutex::new(Some(completion)));
             let (started, mut starts) = mpsc::unbounded_channel();
             let dialer: Dialer = Arc::new(move |_| {
                 let completion = completion.lock().unwrap().take().unwrap();
                 let started = started.clone();
-                Box::pin(async move { started.send(()).unwrap(); completion.await.unwrap() })
+                Box::pin(async move {
+                    started.send(()).unwrap();
+                    completion.await.unwrap()
+                })
             });
             let transport = BleGattTransport::builder().dialer(dialer).build();
-            let sender = Sender { inner: transport.inner.clone() };
+            let sender = Sender {
+                inner: transport.inner.clone(),
+            };
             sender.send(&remote, vec![0xc0]).unwrap();
             starts.recv().await.unwrap();
-            let mut peer_carrier = ble_gatt::datagram::connect(&b, &local, &config).await.unwrap();
-            let replacement = transport.attach(a_incoming.next().await.unwrap());
+            let (peer_carrier, accepted) = managed_pair(&a, &b, &local).await;
+            let duplicate = accepted.clone();
+            let replacement = transport.attach(accepted);
             if success {
-                let channel = ble_gatt::datagram::connect(&a, &remote, &config).await.unwrap();
-                let mut peer_candidate = b_incoming.next().await.unwrap();
-                assert!(complete.send(Ok(channel)).is_ok());
-                // Exercise the real late success, its queue and channel Drop
-                // cleanup, not just remove_link with fabricated senders.
-                assert_eq!(tokio::time::timeout(Duration::from_secs(2), peer_candidate.recv()).await.unwrap().unwrap().unwrap(), vec![0xc0]);
-                peer_candidate.disconnect().await.unwrap();
+                // A late acquired use is not another native carrier.
+                assert!(complete.send(Ok(duplicate)).is_ok());
             } else {
-                assert!(complete.send(Err(ble_gatt::BleError::GattBusy("overlapping operation refused".into()))).is_ok());
+                drop(duplicate);
+                assert!(complete
+                    .send(Err(ble_gatt::BleError::GattBusy(
+                        "outgoing attempt lost".into()
+                    )))
+                    .is_ok());
             }
+            // Queued packets must use the independently accepted carrier.
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), peer_carrier.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+                vec![0xc0]
+            );
             tokio::time::timeout(Duration::from_secs(2), async {
-                while transport.inner.closers.lock().unwrap().get(&remote).unwrap().len() != 1 {
+                while transport
+                    .inner
+                    .closers
+                    .lock()
+                    .unwrap()
+                    .get(&remote)
+                    .unwrap()
+                    .len()
+                    != 1
+                {
                     tokio::task::yield_now().await;
                 }
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
             sender.send(&remote, b"replacement".to_vec()).unwrap();
-            assert_eq!(tokio::time::timeout(Duration::from_secs(2), peer_carrier.recv()).await.unwrap().unwrap().unwrap(), b"replacement");
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), peer_carrier.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+                b"replacement"
+            );
             assert!(!replacement.is_finished());
             transport.close_link(&remote);
-            tokio::time::timeout(Duration::from_secs(2), replacement).await.unwrap().unwrap();
+            tokio::time::timeout(Duration::from_secs(2), replacement)
+                .await
+                .unwrap()
+                .unwrap();
         }
     }
 
@@ -1539,7 +1855,9 @@ mod tests {
     async fn cancelling_a_pending_dial_drops_its_future_and_queue() {
         struct OnDrop(Option<oneshot::Sender<()>>);
         impl Drop for OnDrop {
-            fn drop(&mut self) { let _ = self.0.take().unwrap().send(()); }
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
         }
         let (dropped, drop_seen) = oneshot::channel();
         let dropped = Arc::new(Mutex::new(Some(dropped)));
@@ -1555,13 +1873,697 @@ mod tests {
         });
         let transport = BleGattTransport::builder().dialer(dialer).build();
         let remote = PeerAddress("remote".into());
-        Sender { inner: transport.inner.clone() }.send(&remote, vec![0xc0]).unwrap();
+        Sender {
+            inner: transport.inner.clone(),
+        }
+        .send(&remote, vec![0xc0])
+        .unwrap();
         starts.recv().await.unwrap();
         transport.close_link(&remote);
-        tokio::time::timeout(Duration::from_secs(1), drop_seen).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), drop_seen)
+            .await
+            .unwrap()
+            .unwrap();
         tokio::task::yield_now().await;
         assert!(transport.linked_peers().is_empty());
         assert!(transport.inner.closers.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn closing_a_published_queue_before_the_dial_task_starts_cancels_it() {
+        use std::sync::atomic::AtomicUsize;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let dialer: Dialer = Arc::new(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        });
+        let transport = BleGattTransport::builder().dialer(dialer).build();
+        let peer = PeerAddress("publication-race".into());
+        let closing = transport.clone();
+        let address = peer.clone();
+        *transport.inner.published.lock().unwrap() = Some(Box::new(move || {
+            assert_eq!(closing.linked_peers(), vec![address.clone()]);
+            closing.close_link(&address);
+        }));
+        Sender {
+            inner: transport.inner.clone(),
+        }
+        .send(&peer, vec![1])
+        .unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            transport.linked_peers().is_empty(),
+            "close must see the published queue's cancellation signal"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "cancelled work must not start the dialer"
+        );
+        assert!(transport.inner.closers.lock().unwrap().is_empty());
+    }
+
+    async fn received_packet(endpoint: &mut dyn CustomEndpoint, peer: &PeerAddress) -> Vec<u8> {
+        let mut bytes = [0; 256];
+        let mut meta = [noq_udp::RecvMeta::default()];
+        let mut info = [RecvInfo::new(custom_addr(peer), None)];
+        std::future::poll_fn(|cx| {
+            endpoint.poll_recv(
+                cx,
+                &mut [io::IoSliceMut::new(&mut bytes)],
+                &mut meta,
+                &mut info,
+            )
+        })
+        .await
+        .unwrap();
+        bytes[..meta[0].len].to_vec()
+    }
+
+    #[tokio::test]
+    async fn retired_generation_cleanup_cannot_suppress_or_remove_a_live_replacement() {
+        let config = DatagramConfig::new(
+            ServiceUuid(uuid::Uuid::new_v4()),
+            CharacteristicUuid(uuid::Uuid::new_v4()),
+        );
+        let network = MockNetwork::new();
+        let server = managed_peer(&network, "generation-server", &config);
+        let client = managed_peer(&network, "generation-client", &config);
+        let server_address = PeerAddress("generation-server".into());
+        let client_address = PeerAddress("generation-client".into());
+        let mut incoming = server.incoming().unwrap();
+        server.set_advertising(true).await.unwrap();
+        let (old_remote, old) = tokio::join!(
+            async {
+                client
+                    .request(&server_address)
+                    .await
+                    .unwrap()
+                    .accept()
+                    .await
+                    .unwrap()
+            },
+            async { incoming.next().await.unwrap().accept().await.unwrap() }
+        );
+        let transport = BleGattTransport::builder().build();
+        let mut endpoint = transport.bind().unwrap();
+        let sender = Sender {
+            inner: transport.inner.clone(),
+        };
+        let (reached, retiring) = oneshot::channel();
+        let resume = Arc::new(Notify::new());
+        *transport.inner.retiring.lock().unwrap() = Some((reached, resume.clone()));
+        let old_task = transport.attach(old.clone());
+        old_remote.send(vec![0, 0]).await.unwrap();
+        assert_eq!(
+            received_packet(endpoint.as_mut(), &client_address).await,
+            vec![0, 0]
+        );
+        old.disconnect().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), retiring)
+            .await
+            .unwrap()
+            .unwrap();
+        // A has closed its receive queue but cannot finish scoped release yet.
+        let (remote, new) = tokio::join!(
+            async {
+                client
+                    .request(&server_address)
+                    .await
+                    .unwrap()
+                    .accept()
+                    .await
+                    .unwrap()
+            },
+            async { incoming.next().await.unwrap().accept().await.unwrap() }
+        );
+        let first_new_task = transport.attach(new.clone());
+        let second_new_task = transport.attach(new.clone());
+        let new_task = transport.attach(new);
+        for number in 1..=3u8 {
+            sender.send(&client_address, vec![1, number]).unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), remote.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+                vec![1, number]
+            );
+            remote.send(vec![0, number]).await.unwrap();
+            assert_eq!(
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    received_packet(endpoint.as_mut(), &client_address)
+                )
+                .await
+                .unwrap(),
+                vec![0, number]
+            );
+        }
+        resume.notify_one();
+        old_task.await.unwrap();
+        first_new_task.await.unwrap();
+        second_new_task.await.unwrap();
+        for number in 4..=6u8 {
+            sender.send(&client_address, vec![1, number]).unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), remote.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+                vec![1, number]
+            );
+            remote.send(vec![0, number]).await.unwrap();
+            assert_eq!(
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    received_packet(endpoint.as_mut(), &client_address)
+                )
+                .await
+                .unwrap(),
+                vec![0, number]
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), remote.recv())
+                .await
+                .is_err()
+        );
+        assert!(tokio::time::timeout(
+            Duration::from_millis(50),
+            received_packet(endpoint.as_mut(), &client_address)
+        )
+        .await
+        .is_err());
+        assert!(!new_task.is_finished());
+        transport.close_link(&client_address);
+        tokio::time::timeout(Duration::from_secs(2), new_task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_destination_hints_preserve_identity_validation_and_dial_guards() {
+        let (called, mut calls) = mpsc::unbounded_channel();
+        let dialer: Dialer = Arc::new(move |peer| {
+            called.send(peer).unwrap();
+            Box::pin(async { Err(ble_gatt::BleError::GattBusy("probe dispatched".into())) })
+        });
+        let transport = BleGattTransport::builder().dialer(dialer).build();
+        let id = iroh::SecretKey::generate().public();
+        let authenticated_id = iroh::SecretKey::generate().public();
+        let current = PeerAddress("hint-current".into());
+        let retired = PeerAddress("hint-retired".into());
+        let private = PeerAddress("hint-private-source".into());
+        let supplied = PeerAddress("hint-unlearned".into());
+        transport.set_peer_address(id, retired.clone());
+        transport.set_peer_address(id, current.clone());
+        learn(
+            &transport.inner,
+            authenticated_id,
+            0,
+            &TransportAddr::Custom(custom_addr(&supplied)),
+        );
+        transport
+            .inner
+            .incoming_addresses
+            .lock()
+            .unwrap()
+            .insert(private.clone());
+        for peer in [&current, &retired, &private, &supplied] {
+            transport
+                .inner
+                .acquisition
+                .lock()
+                .unwrap()
+                .entry(peer.clone())
+                .or_default()
+                .terminal = true;
+        }
+        let remote = iroh::EndpointAddr::from_parts(
+            id,
+            [
+                TransportAddr::Custom(custom_addr(&current)),
+                TransportAddr::Custom(custom_addr(&retired)),
+                TransportAddr::Custom(custom_addr(&private)),
+                TransportAddr::Custom(custom_addr(&supplied)),
+                TransportAddr::Custom(CustomAddr::from_parts(TRANSPORT_ID, &[0xff])),
+                TransportAddr::Custom(CustomAddr::from_parts(0x20, b"other-transport")),
+                TransportAddr::Ip("127.0.0.1:12345".parse().unwrap()),
+            ],
+        );
+        transport
+            .hooks()
+            .before_connect(&remote, b"fresh-user")
+            .await;
+        {
+            let acquisition = transport.inner.acquisition.lock().unwrap();
+            assert_eq!(
+                acquisition.len(),
+                4,
+                "invalid and non-BLE destinations are ignored"
+            );
+            for peer in [&current, &retired, &private, &supplied] {
+                assert!(!acquisition[peer].terminal);
+                assert_eq!(
+                    acquisition[peer].generation, 1,
+                    "mapped and supplied duplicates authorize once"
+                );
+            }
+        }
+        {
+            let learned = transport.inner.learned.lock().unwrap();
+            assert_eq!(
+                learned.len(),
+                1,
+                "caller hints create no authenticated identities"
+            );
+            assert_eq!(
+                learned[&supplied].endpoint, authenticated_id,
+                "hints cannot overwrite authenticated identity"
+            );
+        }
+        assert_eq!(transport.inner.peers.lock().unwrap().len(), 1);
+        assert_eq!(transport.inner.peers.lock().unwrap()[&id], current);
+        let sender = Sender {
+            inner: transport.inner.clone(),
+        };
+        for peer in [&retired, &private] {
+            sender.send(peer, vec![0xc0, 1]).unwrap();
+        }
+        assert!(
+            transport.linked_peers().is_empty(),
+            "authorization does not remove dial guards"
+        );
+        assert!(matches!(
+            calls.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        sender.send(&supplied, vec![0x40, 2]).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(300), calls.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            supplied
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_destination_recovers_after_authenticated_history_drains() {
+        use iroh::endpoint::presets;
+
+        const ALPN: &[u8] = b"explicit-history";
+        let network = MockNetwork::new();
+        let config = DatagramConfig::new(
+            ServiceUuid(uuid::Uuid::new_v4()),
+            CharacteristicUuid(uuid::Uuid::new_v4()),
+        );
+        let address = PeerAddress("history-server".into());
+        let server_link = managed_peer(&network, &address.0, &config);
+        let client_link = managed_peer(&network, "history-client", &config);
+        let server_transport = BleGattTransport::builder().build();
+        let mut incoming = server_link.incoming().unwrap();
+        server_link.set_advertising(true).await.unwrap();
+        let (attached, mut channels) = mpsc::unbounded_channel();
+        let attaching = tokio::spawn({
+            let transport = server_transport.clone();
+            async move {
+                while let Some(request) = incoming.next().await {
+                    let channel = request.accept().await.unwrap();
+                    transport.attach(channel.clone());
+                    attached.send(channel).unwrap();
+                }
+            }
+        });
+        let server = iroh::Endpoint::builder(presets::Minimal)
+            .clear_ip_transports()
+            .alpns(vec![ALPN.to_vec()])
+            .add_custom_transport(Arc::new(server_transport.clone()))
+            .hooks(server_transport.hooks())
+            .bind()
+            .await
+            .unwrap();
+        let transport = BleGattTransport::builder()
+            .dialer(dial_with(client_link.clone()))
+            .build();
+        let client = iroh::Endpoint::builder(presets::Minimal)
+            .clear_ip_transports()
+            .add_custom_transport(Arc::new(transport.clone()))
+            .hooks(transport.hooks())
+            .bind()
+            .await
+            .unwrap();
+        let remote = iroh::EndpointAddr::from_parts(
+            server.id(),
+            [TransportAddr::Custom(custom_addr(&address))],
+        );
+        let connect = || async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let (outgoing, accepted) =
+                    tokio::join!(client.connect(remote.clone(), ALPN), async {
+                        server.accept().await.unwrap().await.unwrap()
+                    });
+                (outgoing.unwrap(), accepted)
+            })
+            .await
+            .unwrap()
+        };
+        let (first, accepted) = connect().await;
+        let channel = channels.recv().await.unwrap();
+        assert_eq!(first.remote_id(), server.id());
+        assert_eq!(
+            transport
+                .inner
+                .learned
+                .lock()
+                .unwrap()
+                .get(&address)
+                .unwrap()
+                .endpoint,
+            server.id(),
+            "real TLS handshake established the learned identity"
+        );
+        let generation = transport.inner.acquisition.lock().unwrap()[&address].generation;
+        let (second, other_accepted) = connect().await;
+        assert_eq!(
+            transport.inner.acquisition.lock().unwrap()[&address].generation,
+            generation,
+            "a fresh explicit user shares a healthy carrier's authorization"
+        );
+        assert!(matches!(
+            channels.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        second
+            .send_datagram(b"shared carrier".to_vec().into())
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), other_accepted.read_datagram())
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            b"shared carrier"
+        );
+        channel.disconnect().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !transport.linked_peers().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        for connection in [&first, &second, &accepted, &other_accepted] {
+            connection.close(0u32.into(), b"done");
+        }
+        drop((first, second, accepted, other_accepted));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !transport.inner.learned.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("authenticated connection history must actually drain");
+        assert!(addresses_of(&transport.inner, &server.id()).is_empty());
+        assert!(transport.inner.acquisition.lock().unwrap()[&address].terminal);
+        let (replacement, replacement_accepted) = connect().await;
+        replacement
+            .send_datagram(b"after drain".to_vec().into())
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), replacement_accepted.read_datagram())
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            b"after drain"
+        );
+        replacement.close(0u32.into(), b"done");
+        drop((replacement, replacement_accepted));
+        client.close().await;
+        server.close().await;
+        attaching.abort();
+        let _ = attaching.await;
+        client_link.close().await.unwrap();
+        server_link.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_authorization_survives_a_terminal_carriers_delayed_publication() {
+        let config = DatagramConfig::new(
+            ServiceUuid(uuid::Uuid::new_v4()),
+            CharacteristicUuid(uuid::Uuid::new_v4()),
+        );
+        let network = MockNetwork::new();
+        let server = managed_peer(&network, "authorization-server", &config);
+        let client = managed_peer(&network, "authorization-client", &config);
+        let (remote, channel) = managed_pair(
+            &server,
+            &client,
+            &PeerAddress("authorization-server".into()),
+        )
+        .await;
+        let peer = channel.peer();
+        let (called, mut calls) = mpsc::unbounded_channel();
+        let dialer: Dialer = Arc::new(move |peer| {
+            called.send(peer).unwrap();
+            Box::pin(async { Err(ble_gatt::BleError::GattBusy("probe dispatched".into())) })
+        });
+        let transport = BleGattTransport::builder().dialer(dialer).build();
+        let id = iroh::SecretKey::generate().public();
+        transport.set_peer_address(id, peer.clone());
+        let mut endpoint = transport.bind().unwrap();
+        let (reached, terminating) = oneshot::channel();
+        let resume = Arc::new(Notify::new());
+        *transport.inner.terminating.lock().unwrap() = Some((reached, resume.clone()));
+        let task = transport.attach(channel.clone());
+        remote.send(vec![0, 1]).await.unwrap();
+        assert_eq!(received_packet(endpoint.as_mut(), &peer).await, vec![0, 1]);
+        // Core has published the terminal reason, but the old adapter task
+        // has not yet published suppression or closed its packet queue.
+        remote.disconnect().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), terminating)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            channel.close_reason(),
+            Some(PeerChannelCloseReason::PeerDisconnect)
+        );
+        assert!(matches!(
+            transport
+                .hooks()
+                .before_connect(&iroh::EndpointAddr::from(id), b"new-user")
+                .await,
+            BeforeConnectOutcome::Accept
+        ));
+        resume.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        Sender {
+            inner: transport.inner.clone(),
+        }
+        .send(&peer, vec![0x40, 2])
+        .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(300), calls.recv())
+                .await
+                .expect(
+                    "fresh explicit authorization must survive the old task's terminal publication"
+                )
+                .unwrap(),
+            peer
+        );
+    }
+
+    // Hookless negative contract coverage: peer scoped release becomes a wire
+    // Disconnect, indistinguishable here from explicit peer disconnect. The
+    // shared integration endpoint helper installs hooks; this test deliberately
+    // withholds the fresh hook until after proving packet-only suppression.
+    #[tokio::test]
+    async fn peer_idle_release_needs_fresh_authorization_for_reverse_traffic() {
+        let config = DatagramConfig::new(
+            ServiceUuid(uuid::Uuid::new_v4()),
+            CharacteristicUuid(uuid::Uuid::new_v4()),
+        );
+        let network = MockNetwork::new();
+        let server = managed_peer(&network, "idle-auth-server", &config);
+        let client = managed_peer(&network, "idle-auth-client", &config);
+        let (remote, channel) =
+            managed_pair(&server, &client, &PeerAddress("idle-auth-server".into())).await;
+        let peer = channel.peer();
+        let (called, mut calls) = mpsc::unbounded_channel();
+        let dialer: Dialer = Arc::new(move |peer| {
+            called.send(peer).unwrap();
+            Box::pin(async { Err(ble_gatt::BleError::GattBusy("probe dispatched".into())) })
+        });
+        let transport = BleGattTransport::builder().dialer(dialer).build();
+        let id = iroh::SecretKey::generate().public();
+        transport.set_peer_address(id, peer.clone());
+        let mut endpoint = transport.bind().unwrap();
+        let task = transport.attach(channel.clone());
+        remote.send(vec![0, 1]).await.unwrap();
+        assert_eq!(received_packet(endpoint.as_mut(), &peer).await, vec![0, 1]);
+        // Exactly the action performed by the peer's idle packet-task exit.
+        remote.release().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            channel.close_reason(),
+            Some(PeerChannelCloseReason::PeerDisconnect)
+        );
+        let sender = Sender {
+            inner: transport.inner.clone(),
+        };
+        for bytes in [vec![0xc0, 1], vec![0x40, 2]] {
+            sender.send(&peer, bytes).unwrap();
+        }
+        assert!(
+            transport
+                .inner
+                .acquisition
+                .lock()
+                .unwrap()
+                .get(&peer)
+                .unwrap()
+                .terminal
+        );
+        assert!(transport.linked_peers().is_empty());
+        assert!(matches!(
+            calls.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        // Only an authoritative new application action clears this state;
+        // packets alone above deliberately had no fresh hook invocation.
+        transport
+            .hooks()
+            .before_connect(&iroh::EndpointAddr::from(id), b"reverse")
+            .await;
+        sender.send(&peer, vec![0x40, 3]).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(300), calls.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            peer
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_old_generation_barrier_cannot_report_delivery_after_replacement() {
+        let config = DatagramConfig::new(
+            ServiceUuid(uuid::Uuid::new_v4()),
+            CharacteristicUuid(uuid::Uuid::new_v4()),
+        );
+        let network = MockNetwork::new();
+        let server = managed_peer(&network, "barrier-server", &config);
+        let client = managed_peer(&network, "barrier-client", &config);
+        let (_remote, channel) =
+            managed_pair(&server, &client, &PeerAddress("barrier-server".into())).await;
+        let transport = BleGattTransport::builder().build();
+        let peer = channel.peer();
+        let first = transport.attach(channel.clone());
+        let (reached, barrier) = oneshot::channel();
+        let old_queue = transport
+            .inner
+            .links
+            .lock()
+            .unwrap()
+            .get(&peer)
+            .unwrap()
+            .clone();
+        old_queue.try_send(Outgoing::Packet(vec![0, 1])).unwrap();
+        old_queue.try_send(Outgoing::Barrier(reached)).unwrap();
+        let second = transport.attach(channel.clone());
+        let third = transport.attach(channel);
+        transport.close_link(&peer);
+        for task in [first, second, third] {
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert!(
+            barrier.await.is_err(),
+            "discarded old-generation data is not close-delivery proof"
+        );
+        assert!(transport.inner.dropped.lock().unwrap().contains_key(&peer));
+        assert!(transport.linked_peers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_queued_close_barrier_cannot_report_close_sent() {
+        use iroh::endpoint::presets;
+        const ALPN: &[u8] = b"failed-close-barrier";
+        let server = iroh::Endpoint::builder(presets::Minimal)
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let client = iroh::Endpoint::bind(presets::Minimal).await.unwrap();
+        let address = iroh::EndpointAddr::from_parts(
+            server.id(),
+            server
+                .bound_sockets()
+                .iter()
+                .copied()
+                .map(TransportAddr::Ip),
+        );
+        let (connection, accepted) = tokio::join!(client.connect(address, ALPN), async {
+            server.accept().await.unwrap().await.unwrap()
+        });
+        let connection = connection.unwrap();
+        let transport = BleGattTransport::builder().build();
+        let peer = PeerAddress("failed-barrier".into());
+        learn(
+            &transport.inner,
+            server.id(),
+            0,
+            &TransportAddr::Custom(custom_addr(&peer)),
+        );
+        let (queue, mut pending) = mpsc::channel(4);
+        queue.try_send(Outgoing::Packet(vec![0, 7])).unwrap();
+        transport.inner.links.lock().unwrap().insert(peer, queue);
+        let weak = connection.weak_handle();
+        connection.close(0u32.into(), b"done");
+        let inner = transport.inner.clone();
+        let mut proof =
+            tokio::spawn(async move { close_sent(&inner, &weak, 0, Instant::now()).await });
+        assert!(
+            matches!(pending.recv().await, Some(Outgoing::Packet(bytes)) if bytes == vec![0, 7])
+        );
+        let Outgoing::Barrier(reached) =
+            tokio::time::timeout(Duration::from_secs(2), pending.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("expected close barrier")
+        };
+        drop(reached);
+        drop(pending);
+        // Failure can finish false if QUIC already drained, but never true.
+        if let Ok(result) = tokio::time::timeout(Duration::from_millis(50), &mut proof).await {
+            assert!(!result.unwrap());
+        } else {
+            drop(connection);
+            drop(accepted);
+            client.close().await;
+            server.close().await;
+            assert!(!tokio::time::timeout(Duration::from_secs(5), proof)
+                .await
+                .unwrap()
+                .unwrap());
+        }
     }
 
     // iroh exposes no public close-path operation. Replay its documented
@@ -1569,71 +2571,124 @@ mod tests {
     // while real QUIC stays alive on IP and a real mock GATT task idles.
     // This is not a claim of physically induced multipath closure.
     async fn historical_path_runtime(survivor: bool) {
-        use ble_gatt::drivers::mock::{MockDriver, MockNetwork};
-        use ble_gatt::{CapabilityReport, CharacteristicUuid, ServiceUuid};
         use iroh::endpoint::presets;
 
         const ALPN: &[u8] = b"path-ownership-regression";
         let server = iroh::Endpoint::builder(presets::Minimal)
-            .alpns(vec![ALPN.to_vec()]).bind().await.unwrap();
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
         let client = iroh::Endpoint::bind(presets::Minimal).await.unwrap();
-        let address = iroh::EndpointAddr::from_parts(server.id(), server.bound_sockets().iter().copied().map(TransportAddr::Ip));
-        let (connection, accepted) = tokio::join!(
-            client.connect(address.clone(), ALPN),
-            async { server.accept().await.unwrap().await.unwrap() },
+        let address = iroh::EndpointAddr::from_parts(
+            server.id(),
+            server
+                .bound_sockets()
+                .iter()
+                .copied()
+                .map(TransportAddr::Ip),
         );
+        let (connection, accepted) = tokio::join!(client.connect(address.clone(), ALPN), async {
+            server.accept().await.unwrap().await.unwrap()
+        },);
         let connection = connection.unwrap();
         let surviving_connection = if survivor {
-            let (other, incoming) = tokio::join!(
-                client.connect(address, ALPN),
-                async { server.accept().await.unwrap().await.unwrap() },
-            );
+            let (other, incoming) = tokio::join!(client.connect(address, ALPN), async {
+                server.accept().await.unwrap().await.unwrap()
+            },);
             let other = other.unwrap();
             assert_ne!(connection.stable_id(), other.stable_id());
             Some((other, incoming))
         } else {
             None
         };
-        assert!(connection.paths().iter().any(|path| matches!(path.remote_addr(), TransportAddr::Ip(_))));
+        assert!(connection
+            .paths()
+            .iter()
+            .any(|path| matches!(path.remote_addr(), TransportAddr::Ip(_))));
 
         let network = MockNetwork::new();
-        let caps = CapabilityReport { central: true, peripheral: true };
         let local = PeerAddress("idle-server".into());
         let remote = PeerAddress("historical-client".into());
-        let gatt_server = Adapter::new(Arc::new(MockDriver::new(local.clone(), network.clone(), caps))).await;
-        let gatt_client = Adapter::new(Arc::new(MockDriver::new(remote.clone(), network, caps))).await;
-        let config = DatagramConfig::new(ServiceUuid(uuid::Uuid::new_v4()), CharacteristicUuid(uuid::Uuid::new_v4()));
-        let mut incoming = ble_gatt::datagram::serve(&gatt_server, &config).await.unwrap();
-        let _carrier = ble_gatt::datagram::connect(&gatt_client, &local, &config).await.unwrap();
-        let transport = BleGattTransport::builder().link_idle_timeout(Duration::from_millis(80)).build();
+        let config = DatagramConfig::new(
+            ServiceUuid(uuid::Uuid::new_v4()),
+            CharacteristicUuid(uuid::Uuid::new_v4()),
+        );
+        let gatt_server = managed_peer(&network, &local.0, &config);
+        let gatt_client = managed_peer(&network, &remote.0, &config);
+        let (_carrier, accepted_carrier) = managed_pair(&gatt_server, &gatt_client, &local).await;
+        let transport = BleGattTransport::builder()
+            .link_idle_timeout(Duration::from_millis(80))
+            .build();
         let ble = TransportAddr::Custom(custom_addr(&remote));
-        let current: Vec<_> = connection.paths().iter().map(|path| path.remote_addr().clone()).collect();
+        let current: Vec<_> = connection
+            .paths()
+            .iter()
+            .map(|path| path.remote_addr().clone())
+            .collect();
         // Prior snapshot had both transports. Closing the BLE path does NOT
-        // end this connection, close the candidate, or erase its history.
-        reconcile_paths(&transport.inner, server.id(), 0, current.iter().cloned().chain([ble.clone()]));
+        // end this connection, close the carrier, or erase its history.
+        reconcile_paths(
+            &transport.inner,
+            server.id(),
+            0,
+            current.iter().cloned().chain([ble.clone()]),
+        );
         if survivor {
             // A different connection still has a path at the same address.
             reconcile_paths(&transport.inner, server.id(), 1, [ble]);
         }
-        let mut task = transport.attach(incoming.next().await.unwrap());
+        let mut task = transport.attach(accepted_carrier);
         reconcile_paths(&transport.inner, server.id(), 0, current);
         if survivor {
-            assert!(tokio::time::timeout(Duration::from_millis(350), &mut task).await.is_err(),
-                "another connection's current BLE path must protect the carrier");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(350), &mut task)
+                    .await
+                    .is_err(),
+                "another connection's current BLE path must protect the carrier"
+            );
             let (other, incoming) = surviving_connection.as_ref().unwrap();
             other.send_datagram(b"survivor".to_vec().into()).unwrap();
-            assert_eq!(tokio::time::timeout(Duration::from_secs(2), incoming.read_datagram()).await.unwrap().unwrap().as_ref(), b"survivor");
-            // The survivor also moves away, without closing the candidate.
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), incoming.read_datagram())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .as_ref(),
+                b"survivor"
+            );
+            // The survivor also moves away, without closing the carrier.
             reconcile_paths(&transport.inner, server.id(), 1, []);
         }
-        tokio::time::timeout(Duration::from_millis(700), &mut task).await
-            .expect("historical BLE ownership must not prevent idle expiry").unwrap();
+        tokio::time::timeout(Duration::from_millis(700), &mut task)
+            .await
+            .expect("historical BLE ownership must not prevent idle expiry")
+            .unwrap();
         assert!(transport.linked_peers().is_empty());
-        assert!(transport.inner.learned.lock().unwrap().get(&remote).unwrap().connections.contains(&0),
-            "history must remain for close barriers and ended-packet suppression");
+        assert!(
+            transport
+                .inner
+                .learned
+                .lock()
+                .unwrap()
+                .get(&remote)
+                .unwrap()
+                .connections
+                .contains(&0),
+            "history must remain for close barriers and ended-packet suppression"
+        );
         assert!(connection.close_reason().is_none());
-        connection.send_datagram(b"still alive on IP".to_vec().into()).unwrap();
-        assert_eq!(tokio::time::timeout(Duration::from_secs(2), accepted.read_datagram()).await.unwrap().unwrap().as_ref(), b"still alive on IP");
+        connection
+            .send_datagram(b"still alive on IP".to_vec().into())
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), accepted.read_datagram())
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            b"still alive on IP"
+        );
         connection.close(0u32.into(), b"done");
     }
 

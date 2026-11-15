@@ -15,6 +15,9 @@
 
 use std::collections::{HashMap, HashSet};
 
+#[path = "advertisement_release.rs"]
+mod advertisement_release;
+
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -91,7 +94,8 @@ const ADVERTISING_INSTANCE_WAIT: std::time::Duration = std::time::Duration::from
 const ADVERTISING_INSTANCE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{broadcast, Mutex as AsyncMutex};
+use tokio::sync::Mutex as AsyncMutex;
+use crate::drivers::event_bus::EventBus;
 
 use crate::hal::{Driver, BoxStream, GattConnection};
 use crate::entities::error::{BleError, Result};
@@ -479,9 +483,10 @@ pub struct LinuxDriver {
     /// `StartNotify` does not — so each session here has a known peer, with
     /// no inference involved.
     notify_writers: Arc<AsyncMutex<HashMap<CharacteristicUuid, Vec<CharacteristicWriter>>>>,
-    events_tx: broadcast::Sender<GattEvent>,
+    events_tx: EventBus,
     app_handle: AsyncMutex<Option<ApplicationHandle>>,
     adv_handle: AsyncMutex<Option<bluer::adv::AdvertisementHandle>>,
+    advertisement_release: StdMutex<Option<u8>>,
     /// The spec the live application and advertisement were built from, so
     /// `update_advertisement` can tell whether a spec is for the served
     /// service. `None` while nothing is fully registered.
@@ -575,6 +580,29 @@ pub struct LinuxDriver {
 }
 
 impl LinuxDriver {
+    async fn release_advertisement(&self, handle: &mut Option<bluer::adv::AdvertisementHandle>) -> Result<()> {
+        let released = advertisement_release::release(handle, &self.advertisement_release,
+            || self.adapter.supported_advertising_instances(),
+            ADVERTISING_INSTANCE_WAIT, ADVERTISING_INSTANCE_CHECK_INTERVAL).await
+            .map_err(|err| BleError::Gatt(err.to_string()))?;
+        Self::check_advertisement_release(released)
+    }
+
+    async fn wait_advertisement_release(&self) -> Result<()> {
+        let released = advertisement_release::wait(&self.advertisement_release,
+            || self.adapter.supported_advertising_instances(),
+            ADVERTISING_INSTANCE_WAIT, ADVERTISING_INSTANCE_CHECK_INTERVAL).await
+            .map_err(|err| BleError::Gatt(err.to_string()))?;
+        Self::check_advertisement_release(released)
+    }
+
+    fn check_advertisement_release(released: bool) -> Result<()> {
+        if !released {
+            return Err(BleError::Gatt("advertisement unregister was not confirmed before the deadline".into()));
+        }
+        Ok(())
+    }
+
     /// A generation number never handed out before; see `generation_counter`.
     fn next_generation(&self) -> u64 {
         self.generation_counter.fetch_add(1, Ordering::SeqCst) + 1
@@ -669,7 +697,7 @@ impl DialLocks {
 /// Returns once the subscription is in place, so no restart is missed
 /// between this call and the watch starting.
 async fn spawn_bluez_restart_watch(
-    conn: Arc<dbus::nonblock::SyncConnection>, adapter: Adapter, events_tx: broadcast::Sender<GattEvent>,
+    conn: Arc<dbus::nonblock::SyncConnection>, adapter: Adapter, events_tx: EventBus,
 ) {
     let rule = dbus::message::MatchRule::new_signal("org.freedesktop.DBus", "NameOwnerChanged");
     let Ok(matched) = conn.add_match(rule).await else {
@@ -730,7 +758,7 @@ impl LinuxDriver {
         // is unrecoverable. Operations attempted while unpowered fail on
         // their own, honestly.
         let discovery = Arc::new(DiscoveryBus::open(&adapter).await?);
-        let (events_tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let events_tx = EventBus::new(EVENT_CHANNEL_CAPACITY);
 
         // Watch the adapter's `Powered` property and forward it as
         // `GattEvent::RadioChanged`, so `PeerLink` can project per-peer
@@ -778,6 +806,7 @@ impl LinuxDriver {
             events_tx,
             app_handle: AsyncMutex::new(None),
             adv_handle: AsyncMutex::new(None),
+            advertisement_release: StdMutex::new(None),
             served_service: StdMutex::new(None),
             server_watch: Arc::new(StdMutex::new(Vec::new())),
             dialed: Arc::new(StdMutex::new(HashMap::new())),
@@ -868,7 +897,7 @@ impl LinuxDriver {
 /// tear down a channel that is working — and would clear a `dialed` entry
 /// that now belongs to the new connection.
 fn report_central_loss(
-    events_tx: &broadcast::Sender<GattEvent>, dialed: &Arc<StdMutex<HashMap<PeerAddress, u64>>>,
+    events_tx: &EventBus, dialed: &Arc<StdMutex<HashMap<PeerAddress, u64>>>,
     peer: &PeerAddress, generation: u64,
 ) {
     let mut dialed = dialed.lock().unwrap();
@@ -891,7 +920,7 @@ fn report_central_loss(
 async fn watch_notify_sessions(
     mut control: CharacteristicControl, uuid: CharacteristicUuid,
     writers: Arc<AsyncMutex<HashMap<CharacteristicUuid, Vec<CharacteristicWriter>>>>,
-    events_tx: broadcast::Sender<GattEvent>,
+    events_tx: EventBus,
     served_peers: Arc<StdMutex<HashMap<PeerAddress, u64>>>, adapter: Adapter,
     next_session: Arc<AtomicU64>, watchers: Arc<StdMutex<Vec<tokio::task::AbortHandle>>>,
     advertise_generation: Arc<StdMutex<u64>>, this_generation: u64,
@@ -994,7 +1023,7 @@ async fn watch_notify_sessions(
 #[allow(clippy::too_many_arguments)]
 fn spawn_peripheral_disconnect_watch(
     adapter: Adapter, address: bluer::Address, peer: PeerAddress,
-    events_tx: broadcast::Sender<GattEvent>,
+    events_tx: EventBus,
     served_peers: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
     writers: Arc<AsyncMutex<HashMap<CharacteristicUuid, Vec<CharacteristicWriter>>>>,
     session: u64,
@@ -2168,12 +2197,11 @@ impl Driver for LinuxDriver {
         self.served_service.lock().unwrap().clone()
     }
 
-    /// The read handler of every served characteristic answers from
-    /// `values`, so replacing the entry is the whole change.
+    /// Replace the stored value that the characteristic's read handler returns.
     async fn set_characteristic_value(&self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
         let served = self.served_service.lock().unwrap().clone();
         let served = served.ok_or_else(|| BleError::Gatt("set_characteristic_value: nothing is served".into()))?;
-        if !served.characteristics.iter().any(|c| c.uuid == characteristic) {
+        if !served.characteristics.iter().any(|served_characteristic| served_characteristic.uuid == characteristic) {
             return Err(BleError::Gatt(format!("characteristic {} is not served", characteristic.0)));
         }
         self.values.lock().unwrap().insert(characteristic, value);
@@ -2202,19 +2230,13 @@ impl Driver for LinuxDriver {
         // instance (some have one): BlueZ would refuse the second, so the
         // old one is withdrawn first.
         let mut adv_handle = self.adv_handle.lock().await;
-        if adv_handle.is_some() && self.adapter.supported_advertising_instances().await.unwrap_or(1) == 0 {
-            // Dropping only queues bluer's UnregisterAdvertisement, so wait
-            // for BlueZ to report the instance free.
-            *adv_handle = None;
-            let freed = tokio::time::timeout(ADVERTISING_INSTANCE_WAIT, async {
-                while self.adapter.supported_advertising_instances().await.unwrap_or(1) == 0 {
-                    tokio::time::sleep(ADVERTISING_INSTANCE_CHECK_INTERVAL).await;
-                }
-            })
-            .await;
-            if freed.is_err() {
-                log::warn!("advertise: the old advertisement's instance is still in use");
-            }
+        if adv_handle.is_none() {
+            self.wait_advertisement_release().await?;
+            *self.served_service.lock().unwrap() = Some(service);
+            return Ok(());
+        }
+        if self.adapter.supported_advertising_instances().await.map_err(|err| BleError::Gatt(err.to_string()))? == 0 {
+            self.release_advertisement(&mut adv_handle).await?;
         }
         let registered = self.adapter.advertise(advertisement(&service)).await;
         match registered {
@@ -2232,6 +2254,23 @@ impl Driver for LinuxDriver {
                 Err(BleError::Gatt(err.to_string()))
             }
         }
+    }
+
+    async fn set_advertising_enabled(&self, enabled: bool) -> Result<()> {
+        let _serialise = self.advertise_lock.lock().await;
+        let service = self.served_service.lock().unwrap().clone()
+            .ok_or_else(|| BleError::Gatt("advertising visibility: nothing is served".into()))?;
+        let mut handle = self.adv_handle.lock().await;
+        if enabled {
+            if handle.is_none() {
+                self.wait_advertisement_release().await?;
+                *handle = Some(self.adapter.advertise(advertisement(&service)).await
+                    .map_err(|err| BleError::Gatt(err.to_string()))?);
+            }
+        } else {
+            self.release_advertisement(&mut handle).await?;
+        }
+        Ok(())
     }
 
     async fn stop_advertising(&self) -> Result<()> {
@@ -2330,6 +2369,10 @@ impl Driver for LinuxDriver {
             .map_err(|err| BleError::Gatt(format!("disconnecting {} failed: {err}", peer.0)))
     }
 
+    fn lifecycle_events(&self) -> BoxStream<GattEvent> {
+        self.events_tx.lifecycle_events()
+    }
+
     fn events(&self) -> BoxStream<GattEvent> {
         let rx = self.events_tx.subscribe();
         Box::pin(
@@ -2393,7 +2436,7 @@ struct LinuxGattConnection {
     notify_writers: Arc<AsyncMutex<HashMap<CharacteristicUuid, Vec<CharacteristicWriter>>>>,
     /// So `disconnect()` can report the central-role link as lost without
     /// actually tearing down the ACL — see its doc comment.
-    events_tx: broadcast::Sender<GattEvent>,
+    events_tx: EventBus,
     peer: PeerAddress,
     device: bluer::Device,
     /// Negotiated ATT MTU, refreshed from BlueZ whenever a characteristic
@@ -2797,9 +2840,10 @@ mod tests {
 
         // bluetoothd restarting: `org.bluez` leaves the bus, then comes back.
         // `Off` must be reported, and `On` only once the adapter is powered.
-        let (events_tx, mut events) = broadcast::channel(8);
+        let events_tx = EventBus::new(8);
+        let mut events = events_tx.subscribe();
         spawn_bluez_restart_watch(discovery.conn.clone(), adapter.clone(), events_tx).await;
-        let next = |events: &mut broadcast::Receiver<GattEvent>, wait_ms| {
+        let next = |events: &mut tokio::sync::broadcast::Receiver<GattEvent>, wait_ms| {
             let wait = std::time::Duration::from_millis(wait_ms);
             let mut events = events.resubscribe();
             async move { tokio::time::timeout(wait, events.recv()).await.ok().and_then(|e| e.ok()) }

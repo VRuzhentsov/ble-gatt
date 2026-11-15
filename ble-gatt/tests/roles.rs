@@ -81,6 +81,33 @@ async fn a_connection_publishes_disconnected_when_the_peer_goes_away() {
 }
 
 #[tokio::test]
+async fn critical_lifecycle_loss_ends_an_owned_connection() {
+    let network = MockNetwork::new();
+    let peripheral = device(&network, "lag-peripheral");
+    let central = device(&network, "lag-central");
+    let _server = Adapter::new(peripheral as Arc<dyn Driver>)
+        .await
+        .peripheral()
+        .serve(service())
+        .await
+        .unwrap();
+    let connection = Adapter::new(central as Arc<dyn Driver>)
+        .await
+        .central()
+        .connect(&PeerAddress("lag-peripheral".into()))
+        .await
+        .unwrap();
+    let mut state = connection.state();
+    let token = connection.cancelled();
+
+    network.simulate_event_lag(&PeerAddress("lag-central".into()), 1);
+    timeout(Duration::from_millis(300), token.cancelled())
+        .await
+        .expect("unknown lifecycle loss must end the owned connection");
+    assert!(state.wait_for(|state| state.is_disconnected()).await.unwrap().is_disconnected());
+}
+
+#[tokio::test]
 async fn dropping_a_connection_cancels_its_token() {
     let network = MockNetwork::new();
     let peripheral_driver = device(&network, "peripheral");

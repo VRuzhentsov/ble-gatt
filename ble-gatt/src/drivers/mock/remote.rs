@@ -9,13 +9,14 @@ use std::sync::{Arc, Mutex};
 
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::{TcpStream, ToSocketAddrs};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
+use crate::drivers::event_bus::EventBus;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::hal::BoxStream;
 use crate::entities::error::{BleError, Result};
 use crate::entities::models::{
-    CharacteristicUuid, DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress, ServiceUuid,
+    CharacteristicUuid, DiscoveredPeer, GattServiceSpec, PeerAddress, ServiceUuid,
     WriteType,
 };
 
@@ -32,7 +33,7 @@ struct PendingState {
     closed: bool,
 }
 type PendingMap = Arc<Mutex<PendingState>>;
-type EventsMap = Arc<Mutex<HashMap<PeerAddress, broadcast::Sender<GattEvent>>>>;
+type EventsMap = Arc<Mutex<HashMap<PeerAddress, EventBus>>>;
 type SubscriptionsMap = Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Result<Vec<u8>>>>>>;
 
 pub(crate) struct RemoteClient {
@@ -112,7 +113,12 @@ impl RemoteClient {
                 }
                 Frame::Push(Push::Event { address, event }) => {
                     if let Some(tx) = events.lock().unwrap().get(&address) {
-                        let _ = tx.send(event);
+                        let _ = tx.send_legacy(event);
+                    }
+                }
+                Frame::Push(Push::LifecycleEvent { address, event }) => {
+                    if let Some(tx) = events.lock().unwrap().get(&address) {
+                        tx.send_lifecycle(event);
                     }
                 }
                 Frame::Push(Push::NotifyItem { subscription_id, item }) => {
@@ -146,6 +152,11 @@ impl RemoteClient {
         // already sees `pending`'s `closed` flag and fails fast, and
         // `subscribe()`'s own error path removes the entry it just added.
         subscriptions.lock().unwrap().clear();
+        // The transport disappeared, not merely a notification. Its lost
+        // lifecycle history is unknown, so fail closed on the critical port.
+        for bus in events.lock().unwrap().values() {
+            bus.send_lifecycle(crate::entities::models::GattEvent::Lagged { dropped: 0 });
+        }
     }
 
     /// `closed` and the waiter map share one lock (`PendingState`) so this
@@ -175,7 +186,7 @@ impl RemoteClient {
         }
     }
 
-    pub(crate) fn register_events_sender(&self, address: PeerAddress, sender: broadcast::Sender<GattEvent>) {
+    pub(crate) fn register_events_sender(&self, address: PeerAddress, sender: EventBus) {
         self.events.lock().unwrap().insert(address.clone(), sender);
         // Fire-and-forget (correlation_id 0: no one is waiting on a
         // response). Always the first frame sent by this client — the
@@ -219,6 +230,13 @@ impl RemoteClient {
         match self.call(request).await? {
             Response::Unit => Ok(()),
             _ => Err(BleError::Transport("unexpected response to SetCharacteristicValue".to_string())),
+        }
+    }
+
+    pub(crate) async fn set_advertising_enabled(&self, address: &PeerAddress, enabled: bool) -> Result<()> {
+        match self.call(Request::SetAdvertisingEnabled { address: address.clone(), enabled }).await? {
+            Response::Unit => Ok(()),
+            _ => Err(BleError::Transport("unexpected response to SetAdvertisingEnabled".into())),
         }
     }
 

@@ -1,15 +1,15 @@
 # Hardware verification
 
-Verify existing datagram examples, the current iroh diagnostic and the target in
+Verify raw datagram examples and managed communication in
 [ADR-0012](adr/0012-discovery-like-nearby.md) separately. This guide lists required
 checks, not passed scenarios.
 
 ## Status and scope
 
-The current iroh diagnostic exercises the adapter's `InitiationPolicy::EitherPeer`
-and retained-candidate model. **It does not implement or verify the new core
-endpoint-ID/nonce handshake.** Old mock/emulator results must not be relabeled as
-acceptance of that design. Windows acceptance is listed in
+The shared iroh diagnostic now uses core managed discovery, requests and
+independent incoming acceptance. Final integrated verification remains pending;
+this refactor is not published or hardware-accepted. Old candidate-model results
+do not certify the new protocol. Windows acceptance is listed in
 [ADR-0011](adr/0011-windows-winrt-driver.md#verification-and-known-limits).
 
 Historical discovery, release-JNI and crossed-start failures describe specific runs,
@@ -18,16 +18,19 @@ prove universal emulator failure. Missing native scan results block discovery;
 arbitration cannot repair them.
 
 Device testing requires separate authorization and exact build/input provenance.
-The design revision changes no hardware, phone settings or consumer source.
+This documentation revision changes no hardware, phone settings or consumer source.
 Source checks, mocks, packaged JNI, native events and physical teardown prove different things.
 
 ## Software checks for the current implementation
 
-From the repository root:
+Suggested checks from the repository root; this guide does not record them as run:
 
 ```sh
 cargo test --workspace --locked --offline
+cargo test -p ble-gatt --test peer_link --test peer_protocol --locked --offline
+cargo test -p ble-gatt --test advertising_visibility --test native_advertisement_state --locked --offline
 cargo test -p ble-gatt --features mock-broker --locked --offline
+cargo test -p tauri-plugin-ble-gatt --test jni_parity --locked --offline
 cargo test -p ble-gatt-iroh --test hardware_diagnostic --locked --offline
 cargo build -p ble-gatt-iroh --example hw_iroh_peer --locked --offline
 ```
@@ -35,7 +38,7 @@ cargo build -p ble-gatt-iroh --example hw_iroh_peer --locked --offline
 The shared runner is `ble-gatt-iroh/examples/support/iroh_diagnostic.rs`.
 The Linux entrypoint, sample Android application and integration tests use it.
 The radio-free tests run actual iroh endpoints over mock GATT; this proves the
-current software path, not physical crossed-dial safety or the future protocol.
+managed software path, not physical crossed-attempt safety or OS teardown.
 
 ## Android diagnostic packaging
 
@@ -57,7 +60,7 @@ lock. The Rust diagnostic requires this process's service marker.
 
 Use package `dev.blegatt.example.debug` and activity
 `dev.blegatt.example.MainActivity`. Verify the packaged ABI, manifest and bridge
-bytecode; Rust/Kotlin source parity alone is insufficient. Diagnostic properties
+bytecode, including bridge ABI 7. Source parity alone is insufficient. Diagnostic properties
 are read only by debug builds. Do not run the interactive/datagram buttons at
 the same time as the iroh runner.
 
@@ -141,9 +144,9 @@ Correlate both peers' logs:
   the remote application's business operation completed.
 - Before shutdown, `NATIVE_CLEANUP active_sessions=0 ... evidence=driver_events
   before_shutdown=true`, then `CLEANUP address_queues=0 ... before_shutdown=true`
-  and joined retained incoming candidates. Lagged/missing lifecycle evidence fails.
+  and joined incoming carrier tasks. Lagged/missing lifecycle evidence fails.
 - The current `PASS payload-reuse-survivor-cleanup` remains software evidence
-  with `native_teardown=unverified` unless all native/OS candidates are separately
+  with `native_teardown=unverified` unless all native/OS sessions are separately
   correlated. An empty queue map or observed ready-session closure is not proof
   of every raw ACL/session ending. Shutdown-induced teardown is not last-user
   cleanup. Emergency force-close cannot turn a failure into a pass.
@@ -154,25 +157,30 @@ handle alone does not prove unchanged native carrier continuity; the remote
 peer or OS may have replaced it. A failed required role is not a pass because
 another role subsequently connected. Repeat after cleanup for reconnect evidence.
 
-## New core design: separate acceptance gates
+## Managed core: separate acceptance gates
 
-After the protocol/API review and implementation, add evidence independent of
-this old adapter diagnostic for:
+The working tree contains non-iroh protocol tests and the migrated adapter.
+Require fresh evidence, independent of historical diagnostic passes, for:
 
 1. Non-iroh establishment in either direction and matching endpoint correlation.
 2. Crossed attempts with both nonce orderings; equal nonces fail both.
 3. Losing outgoing failure/rejection and separate accepted incoming delivery;
    no silent success handoff and no false global disconnection.
 4. Rejection, duplicate requests, cancellation and explicit disconnect without
-   an unintended autonomous reconnect.
+   unintended reconnect. Old QUIC retransmissions must not authorize replacement;
+   fresh explicit connects/attachment can authorize it. Test unexpected loss separately.
 5. Stale completion, replacement generations and loser cleanup preserving the
    winner, existing users and healthy established communication.
 6. Discovery metadata reads while another user is active, bounded failures,
    stopping discovery/advertising during communication and idle liveness.
 7. Version mismatch/control framing and opaque payload preservation; raw vendor
    GATT must remain unaffected.
-8. iroh adaptation preserving multi-user/path accounting after the core owns
-   establishment, then native/physical checks on each required platform pair.
+8. iroh multi-user/path accounting with core-owned establishment, then native
+   visibility, cancellation and physical checks on each required platform pair.
+
+Review metadata partial failure and WinRT watcher overflow/cache behavior.
+Source ownership guards and ABI checks do not prove native cancellation,
+compiled JNI descriptors, sample packaging or callback timing.
 
 Keep unsupported capabilities and the current single-inbound-peer profile limit
 explicit. Do not claim Cluster/M-to-N, locked-device reliability or exhaustive

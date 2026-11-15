@@ -1,9 +1,9 @@
 # Architecture: crates, roles and ownership
 
-The shared target design is [ADR-0012](adr/0012-discovery-like-nearby.md).
+The shared design is [ADR-0012](adr/0012-discovery-like-nearby.md).
 [ADR-0011](adr/0011-windows-winrt-driver.md) owns Windows-native choices.
-The nonce handshake and core/iroh migration are not implemented.
-Current API examples do not define target signatures.
+The managed core and iroh migration exist in the working tree. Final integrated
+verification is pending; this refactor is not published or hardware-accepted.
 
 ## Workspace boundaries
 
@@ -21,10 +21,10 @@ The core works without iroh or Tauri. A Tauri app can obtain a shared core
 need not cross frontend IPC. Android still needs a compatible native bridge and
 Application context, even in a non-Tauri host.
 
-## Target map
+## Ownership map
 
 Boxes group responsibilities; arrows show selected caller/provider dependencies,
-not every call. `Peer coordination` does not name an approved class or new crate.
+not every call. One `PeerLink` worker owns managed communication.
 
 ```mermaid
 flowchart TB
@@ -40,7 +40,7 @@ flowchart TB
         tauriAdapter["tauri-plugin-ble-gatt: host access/setup"]
     end
     subgraph core["ble-gatt: reusable core and native implementations"]
-        peer["Peer coordination: discovery / handshake / tie-break (target)"]
+        peer["PeerLink worker: discovery / handshake / tie-break"]
         adapter["Adapter: radio / capabilities / role access"]
         central["Central: scan / connect / GATT client"]
         peripheral["Peripheral: advertise / serve / notify"]
@@ -92,8 +92,8 @@ Power profiles provide advice rather than mandatory radio control.
 
 A central initiates a BLE connection; a peripheral serves GATT. Writes in one
 direction and notifications in the other already provide bidirectional traffic.
-Either eligible application peer can initiate the target protocol. A permanent
-identity-ranked dialler and caller-selected initiation modes are not the target.
+Either eligible application peer can initiate the managed protocol. No permanent
+identity ranking or caller-selected initiation mode controls the initiator.
 Raw role operations remain available for vendor devices without our handshake.
 
 ```text
@@ -111,30 +111,47 @@ larger wins; equal nonces fail both. The losing outgoing request reports failure
 the winning incoming request is processed separately. Do not transfer its success
 to the outgoing caller. Closing a loser is not global peer disconnection.
 Endpoint correlation, native session generation and authenticated identity are
-different facts. See ADR-0012 for source references and remaining wire/API gates.
+different facts. See ADR-0012 for selected bytes, typed outcomes and acceptance gates.
 
-## Current implementation gap
+## Core coordinator and independent raw paths
 
-Today the iroh path is:
+The managed iroh path is:
 
 ```text
 Application -> external iroh -> BleGattTransport
-            -> datagram::connect / serve -> HAL -> native driver
+            -> PeerLink worker -> datagram profile -> HAL -> native driver
 ```
 
-The adapter still owns initiation modes and crossed-candidate handling. It
-accounts for current iroh path use separately from historical address mappings.
-Core `PeerLink::Symmetric` still selects a lower-`LinkId` dialler; it is not the
-new protocol or a mandated basis for it. Do not nest independent native
-retry/close owners to simulate the target.
+Non-iroh applications use the same worker directly, including standalone CLIs.
+Raw `Central`, `Peripheral` and datagram APIs remain independent for vendor or
+caller-owned protocols. They do not run the managed handshake.
 
-Existing core metadata completion is opt-in. Its timer-based refresh is not
-Nearby's exact wire protocol. The datagram server still admits one inbound peer;
-this design does not establish Cluster/M-to-N or universal crossed-dial support.
+The refactor replaces the existing worker's tracking/ranking contract. It does
+not add a second manager. The unused crate-private `link_state` implementation
+is retired; historical ADR-0005 remains unchanged.
 
-Reuse state tables, owned handles, fragmentation/reassembly and native guards
-where their contracts fit. Implement peer behavior without integrations, then
-adapt iroh. See [current API examples](interface.md).
+Managed discovery completes missing metadata through bounded GATT reads. Raw
+scan completion remains opt-in. Neither path implements Nearby's exact wire protocol.
+The datagram server still admits one inbound peer; `MaxLinks` does not establish
+Cluster/M-to-N or universal crossed-attempt support.
+
+Each generation's existing transport task waits for bounded application capacity.
+It holds at most one pending record and pauses raw reads, not the shared worker.
+Native send and control paths remain responsive. Admission keeps the five-second
+I/O bound; native end and retirement interrupt the wait. Queue pressure alone
+does not create a receive gap.
+
+Drivers publish bounded lifecycle events separately from characteristic writes.
+Native/mock drivers, the broker and wrappers preserve this separation through
+`Driver::lifecycle_events()`. The third-party default filters the legacy stream;
+it cannot isolate loss. Critical lag remains terminal, unlike known payload gaps.
+See [event-stream limits](interface.md#driver-event-streams-and-receive-loss).
+
+Core handles separate scoped release from generation-wide disconnect. The iroh
+adapter accounts for current users/paths separately from address history.
+It uses core close reasons to block automatic reacquisition after terminal
+disconnect. Old packets cannot authorize replacement; unexpected loss remains
+recoverable. See [API usage](interface.md) and the [adapter](../ble-gatt-iroh/README.md).
 
 ## Layers and validation
 

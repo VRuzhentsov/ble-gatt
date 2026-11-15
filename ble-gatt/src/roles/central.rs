@@ -26,7 +26,7 @@ impl Central {
     /// Connects to `peer`. The returned `Connection` publishes its state
     /// (ADR-0007 D5).
     pub async fn connect(&self, peer: &PeerAddress) -> Result<Connection> {
-        let events = self.driver.events();
+        let events = self.driver.lifecycle_events();
         let inner = self.driver.connect(peer).await?;
         Ok(Connection::new(inner, events))
     }

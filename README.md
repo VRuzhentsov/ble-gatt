@@ -20,32 +20,29 @@ This repo is a Cargo workspace with three crates:
   permissions through Tauri's permission mechanism, and exposes both a Rust
   API and JavaScript commands.
 - **[`ble-gatt-iroh`](ble-gatt-iroh/README.md)** — an [iroh](https://github.com/n0-computer/iroh)
-  custom transport that carries QUIC over `ble-gatt`'s GATT datagram
-  channel. In the current implementation, the caller schedules scanning and
-  advertising; the adapter also contains initiation policies described in
-  [ADR-0012's current implementation gap](docs/adr/0012-discovery-like-nearby.md#current-implementation-gap).
+  custom transport over core `PeerChannel` messages. It translates packets and
+  addresses and accounts for authenticated QUIC users of a shared carrier.
 
-## Design under review
+## Managed communication: working-tree implementation
 
-The target in [ADR-0012](docs/adr/0012-discovery-like-nearby.md) makes symmetric
-peer communication a core `ble-gatt` capability, independent of iroh. Either
-eligible peer can initiate or reconnect; applications do not select an
-`EitherPeer`, previous-dialler or identity-ordered mode. Raw central/peripheral
-operations remain available for vendor protocols.
+[ADR-0012](docs/adr/0012-discovery-like-nearby.md) now has a core implementation:
+`PeerLink` provides discovery, explicit requests, mutual acceptance, scoped
+channels and endpoint/nonce arbitration. Either peer can initiate. An outgoing
+loser fails; the incoming winner proceeds separately through acceptance.
+The refactor reuses one dedicated core worker, not a second manager.
+Bounded application receive pressure pauses only that generation, within the
+existing I/O deadline. Native/mock lifecycle streams are isolated from payload
+traffic; third-party defaults retain unknown-loss limits. See
+[event and receive contracts](docs/interface.md#driver-event-streams-and-receive-loss).
 
-`ble-gatt-iroh` adapts generic BLE messages to iroh packets and accounts for
-iroh users of a carrier. The Tauri plugin supplies host access and setup; it
-is not another packet layer. iroh itself remains an external library.
+Raw central/peripheral and datagram APIs remain separate for vendor protocols
+and caller-owned channels. A standalone CLI can use the
+[minimal managed example](docs/interface.md#minimal-outgoing-use) without iroh or Tauri.
+The Tauri plugin supplies host setup; external iroh supplies QUIC and security.
 
-**The core handshake and migration are not implemented.** Current
-`PeerLink::Symmetric` and adapter initiation APIs do not provide that contract.
-See the [architecture map](docs/architecture.md) and crate READMEs for current behavior and target ownership.
-
-ADR-0011 owns Windows-native choices; ADR-0012 owns the shared Nearby-inspired
-redesign, including discovery, lifecycle and the new core nonce tie-break required
-in this PR. A losing outgoing attempt must report failure while a winning incoming
-attempt proceeds separately. The protocol/API details and implementation remain
-review gates; the new design does not claim Google Nearby wire interoperability.
+**Final integrated verification is pending. This refactor is not published or
+hardware-accepted.** [ADR-0011](docs/adr/0011-windows-winrt-driver.md) owns native
+Windows choices. Neither ADR claims Google Nearby wire interoperability.
 
 ### Using the plugin from a Rust application
 
@@ -120,7 +117,7 @@ ble-gatt/src/
 ├── entities/     Entities: types, events, errors
 ├── hal/          Use Cases: the Driver / GattConnection ports (async, Tokio)
 ├── roles/        Use Cases: Adapter, Central and Peripheral
-├── connection/   Use Cases: one connection's state machine, PeerLink
+├── connection/   Use Cases: owned Connection, managed PeerLink worker and codec
 ├── profile/      Use Cases: the datagram profile (fragmentation, reassembly)
 ├── power/        Use Cases: power-profile advice
 └── drivers/      Frameworks & Drivers: one Driver per platform
@@ -134,19 +131,10 @@ ble-gatt/src/
 
 ### Roles, published state, handles
 
-```rust
-use ble_gatt::{Adapter, RadioStatus};
-
-let adapter = Adapter::platform().await?;      // or Adapter::new(driver) to inject one
-adapter.wait_available().await;                 // adapter.status(): watch::Receiver<RadioStatus>
-
-let server = adapter.peripheral().serve(spec).await?; // advertising stops when `server` drops
-
-let mut conn = adapter.central().connect(&peer).await?;
-let mut state = conn.state();                   // watch::Receiver<ConnectionState>
-tokio::spawn(conn.cancelled().run_until_cancelled_owned(read_loop()));
-state.wait_for(|s| s.is_disconnected()).await?;
-```
+`Adapter::platform().await` obtains raw role access. `Central::connect` returns
+an owned `Connection`; `Peripheral::serve` returns `ServerHandle`.
+Their state/cleanup contracts differ from managed scoped channels. See
+[API usage](docs/interface.md#raw-apis-and-lifetime-limits).
 
 ### Power profiles
 
@@ -158,9 +146,8 @@ the radio; the application applies it (ADR-0007 D8).
 Layers are named after Clean Architecture and modules after the Bluetooth
 specification (ADR-0007). The short paths `ble_gatt::datagram` and
 `ble_gatt::peer_link` still resolve; `ble_gatt::backend::…` is gone (use
-`ble_gatt::drivers` and `ble_gatt::hal`). Application code takes an
-`Adapter` (`datagram::connect`/`serve`, `ble_gatt_iroh::dial_with`);
-`Driver` is the driver port underneath it.
+`ble_gatt::drivers` and `ble_gatt::hal`). Raw datagram helpers take an `Adapter`;
+`ble_gatt_iroh::dial_with` takes `Arc<PeerLink>`. `Driver` is the native port.
 
 Every driver speaks the same generic GATT vocabulary
 (`ServiceUuid`/`CharacteristicUuid`/`GattEvent`/`GattServiceSpec`/...) —
@@ -169,8 +156,8 @@ crossing the `Driver`/`GattConnection` port boundary.
 
 ### Three tiers, one carrier
 
-`ble-gatt` carries bytes; it does not interpret them (ADR-0003). A consumer
-picks the tier that fits:
+`ble-gatt` carries application bytes without authenticating or encrypting them
+(ADR-0003). Managed channels add control records. Choose the required tier:
 
 | Tier | Use for | Owns the connection? |
 |---|---|---|
@@ -178,9 +165,8 @@ picks the tier that fits:
 | **datagram** (`datagram::connect` / `serve`) | one message pipe, driven by hand | you |
 | **`PeerLink`** | app-to-app links to a set of peers | the library |
 
-These are current APIs, not three target peer-initiation behaviors. See
-[`docs/interface.md`](docs/interface.md) for their current use and
-[ADR-0012](docs/adr/0012-discovery-like-nearby.md) for the pending ownership change.
+See [`docs/interface.md`](docs/interface.md) for requests, incoming acceptance,
+scoped release, disconnect and the adapter's terminal-authorization rules.
 
 ### Load-bearing files
 
@@ -188,10 +174,14 @@ Read the doc next to each before changing it:
 
 | File | What it governs | Doc |
 |---|---|---|
-| `ble-gatt/src/connection/link_state.rs` | `RadioState` / `CentralLink` / `PeripheralLink` — pure lifecycle transitions | ADR-0005 |
-| `ble-gatt/src/connection/peer_link.rs` | current tracked-peer API and dedicated worker | `docs/interface.md`, ADR-0005 |
+| `ble-gatt/src/connection/peer_link.rs` | request/accept and scoped channel API | `docs/interface.md`, ADR-0012 |
+| `ble-gatt/src/connection/managed_worker.rs` | attempt state, arbitration and native channel ownership | ADR-0012 |
+| `ble-gatt/src/connection/managed_codec.rs` | managed metadata and record bytes | ADR-0012 |
 | `ble-gatt/src/drivers/linux.rs` — `LinuxConnectGuard` / `pending_cleanup` | abandoned-connect cleanup and native ownership | code comments, ADR-0009 |
 | `ble-gatt/src/profile/datagram/mod.rs` | complete messages, serving and channel limits | ADR-0003, ADR-0012 |
+
+The unused crate-private `link_state` implementation is retired. ADR-0005 remains
+a historical record, not the current managed state-machine specification.
 
 ## Status
 
@@ -199,7 +189,7 @@ Under active development. Implemented APIs, target design and device acceptance
 are separate claims. The architecture does not certify native roles or background scenarios. See
 [hardware verification and current iroh diagnostic checklist](docs/hardware-verification.md).
 Not yet published to crates.io/npm — consume as a git dependency, pinned to a
-release tag:
+release tag for released APIs. The example tag does not include this working-tree refactor:
 
 ```toml
 ble-gatt = { git = "https://github.com/VRuzhentsov/ble-gatt", tag = "v0.1.0" }

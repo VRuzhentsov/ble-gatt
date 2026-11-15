@@ -90,12 +90,10 @@ fn scan_start_status_and_abi_match_on_both_sides() {
     assert!(scan.contains("return SCAN_BUSY"));
     assert!(scan.contains("adapter?.bluetoothLeScanner ?: return SCAN_UNAVAILABLE"));
     assert!(scan.contains("return SCAN_STARTED"));
-    assert!(
-        !scan.contains("catch ("),
-        "scan permission/platform exceptions must reach JNI"
-    );
-    assert!(rust.contains("const BRIDGE_ABI_VERSION: i32 = 6;"));
-    assert!(kotlin.contains("fun bridgeAbiVersion(): Int = 6"));
+    assert!(scan.contains("if (scanCallback === callback) scanCallback = null"));
+    assert!(scan.contains("throw error"), "scan exceptions must reach JNI after ownership rollback");
+    assert!(rust.contains("const BRIDGE_ABI_VERSION: i32 = 7;"));
+    assert!(kotlin.contains("fun bridgeAbiVersion(): Int = 7"));
 }
 
 /// Source-contract regression for duplicate Tao versions. Runtime acceptance

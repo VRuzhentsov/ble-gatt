@@ -13,6 +13,8 @@
 //! `set_characteristic_value` replaces.
 
 use std::collections::HashMap;
+#[path = "advertising_start.rs"]
+mod advertising_start;
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 
 use tokio::sync::mpsc;
@@ -65,18 +67,30 @@ type Tokens = (GattLocalCharacteristic, Option<i64>, Option<i64>, Option<i64>);
 
 /// The live GATT server.
 pub(super) struct Server {
+    inner: Weak<Inner>,
+    generation: u64,
     pub(super) provider: GattServiceProvider,
+    pub(super) desired_visibility: bool,
     characteristics: HashMap<CharacteristicUuid, GattLocalCharacteristic>,
     /// What reads return, per readable characteristic.
     values: Arc<StdMutex<HashMap<CharacteristicUuid, Vec<u8>>>>,
     tokens: Vec<Tokens>,
     /// Answers reads and writes in arrival order.
-    request_task: tokio::task::JoinHandle<()>,
+    request_task: Option<tokio::task::JoinHandle<()>>,
 }
 
-impl Server {
-    pub(super) fn shut_down(self) {
-        self.request_task.abort();
+impl Drop for Server {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.upgrade() {
+            let mut current = inner.server_generation.lock().unwrap();
+            if *current == self.generation {
+                *current = inner.next_id();
+                inner.forget_server_peers();
+            }
+        }
+        if let Some(task) = self.request_task.take() {
+            task.abort();
+        }
         for (characteristic, read, write, subscribed) in &self.tokens {
             if let Some(token) = read {
                 let _ = characteristic.RemoveReadRequested(*token);
@@ -90,23 +104,32 @@ impl Server {
         }
         let _ = self.provider.StopAdvertising();
     }
+}
+
+impl Server {
+    pub(super) fn shut_down(self) {
+        drop(self);
+    }
 
     /// `Driver::set_characteristic_value`.
     pub(super) fn set_value(&self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
         let mut values = self.values.lock().unwrap();
-        let slot = values
+        let stored_value = values
             .get_mut(&characteristic)
             .ok_or_else(|| BleError::Gatt(format!("characteristic {} is not served as readable", characteristic.0)))?;
-        *slot = value;
+        *stored_value = value;
         Ok(())
     }
 }
 
 impl Inner {
-    /// Record a central seen through `gatt_session`, minting a session for
-    /// it the first time. Emits `Connected { Peripheral }` on every call:
-    /// `Driver::events` documents that it is idempotent.
-    pub(super) fn note_server_peer(self: &Arc<Self>, gatt_session: &GattSession) -> Option<(String, u64)> {
+    /// Record the central from `gatt_session`. Assign a driver session on the first call.
+    /// Emit `Connected { Peripheral }` on every call, as permitted by `Driver::events`.
+    pub(super) fn note_server_peer(self: &Arc<Self>, gatt_session: &GattSession, generation: u64) -> Option<(String, u64)> {
+        let current = self.server_generation.lock().unwrap();
+        if *current != generation {
+            return None;
+        }
         let address = match session_address(gatt_session) {
             Ok(address) => address,
             Err(err) => {
@@ -117,6 +140,9 @@ impl Inner {
         let session = {
             let mut peers = self.server_peers.lock().unwrap();
             if let Some(peer) = peers.get(&address) {
+                if peer.excluded {
+                    return None;
+                }
                 peer.session
             } else {
                 let session = self.next_id();
@@ -219,12 +245,11 @@ impl Inner {
     }
 }
 
-/// The service data the provider's own advertisement carries under the
-/// served UUID: the name, sent as service data like the Android driver
-/// does, or the caller's service data under that UUID (`validate` forbids
-/// both). With a 128-bit UUID it does not fit and Windows leaves it out
-/// (`StartedWithoutAllAdvertisementData`); the GATT advertisement carries
-/// it then.
+/// Select the provider advertisement's service data: the local name or the
+/// caller's data under the served UUID.
+/// `validate` rejects specifications that supply both.
+/// Windows omits data that cannot fit with a 128-bit UUID
+/// (`StartedWithoutAllAdvertisementData`). The GATT advertisement carries it instead.
 pub(super) fn provider_service_data(spec: &GattServiceSpec) -> Option<Vec<u8>> {
     match &spec.local_name {
         Some(name) => Some(truncate_name(name, NAME_SERVICE_DATA_MAX_LEN).as_bytes().to_vec()),
@@ -245,8 +270,8 @@ fn server_error(context: &str, error: BluetoothError) -> BleError {
 pub(super) async fn start_server(inner: &Arc<Inner>, spec: &GattServiceSpec) -> Result<Server> {
     if !spec.manufacturer_data.is_empty() || spec.service_data.keys().any(|uuid| *uuid != spec.uuid) {
         log::info!(
-            "advertise: Windows cannot advertise manufacturer data or other service data with a GATT service; \
-             scanners read it from the GATT advertisement (ADR-0012)"
+            "advertise: Windows omits manufacturer data and data for other services; \
+             scanners use the GATT advertisement (ADR-0012)"
         );
     }
     let created = GattServiceProvider::CreateAsync(to_guid(spec.uuid.0))
@@ -261,30 +286,36 @@ pub(super) async fn start_server(inner: &Arc<Inner>, spec: &GattServiceSpec) -> 
 
     let (requests_tx, requests_rx) = mpsc::unbounded_channel::<ServerRequest>();
     let values = Arc::new(StdMutex::new(HashMap::new()));
-    let mut characteristics = HashMap::new();
-    let mut tokens = Vec::new();
-    for spec_char in &spec.characteristics {
+    let generation = inner.next_id();
+    *inner.server_generation.lock().unwrap() = generation;
+    let mut server = Server {
+        inner: Arc::downgrade(inner), generation,
+        provider: provider.clone(), characteristics: HashMap::new(), values: values.clone(),
+        desired_visibility: true,
+        tokens: Vec::new(), request_task: None,
+    };
+    for characteristic_spec in &spec.characteristics {
         let parameters =
             GattLocalCharacteristicParameters::new().map_err(|err| win_err("CharacteristicParameters", err))?;
         let mut properties = GattCharacteristicProperties::None;
-        if spec_char.readable {
+        if characteristic_spec.readable {
             properties |= GattCharacteristicProperties::Read;
         }
-        if spec_char.writable {
+        if characteristic_spec.writable {
             properties |= GattCharacteristicProperties::Write | GattCharacteristicProperties::WriteWithoutResponse;
         }
-        if spec_char.notifiable {
+        if characteristic_spec.notifiable {
             properties |= GattCharacteristicProperties::Notify;
         }
-        let set = || -> windows::core::Result<()> {
+        let configure_characteristic = || -> windows::core::Result<()> {
             parameters.SetCharacteristicProperties(properties)?;
             parameters.SetReadProtectionLevel(GattProtectionLevel::Plain)?;
             parameters.SetWriteProtectionLevel(GattProtectionLevel::Plain)?;
             Ok(())
         };
-        set().map_err(|err| win_err("CharacteristicParameters", err))?;
+        configure_characteristic().map_err(|err| win_err("CharacteristicParameters", err))?;
         let op = local_service
-            .CreateCharacteristicAsync(to_guid(spec_char.uuid.0), &parameters)
+            .CreateCharacteristicAsync(to_guid(characteristic_spec.uuid.0), &parameters)
             .map_err(|err| win_err("CreateCharacteristicAsync", err))?;
         drop(parameters);
         let created = op.await.map_err(|err| win_err("CreateCharacteristicAsync", err))?;
@@ -293,12 +324,15 @@ pub(super) async fn start_server(inner: &Arc<Inner>, spec: &GattServiceSpec) -> 
             return Err(server_error("CreateCharacteristicAsync", error));
         }
         let local = created.Characteristic().map_err(|err| win_err("Characteristic", err))?;
-        let uuid = spec_char.uuid;
+        let uuid = characteristic_spec.uuid;
+        // Register each token in its owner before the next fallible acquisition.
+        let token_index = server.tokens.len();
+        server.tokens.push((local.clone(), None, None, None));
 
         // Answered from `values` rather than a `StaticValue`, so
         // `set_characteristic_value` can change it while serving.
-        let read_token = if spec_char.readable {
-            values.lock().unwrap().insert(uuid, spec_char.initial_value.clone());
+        server.tokens[token_index].1 = if characteristic_spec.readable {
+            values.lock().unwrap().insert(uuid, characteristic_spec.initial_value.clone());
             let requests_tx = requests_tx.clone();
             let handler = TypedEventHandler::new(
                 move |_: Ref<GattLocalCharacteristic>, args: Ref<GattReadRequestedEventArgs>| {
@@ -310,7 +344,7 @@ pub(super) async fn start_server(inner: &Arc<Inner>, spec: &GattServiceSpec) -> 
         } else {
             None
         };
-        let write_token = if spec_char.writable {
+        server.tokens[token_index].2 = if characteristic_spec.writable {
             let requests_tx = requests_tx.clone();
             let handler = TypedEventHandler::new(
                 move |_: Ref<GattLocalCharacteristic>, args: Ref<GattWriteRequestedEventArgs>| {
@@ -324,13 +358,13 @@ pub(super) async fn start_server(inner: &Arc<Inner>, spec: &GattServiceSpec) -> 
         } else {
             None
         };
-        let subscribed_token = if spec_char.notifiable {
+        server.tokens[token_index].3 = if characteristic_spec.notifiable {
             let weak = Arc::downgrade(inner);
             let handler = TypedEventHandler::new(move |sender: Ref<GattLocalCharacteristic>, _: Ref<IInspectable>| {
                 let Some(inner) = weak.upgrade() else { return Ok(()) };
                 for client in sender.ok()?.SubscribedClients()? {
                     if let Ok(session) = client.Session() {
-                        inner.note_server_peer(&session);
+                        inner.note_server_peer(&session, generation);
                     }
                 }
                 Ok(())
@@ -339,18 +373,12 @@ pub(super) async fn start_server(inner: &Arc<Inner>, spec: &GattServiceSpec) -> 
         } else {
             None
         };
-        tokens.push((local.clone(), read_token, write_token, subscribed_token));
-        characteristics.insert(uuid, local);
+        server.characteristics.insert(uuid, local);
     }
     drop(requests_tx);
 
-    let request_task = tokio::spawn(drain_requests(Arc::downgrade(inner), values.clone(), requests_rx));
-    let server = Server { provider: provider.clone(), characteristics, values, tokens, request_task };
-
-    if let Err(err) = start_provider_advertising(&provider, spec).await {
-        server.shut_down();
-        return Err(err);
-    }
+    server.request_task = Some(tokio::spawn(drain_requests(Arc::downgrade(inner), generation, values.clone(), requests_rx)));
+    start_provider_advertising(&provider, spec).await?;
     Ok(server)
 }
 
@@ -365,43 +393,40 @@ pub(super) async fn start_provider_advertising(provider: &GattServiceProvider, s
         }
         provider.StartAdvertisingWithParameters(&parameters).map_err(|err| win_err("StartAdvertising", err))?;
     }
-    // `Aborted` is not final here. On the test computer (Intel adapter,
-    // Windows 11) the provider reports `Aborted` with no error first and
-    // `Started` a moment later, so only the status at the deadline counts.
+    // On the Windows 11 test computer with an Intel adapter, `Aborted` without an error preceded `Started`.
+    // Accept a started status immediately. Otherwise, wait until the deadline before reporting failure.
     // Google Nearby's Windows GATT server waits the same way.
-    let deadline = tokio::time::Instant::now() + ADVERTISE_START_TIMEOUT;
-    loop {
+    let confirmed = advertising_start::confirm(|| -> Result<bool> {
         let status = provider.AdvertisementStatus().map_err(|err| win_err("AdvertisementStatus", err))?;
         if status == GattServiceProviderAdvertisementStatus::Started {
-            return Ok(());
+            return Ok(true);
         }
         if status == GattServiceProviderAdvertisementStatus::StartedWithoutAllAdvertisementData {
-            log::info!("advertise: started without the service data (it does not fit); the GATT advertisement carries it");
-            return Ok(());
+            log::info!("advertise: started; service data does not fit. The GATT advertisement carries it");
+            return Ok(true);
         }
-        if tokio::time::Instant::now() >= deadline {
-            let _ = provider.StopAdvertising();
-            let reason = if status == GattServiceProviderAdvertisementStatus::Aborted {
-                "Windows aborted the advertisement".to_string()
-            } else {
-                format!("not started after {ADVERTISE_START_TIMEOUT:?} (status {})", status.0)
-            };
-            return Err(BleError::Gatt(format!("advertise: {reason}")));
+        Ok(false)
+    }, || {
+        if let Err(err) = provider.StopAdvertising() {
+            log::warn!("advertise: pending start cleanup failed: {err}");
         }
-        tokio::time::sleep(STATUS_POLL_INTERVAL).await;
+    }, ADVERTISE_START_TIMEOUT, STATUS_POLL_INTERVAL).await?;
+    if !confirmed {
+        return Err(BleError::Gatt(format!("advertise: not started after {ADVERTISE_START_TIMEOUT:?}")));
     }
+    Ok(())
 }
 
 /// Answers inbound reads and writes in the order they arrived; writes are
 /// published as `CharacteristicWritten`.
 async fn drain_requests(
-    inner: Weak<Inner>, values: Arc<StdMutex<HashMap<CharacteristicUuid, Vec<u8>>>>,
+    inner: Weak<Inner>, generation: u64, values: Arc<StdMutex<HashMap<CharacteristicUuid, Vec<u8>>>>,
     mut requests: mpsc::UnboundedReceiver<ServerRequest>,
 ) {
     while let Some(request) = requests.recv().await {
         let Some(inner) = inner.upgrade() else { return };
         let (characteristic, outcome) = match &request {
-            ServerRequest::Write(characteristic, args) => (*characteristic, handle_write(&inner, *characteristic, args).await),
+            ServerRequest::Write(characteristic, args) => (*characteristic, handle_write(&inner, generation, *characteristic, args).await),
             ServerRequest::Read(characteristic, args) => (*characteristic, handle_read(&values, *characteristic, args).await),
         };
         if let Err(err) = outcome {
@@ -410,10 +435,10 @@ async fn drain_requests(
     }
 }
 
-/// A read, including a long read's later parts (`Offset`), answered from
-/// `values`. A read is not a sign of a datagram peer: a scanner reads the
-/// GATT advertisement and leaves, so no `Connected` is emitted, as on
-/// Android and Linux.
+/// Answer reads from `values`, including long reads that use `Offset`.
+/// Do not emit `Connected` for a read: a scanner can read the GATT advertisement
+/// without becoming a datagram peer.
+/// Android and Linux use the same rule.
 async fn handle_read(
     values: &StdMutex<HashMap<CharacteristicUuid, Vec<u8>>>, characteristic: CharacteristicUuid,
     args: &GattReadRequestedEventArgs,
@@ -434,17 +459,29 @@ async fn handle_read(
 }
 
 async fn handle_write(
-    inner: &Arc<Inner>, characteristic: CharacteristicUuid, args: &GattWriteRequestedEventArgs,
+    inner: &Arc<Inner>, generation: u64, characteristic: CharacteristicUuid, args: &GattWriteRequestedEventArgs,
 ) -> windows::core::Result<()> {
     let deferral = args.GetDeferral()?;
     let outcome = async {
         let session = args.Session()?;
         let request = args.GetRequestAsync()?.await?;
         let with_response = request.Option()? == GattWriteOption::WriteWithResponse;
-        let Some((address, _)) = inner.note_server_peer(&session) else {
+        let address = session_address(&session)?;
+        if inner.is_excluded(&address) {
+            if with_response {
+                request.RespondWithProtocolError(ATT_WRITE_NOT_PERMITTED)?;
+            }
+            return Ok(());
+        }
+        let Some((address, _)) = inner.note_server_peer(&session, generation) else {
+            if with_response {
+                request.RespondWithProtocolError(ATT_WRITE_NOT_PERMITTED)?;
+            }
             return Ok(());
         };
-        if inner.is_excluded(&address) {
+        // Serialize event publication with server replacement. No native await occurs under this lock.
+        let current = inner.server_generation.lock().unwrap();
+        if *current != generation || inner.is_excluded(&address) {
             if with_response {
                 request.RespondWithProtocolError(ATT_WRITE_NOT_PERMITTED)?;
             }

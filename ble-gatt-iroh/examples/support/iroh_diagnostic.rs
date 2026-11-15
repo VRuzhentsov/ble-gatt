@@ -1,11 +1,10 @@
 //! Application-only diagnostic shared by the Linux and Android examples.
-//! iroh owns connections; the unchanged adapter owns BLE candidates. No PeerLink.
+//! iroh owns QUIC connections. The core worker owns BLE establishment and cleanup.
 use ble_gatt::{
-    advertisement,
-    datagram::{self, DatagramConfig},
-    Adapter, CharacteristicUuid, GattEvent, PeerAddress, Role, ServiceUuid,
+    datagram::DatagramConfig, Adapter, CharacteristicUuid, GattEvent, PeerAddress, PeerLink,
+    PeerLinkConfig, Role, ServiceUuid,
 };
-use ble_gatt_iroh::{dial_with, BleGattTransport, Dialer, InitiationPolicy};
+use ble_gatt_iroh::{dial_with, BleGattTransport, Dialer};
 use iroh::{
     endpoint::{presets, Connection},
     protocol::{AcceptError, ProtocolHandler, Router},
@@ -191,7 +190,7 @@ async fn probe(connection: &Connection, local: EndpointId, round: u8) -> Result<
     Ok(())
 }
 
-type Candidates = Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>;
+type CarrierTasks = Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>;
 
 /// Driver lifecycle evidence, not a claim about every OS Bluetooth object.
 /// Subscribe before serving/dialling; a lost event makes the evidence invalid.
@@ -265,13 +264,13 @@ async fn wait_for_native_cleanup(
 
 async fn wait_for_cleanup(
     transport: &BleGattTransport,
-    candidates: &Candidates,
+    carriers: &CarrierTasks,
     timeout: Duration,
 ) -> Result<usize, String> {
     tokio::time::timeout(timeout, async {
         loop {
             let finished = {
-                let mut handles = candidates.lock().expect("diagnostic candidates mutex");
+                let mut handles = carriers.lock().expect("diagnostic carriers mutex");
                 if transport.linked_peers().is_empty() && handles.iter().all(|h| h.is_finished()) {
                     Some(std::mem::take(&mut *handles))
                 } else {
@@ -281,26 +280,26 @@ async fn wait_for_cleanup(
             if let Some(handles) = finished {
                 let count = handles.len();
                 for handle in handles {
-                    handle.await.map_err(|e| format!("incoming candidate task failed: {e}"))?;
+                    handle.await.map_err(|e| format!("incoming carrier task failed: {e}"))?;
                 }
                 return Ok(count);
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }).await.map_err(|_| format!(
-        "last-user cleanup timed out before shutdown: address_queues={:?} incoming_candidates_pending={}",
+        "last-user cleanup timed out before shutdown: address_queues={:?} incoming_carriers_pending={}",
         transport.linked_peers(),
-        candidates.lock().expect("diagnostic candidates mutex").iter().filter(|h| !h.is_finished()).count(),
+        carriers.lock().expect("diagnostic carriers mutex").iter().filter(|h| !h.is_finished()).count(),
     ))?
 }
 
-// Shared production finalization seam: candidate cleanup may yield while the
+// Shared production finalization seam: carrier cleanup may yield while the
 // independent native observer continues to update its evidence.
 async fn finalize_cleanup<F, Fut, C>(
     sessions: &Mutex<NativeSessions>,
     timeout: Duration,
     mut cleanup: F,
-    candidates_clean: C,
+    carriers_clean: C,
 ) -> Result<(usize, usize), String>
 where
     F: FnMut() -> Fut,
@@ -311,7 +310,7 @@ where
         let mut joined = cleanup().await?;
         loop {
             wait_for_native_cleanup(sessions, timeout).await?;
-            // Late QUIC close traffic may have produced another candidate
+            // Late QUIC close traffic may have produced another carrier
             // while the native disconnect was in flight. Joining it can yield
             // and invalidate the native checkpoint: never reuse that snapshot.
             joined += cleanup().await?;
@@ -320,7 +319,7 @@ where
                 if let Some(error) = &state.failure {
                     return Err(error.clone());
                 }
-                if state.observed > 0 && state.active.is_empty() && candidates_clean() {
+                if state.observed > 0 && state.active.is_empty() && carriers_clean() {
                     return Ok((joined, state.observed));
                 }
             }
@@ -329,9 +328,7 @@ where
         }
     })
     .await
-    .map_err(|_| {
-        "final native/candidate cleanup checkpoint timed out before shutdown".to_string()
-    })?
+    .map_err(|_| "final native/carrier cleanup checkpoint timed out before shutdown".to_string())?
 }
 
 /// Bounded run, including shutdown on failure. A PASS requires last-user cleanup
@@ -349,52 +346,47 @@ pub async fn run(adapter: Adapter, options: Options) -> Result<(), String> {
 async fn run_inner(
     adapter: Adapter,
     options: Options,
-    #[cfg(test)] redial_before_survivor: bool,
+    #[cfg(test)] acquire_before_survivor: bool,
 ) -> Result<(), String> {
     let id = options.key.public();
     if id == options.peer {
         return Err("local and remote keys must differ".into());
     }
     let caps = adapter.capabilities().await;
-    mark(format!("START local={id} peer={} policy=EitherPeer initiate={} expect_incoming={} ip=disabled relay=disabled central={} peripheral={}", options.peer, options.initiate, options.expect_incoming, caps.central, caps.peripheral));
+    mark(format!("START local={id} peer={} establishment=core initiate={} expect_incoming={} ip=disabled relay=disabled central={} peripheral={}", options.peer, options.initiate, options.expect_incoming, caps.central, caps.peripheral));
     if !caps.central || !caps.peripheral {
         return Err("diagnostic requires both individual roles (not proof of concurrency)".into());
     }
     let config = config(id);
-    let base_dial = dial_with(adapter.clone(), config.clone());
+    let mut native_events = adapter.driver().events();
+    let peer_link = PeerLink::with_driver(adapter.driver(), PeerLinkConfig::new(config.clone()));
+    let base_dial = dial_with(peer_link.clone());
     let attempts = Arc::new(AtomicUsize::new(0));
     let count = attempts.clone();
     let dialer: Dialer = Arc::new(move |peer| {
         let base = base_dial.clone();
         let n = count.fetch_add(1, Ordering::SeqCst) + 1;
         Box::pin(async move {
-            mark(format!(
-                "CANDIDATE role=central attempt={n} advertised_address={}",
-                peer.0
-            ));
+            mark(format!("ACQUIRE request={n} advertised_address={}", peer.0));
             let result = base(peer.clone()).await;
             match &result {
-                Ok(_) => mark(format!(
-                    "ATTACH role=central attempt={n} address={}",
-                    peer.0
-                )),
-                Err(e) => mark(format!(
-                    "FAILED role=central attempt={n} address={} error={e}",
-                    peer.0
-                )),
+                Ok(_) => mark(format!("ACQUIRED request={n} address={}", peer.0)),
+                Err(e) => mark(format!("FAILED request={n} address={} error={e}", peer.0)),
             }
             result
         })
     });
     let transport = BleGattTransport::builder()
         .dialer(dialer.clone())
-        .initiation_policy(InitiationPolicy::EitherPeer)
         .link_idle_timeout(Duration::from_secs(2))
         .build();
-    let mut native_events = adapter.driver().events();
-    let mut incoming = datagram::serve(&adapter, &config)
+    let mut incoming = peer_link
+        .incoming()
+        .map_err(|e| format!("incoming requests: {e}"))?;
+    peer_link
+        .set_advertising(true)
         .await
-        .map_err(|e| format!("serve: {e}"))?;
+        .map_err(|e| format!("advertising: {e}"))?;
     let native_sessions = Arc::new(Mutex::new(NativeSessions::default()));
     let watched_sessions = native_sessions.clone();
     let native_watch = tokio::spawn(async move {
@@ -410,16 +402,26 @@ async fn run_inner(
             .failure = Some("native lifecycle event stream ended before cleanup".into());
     });
     let attach_to = transport.clone();
-    let candidates: Candidates = Arc::new(Mutex::new(Vec::new()));
-    let incoming_candidates = candidates.clone();
+    let carriers: CarrierTasks = Arc::new(Mutex::new(Vec::new()));
+    let incoming_carriers = carriers.clone();
     let attach = tokio::spawn(async move {
         let mut n = 0;
-        while let Some(channel) = incoming.next().await {
+        while let Some(request) = incoming.next().await {
+            let channel = match request.accept().await {
+                Ok(channel) => channel,
+                Err(error) => {
+                    mark(format!("INCOMING failed error={error}"));
+                    continue;
+                }
+            };
             n += 1;
-            mark(format!("ATTACH role=peripheral candidate={n} source_address={} source_is_not_dial_mapping=true", channel.peer().0));
-            incoming_candidates
+            mark(format!(
+                "ATTACH incoming={n} source_address={} source_is_not_dial_mapping=true",
+                channel.peer().0
+            ));
+            incoming_carriers
                 .lock()
-                .expect("diagnostic candidates mutex")
+                .expect("diagnostic carriers mutex")
                 .push(attach_to.attach(channel));
         }
     });
@@ -453,17 +455,9 @@ async fn run_inner(
     mark(format!("READY local={id} service={}", config.service.0));
     let result = tokio::time::timeout(options.timeout, async {
         if options.initiate {
-            let scan = adapter
-                .central()
-                .scan(config.service)
-                .await
-                .map_err(|e| format!("scan: {e}"))?;
-            // Nearby-style fast advertisement / GATT-read fallback, not a
-            // bare service-UUID match and not an incoming private source.
-            let mut scan =
-                advertisement::complete(adapter.driver(), config.service, scan, Default::default());
+            let mut scan = peer_link.discover().await.map_err(|e| format!("discovery: {e}"))?;
             let address = loop {
-                let peer = scan
+                let (_core_endpoint, peer) = scan
                     .next()
                     .await
                     .ok_or("discovery ended")?
@@ -507,7 +501,7 @@ async fn run_inner(
             probe(&second, id, 2).await?;
             if attempts.load(Ordering::SeqCst) != before {
                 return Err(
-                    "second QUIC connection unexpectedly dialled a new BLE candidate".into(),
+                    "second QUIC connection unexpectedly dialled a new BLE carrier".into(),
                 );
             }
             mark(format!(
@@ -515,7 +509,7 @@ async fn run_inner(
                 first.stable_id(),
                 second.stable_id()
             ));
-            first.close(0u32.into(), b"end first diagnostic candidate only");
+            first.close(0u32.into(), b"end first diagnostic carrier only");
             drop(first);
             // Longer than the deliberately short idle timer: the remaining
             // connection must protect its BLE path after the first ends.
@@ -524,8 +518,8 @@ async fn run_inner(
                 return Err("survivor closed after first connection ended".into());
             }
             #[cfg(test)]
-            if redial_before_survivor {
-                // A real additional mock BLE dial, without replacing the live QUIC handle.
+            if acquire_before_survivor {
+                // An extra scoped acquisition, without replacing the QUIC handle.
                 let extra = dialer(address.clone()).await.map_err(|e| e.to_string())?;
                 drop(extra);
             }
@@ -533,7 +527,7 @@ async fn run_inner(
             let after = attempts.load(Ordering::SeqCst);
             if after != before {
                 return Err(format!(
-                    "survivor unexpectedly dialled a new BLE candidate: before={before} after={after} (round 3 echoed)"
+                    "survivor unexpectedly dialled a new BLE carrier: before={before} after={after} (round 3 echoed)"
                 ));
             }
             mark(format!("SURVIVOR live_after_first_close_and_idle=true dial_attempts={after} unchanged=true"));
@@ -550,16 +544,16 @@ async fn run_inner(
         let (joined, observed) = finalize_cleanup(
             &native_sessions,
             Duration::from_secs(20),
-            || wait_for_cleanup(&transport, &candidates, Duration::from_secs(20)),
+            || wait_for_cleanup(&transport, &carriers, Duration::from_secs(20)),
             || {
-                let handles = candidates.lock().expect("diagnostic candidates mutex");
+                let handles = carriers.lock().expect("diagnostic carriers mutex");
                 handles.is_empty() && transport.linked_peers().is_empty()
             },
         ).await?;
         mark(format!("NATIVE_CLEANUP active_sessions=0 observed_sessions={observed} evidence=driver_events final_checkpoint=current before_shutdown=true"));
         echo.check()?;
         mark(format!(
-            "CLEANUP address_queues=0 incoming_candidates_joined={joined} before_shutdown=true dial_attempts={} received_rounds_mask={:03b} native_teardown=unverified",
+            "CLEANUP address_queues=0 incoming_carriers_joined={joined} before_shutdown=true dial_attempts={} received_rounds_mask={:03b} native_teardown=unverified",
             attempts.load(Ordering::SeqCst),
             received.load(Ordering::SeqCst)
         ));
@@ -576,12 +570,13 @@ async fn run_inner(
     endpoint.close().await;
     attach.abort();
     let _ = attach.await;
+    let _ = peer_link.close().await;
     let closed = adapter
         .close()
         .await
         .map_err(|e| format!("adapter shutdown: {e}"));
     // Only failure/late-arrival tasks can remain; this is teardown, not PASS evidence.
-    let remaining = std::mem::take(&mut *candidates.lock().expect("diagnostic candidates mutex"));
+    let remaining = std::mem::take(&mut *carriers.lock().expect("diagnostic carriers mutex"));
     for handle in remaining {
         handle.abort();
         let _ = handle.await;
@@ -601,7 +596,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn final_cleanup_rechecks_session_arriving_during_late_candidate_wait() {
+    async fn final_cleanup_rechecks_session_arriving_during_late_carrier_wait() {
         use std::{future::Future, task::Poll};
         let state = Mutex::new(NativeSessions {
             observed: 1,
@@ -621,7 +616,7 @@ mod tests {
                             local_role: Role::Peripheral,
                             session: Some(2),
                         });
-                        // Deliberately yield within the final candidate wait,
+                        // Deliberately yield within the final carrier wait,
                         // after the initial native-clean checkpoint succeeded.
                         tokio::task::yield_now().await;
                     }
@@ -654,7 +649,7 @@ mod tests {
         assert_eq!(
             calls.load(Ordering::SeqCst),
             3,
-            "recheck candidate queues after native retry"
+            "recheck carrier queues after native retry"
         );
     }
 
@@ -693,17 +688,17 @@ mod tests {
             } else {
                 "lost 7 events"
             })),
-            "lost native evidence during the final candidate wait must fail closed: {result:?}"
+            "lost native evidence during the final carrier wait must fail closed: {result:?}"
         );
     }
 
     #[tokio::test]
-    async fn final_cleanup_rejects_lag_during_late_candidate_wait() {
+    async fn final_cleanup_rejects_lag_during_late_carrier_wait() {
         final_cleanup_lost_evidence(false).await;
     }
 
     #[tokio::test]
-    async fn final_cleanup_rejects_ended_stream_during_late_candidate_wait() {
+    async fn final_cleanup_rejects_ended_stream_during_late_carrier_wait() {
         final_cleanup_lost_evidence(true).await;
     }
 
@@ -829,7 +824,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn survivor_rejects_real_extra_dial_even_when_round_three_echoes() {
+    async fn survivor_rejects_extra_acquisition_even_when_round_three_echoes() {
         use ble_gatt::drivers::mock::{MockDriver, MockNetwork};
         use ble_gatt::{CapabilityReport, PeerAddress};
         let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -865,7 +860,7 @@ mod tests {
         assert!(
             ar.as_ref()
                 .is_err_and(|e| e.contains("survivor unexpectedly dialled")),
-            "must reject a new candidate even if logical QUIC and round 3 survive: {ar:?}"
+            "must reject a new carrier even if logical QUIC and round 3 survive: {ar:?}"
         );
     }
 
@@ -897,18 +892,23 @@ mod tests {
         let b = SecretKey::generate();
         let config = config(b.public());
         let bt = BleGattTransport::builder().build();
-        let mut incoming = datagram::serve(&ba, &config).await.unwrap();
+        let bp = PeerLink::with_driver(ba.driver(), PeerLinkConfig::new(config.clone()));
+        let ap = PeerLink::with_driver(aa.driver(), PeerLinkConfig::new(config));
+        let mut incoming = bp.incoming().unwrap();
+        bp.set_advertising(true).await.unwrap();
         let accept = tokio::spawn({
             let bt = bt.clone();
             async move {
-                while let Some(channel) = incoming.next().await {
+                let _keep_alive = bp;
+                while let Some(request) = incoming.next().await {
+                    let Ok(channel) = request.accept().await else {
+                        continue;
+                    };
                     bt.attach(channel);
                 }
             }
         });
-        let at = BleGattTransport::builder()
-            .dialer(dial_with(aa.clone(), config))
-            .build();
+        let at = BleGattTransport::builder().dialer(dial_with(ap)).build();
         at.set_peer_address(b.public(), PeerAddress("ack-b".into()));
         let endpoint = |key, transport: BleGattTransport| async move {
             Endpoint::builder(presets::Minimal)
@@ -1019,15 +1019,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_address_map_does_not_hide_live_incoming_candidate() {
+    async fn empty_address_map_does_not_hide_live_incoming_carrier() {
         let transport = BleGattTransport::builder().build();
         let task = tokio::spawn(std::future::pending());
-        let candidates = Arc::new(Mutex::new(vec![task]));
-        let result = wait_for_cleanup(&transport, &candidates, Duration::from_millis(100)).await;
-        candidates.lock().unwrap()[0].abort();
+        let carriers = Arc::new(Mutex::new(vec![task]));
+        let result = wait_for_cleanup(&transport, &carriers, Duration::from_millis(100)).await;
+        carriers.lock().unwrap()[0].abort();
         assert!(
             result.is_err(),
-            "empty address queues must not mask a live candidate: {result:?}"
+            "empty address queues must not mask a live carrier: {result:?}"
         );
     }
 
@@ -1044,24 +1044,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_joins_finished_candidates_and_rejects_cancelled_task() {
+    async fn cleanup_joins_finished_carriers_and_rejects_cancelled_task() {
         let transport = BleGattTransport::builder().build();
         let done = tokio::spawn(async {});
-        let candidates = Arc::new(Mutex::new(vec![done]));
+        let carriers = Arc::new(Mutex::new(vec![done]));
         assert_eq!(
-            wait_for_cleanup(&transport, &candidates, Duration::from_secs(1))
+            wait_for_cleanup(&transport, &carriers, Duration::from_secs(1))
                 .await
                 .unwrap(),
             1
         );
-        assert!(candidates.lock().unwrap().is_empty());
+        assert!(carriers.lock().unwrap().is_empty());
         let cancelled = tokio::spawn(std::future::pending());
         cancelled.abort();
-        candidates.lock().unwrap().push(cancelled);
-        let error = wait_for_cleanup(&transport, &candidates, Duration::from_secs(1))
+        carriers.lock().unwrap().push(cancelled);
+        let error = wait_for_cleanup(&transport, &carriers, Duration::from_secs(1))
             .await
             .unwrap_err();
-        assert!(error.contains("incoming candidate task failed"), "{error}");
+        assert!(error.contains("incoming carrier task failed"), "{error}");
     }
 
     #[test]

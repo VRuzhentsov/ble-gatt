@@ -8,7 +8,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
+use crate::drivers::event_bus::EventBus;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::hal::BoxStream;
@@ -22,6 +23,7 @@ use crate::entities::models::{
 type NotifySessions = HashMap<PeerAddress, mpsc::UnboundedSender<Result<Vec<u8>>>>;
 
 struct PeripheralState {
+    advertising_enabled: bool,
     service: GattServiceSpec,
     values: HashMap<CharacteristicUuid, Vec<u8>>,
     /// One sender per *subscriber*, not one per characteristic. Modelling
@@ -43,7 +45,7 @@ pub(crate) struct LocalRadio {
     /// peripheral learns that a central connected to *it*, and a central
     /// learns that its peer vanished. Mirrors how the real drivers behave:
     /// `events()` is this driver's view, not a global feed.
-    event_senders: Mutex<HashMap<PeerAddress, broadcast::Sender<GattEvent>>>,
+    event_senders: Mutex<HashMap<PeerAddress, EventBus>>,
     /// Every `GattConnection::disconnect` this network has seen, so a test
     /// can assert that an abandoned setup actually released the platform
     /// connection rather than merely dropping the Rust handle.
@@ -69,7 +71,7 @@ pub(crate) struct LocalRadio {
 impl LocalRadio {
     // --- Registration / fault injection (Local-only; see mock/mod.rs) ---
 
-    pub(crate) fn register_events_sender(&self, address: PeerAddress, sender: broadcast::Sender<GattEvent>) {
+    pub(crate) fn register_events_sender(&self, address: PeerAddress, sender: EventBus) {
         self.event_senders.lock().unwrap().insert(address, sender);
     }
 
@@ -93,9 +95,7 @@ impl LocalRadio {
         if let Some(state) = peripherals.get(peripheral) {
             for peers in state.subscribers.values() {
                 if let Some(tx) = peers.get(central) {
-                    let _ = tx.send(Err(BleError::Gatt(
-                        "notification queue overflowed: payloads were dropped".to_string(),
-                    )));
+                    let _ = tx.send(Err(crate::drivers::notification_receive_gap()));
                 }
             }
         }
@@ -219,7 +219,7 @@ impl LocalRadio {
         let peripherals = self.peripherals.lock().unwrap();
         let matches: Vec<DiscoveredPeer> = peripherals
             .iter()
-            .filter(|(addr, state)| *addr != requester && state.service.uuid == service)
+            .filter(|(addr, state)| *addr != requester && state.service.uuid == service && state.advertising_enabled)
             .map(|(addr, state)| DiscoveredPeer {
                 address: addr.clone(),
                 name: state.service.local_name.clone(),
@@ -269,6 +269,7 @@ impl LocalRadio {
         peripherals.insert(
             address.clone(),
             PeripheralState {
+                advertising_enabled: true,
                 service,
                 values,
                 subscribers,
@@ -294,17 +295,24 @@ impl LocalRadio {
         Ok(())
     }
 
-    /// Replace what reads of `characteristic` return; subscribers stay.
+    /// Replace the value returned by reads of `characteristic`. Keep existing subscriptions.
     pub(crate) async fn set_characteristic_value(
         &self, address: &PeerAddress, characteristic: CharacteristicUuid, value: Vec<u8>,
     ) -> Result<()> {
         let mut peripherals = self.peripherals.lock().unwrap();
         let state = peripherals.get_mut(address).ok_or_else(|| BleError::Gatt("not advertising".to_string()))?;
-        let slot = state
+        let stored_value = state
             .values
             .get_mut(&characteristic)
             .ok_or_else(|| BleError::Gatt(format!("characteristic {} is not served", characteristic.0)))?;
-        *slot = value;
+        *stored_value = value;
+        Ok(())
+    }
+
+    pub(crate) async fn set_advertising_enabled(&self, address: &PeerAddress, enabled: bool) -> Result<()> {
+        let mut peripherals = self.peripherals.lock().unwrap();
+        let state = peripherals.get_mut(address).ok_or_else(|| BleError::Gatt("nothing is served".into()))?;
+        state.advertising_enabled = enabled;
         Ok(())
     }
 

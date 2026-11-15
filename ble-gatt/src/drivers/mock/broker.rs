@@ -18,10 +18,11 @@ use crate::entities::error::{BleError, Result};
 use crate::entities::models::{GattEvent, PeerAddress};
 
 use super::local::LocalRadio;
+use crate::drivers::event_bus::EventBus;
 use super::wire::{read_frame, write_frame, Envelope, Frame, Push, Request, Response};
 
 struct ConnHandle {
-    outbox: mpsc::UnboundedSender<Envelope>,
+    outbox: mpsc::Sender<Envelope>,
     /// Addresses this connection has `RegisterAddress`'d — swept on
     /// disconnect so a killed process doesn't leave the survivor's
     /// `events()` stream waiting forever for a `Disconnected` that will
@@ -46,7 +47,7 @@ async fn handle_connection(socket: TcpStream, radio: Arc<LocalRadio>) {
     // ACKs would hold each small frame back tens of milliseconds.
     let _ = socket.set_nodelay(true);
     let (mut read_half, write_half) = tokio::io::split(socket);
-    let (outbox_tx, mut outbox_rx) = mpsc::unbounded_channel::<Envelope>();
+    let (outbox_tx, mut outbox_rx) = mpsc::channel::<Envelope>(64);
     let conn = Arc::new(ConnHandle {
         outbox: outbox_tx,
         owned_addresses: Mutex::new(HashSet::new()),
@@ -77,8 +78,9 @@ async fn handle_connection(socket: TcpStream, radio: Arc<LocalRadio>) {
             _ => continue,
         };
         let response = dispatch(request, &radio, &conn).await;
-        if env.correlation_id != 0 {
-            let _ = conn.outbox.send(Envelope { correlation_id: env.correlation_id, frame: Frame::Resp(response) });
+        if env.correlation_id != 0
+            && conn.outbox.send(Envelope { correlation_id: env.correlation_id, frame: Frame::Resp(response) }).await.is_err() {
+            break;
         }
     }
 
@@ -101,36 +103,34 @@ async fn dispatch(request: Request, radio: &Arc<LocalRadio>, conn: &Arc<ConnHand
     match request {
         Request::RegisterAddress { address } => {
             conn.owned_addresses.lock().unwrap().insert(address.clone());
-            let (tx, mut rx) = tokio::sync::broadcast::channel(64);
+            let tx = EventBus::new(64);
+            let mut rx = tx.subscribe();
+            let mut critical = tx.lifecycle_events();
             radio.register_events_sender(address.clone(), tx);
             let outbox = conn.outbox.clone();
             let handle = tokio::spawn(async move {
                 loop {
-                    match rx.recv().await {
+                    tokio::select! {
+                        biased;
+                        event = critical.next() => {
+                            let Some(event) = event else { break; };
+                            let env = Envelope { correlation_id: 0, frame: Frame::Push(Push::LifecycleEvent { address: address.clone(), event }) };
+                            if outbox.send(env).await.is_err() { break; }
+                        }
+                        received = rx.recv() => match received {
                         Ok(event) => {
                             let env = Envelope {
                                 correlation_id: 0,
                                 frame: Frame::Push(Push::Event { address: address.clone(), event }),
                             };
-                            if outbox.send(env).is_err() {
+                            if outbox.send(env).await.is_err() {
                                 break;
                             }
                         }
-                        // Forward the gap as `GattEvent::Lagged`, exactly as
-                        // the local driver's own `events()` converts a
-                        // `BroadcastStreamRecvError::Lagged` — not swallow
-                        // it. The datagram layer's `serve`/`connect` treat
-                        // `Lagged` as terminal specifically because the
-                        // discarded events may include this peer's own
-                        // `CharacteristicWritten`/`Disconnected`, and
-                        // silently continuing left a receiver with no way to
-                        // learn a fragment vanished: the channel looked
-                        // perfectly healthy (no overflow signal, no forced
-                        // reconnect) while a message that will now never
-                        // arrive sat missing a piece. Confirmed as the root
-                        // cause of a real "clean session, one message never
-                        // arrives" bug found running fini's actors-ble e2e
-                        // under bursty resend traffic.
+                        // Preserve legacy gap reporting, but preserve its
+                        // source port too: only the independent critical
+                        // subscription above can report critical loss. Never
+                        // promote a lossy payload subscription to lifecycle.
                         Err(RecvError::Lagged(dropped)) => {
                             let env = Envelope {
                                 correlation_id: 0,
@@ -139,11 +139,12 @@ async fn dispatch(request: Request, radio: &Arc<LocalRadio>, conn: &Arc<ConnHand
                                     event: GattEvent::Lagged { dropped },
                                 }),
                             };
-                            if outbox.send(env).is_err() {
+                            if outbox.send(env).await.is_err() {
                                 break;
                             }
                         }
                         Err(RecvError::Closed) => break,
+                        }
                     }
                 }
             });
@@ -174,6 +175,10 @@ async fn dispatch(request: Request, radio: &Arc<LocalRadio>, conn: &Arc<ConnHand
                 Err(e) => Response::Err(e),
             }
         }
+        Request::SetAdvertisingEnabled { address, enabled } => match radio.set_advertising_enabled(&address, enabled).await {
+            Ok(()) => Response::Unit,
+            Err(e) => Response::Err(e),
+        },
         Request::StopAdvertising { address } => match radio.stop_advertising(&address).await {
             Ok(()) => Response::Unit,
             Err(e) => Response::Err(e),
@@ -218,7 +223,7 @@ async fn dispatch(request: Request, radio: &Arc<LocalRadio>, conn: &Arc<ConnHand
                                 correlation_id: 0,
                                 frame: Frame::Push(Push::NotifyItem { subscription_id, item }),
                             };
-                            if outbox.send(env).is_err() {
+                            if outbox.send(env).await.is_err() {
                                 break;
                             }
                         }
@@ -237,3 +242,7 @@ async fn dispatch(request: Request, radio: &Arc<LocalRadio>, conn: &Arc<ConnHand
         }
     }
 }
+
+#[cfg(test)]
+#[path = "broker_tests.rs"]
+mod tests;

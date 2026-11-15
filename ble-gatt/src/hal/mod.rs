@@ -180,20 +180,24 @@ pub trait Driver: Send + Sync {
     /// forward it, or serving never recovers (ADR-0010).
     fn served_service(&self) -> Option<GattServiceSpec>;
 
-    /// Replace the value a central's read of `characteristic` returns on
-    /// the local GATT server, leaving the server, its centrals and their
-    /// subscriptions untouched. `advertise` sets the first value from
-    /// `GattCharacteristicSpec::initial_value`; this changes it later. It
-    /// does not notify anyone.
+    /// Replace the local value returned when a central reads `characteristic`.
+    /// Preserve the server, connected centrals and subscriptions. Do not send notifications.
+    /// `advertise` sets the first value from `GattCharacteristicSpec::initial_value`; this method changes it later.
     ///
-    /// The GATT advertisement (ADR-0012) changes this way when the
-    /// advertisement data changes. Errors when nothing is served or the
-    /// characteristic is not part of the served service.
+    /// The GATT advertisement uses this method when its advertisement data changes (ADR-0012).
+    /// Return an error if no service is served or the served service does not contain the characteristic.
     ///
-    /// No default, for the reason `served_service` has none: a wrapping
-    /// driver that forgot to forward it would serve a stale value without
-    /// any error.
+    /// Like `served_service`, this method has no default implementation.
+    /// Wrapping drivers must forward it to avoid silently serving a stale value.
     async fn set_characteristic_value(&self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()>;
+
+    /// Change visibility without replacing the served service or its sessions.
+    /// Preserve callbacks, characteristic values and subscriptions. A service must already be served.
+    /// This operation does not disconnect peers. Raw `stop_advertising` remains destructive.
+    async fn set_advertising_enabled(&self, enabled: bool) -> Result<()> {
+        let _ = enabled;
+        Err(crate::BleError::Unsupported("advertising visibility on this driver".into()))
+    }
 
     async fn stop_advertising(&self) -> Result<()>;
 
@@ -286,6 +290,15 @@ pub trait Driver: Send + Sync {
     /// Characteristic *values* are not carried here — client-side
     /// notifications come back through `GattConnection::subscribe`.
     fn events(&self) -> BoxStream<GattEvent>;
+
+    /// Critical connection/radio events, subscribed before acquiring a session.
+    /// Native drivers isolate this bounded port from characteristic payloads.
+    /// The compatibility default cannot promise isolation: unknown loss is
+    /// retained as `Lagged`, so consumers must fail closed on it.
+    fn lifecycle_events(&self) -> BoxStream<GattEvent> {
+        use tokio_stream::StreamExt;
+        Box::pin(self.events().filter(|event| !matches!(event, GattEvent::CharacteristicWritten { .. })))
+    }
 
     /// The radio's usability *right now*. `events()` carries the
     /// [`GattEvent::RadioChanged`] transitions; this is the initial value a

@@ -9,15 +9,24 @@ pub mod linux;
 
 pub mod mock;
 
+pub(crate) mod event_bus;
+
 #[cfg(target_os = "windows")]
 pub mod windows;
 
 use crate::entities::error::Result;
 use crate::hal::Driver;
 
-/// Decode `BleGattBridge.startScan`'s result, not Android's asynchronous
-/// `ScanCallback` error codes. Kept radio-free so the JNI contract can be
-/// tested on a host as well as compiled for Android.
+/// Only a known dropped notification payload is recoverable. Native operation
+/// failures and critical-port lag must not use this constructor.
+fn notification_receive_gap() -> crate::entities::error::BleError {
+    crate::entities::error::BleError::ReceiveGap(
+        "notification queue overflowed: payloads were dropped and at least one message is lost".into(),
+    )
+}
+
+/// Decode the `BleGattBridge.startScan` result, not asynchronous Android `ScanCallback` error codes.
+/// This function needs no radio, so host tests can check the JNI contract.
 #[cfg(any(target_os = "android", test))]
 fn android_scan_start_result(status: i32) -> Result<()> {
     use crate::entities::error::BleError;

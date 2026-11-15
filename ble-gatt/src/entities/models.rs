@@ -274,17 +274,16 @@ impl GattServiceSpec {
         Ok(())
     }
 
-    /// Whether `other` describes the same GATT service: the same UUID and
-    /// characteristics with the same properties, whatever its advertisement
-    /// data and characteristic values. What `Driver::update_advertisement`
-    /// requires of its spec. Values are not compared: they change while
-    /// serving (`Driver::set_characteristic_value`, the GATT advertisement
-    /// of ADR-0012).
+    /// Compare service UUIDs and characteristic properties in their listed order, as `Driver::update_advertisement` requires.
+    /// Ignore advertisement data and characteristic values, which can change while serving (`Driver::set_characteristic_value`, ADR-0012).
     pub(crate) fn same_service(&self, other: &GattServiceSpec) -> bool {
         self.uuid == other.uuid
             && self.characteristics.len() == other.characteristics.len()
-            && self.characteristics.iter().zip(&other.characteristics).all(|(a, b)| {
-                a.uuid == b.uuid && a.readable == b.readable && a.writable == b.writable && a.notifiable == b.notifiable
+            && self.characteristics.iter().zip(&other.characteristics).all(|(current, proposed)| {
+                current.uuid == proposed.uuid
+                    && current.readable == proposed.readable
+                    && current.writable == proposed.writable
+                    && current.notifiable == proposed.notifiable
             })
     }
 }

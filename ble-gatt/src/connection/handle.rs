@@ -24,6 +24,7 @@ pub struct Connection {
     state_tx: watch::Sender<ConnectionState>,
     cancel: CancellationToken,
     watcher: JoinHandle<()>,
+    managed_cleanup: bool,
 }
 
 impl Connection {
@@ -31,6 +32,14 @@ impl Connection {
     /// must be subscribed **before** the connection was made, so a
     /// disconnect that happens in between is not missed.
     pub(crate) fn new(inner: Box<dyn GattConnection>, events: BoxStream<GattEvent>) -> Self {
+        Self::new_owned(inner, events, false)
+    }
+
+    pub(crate) fn new_managed(inner: Box<dyn GattConnection>, events: BoxStream<GattEvent>) -> Self {
+        Self::new_owned(inner, events, true)
+    }
+
+    fn new_owned(inner: Box<dyn GattConnection>, events: BoxStream<GattEvent>, managed_cleanup: bool) -> Self {
         let (state_tx, _) = watch::channel(ConnectionState::Connected);
         let cancel = CancellationToken::new();
         let watcher = tokio::spawn(watch_for_end(
@@ -46,6 +55,7 @@ impl Connection {
             state_tx,
             cancel,
             watcher,
+            managed_cleanup,
         }
     }
 
@@ -136,6 +146,7 @@ impl Drop for Connection {
         let Some(mut inner) = self.inner.take().filter(|_| self.open) else {
             return;
         };
+        if self.managed_cleanup { drop(inner); return; }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
@@ -173,6 +184,8 @@ fn ends_connection(event: &GattEvent, peer: &PeerAddress, session: Option<u64>) 
                 }
         }
         GattEvent::RadioChanged { status } => *status != RadioStatus::On,
+        // A discarded lifecycle transition may have ended this connection.
+        GattEvent::Lagged { .. } => true,
         _ => false,
     }
 }
@@ -187,6 +200,8 @@ async fn watch_for_end(
             return;
         }
     }
+    // Without a lifecycle source, connection state can no longer be verified.
+    end(&state_tx, &cancel);
 }
 
 #[cfg(test)]
@@ -210,6 +225,22 @@ mod tests {
         assert!(!ends_connection(&disconnected("BB", Role::Central, Some(1)), &peer, Some(1)));
         // The same peer connected to our GATT server is a different link.
         assert!(!ends_connection(&disconnected("AA", Role::Peripheral, Some(1)), &peer, Some(1)));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_stream_end_publishes_disconnected() {
+        let (state, _) = watch::channel(ConnectionState::Connected);
+        let cancelled = CancellationToken::new();
+        watch_for_end(
+            Box::pin(tokio_stream::empty()),
+            PeerAddress("closed-source".into()),
+            Some(1),
+            state.clone(),
+            cancelled.clone(),
+        )
+        .await;
+        assert!(cancelled.is_cancelled(), "a closed lifecycle source is not a live connection");
+        assert!(state.borrow().is_disconnected());
     }
 
     #[test]

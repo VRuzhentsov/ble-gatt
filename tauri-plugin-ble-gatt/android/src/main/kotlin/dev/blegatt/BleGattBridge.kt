@@ -233,6 +233,8 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     private var gattServer: BluetoothGattServer? = null
     @Volatile
     private var advertiseCallback: AdvertiseCallback? = null
+    private val advertisingResume = AdvertisingResume()
+    private var advertisingStarted = false
     private val serverCharacteristics = ConcurrentHashMap<String, BluetoothGattCharacteristic>()
     /// Values are concurrent sets: a CCCD write and a notify can touch the
     /// same characteristic's subscriber set from different threads.
@@ -368,7 +370,13 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         // filter parameters were accepted (status=0); an unfiltered scan
         // with matching done here works identically on real adapters and
         // sidesteps whatever that native-filter gap is. See docs/adr/0002.
-        scanner.startScan(emptyList(), settings, callback)
+        try {
+            scanner.startScan(emptyList(), settings, callback)
+        } catch (error: Exception) {
+            // Release only this failed acquisition. JNI must still receive the exception.
+            if (scanCallback === callback) scanCallback = null
+            throw error
+        }
         return SCAN_STARTED
     }
 
@@ -1423,6 +1431,17 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             if (advertiser == null || gattServer == null) {
                 false
             } else {
+                if (advertiseCallback == null) {
+                    advertisingResume.replace {
+                        beginAdvertising(
+                            advertiser, serviceUuid, serverGeneration,
+                            manufacturerIds, manufacturerValues, serviceDataUuids, serviceDataValues,
+                            scanResponseName, keepServerOnFailure = true,
+                        )
+                    }
+                    onAdvertiseResult(nativeHandle, true, 0)
+                    return
+                }
                 advertiseCallback?.let { advertiser.stopAdvertising(it) }
                 advertiseCallback = null
                 beginAdvertising(
@@ -1449,6 +1468,12 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         // down with the advertisement.
         keepServerOnFailure: Boolean = false,
     ) {
+        advertisingResume.begin {
+            beginAdvertising(
+                advertiser, serviceUuid, generation, manufacturerIds, manufacturerValues,
+                serviceDataUuids, serviceDataValues, scanResponseName, keepServerOnFailure = true,
+            )
+        }
         val settings = AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
             .setConnectable(true)
@@ -1493,6 +1518,8 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                         return
                     }
                     Log.d(TAG, "advertise onStartSuccess: serviceUuid=$serviceUuid")
+                    advertisingStarted = true
+                    advertisingResume.confirm()
                     onAdvertiseResult(nativeHandle, true, 0)
                 }
             }
@@ -1511,6 +1538,8 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                 // back is what stops Rust claiming the service is reachable
                 // when no advertisement exists.
                 Log.e(TAG, "advertise onStartFailure: errorCode=$errorCode serviceUuid=$serviceUuid")
+                advertisingStarted = false
+                advertisingResume.cancel()
                 if (keepServerOnFailure) {
                     advertiseCallback = null
                     onAdvertiseResult(nativeHandle, false, errorCode)
@@ -1521,6 +1550,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             }
         }
         advertiseCallback = callback
+        advertisingStarted = false
         Log.d(TAG, "startAdvertising: serviceUuid=$serviceUuid advertiser=${advertiser != null} scanResponseName=${scanResponse != null}")
         if (scanResponse != null) {
             advertiser.startAdvertising(settings, data, scanResponse, callback)
@@ -1627,7 +1657,8 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     /// `requestConnectionPriority`. v4: added the local-name byte array to
     /// `startAdvertising`. v5: added `setCharacteristicValue` (ADR-0012).
     /// v6: `startScan` returns a scan-start status instead of a boolean.
-    fun bridgeAbiVersion(): Int = 6
+    /// v7: add visibility-only `setAdvertisingEnabled`.
+    fun bridgeAbiVersion(): Int = 7
 
     /// Replace what reads of a served characteristic return
     /// (`Driver::set_characteristic_value`). `onCharacteristicReadRequest`
@@ -1682,6 +1713,33 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         stopAdvertising()
     }
 
+    /// Change visibility. Keep the GATT server, callbacks, subscriptions and session generation.
+    fun setAdvertisingEnabled(enabled: Boolean) {
+        synchronized(this) {
+            val advertiser = adapter?.bluetoothLeAdvertiser
+            val resume = advertisingResume.current()
+            if (gattServer == null || advertiser == null || resume == null) {
+                onAdvertiseResult(nativeHandle, false, ADVERTISE_ERROR_UNAVAILABLE)
+                return
+            }
+            if (!enabled) {
+                advertiseCallback?.let { advertiser.stopAdvertising(it) }
+                advertiseCallback = null
+                advertisingStarted = false
+                advertisingResume.cancel()
+                onAdvertiseResult(nativeHandle, true, 0)
+            } else if (advertisingStarted) {
+                onAdvertiseResult(nativeHandle, true, 0)
+            } else {
+                // Replace an unconfirmed start left by a cancelled Rust waiter.
+                advertiseCallback?.let { advertiser.stopAdvertising(it) }
+                advertiseCallback = null
+                advertisingResume.cancel()
+                resume()
+            }
+        }
+    }
+
     fun stopAdvertising() {
         val advertiser = adapter?.bluetoothLeAdvertiser
 
@@ -1693,6 +1751,8 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         // `advertise_tx`, which Rust installs before calling in here.
         val stopping = synchronized(this) {
             ++serverGeneration
+            advertisingResume.clear()
+            advertisingStarted = false
             val previous = advertiseCallback
             advertiseCallback = null
             previous

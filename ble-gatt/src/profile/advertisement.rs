@@ -91,30 +91,30 @@ impl GattAdvertisement {
     /// the 512 bytes one ATT attribute holds, or one AD structure past 255,
     /// is left out and logged.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = vec![FORMAT_VERSION];
-        let mut push = |kind: u8, data: Vec<u8>| {
-            if data.len() > AD_MAX_DATA_LEN || out.len() + 2 + data.len() > MAX_ATT_ATTRIBUTE_LEN {
-                log::warn!("gatt advertisement: AD type {kind:#04x} ({} bytes) does not fit, left out", data.len());
+        let mut encoded = vec![FORMAT_VERSION];
+        let mut append_structure = |kind: u8, data: Vec<u8>| {
+            if data.len() > AD_MAX_DATA_LEN || encoded.len() + 2 + data.len() > MAX_ATT_ATTRIBUTE_LEN {
+                log::warn!("gatt advertisement: omit AD type {kind:#04x} ({} bytes): size limit exceeded", data.len());
                 return;
             }
-            out.push((data.len() + 1) as u8);
-            out.push(kind);
-            out.extend_from_slice(&data);
+            encoded.push((data.len() + 1) as u8);
+            encoded.push(kind);
+            encoded.extend_from_slice(&data);
         };
         for (company, value) in &self.manufacturer_data {
             let mut data = company.to_le_bytes().to_vec();
             data.extend_from_slice(value);
-            push(AD_MANUFACTURER_DATA, data);
+            append_structure(AD_MANUFACTURER_DATA, data);
         }
         for (uuid, value) in &self.service_data {
             let mut data = uuid.0.as_u128().to_le_bytes().to_vec();
             data.extend_from_slice(value);
-            push(AD_SERVICE_DATA_128, data);
+            append_structure(AD_SERVICE_DATA_128, data);
         }
         if let Some(name) = &self.local_name {
-            push(AD_COMPLETE_LOCAL_NAME, name.as_bytes().to_vec());
+            append_structure(AD_COMPLETE_LOCAL_NAME, name.as_bytes().to_vec());
         }
-        out
+        encoded
     }
 
     /// Read a characteristic value [`encode`](Self::encode) wrote.
@@ -175,15 +175,15 @@ impl GattAdvertisement {
 }
 
 fn service_data_entry(kind: u8, data: &[u8]) -> Option<(ServiceUuid, Vec<u8>)> {
-    let short = |value: u32| Uuid::from_u128(BLUETOOTH_BASE_UUID | ((value as u128) << 96));
+    let expand_short_uuid = |value: u32| Uuid::from_u128(BLUETOOTH_BASE_UUID | ((value as u128) << 96));
     let (uuid, rest) = match kind {
         AD_SERVICE_DATA_16 => {
             let (bytes, rest) = data.split_first_chunk::<2>()?;
-            (short(u16::from_le_bytes(*bytes) as u32), rest)
+            (expand_short_uuid(u16::from_le_bytes(*bytes) as u32), rest)
         }
         AD_SERVICE_DATA_32 => {
             let (bytes, rest) = data.split_first_chunk::<4>()?;
-            (short(u32::from_le_bytes(*bytes)), rest)
+            (expand_short_uuid(u32::from_le_bytes(*bytes)), rest)
         }
         _ => {
             let (bytes, rest) = data.split_first_chunk::<16>()?;
@@ -213,12 +213,28 @@ pub fn needs_gatt_advertisement(peer: &DiscoveredPeer) -> bool {
 
 /// Connect to `peer`, read its GATT advertisement and disconnect.
 pub async fn read(driver: &dyn Driver, peer: &PeerAddress) -> Result<GattAdvertisement> {
-    let events = driver.events();
-    let mut connection = crate::connection::Connection::new(driver.connect(peer).await?, events);
-    let value = connection.read(GATT_ADVERTISEMENT_CHARACTERISTIC).await;
-    // Disconnect after the read. Connection also disconnects on cancellation.
-    let _ = connection.disconnect().await;
-    GattAdvertisement::decode(&value?)
+    read_owned(driver, peer, false).await
+}
+
+pub(crate) async fn read_managed(driver: &dyn Driver, peer: &PeerAddress) -> Result<GattAdvertisement> {
+    read_owned(driver, peer, true).await
+}
+
+async fn read_owned(driver: &dyn Driver, peer: &PeerAddress, managed_cleanup: bool) -> Result<GattAdvertisement> {
+    // Subscribe before connecting so the connection observes events from its driver session.
+    let events = driver.lifecycle_events();
+    let connection = driver.connect(peer).await?;
+    let mut owned_connection = if managed_cleanup {
+        crate::connection::Connection::new_managed(connection, events)
+    } else {
+        crate::connection::Connection::new(connection, events)
+    };
+    let read_result = owned_connection.read(GATT_ADVERTISEMENT_CHARACTERISTIC).await;
+    // Disconnect the owned connection even if the read fails.
+    // Cancellation after acquisition drops this handle and schedules disconnect of its owned driver session.
+    // The driver handles cancellation while connect is pending.
+    let _ = owned_connection.disconnect().await;
+    GattAdvertisement::decode(&read_result?)
 }
 
 /// How [`complete`] reads GATT advertisements.
@@ -245,20 +261,19 @@ impl Default for GattAdvertisementPolicy {
     }
 }
 
-struct Tracked {
+struct TrackedPeer {
     peer: DiscoveredPeer,
-    due: Instant,
-    last: Option<GattAdvertisement>,
-    failures: u32,
-    reported: bool,
+    next_read_at: Instant,
+    last_advertisement: Option<GattAdvertisement>,
+    consecutive_failures: u32,
+    has_been_reported: bool,
 }
 
 /// `scan` (a scan for `service` on `driver`), with the GATT advertisement
 /// of every peer that [needs one](needs_gatt_advertisement) read and merged
-/// in. Peers whose radio advertisement carries the data pass straight
-/// through. Such a peer is reported after its first read, and again when a
-/// later read finds different data. When a read fails, the peer is reported
-/// once as the radio advertisement shows it.
+/// in. Peers whose radio advertisement carries the data pass through without a read.
+/// A peer that needs a read is reported after its first read and when later reads find changed data.
+/// On failure, a peer not yet reported is reported with its radio advertisement data.
 ///
 /// Reads run one at a time, so a crowd of peers cannot exhaust the
 /// platform's connection slots. A scan error ends the stream as it ends a
@@ -269,19 +284,20 @@ pub fn complete(
     scan: BoxStream<Result<DiscoveredPeer>>,
     policy: GattAdvertisementPolicy,
 ) -> BoxStream<Result<DiscoveredPeer>> {
-    let (tx, rx) = mpsc::channel(64);
+    let (sender, receiver) = mpsc::channel(64);
     tokio::spawn(async move {
-        // Drop the scan and any active read when the caller drops the output.
+        // Dropping the output cancels this scan and its active read.
+        // The read's connection handle owns cleanup after acquisition.
         tokio::select! {
-            result = complete_scan(driver.as_ref(), service, scan, policy, &tx) => {
+            result = complete_scan(driver.as_ref(), service, scan, policy, &sender) => {
                 if let Err(err) = result {
-                    let _ = tx.send(Err(err)).await;
+                    let _ = sender.send(Err(err)).await;
                 }
             }
-            () = tx.closed() => {}
+            () = sender.closed() => {}
         }
     });
-    Box::pin(ReceiverStream::new(rx))
+    Box::pin(ReceiverStream::new(receiver))
 }
 
 async fn complete_scan(
@@ -289,31 +305,31 @@ async fn complete_scan(
     service: ServiceUuid,
     mut scan: BoxStream<Result<DiscoveredPeer>>,
     policy: GattAdvertisementPolicy,
-    tx: &mpsc::Sender<Result<DiscoveredPeer>>,
+    sender: &mpsc::Sender<Result<DiscoveredPeer>>,
 ) -> Result<()> {
     let mut tracked = HashMap::new();
-    let mut scanning = true;
+    let mut scan_active = true;
     loop {
-        let due = next_read(&tracked, scanning, policy.max_failures);
-        if !scanning && due.is_none() {
+        let scheduled_read = next_read(&tracked, scan_active, policy.max_failures);
+        if !scan_active && scheduled_read.is_none() {
             return Ok(());
         }
         let peer = tokio::select! {
-            item = scan.next(), if scanning => match item {
-                None => { scanning = false; None }
+            item = scan.next(), if scan_active => match item {
+                None => { scan_active = false; None }
                 Some(item) => track_peer(&mut tracked, item?, policy.max_peers),
             },
-            _ = tokio::time::sleep_until(due.as_ref().map(|(_, at)| *at).unwrap_or_else(Instant::now)), if due.is_some() => {
-                let (address, _) = due.expect("a read is due");
+            _ = tokio::time::sleep_until(scheduled_read.as_ref().map(|(_, at)| *at).unwrap_or_else(Instant::now)), if scheduled_read.is_some() => {
+                let (address, _) = scheduled_read.expect("a read is due");
                 let result = tokio::time::timeout(policy.timeout, read(driver, &address)).await
                     .unwrap_or_else(|_| Err(BleError::Gatt(format!("no answer in {:?}", policy.timeout))));
                 let entry = tracked.get_mut(&address).expect("the peer stays tracked");
-                entry.due = Instant::now() + policy.refresh;
+                entry.next_read_at = Instant::now() + policy.refresh;
                 entry.record_read(service, result)
             }
         };
         if let Some(peer) = peer {
-            if tx.send(Ok(peer)).await.is_err() {
+            if sender.send(Ok(peer)).await.is_err() {
                 return Ok(());
             }
         }
@@ -321,21 +337,21 @@ async fn complete_scan(
 }
 
 fn next_read(
-    tracked: &HashMap<PeerAddress, Tracked>,
-    scanning: bool,
+    tracked: &HashMap<PeerAddress, TrackedPeer>,
+    scan_active: bool,
     max_failures: u32,
 ) -> Option<(PeerAddress, Instant)> {
     tracked
         .iter()
-        .filter(|(_, entry)| entry.failures == 0 || entry.failures < max_failures)
+        .filter(|(_, entry)| entry.consecutive_failures == 0 || entry.consecutive_failures < max_failures)
         // After the scan ends, read only peers not yet reported.
-        .filter(|(_, entry)| scanning || !entry.reported)
-        .min_by_key(|(_, entry)| entry.due)
-        .map(|(address, entry)| (address.clone(), entry.due))
+        .filter(|(_, entry)| scan_active || !entry.has_been_reported)
+        .min_by_key(|(_, entry)| entry.next_read_at)
+        .map(|(address, entry)| (address.clone(), entry.next_read_at))
 }
 
 fn track_peer(
-    tracked: &mut HashMap<PeerAddress, Tracked>,
+    tracked: &mut HashMap<PeerAddress, TrackedPeer>,
     peer: DiscoveredPeer,
     max_peers: usize,
 ) -> Option<DiscoveredPeer> {
@@ -347,7 +363,13 @@ fn track_peer(
     } else if tracked.len() < max_peers {
         tracked.insert(
             peer.address.clone(),
-            Tracked { peer, due: Instant::now(), last: None, failures: 0, reported: false },
+            TrackedPeer {
+                peer,
+                next_read_at: Instant::now(),
+                last_advertisement: None,
+                consecutive_failures: 0,
+                has_been_reported: false,
+            },
         );
     } else {
         return Some(peer);
@@ -355,7 +377,7 @@ fn track_peer(
     None
 }
 
-impl Tracked {
+impl TrackedPeer {
     fn record_read(
         &mut self,
         service: ServiceUuid,
@@ -363,26 +385,26 @@ impl Tracked {
     ) -> Option<DiscoveredPeer> {
         match result {
             Ok(advertisement) => {
-                self.failures = 0;
-                if self.last.as_ref() == Some(&advertisement) {
+                self.consecutive_failures = 0;
+                if self.last_advertisement.as_ref() == Some(&advertisement) {
                     return None;
                 }
                 log::debug!("gatt advertisement: read from {}", self.peer.address.0);
                 let peer = advertisement.merge_into(service, self.peer.clone());
-                self.last = Some(advertisement);
-                self.reported = true;
+                self.last_advertisement = Some(advertisement);
+                self.has_been_reported = true;
                 Some(peer)
             }
             Err(err) => {
-                self.failures += 1;
+                self.consecutive_failures += 1;
                 log::debug!(
                     "gatt advertisement: reading {} failed ({err}), failure {}",
                     self.peer.address.0,
-                    self.failures
+                    self.consecutive_failures
                 );
                 // Keep failed peers in the bounded table for the rest of this scan.
-                let reported = std::mem::replace(&mut self.reported, true);
-                (!reported).then(|| self.peer.clone())
+                let was_reported = std::mem::replace(&mut self.has_been_reported, true);
+                (!was_reported).then(|| self.peer.clone())
             }
         }
     }

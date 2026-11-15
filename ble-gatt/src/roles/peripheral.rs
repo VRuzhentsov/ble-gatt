@@ -27,7 +27,7 @@ impl Peripheral {
     /// see `datagram::connect`/`serve` — so a radio recovery landing in the
     /// gap is not missed.
     pub async fn serve(&self, service: GattServiceSpec) -> Result<ServerHandle> {
-        let events = self.driver.events();
+        let events = self.driver.lifecycle_events();
         self.driver.advertise(service.clone()).await?;
         let recovery = spawn_recovery(self.driver.clone(), service, events);
         Ok(ServerHandle {

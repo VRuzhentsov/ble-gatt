@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::broadcast;
+use crate::drivers::event_bus::EventBus;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
@@ -162,7 +162,7 @@ impl MockNetwork {
 
     // --- Dispatch to Local or Remote, identically ---
 
-    fn register_events_sender(&self, address: PeerAddress, sender: broadcast::Sender<GattEvent>) {
+    fn register_events_sender(&self, address: PeerAddress, sender: EventBus) {
         match &self.0 {
             Radio::Local(r) => r.register_events_sender(address, sender),
             #[cfg(feature = "mock-broker")]
@@ -209,6 +209,14 @@ impl MockNetwork {
             Radio::Local(r) => r.set_characteristic_value(address, characteristic, value).await,
             #[cfg(feature = "mock-broker")]
             Radio::Remote(r) => r.set_characteristic_value(address, characteristic, value).await,
+        }
+    }
+
+    async fn set_advertising_enabled(&self, address: &PeerAddress, enabled: bool) -> Result<()> {
+        match &self.0 {
+            Radio::Local(r) => r.set_advertising_enabled(address, enabled).await,
+            #[cfg(feature = "mock-broker")]
+            Radio::Remote(r) => r.set_advertising_enabled(address, enabled).await,
         }
     }
 
@@ -291,7 +299,7 @@ pub struct MockDriver {
     address: PeerAddress,
     network: Arc<MockNetwork>,
     capabilities: CapabilityReport,
-    events_tx: broadcast::Sender<GattEvent>,
+    events_tx: EventBus,
     /// What `Driver::served_service` reports, as the real drivers keep it.
     served: std::sync::Mutex<Option<GattServiceSpec>>,
 }
@@ -301,7 +309,7 @@ impl MockDriver {
     /// mode (e.g. most Android devices) without a second driver impl — see
     /// the plan's role-assignment-with-capability-fallback decision.
     pub fn new(address: PeerAddress, network: Arc<MockNetwork>, capabilities: CapabilityReport) -> Self {
-        let (events_tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let events_tx = EventBus::new(EVENT_CHANNEL_CAPACITY);
         network.register_events_sender(address.clone(), events_tx.clone());
         Self { address, network, capabilities, events_tx, served: std::sync::Mutex::new(None) }
     }
@@ -389,6 +397,10 @@ impl Driver for MockDriver {
         self.network.set_characteristic_value(&self.address, characteristic, value).await
     }
 
+    async fn set_advertising_enabled(&self, enabled: bool) -> Result<()> {
+        self.network.set_advertising_enabled(&self.address, enabled).await
+    }
+
     async fn stop_advertising(&self) -> Result<()> {
         *self.served.lock().unwrap() = None;
         self.network.stop_advertising(&self.address).await
@@ -406,6 +418,10 @@ impl Driver for MockDriver {
         &self, peer: &PeerAddress, session: Option<u64>, characteristic: CharacteristicUuid, value: Vec<u8>,
     ) -> Result<()> {
         self.network.notify_peer(&self.address, peer, session, characteristic, value).await
+    }
+
+    fn lifecycle_events(&self) -> BoxStream<GattEvent> {
+        self.events_tx.lifecycle_events()
     }
 
     fn events(&self) -> BoxStream<GattEvent> {

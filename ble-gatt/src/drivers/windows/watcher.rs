@@ -82,11 +82,11 @@ pub(super) fn start(inner: &Arc<Inner>, service: ServiceUuid, generation: u64) -
                 let advertisement = args.Advertisement()?;
                 let advertised_uuids: Vec<ServiceUuid> =
                     advertisement.ServiceUuids()?.into_iter().map(|guid| ServiceUuid(from_guid(guid))).collect();
-                let matches = advertised_uuids.contains(&service);
+                let matches_service = advertised_uuids.contains(&service);
                 let is_scan_response = args.AdvertisementType() == Ok(BluetoothLEAdvertisementType::ScanResponse);
 
                 let mut seen = seen.lock().unwrap();
-                if !matches && !(is_scan_response && seen.contains_key(&address)) {
+                if !(matches_service || is_scan_response && seen.contains_key(&address)) {
                     return Ok(());
                 }
                 if !seen.contains_key(&address) && seen.len() >= MATCH_CACHE_CAPACITY {
@@ -96,7 +96,7 @@ pub(super) fn start(inner: &Arc<Inner>, service: ServiceUuid, generation: u64) -
                     inner.address_types.lock().unwrap().insert(address, kind);
                 }
                 let entry = seen.entry(address).or_default();
-                let before = entry.clone();
+                let previous_data = entry.clone();
                 for uuid in advertised_uuids {
                     if !entry.services.contains(&uuid) {
                         entry.services.push(uuid);
@@ -110,10 +110,9 @@ pub(super) fn start(inner: &Arc<Inner>, service: ServiceUuid, generation: u64) -
                 if !name.is_empty() {
                     entry.local_name = Some(name);
                 }
-                // Reported when it first matches and again whenever its data
-                // changes (the scan response arriving later), not on every
-                // repeated packet.
-                if *entry == before {
+                // Report new or changed peer data, including a later scan response.
+                // Ignore repeated packets with no data changes.
+                if *entry == previous_data {
                     return Ok(());
                 }
                 let peer = DiscoveredPeer {
@@ -190,9 +189,8 @@ impl tokio_stream::Stream for ScanStream {
         if self.done {
             return Poll::Ready(None);
         }
-        // A terminal error goes first, out of band: if it waited behind a
-        // full queue, a slow consumer would read a truncated peer list and
-        // then an ordinary end of stream.
+        // Report terminal errors before queued results.
+        // Otherwise, a slow consumer could mistake lost results for a complete scan.
         let pending = self.error.lock().unwrap().take();
         if let Some(err) = pending {
             self.done = true;
