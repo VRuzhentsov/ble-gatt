@@ -2,6 +2,11 @@
 
 ## Status
 
+The provisional target in [ADR-0014](0014-core-peer-ownership.md) replaces the
+public initiation-mode design with symmetric behavior owned by the core.
+This ADR remains the record of the current implementation; that refactor has
+not happened and existing APIs have not changed.
+
 Implemented locally; radio-free tests only. Hardware acceptance and Fini
 adoption remain separate gates. No new handshake, wire format or bridge ABI.
 

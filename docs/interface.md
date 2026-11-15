@@ -1,22 +1,31 @@
-# How `ble-gatt` is meant to be used
+# Current APIs and the target peer contract
 
-`ble-gatt` is a **carrier**. It moves bytes between two devices over BLE GATT
-and does not interpret them — no framing, no session protocol, no encryption
-(`docs/adr/0003`). This document is about *which shape of carrier* a given
-consumer should reach for. The internals behind the tier-3 API are in
-`docs/adr/0005`.
+`ble-gatt` is a **carrier**. It moves bytes over BLE GATT. The datagram profile
+adds fragmentation and message boundaries, but not an application-session
+protocol or end-to-end encryption (ADR-0003).
 
-## The one-sentence decision
+The [provisional target](adr/0014-core-peer-ownership.md) gives the core one
+symmetric peer contract, independent of iroh: either peer can initiate or
+reconnect. The public initiation-mode choice is not part of that target.
+The source has not yet been refactored. This page documents current APIs;
+examples using `LinkRole` or `InitiationPolicy` are not the proposed new API.
+
+See the [core](../ble-gatt/README.md),
+[iroh adapter](../ble-gatt-iroh/README.md) and
+[Tauri adapter](../tauri-plugin-ble-gatt/README.md) for the ownership boundaries.
+
+## Choosing a current API
 
 | You are… | Use |
 |---|---|
 | talking to third-party hardware that speaks its own GATT protocol | **Tier 1 — raw GATT** |
 | moving whole messages to/from one peer and you want to own the connection yourself | **Tier 2 — datagram** |
-| keeping app-to-app links to a set of peers alive over time | **Tier 3 — `PeerLink`** ← the default for app-to-app |
+| keeping non-iroh byte channels to a set of peers alive over time | **Tier 3 — current `PeerLink`**, with its existing role policy |
 
-Most app-to-app consumers (Fini, a Bitchat-style mesh) want **Tier 3**. Tier 2
-is the primitive it is built on, kept public for the rare consumer that
-genuinely wants to drive one channel by hand.
+Current iroh consumers use the datagram tier through `ble-gatt-iroh`, not the
+existing `PeerLink` controller. The target must reuse core BLE behavior in both
+cases without duplicating lifecycle ownership. It does not yet select an
+operation-scoped or persistent tracked-peer API.
 
 ---
 
@@ -45,7 +54,8 @@ transport.set_peer_address(remote_endpoint_id, advertised_address);
 // Either endpoint may call endpoint.connect(remote_endpoint_id, alpn).
 ```
 
-Select `EitherPeer` explicitly after verifying crossed-dial support. The
+This is a current-API example, not the target design. Today callers select
+`EitherPeer` explicitly after verifying crossed-dial support. The
 unchanged default is `PreviousDialer` (30-second yield after an unexpected
 incoming-link loss). If crossed dials are unsafe, configure both peers with
 `InitiationPolicy::Ordered { local_id: key.public() }` before moving `key`
@@ -79,20 +89,20 @@ You own everything: when to reconnect, what the bytes mean, how to frame them.
 
 ## Tier 2 — datagram (`datagram::connect` / `datagram::serve`)
 
-An ordered, opaque-bytes **message pipe** to one peer. Hand it a `Vec<u8>` of
-any size, get exactly that `Vec<u8>` out the other end. Fragmentation against
-the negotiated MTU and bounded reassembly are handled inside; boundaries are
-preserved so you can layer encryption on top without reinventing framing.
+An opaque-bytes **message pipe** to one peer. Messages are subject to the
+configured size and reassembly bounds. Fragmentation against the negotiated
+MTU and reassembly are handled inside; boundaries are preserved so you can
+layer encryption on top without implementing GATT fragmentation yourself.
 
 ```rust
-let mut channel = datagram::connect(driver, &peer, &config).await?;
+let mut channel = datagram::connect(&adapter, &peer, &config).await?;
 channel.send(encrypted_message).await?;
 let incoming = channel.recv().await?;
 ```
 
 **You still own the connection lifecycle**: deciding to dial, redialing after a
-drop, ensuring one link per peer, resolving simultaneous-dial glare, recovering
-from an adapter power-cycle. You also supply the `Driver` and run on your own
+drop, choosing usable channels, resolving simultaneous-dial glare, recovering
+from an adapter power-cycle. You supply an `Adapter` and run on your own
 runtime — the `DatagramChannel` here holds the `GattConnection` directly. For a
 one-shot transfer or a test that is fine. For a long-lived app-to-app
 relationship it is a lot of machinery to get right — which is why Tier 3
@@ -100,7 +110,11 @@ exists, **on top of this**, not replacing it.
 
 ---
 
-## Tier 3 — `PeerLink` — the intended default for app-to-app
+## Tier 3 — `PeerLink` (current tracked-peer API)
+
+This section describes the implemented controller, not the target public
+design. Its `Symmetric` role chooses the lower `LinkId` to dial. That must not
+be confused with either-peer initiation in ADR-0014.
 
 You declare **which peers you care about** and **one policy** (who dials). The
 library owns keeping links alive; you consume channels and status.
@@ -163,10 +177,10 @@ The handle's contract across that hop:
   `GattConnection` (Tier 1) and `DatagramChannel` (Tier 2).
 
 Fields. `datagram` carries the wire contract (service + characteristic) and
-the fragmentation bounds. `role` is the one genuine protocol decision — who
-dials for a pair that can both see each other — and has no sensible default,
-because it needs a stable identity both peers compare the same way (glare;
-`docs/adr/0003` revision). `retry_budget` and `max_links` have defaults.
+fragmentation bounds. The current `role` field selects who dials; `Symmetric`
+requires a stable identity for its ordering rule. This is existing API behavior,
+not a target requirement for the caller to choose an initiator.
+`retry_budget` and `max_links` have defaults.
 
 `max_links` caps how many peers hold a live link at once, because a BLE central
 has a hard concurrent-link limit (commonly ~7 on Android, higher on BlueZ). You
@@ -181,13 +195,12 @@ you know your platform allows more.
 | `DialOnly` | only ever dials (central-only platform, a hub) |
 | `AcceptOnly` | only ever advertises and accepts (a peripheral) |
 
-**The accepting side holds one inbound link at a time.** The datagram tier
-serves one central at a time (its wire shape — notify is a broadcast that
-cannot be addressed to one peer). So on the acceptor side of `Symmetric`, or
-in `AcceptOnly`, a second tracked peer stays `Connecting` until the first
-inbound link frees or it gives up. `max_links > 1` only widens the *dialer*
-side. A consumer that needs to serve many peers at once wants a per-peer
-notify on the `Driver` port first (tracked separately).
+**The accepting side currently holds one inbound datagram channel at a time.**
+The HAL already has per-peer notification operations, but the datagram serving
+implementation still enforces a single inbound channel. A second tracked peer
+must wait until that channel is released or its budget expires. `max_links > 1`
+does not remove this cap. Multi-inbound serving needs a separate design and
+tests; it is not included in the symmetric-initiation agreement.
 
 ### Declare interest
 
@@ -284,11 +297,10 @@ events per peer. Three guarantees make N peers safe rather than N times the
 risk:
 
 - **Per-peer isolation.** One unresponsive peer does not stall the others. The
-  per-peer state machines are independent, and the worker does not hold a
-  driver-wide lock across any one peer's platform call (the current Linux
-  driver does — a stuck dial there freezes every peer, and the host app; that
-  lock becomes per-address as part of this work). A test proves one wedged peer
-  leaves the rest connecting.
+  per-peer state machines are independent. The current Linux driver uses
+  address-keyed dial/teardown locks rather than one driver-wide dial lock.
+  The mock isolation test checks that a wedged peer leaves other peers able
+  to connect; that test does not certify native hardware behavior.
 - **The link cap is visible.** More tracked peers than `max_links` → the extra
   ones are `Queued`, not an indistinguishable `Connecting`, and promote when a
   slot frees.
@@ -298,12 +310,13 @@ risk:
 
 ---
 
-## `PeerLink` and a consumer's own state machine
+## Current `PeerLink` and a non-iroh consumer's state machine
 
-A consumer like Fini runs its own session state machine on top (auth, an
-encrypted channel, a ping/ack liveness proof). The seam:
+A non-iroh consumer can run its own session state machine on top (auth, an
+encrypted channel, a ping/ack liveness proof). This is a generic composition,
+not a description of Fini's current iroh integration. The seam:
 
-| | `ble-gatt` (`PeerLink`) | consumer (e.g. Fini's `LinkState`) |
+| | `ble-gatt` (`PeerLink`) | non-iroh consumer |
 |---|---|---|
 | Owns | transport: dial, connect, drop, redial ladder + give-up, radio | session: auth, proof, fade; preconditions the library is not |
 | Driven by | platform callbacks | `PeerLinkEvent` + its own ping ticks |
@@ -321,7 +334,11 @@ DB-backed eligibility, and the non-radio preconditions above.
 
 ---
 
-## Worked example — Fini
+## Illustrative non-iroh application (current API)
+
+This schematic example uses the current `PeerLink` types. Product-specific
+authentication and UI functions are illustrative. It is not Fini's current
+implementation and does not demonstrate the target API.
 
 ```rust
 // Built where DeviceConnectionState is built — sync, infallible, no await.
@@ -348,9 +365,9 @@ while let Some(ev) = events.next().await {
 }
 ```
 
-What Fini **no longer does**: `driver.connect()`, a `HashMap<(peer,transport),
-LinkState>` for the transport layer, `should_dial_peer` wiring beyond supplying
-`local_id`, redial loops, glare resolution, adapter-bounce recovery.
+In this composition, the consumer delegates transport retry and radio recovery
+to `PeerLink`. That does not prove any particular application has adopted it.
+For the current iroh integration, use the adapter section above instead.
 
 ---
 
@@ -360,9 +377,10 @@ LinkState>` for the transport layer, `should_dial_peer` wiring beyond supplying
   two original tiers.
 - **`docs/adr/0005`** — the owned link-state machine that makes `PeerLink`
   possible, and the "connected but isn't" bug class it removes.
-- `src/datagram/mod.rs` — the fragmentation primitive and its wire-shape limits.
+- [`profile/datagram/mod.rs`](../ble-gatt/src/profile/datagram/mod.rs) — the
+  fragmentation primitive and current channel limits.
 
-## Settled
+## Current `PeerLink` API details, not target decisions
 
 - **Track model:** explicit `track()` only. Discovery is untrusted; a consumer
   that wants "connect to everything advertising the service" writes a loop over

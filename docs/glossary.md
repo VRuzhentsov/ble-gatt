@@ -9,6 +9,10 @@ this file, this file wins.
 same thing, it is listed as *Also called*. Use the first word in code and
 documents.
 
+Current API descriptions and provisional target requirements are distinct.
+The target in [ADR-0014](adr/0014-core-peer-ownership.md) does not rename or
+change an existing API by documenting a new responsibility boundary.
+
 ## Bluetooth basics
 
 ### BLE (Bluetooth Low Energy)
@@ -141,9 +145,10 @@ recognised by its address alone.
 
 ### Connectable advertisement
 An advertisement a central can answer by connecting. A non-connectable
-advertisement only carries data. Windows sends two advertisements for one
-served service: a connectable one for the GATT server and a non-connectable
-one for the manufacturer data (ADR-0011 D4).
+advertisement only carries data. The current Windows driver uses its GATT
+provider advertisement and a readable GATT advertisement characteristic; it
+does not publish a second manufacturer-data radio advertisement. ADR-0012
+replaced the earlier ADR-0011 D4 design.
 
 ### Peripheral role support
 Whether a Bluetooth adapter and its driver can run a GATT server and
@@ -187,8 +192,14 @@ its advertisement.
 ### Link
 This library's handle on one connection, which tracks whether it is
 connecting, connected or gone (`PeerLink`, ADR-0005). The code still uses
-the word; the module it moves into is `connection/` (ADR-0007 D13). *Not the
+the word; its current module is `connection/peer_link.rs`. *Not the
 same as* OSI L2 (data link) or the BLE link layer.
+
+### Driver session
+The optional connection-generation identifier in `GattEvent` and
+`GattConnection::session()`. It distinguishes successive GATT connections to
+the same address and protects a replacement from stale events. It does not
+mean an authenticated QUIC connection or an application conversation.
 
 ### GAP (Generic Access Profile)
 The part of the Bluetooth Core Specification that defines the roles
@@ -236,7 +247,7 @@ In this library: the `hal/` module.
 ### Driver
 The code that implements the `hal/` traits for one platform, or the mock
 (`drivers/`): the `hal::Driver` trait, implemented by `LinuxDriver`,
-`AndroidDriver` and `MockDriver`. Layer: Frameworks & Drivers. *Also
+`AndroidDriver`, `WindowsDriver` and `MockDriver`. Layer: Frameworks & Drivers. *Also
 called:* backend (the code's old word, and SimpleBLE's and Qt's), platform
 implementation, executor (Nordic). Not the operating system's kernel driver
 for the Bluetooth chip, which sits several levels lower.
@@ -334,15 +345,21 @@ connections come up where one was wanted.
 
 ### Symmetric initiation
 Either peer may start or reconnect a link, regardless of permanent identity
-ordering. `ble-gatt-iroh::InitiationPolicy::EitherPeer` selects this behaviour;
-core `PeerLink::LinkRole::Symmetric` instead selects a lower-identity dialler.
-These are not synonymous. Neither guarantees simultaneous-role hardware support.
+ordering. This is the provisional high-level core contract in ADR-0014,
+independent of iroh and without a caller-selected initiation mode.
+In current code, `ble-gatt-iroh::InitiationPolicy::EitherPeer` selects the
+no-yield behavior, whereas core `PeerLink::LinkRole::Symmetric` selects a
+lower-identity dialler. The names are not synonymous, and neither capability
+declaration proves simultaneous-role hardware support. The target refactor
+has not happened yet.
 
 ### Initiation policy
-An explicit choice of who may start an outgoing link when no usable queue
+The current adapter's explicit choice of who may start an outgoing link when no usable queue
 exists. In `ble-gatt-iroh`, `PreviousDialer` preserves the historical redial
 yield, `EitherPeer` removes that yield and `Ordered` is the smaller-endpoint-key
 fallback. It is not peer authentication or an application's session policy.
+ADR-0014 removes this public choice from the target design; it does not merely
+change the default. Existing enum variants remain implemented until refactored.
 
 ### Candidate link
 A BLE channel attached to the iroh transport, potentially one of several

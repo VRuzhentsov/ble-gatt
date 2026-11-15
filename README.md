@@ -10,23 +10,38 @@ surface.
 
 This repo is a Cargo workspace with three crates:
 
-- **`ble-gatt`** — the core library. Scan/advertise, GATT client
+- **[`ble-gatt`](ble-gatt/README.md)** — the core library. Scan/advertise, GATT client
   read/write/subscribe, GATT server characteristics, connection lifecycle as
   an event stream, and a radio-free `MockDriver` for CI-safe protocol
   tests. Depends on nothing Tauri-specific — usable from any Tokio-based
   Rust program (a CLI, a daemon, another GUI framework).
-- **`tauri-plugin-ble-gatt`** — the [Tauri](https://tauri.app) integration:
+- **[`tauri-plugin-ble-gatt`](tauri-plugin-ble-gatt/README.md)** — the [Tauri](https://tauri.app) integration:
   ships the Android Kotlin bridge (an application never copies it), builds
   the platform driver on first use, asks for Android's Bluetooth runtime
   permissions through Tauri's permission mechanism, and exposes both a Rust
   API and JavaScript commands.
-- **`ble-gatt-iroh`** — an [iroh](https://github.com/n0-computer/iroh)
+- **[`ble-gatt-iroh`](ble-gatt-iroh/README.md)** — an [iroh](https://github.com/n0-computer/iroh)
   custom transport that carries QUIC over `ble-gatt`'s GATT datagram
-  channel. The caller decides when the radio scans and advertises. See
-  ADR-0006. Its explicit either-peer initiation policy, deterministic
-  fallback and lifecycle ownership are described in
-  [ADR-0013](docs/adr/0013-symmetric-iroh-initiation.md); hardware adoption is
-  a separate gate.
+  channel. In the current implementation, the caller schedules scanning and
+  advertising; the adapter also contains initiation policies described in
+  [ADR-0013](docs/adr/0013-symmetric-iroh-initiation.md).
+
+## Provisional architecture agreement
+
+The target in [ADR-0014](docs/adr/0014-core-peer-ownership.md) makes symmetric
+peer communication a core `ble-gatt` capability, independent of iroh. Either
+eligible peer can initiate or reconnect; applications do not select an
+`EitherPeer`, previous-dialler or identity-ordered mode. Raw central/peripheral
+operations remain available for vendor protocols.
+
+`ble-gatt-iroh` adapts generic BLE messages to iroh packets and accounts for
+iroh users of a carrier. The Tauri plugin supplies host access and setup; it
+is not another packet layer. iroh itself remains an external library.
+
+**This is the agreed direction, not an implemented refactor.** The current
+`PeerLink::Symmetric` and adapter initiation APIs do not yet provide that
+single core-owned contract. See the [architecture map](docs/architecture.md)
+and each crate's README for current behavior, target ownership and open questions.
 
 ### Using the plugin from a Rust application
 
@@ -89,7 +104,7 @@ over a socket instead of sharing an in-process `Arc`.
 | Platform | Central | Peripheral | Status |
 |---|---|---|---|
 | Linux (BlueZ) | Yes | Yes | **M1 — implemented**, verified against real BlueZ hardware |
-| Android | Yes | Yes (where the chipset/driver allows — see `CapabilityReport`) | **M1 — implemented, not yet verified as a working bridge.** Individual pieces confirmed on a real emulator (real `capabilities()` returning `{central: true, peripheral: true}`, real GATT-server advertise start), but no device-to-device round trip yet — physical-hardware verification is the real bar, planned for after the next minor patch/release. See ADR-0002. |
+| Android | Yes | Yes (where the chipset/driver allows — see `CapabilityReport`) | **M1 — implemented.** Source checks, packaged JNI execution and physical device acceptance are separate evidence levels. See ADR-0002 and the hardware verification guides; no blanket crossed-role or locked-device guarantee is implied. |
 | Windows (WinRT) | Yes | Yes (where the adapter and driver allow — see `CapabilityReport`) | **M2 — first implementation, not yet verified on a radio.** Builds for `x86_64-pc-windows-msvc`; needs Windows 10 2004 or later. Scanners find it through the GATT advertisement (ADR-0012). See ADR-0011. |
 | macOS / iOS | — | — | M3 — reserved, not implemented |
 
@@ -103,11 +118,13 @@ peripheral mode reports that honestly instead of failing opaquely later.
 ble-gatt/src/
 ├── entities/     Entities: types, events, errors
 ├── hal/          Use Cases: the Driver / GattConnection ports (async, Tokio)
+├── roles/        Use Cases: Adapter, Central and Peripheral
 ├── connection/   Use Cases: one connection's state machine, PeerLink
 ├── profile/      Use Cases: the datagram profile (fragmentation, reassembly)
+├── power/        Use Cases: power-profile advice
 └── drivers/      Frameworks & Drivers: one Driver per platform
     ├── linux.rs    BlueZ via bluer — central + peripheral       (M1)
-    ├── android.rs  raw jni + ndk-context JNI bridge              (M1)
+    ├── android.rs  JNI driver with explicit context support    (M1)
     ├── windows/    WinRT; central adapted from btleplug, own peripheral (M2)
     └── mock/       in-process, radio-free — CI-safe protocol tests;
                     optionally a cross-process broker behind the
@@ -160,8 +177,9 @@ picks the tier that fits:
 | **datagram** (`datagram::connect` / `serve`) | one message pipe, driven by hand | you |
 | **`PeerLink`** | app-to-app links to a set of peers | the library |
 
-See **`docs/interface.md`** for how `PeerLink` is meant to be used, and
-**`docs/adr/0005`** for the owned link-state machine underneath it.
+These are current APIs, not three target peer-initiation behaviors. See
+[`docs/interface.md`](docs/interface.md) for their current use and
+[ADR-0014](docs/adr/0014-core-peer-ownership.md) for the pending ownership change.
 
 ### Load-bearing files
 
@@ -169,20 +187,20 @@ Read the doc next to each before changing it:
 
 | File | What it governs | Doc |
 |---|---|---|
-| `src/connection/link_state.rs` | `RadioState` / `CentralLink` / `PeripheralLink` — whether a dial happens, whether a stale record blocks one, whether a consumer is told a link died | `docs/adr/0005` |
-| `src/peer_link.rs` | the tier-3 API and its dedicated-thread driver | `docs/interface.md`, `docs/adr/0005` |
-| `src/drivers/linux.rs` — `LinuxConnectGuard` / `pending_cleanup` | abandoned-connect cleanup, hardware-proven over ~6 review rounds | code comments + `docs/adr/0005` |
-| `src/datagram/mod.rs` | fragmentation, the one-central and one-link-per-peer limits | ADR-0003 |
+| `ble-gatt/src/connection/link_state.rs` | `RadioState` / `CentralLink` / `PeripheralLink` — pure lifecycle transitions | ADR-0005 |
+| `ble-gatt/src/connection/peer_link.rs` | current tracked-peer API and dedicated worker | `docs/interface.md`, ADR-0005 |
+| `ble-gatt/src/drivers/linux.rs` — `LinuxConnectGuard` / `pending_cleanup` | abandoned-connect cleanup and native ownership | code comments, ADR-0009 |
+| `ble-gatt/src/profile/datagram/mod.rs` | complete messages, serving and channel limits | ADR-0003, ADR-0013 |
 
 ## Status
 
-Early, under active development. `ble-gatt`'s Linux driver is real and
-tested against BlueZ hardware. The Android driver is implemented and its
-individual pieces run correctly on a real emulator, but it is **not yet
-verified as a working bridge** — that requires a real device-to-device round
-trip, planned on physical hardware after the next minor patch/release (see
-ADR-0002). Not yet published to crates.io/npm — consume as a git
-dependency, pinned to a release tag:
+Early, under active development. Implemented APIs, the provisional architecture
+and device acceptance are different things. The architecture documentation
+does not certify all drivers, native roles or background scenarios. See
+[hardware verification](docs/hardware-verification.md) and the
+[iroh diagnostic checklist](docs/either-peer-hardware.md).
+Not yet published to crates.io/npm — consume as a git dependency, pinned to a
+release tag:
 
 ```toml
 ble-gatt = { git = "https://github.com/VRuzhentsov/ble-gatt", tag = "v0.1.0" }
