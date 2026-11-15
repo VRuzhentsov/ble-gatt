@@ -9,5 +9,7 @@ mod managed_driver;
 mod managed_tests;
 mod managed_worker;
 pub mod peer_link;
+#[cfg(test)]
+mod retirement_tests;
 
 pub use handle::Connection;

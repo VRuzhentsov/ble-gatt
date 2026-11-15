@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::connection::Connection;
 use crate::entities::error::Result;
 use crate::entities::models::{DiscoveredPeer, PeerAddress, ServiceUuid};
-use crate::hal::{Driver, BoxStream};
+use crate::hal::{BoxStream, Driver};
 
 /// The central role: finds peripherals and connects to them. Created by
 /// `Adapter::central`.

@@ -2,9 +2,8 @@
 
 ## Status
 
-PR #38 implements the selected core protocol and adapter migration in the working
-tree. Final integrated verification remains pending. This refactor is not
-published or hardware-accepted. Keep the PR draft until its acceptance gates pass.
+PR #38 implements the selected core protocol and adapter migration. Software checks
+and hardware acceptance are separate. Keep the PR draft until its acceptance gates pass.
 
 This ADR owns the shared contract. [ADR-0011](0011-windows-winrt-driver.md) owns
 Windows-native choices. Earlier accepted ADRs retain their historical contracts.
@@ -180,7 +179,6 @@ can share it. Ending one user must preserve the others. Stale packet-task cleanu
 must not suppress or remove the replacement.
 
 This remains the existing application-authorization contract, not a new mode.
-Integrated proof of the idle-close/new-authorization race is still pending.
 
 Correlation and acceptance provide neither authentication nor encryption
 ([ADR-0003](0003-carrier-not-crypto-and-the-two-api-tiers.md)). iroh supplies security

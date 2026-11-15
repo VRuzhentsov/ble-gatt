@@ -18,8 +18,9 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use windows::core::Ref;
 use windows::Devices::Bluetooth::Advertisement::{
-    BluetoothLEAdvertisementReceivedEventArgs, BluetoothLEAdvertisementType, BluetoothLEAdvertisementWatcher,
-    BluetoothLEAdvertisementWatcherStoppedEventArgs, BluetoothLEScanningMode,
+    BluetoothLEAdvertisementReceivedEventArgs, BluetoothLEAdvertisementType,
+    BluetoothLEAdvertisementWatcher, BluetoothLEAdvertisementWatcherStoppedEventArgs,
+    BluetoothLEScanningMode,
 };
 use windows::Devices::Bluetooth::BluetoothError;
 use windows::Foundation::TypedEventHandler;
@@ -59,8 +60,13 @@ pub(super) struct ScanStream {
 
 /// Start a watcher for `service`. The caller has already claimed the scan
 /// slot under `generation`.
-pub(super) fn start(inner: &Arc<Inner>, service: ServiceUuid, generation: u64) -> Result<ScanStream> {
-    let watcher = BluetoothLEAdvertisementWatcher::new().map_err(|err| win_err("AdvertisementWatcher", err))?;
+pub(super) fn start(
+    inner: &Arc<Inner>,
+    service: ServiceUuid,
+    generation: u64,
+) -> Result<ScanStream> {
+    let watcher = BluetoothLEAdvertisementWatcher::new()
+        .map_err(|err| win_err("AdvertisementWatcher", err))?;
     watcher
         .SetScanningMode(BluetoothLEScanningMode::Active)
         .map_err(|err| win_err("SetScanningMode", err))?;
@@ -76,14 +82,19 @@ pub(super) fn start(inner: &Arc<Inner>, service: ServiceUuid, generation: u64) -
         let weak = Arc::downgrade(inner);
         let seen: StdMutex<HashMap<u64, SeenPeer>> = StdMutex::new(HashMap::new());
         TypedEventHandler::new(
-            move |_: Ref<BluetoothLEAdvertisementWatcher>, args: Ref<BluetoothLEAdvertisementReceivedEventArgs>| {
+            move |_: Ref<BluetoothLEAdvertisementWatcher>,
+                  args: Ref<BluetoothLEAdvertisementReceivedEventArgs>| {
                 let args = args.ok()?;
                 let address = args.BluetoothAddress()?;
                 let advertisement = args.Advertisement()?;
-                let advertised_uuids: Vec<ServiceUuid> =
-                    advertisement.ServiceUuids()?.into_iter().map(|guid| ServiceUuid(from_guid(guid))).collect();
+                let advertised_uuids: Vec<ServiceUuid> = advertisement
+                    .ServiceUuids()?
+                    .into_iter()
+                    .map(|guid| ServiceUuid(from_guid(guid)))
+                    .collect();
                 let matches_service = advertised_uuids.contains(&service);
-                let is_scan_response = args.AdvertisementType() == Ok(BluetoothLEAdvertisementType::ScanResponse);
+                let is_scan_response =
+                    args.AdvertisementType() == Ok(BluetoothLEAdvertisementType::ScanResponse);
 
                 let mut seen = seen.lock().unwrap();
                 if !(matches_service || is_scan_response && seen.contains_key(&address)) {
@@ -103,9 +114,13 @@ pub(super) fn start(inner: &Arc<Inner>, service: ServiceUuid, generation: u64) -
                     }
                 }
                 for data in advertisement.ManufacturerData()? {
-                    entry.manufacturer_data.insert(data.CompanyId()?, from_buffer(&data.Data()?)?);
+                    entry
+                        .manufacturer_data
+                        .insert(data.CompanyId()?, from_buffer(&data.Data()?)?);
                 }
-                entry.service_data.extend(service_data_of(advertisement.DataSections()?));
+                entry
+                    .service_data
+                    .extend(service_data_of(advertisement.DataSections()?));
                 let name = advertisement.LocalName()?.to_string();
                 if !name.is_empty() {
                     entry.local_name = Some(name);
@@ -136,13 +151,24 @@ pub(super) fn start(inner: &Arc<Inner>, service: ServiceUuid, generation: u64) -
         let tx = tx.clone();
         let error = error.clone();
         TypedEventHandler::new(
-            move |_: Ref<BluetoothLEAdvertisementWatcher>, args: Ref<BluetoothLEAdvertisementWatcherStoppedEventArgs>| {
-                let reason = args.ok().and_then(|args| args.Error()).unwrap_or(BluetoothError::OtherError);
+            move |_: Ref<BluetoothLEAdvertisementWatcher>,
+                  args: Ref<BluetoothLEAdvertisementWatcherStoppedEventArgs>| {
+                let reason = args
+                    .ok()
+                    .and_then(|args| args.Error())
+                    .unwrap_or(BluetoothError::OtherError);
                 log::warn!("scan: watcher stopped, error {}", reason.0);
-                let err = if reason == BluetoothError::RadioNotAvailable || reason == BluetoothError::DisabledByUser {
+                let err = if reason == BluetoothError::RadioNotAvailable
+                    || reason == BluetoothError::DisabledByUser
+                {
                     BleError::AdapterUnavailable("the Bluetooth radio is off".into())
-                } else if reason == BluetoothError::ConsentRequired || reason == BluetoothError::DisabledByPolicy {
-                    BleError::AdapterUnavailable(format!("Windows refused the scan (error {})", reason.0))
+                } else if reason == BluetoothError::ConsentRequired
+                    || reason == BluetoothError::DisabledByPolicy
+                {
+                    BleError::AdapterUnavailable(format!(
+                        "Windows refused the scan (error {})",
+                        reason.0
+                    ))
                 } else {
                     BleError::Gatt(format!("the scan stopped (error {})", reason.0))
                 };
@@ -154,7 +180,9 @@ pub(super) fn start(inner: &Arc<Inner>, service: ServiceUuid, generation: u64) -
             },
         )
     };
-    let received_token = watcher.Received(&received).map_err(|err| win_err("Watcher::Received", err))?;
+    let received_token = watcher
+        .Received(&received)
+        .map_err(|err| win_err("Watcher::Received", err))?;
     let stopped_token = match watcher.Stopped(&stopped) {
         Ok(token) => token,
         Err(err) => {
@@ -165,7 +193,9 @@ pub(super) fn start(inner: &Arc<Inner>, service: ServiceUuid, generation: u64) -
     if let Err(err) = watcher.Start() {
         let _ = watcher.RemoveReceived(received_token);
         let _ = watcher.RemoveStopped(stopped_token);
-        return Err(BleError::AdapterUnavailable(format!("cannot start the scan: {err}")));
+        return Err(BleError::AdapterUnavailable(format!(
+            "cannot start the scan: {err}"
+        )));
     }
     Ok(ScanStream {
         inner: inner.clone(),
@@ -183,7 +213,8 @@ impl tokio_stream::Stream for ScanStream {
     type Item = Result<DiscoveredPeer>;
 
     fn poll_next(
-        mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         use std::task::Poll;
         if self.done {

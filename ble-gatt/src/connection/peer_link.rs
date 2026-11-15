@@ -389,7 +389,7 @@ pub(super) fn failed(reason: &str) -> BleError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::drivers::mock::{MockDriver, MockNetwork};
     use crate::{CapabilityReport, CharacteristicUuid, ServiceUuid};
@@ -416,7 +416,7 @@ mod tests {
         };
         (make("a"), make("b"))
     }
-    async fn nonce(link: &PeerLink, value: i32) {
+    pub(crate) async fn nonce(link: &PeerLink, value: i32) {
         let (reply, receiver) = oneshot::channel();
         link.submit(Command::SetNonce(value, reply)).unwrap();
         receiver.await.unwrap().unwrap();

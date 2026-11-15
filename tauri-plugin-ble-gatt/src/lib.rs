@@ -22,9 +22,9 @@ use std::sync::Arc;
 pub use ble_gatt;
 use ble_gatt::{Adapter, Driver};
 pub use lazy::LazyDriver;
-use tokio::sync::OnceCell;
 use tauri::plugin::{PermissionState, PluginApi, TauriPlugin};
 use tauri::{AppHandle, Manager, Runtime};
+use tokio::sync::OnceCell;
 
 use commands::PluginState;
 
@@ -112,7 +112,9 @@ impl Builder {
                     match closed {
                         Ok(Ok(())) => {}
                         Ok(Err(err)) => log::warn!("closing Bluetooth on exit failed: {err}"),
-                        Err(_) => log::warn!("closing Bluetooth on exit timed out after {EXIT_CLOSE_LIMIT:?}"),
+                        Err(_) => log::warn!(
+                            "closing Bluetooth on exit timed out after {EXIT_CLOSE_LIMIT:?}"
+                        ),
                     }
                 }
             })
@@ -134,7 +136,9 @@ pub struct BleGatt<R: Runtime> {
 
 impl<R: Runtime> BleGatt<R> {
     fn new<C: serde::de::DeserializeOwned>(
-        _app: &AppHandle<R>, _api: PluginApi<R, C>, driver: Arc<dyn Driver>,
+        _app: &AppHandle<R>,
+        _api: PluginApi<R, C>,
+        driver: Arc<dyn Driver>,
     ) -> Result<Self, Error> {
         Ok(Self {
             driver,
@@ -223,7 +227,8 @@ fn default_driver() -> Option<Arc<dyn Driver>> {
 #[cfg(target_os = "android")]
 fn default_driver() -> Option<Arc<dyn Driver>> {
     Some(Arc::new(LazyDriver::new(|| async {
-        let (vm, context) = android_context::get().map_err(ble_gatt::BleError::AdapterUnavailable)?;
+        let (vm, context) =
+            android_context::get().map_err(ble_gatt::BleError::AdapterUnavailable)?;
         let driver = ble_gatt::drivers::android::AndroidDriver::with_context(vm, context).await?;
         Ok(Arc::new(driver) as Arc<dyn Driver>)
     })))

@@ -38,12 +38,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
+use crate::drivers::event_bus::EventBus;
 use async_trait::async_trait;
-use jni::objects::{GlobalRef, JByteArray, JClass, JIntArray, JObject, JObjectArray, JString, JValue};
+use jni::objects::{
+    GlobalRef, JByteArray, JClass, JIntArray, JObject, JObjectArray, JString, JValue,
+};
 use jni::sys::{jboolean, jint, jlong};
 use jni::{JNIEnv, JavaVM};
 use tokio::sync::{mpsc, oneshot};
-use crate::drivers::event_bus::EventBus;
 use tokio_stream::wrappers::ReceiverStream;
 
 /// Scan results buffered before the oldest are dropped. Advertisements are
@@ -80,13 +82,13 @@ const ADVERTISE_ERROR_STOPPED: i32 = 102;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
-use crate::hal::{Driver, BoxStream, GattConnection};
 use crate::entities::error::{BleError, Result};
 use crate::entities::models::{
-    advertised_name, truncate_name, CapabilityReport, CharacteristicUuid, ConnectionPriority, DiscoveredPeer,
-    GattEvent, GattServiceSpec, PeerAddress, RadioStatus, Role, ServiceUuid, WriteType,
-    NAME_SERVICE_DATA_MAX_LEN,
+    advertised_name, truncate_name, CapabilityReport, CharacteristicUuid, ConnectionPriority,
+    DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress, RadioStatus, Role, ServiceUuid,
+    WriteType, NAME_SERVICE_DATA_MAX_LEN,
 };
+use crate::hal::{BoxStream, Driver, GattConnection};
 
 const BRIDGE_CLASS_BINARY_NAME: &str = "dev.blegatt.BleGattBridge";
 const CALLBACK_CLASS: &str = "dev/blegatt/NativeKt";
@@ -246,7 +248,11 @@ impl<'local> AdvertisementArgs<'local> {
         // across JNI costs several reflective calls per entry, so
         // manufacturer/service advertisement data crosses as an id/UUID
         // array plus a matching value array instead.
-        let ids: Vec<i32> = service.manufacturer_data.keys().map(|id| *id as i32).collect();
+        let ids: Vec<i32> = service
+            .manufacturer_data
+            .keys()
+            .map(|id| *id as i32)
+            .collect();
         let manufacturer_ids = env
             .new_int_array(ids.len() as i32)
             .map_err(|err| BleError::Gatt(err.to_string()))?;
@@ -256,13 +262,19 @@ impl<'local> AdvertisementArgs<'local> {
             .new_object_array(ids.len() as i32, "[B", JObject::null())
             .map_err(|err| BleError::Gatt(err.to_string()))?;
         for (i, value) in service.manufacturer_data.values().enumerate() {
-            let jvalue = env.byte_array_from_slice(value).map_err(|err| BleError::Gatt(err.to_string()))?;
+            let jvalue = env
+                .byte_array_from_slice(value)
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
             env.set_object_array_element(&manufacturer_values, i as i32, &jvalue)
                 .map_err(|err| BleError::Gatt(err.to_string()))?;
         }
 
         let service_data_uuids = env
-            .new_object_array(service.service_data.len() as i32, "java/lang/String", JObject::null())
+            .new_object_array(
+                service.service_data.len() as i32,
+                "java/lang/String",
+                JObject::null(),
+            )
             .map_err(|err| BleError::Gatt(err.to_string()))?;
         let service_data_values = env
             .new_object_array(service.service_data.len() as i32, "[B", JObject::null())
@@ -273,7 +285,9 @@ impl<'local> AdvertisementArgs<'local> {
                 .map_err(|err| BleError::Gatt(err.to_string()))?;
             env.set_object_array_element(&service_data_uuids, i as i32, &uuid_str)
                 .map_err(|err| BleError::Gatt(err.to_string()))?;
-            let jvalue = env.byte_array_from_slice(value).map_err(|err| BleError::Gatt(err.to_string()))?;
+            let jvalue = env
+                .byte_array_from_slice(value)
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
             env.set_object_array_element(&service_data_values, i as i32, &jvalue)
                 .map_err(|err| BleError::Gatt(err.to_string()))?;
         }
@@ -283,13 +297,21 @@ impl<'local> AdvertisementArgs<'local> {
         // (`GattServiceSpec::local_name`). Null when there is none.
         let scan_response_name = match service.local_name.as_deref() {
             Some(name) if !name.is_empty() => JObject::from(
-                env.byte_array_from_slice(truncate_name(name, NAME_SERVICE_DATA_MAX_LEN).as_bytes())
-                    .map_err(|err| BleError::Gatt(err.to_string()))?,
+                env.byte_array_from_slice(
+                    truncate_name(name, NAME_SERVICE_DATA_MAX_LEN).as_bytes(),
+                )
+                .map_err(|err| BleError::Gatt(err.to_string()))?,
             ),
             _ => JObject::null(),
         };
 
-        Ok(Self { manufacturer_ids, manufacturer_values, service_data_uuids, service_data_values, scan_response_name })
+        Ok(Self {
+            manufacturer_ids,
+            manufacturer_values,
+            service_data_uuids,
+            service_data_values,
+            scan_response_name,
+        })
     }
 }
 
@@ -340,7 +362,9 @@ impl Inner {
 
     fn call_bool(&self, env: &mut JNIEnv, method: &str, sig: &str) -> Result<bool> {
         let bridge = self.bridge()?;
-        let result = env.call_method(bridge.as_obj(), method, sig, &[]).and_then(|v| v.z());
+        let result = env
+            .call_method(bridge.as_obj(), method, sig, &[])
+            .and_then(|v| v.z());
         match result {
             Ok(value) => Ok(value),
             Err(err) => Err(jni_error(env, method, err)),
@@ -351,9 +375,17 @@ impl Inner {
         self.call_int_with(env, method, sig, &[])
     }
 
-    fn call_int_with(&self, env: &mut JNIEnv, method: &str, sig: &str, args: &[JValue]) -> Result<i32> {
+    fn call_int_with(
+        &self,
+        env: &mut JNIEnv,
+        method: &str,
+        sig: &str,
+        args: &[JValue],
+    ) -> Result<i32> {
         let bridge = self.bridge()?;
-        let result = env.call_method(bridge.as_obj(), method, sig, args).and_then(|v| v.i());
+        let result = env
+            .call_method(bridge.as_obj(), method, sig, args)
+            .and_then(|v| v.i());
         match result {
             Ok(value) => Ok(value),
             Err(err) => Err(jni_error(env, method, err)),
@@ -415,8 +447,9 @@ impl AndroidDriver {
 impl AndroidDriver {
     pub async fn new() -> Result<Self> {
         let ctx = ndk_context::android_context();
-        let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }
-            .map_err(|err| BleError::AdapterUnavailable(format!("JavaVM::from_raw failed: {err}")))?;
+        let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }.map_err(|err| {
+            BleError::AdapterUnavailable(format!("JavaVM::from_raw failed: {err}"))
+        })?;
 
         // Scoped so this first `env` (which borrows `vm`) is dropped before
         // `vm` moves into `Inner` below; a fresh `env` is re-attached from
@@ -427,8 +460,9 @@ impl AndroidDriver {
                 .attach_current_thread_as_daemon()
                 .map_err(|err| BleError::AdapterUnavailable(format!("JNI attach failed: {err}")))?;
             let context_obj = unsafe { JObject::from_raw(ctx.context().cast()) };
-            env.new_global_ref(context_obj)
-                .map_err(|err| BleError::AdapterUnavailable(format!("global ref of Context failed: {err}")))?
+            env.new_global_ref(context_obj).map_err(|err| {
+                BleError::AdapterUnavailable(format!("global ref of Context failed: {err}"))
+            })?
         };
 
         Self::with_context(vm, context).await
@@ -480,13 +514,22 @@ impl AndroidDriver {
         let mut env = inner
             .env()
             .map_err(|err| BleError::AdapterUnavailable(format!("JNI re-attach failed: {err}")))?;
-        let bridge_class = load_app_class(&mut env, inner.context.as_obj(), BRIDGE_CLASS_BINARY_NAME)
-            .map_err(|err| BleError::AdapterUnavailable(format!("failed to load BleGattBridge class: {err}")))?;
+        let bridge_class = load_app_class(
+            &mut env,
+            inner.context.as_obj(),
+            BRIDGE_CLASS_BINARY_NAME,
+        )
+        .map_err(|err| {
+            BleError::AdapterUnavailable(format!("failed to load BleGattBridge class: {err}"))
+        })?;
         let bridge_obj = env
             .new_object(
                 &bridge_class,
                 "(Landroid/content/Context;J)V",
-                &[JValue::Object(inner.context.as_obj()), JValue::Long(native_handle)],
+                &[
+                    JValue::Object(inner.context.as_obj()),
+                    JValue::Long(native_handle),
+                ],
             )
             .map_err(|err| {
                 let detail = describe_pending_exception(&mut env);
@@ -495,9 +538,9 @@ impl AndroidDriver {
                     detail.map(|d| format!(" ({d})")).unwrap_or_default()
                 ))
             })?;
-        let bridge_ref = env
-            .new_global_ref(bridge_obj)
-            .map_err(|err| BleError::AdapterUnavailable(format!("global ref of bridge failed: {err}")))?;
+        let bridge_ref = env.new_global_ref(bridge_obj).map_err(|err| {
+            BleError::AdapterUnavailable(format!("global ref of bridge failed: {err}"))
+        })?;
         inner
             .bridge
             .set(bridge_ref)
@@ -573,7 +616,10 @@ impl Driver for AndroidDriver {
                 false
             }
         };
-        let peripheral = match self.inner.call_bool(&mut env, "hasPeripheralSupport", "()Z") {
+        let peripheral = match self
+            .inner
+            .call_bool(&mut env, "hasPeripheralSupport", "()Z")
+        {
             Ok(value) => value,
             Err(err) => {
                 let detail = describe_pending_exception(&mut env);
@@ -585,7 +631,10 @@ impl Driver for AndroidDriver {
             }
         };
         log::info!("capabilities: central={central} peripheral={peripheral}");
-        CapabilityReport { central, peripheral }
+        CapabilityReport {
+            central,
+            peripheral,
+        }
     }
 
     async fn scan(&self, service: ServiceUuid) -> Result<BoxStream<Result<DiscoveredPeer>>> {
@@ -633,7 +682,10 @@ impl Driver for AndroidDriver {
                 Ok(status) => {
                     // On refusal the active scan keeps ownership untouched.
                     super::android_scan_start_result(status)?;
-                    log::info!("scan: started for service {} generation={generation}", service.0);
+                    log::info!(
+                        "scan: started for service {} generation={generation}",
+                        service.0
+                    );
                 }
             }
         }
@@ -654,10 +706,19 @@ impl Driver for AndroidDriver {
     }
 
     async fn connect(&self, peer: &PeerAddress) -> Result<Box<dyn GattConnection>> {
-        let since = self.inner.client_disconnected_at.lock().unwrap().get(&peer.0).map(|at| at.elapsed());
+        let since = self
+            .inner
+            .client_disconnected_at
+            .lock()
+            .unwrap()
+            .get(&peer.0)
+            .map(|at| at.elapsed());
         if let Some(since) = since {
             if let Some(wait) = REDIAL_GAP.checked_sub(since) {
-                log::info!("connect: {} disconnected {since:?} ago, waiting {wait:?} before dialling", peer.0);
+                log::info!(
+                    "connect: {} disconnected {since:?} ago, waiting {wait:?} before dialling",
+                    peer.0
+                );
                 tokio::time::sleep(wait).await;
             }
         }
@@ -697,14 +758,15 @@ impl Driver for AndroidDriver {
         let dial = (|| -> Result<()> {
             let mut env = self.inner.env()?;
             let session = session as i64;
-            let address = env.new_string(&peer.0).map_err(|err| BleError::Gatt(err.to_string()))?;
-            self.inner
-                .call_void(
-                    &mut env,
-                    "connect",
-                    "(Ljava/lang/String;J)V",
-                    &[JValue::Object(&address), JValue::Long(session)],
-                )
+            let address = env
+                .new_string(&peer.0)
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
+            self.inner.call_void(
+                &mut env,
+                "connect",
+                "(Ljava/lang/String;J)V",
+                &[JValue::Object(&address), JValue::Long(session)],
+            )
         })();
         if let Err(err) = dial {
             log::warn!("connect: JNI dial to {} failed: {err}", peer.0);
@@ -728,7 +790,10 @@ impl Driver for AndroidDriver {
 
         if connected_rx.await.is_err() {
             // The guard handles cleanup on the way out.
-            log::warn!("connect: {} disconnected before the connection completed", peer.0);
+            log::warn!(
+                "connect: {} disconnected before the connection completed",
+                peer.0
+            );
             return Err(BleError::ConnectFailed {
                 peer: peer.0.clone(),
                 reason: "disconnected before connection completed".to_string(),
@@ -767,75 +832,93 @@ impl Driver for AndroidDriver {
         // before awaiting the result, so a cancelled attempt's cleanup can
         // still acquire it.
         let serialise = self.inner.advertise_lock.lock().await;
-        let advertise_generation =
-            self.inner.advertise_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let advertise_generation = self
+            .inner
+            .advertise_generation
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
         // `startAdvertising` replaces the server; set again on success.
         *self.inner.served_service.lock().unwrap() = None;
         // Scoped: `JNIEnv` is `!Send`, so it must be entirely out of scope
         // before the `.await` below, or the whole future stops being `Send`
         // and no longer satisfies the trait.
         let rx = {
-        let mut env = self.inner.env()?;
-        let n = service.characteristics.len() as i32;
+            let mut env = self.inner.env()?;
+            let n = service.characteristics.len() as i32;
 
-        let service_uuid = env
-            .new_string(service.uuid.0.to_string())
-            .map_err(|err| BleError::Gatt(err.to_string()))?;
-        let char_uuids = env
-            .new_object_array(n, "java/lang/String", JObject::null())
-            .map_err(|err| BleError::Gatt(err.to_string()))?;
-        let readable = env.new_boolean_array(n).map_err(|err| BleError::Gatt(err.to_string()))?;
-        let writable = env.new_boolean_array(n).map_err(|err| BleError::Gatt(err.to_string()))?;
-        let notifiable = env.new_boolean_array(n).map_err(|err| BleError::Gatt(err.to_string()))?;
-        let values = env
-            .new_object_array(n, "[B", JObject::null())
-            .map_err(|err| BleError::Gatt(err.to_string()))?;
+            let service_uuid = env
+                .new_string(service.uuid.0.to_string())
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
+            let char_uuids = env
+                .new_object_array(n, "java/lang/String", JObject::null())
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
+            let readable = env
+                .new_boolean_array(n)
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
+            let writable = env
+                .new_boolean_array(n)
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
+            let notifiable = env
+                .new_boolean_array(n)
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
+            let values = env
+                .new_object_array(n, "[B", JObject::null())
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
 
-        for (i, characteristic) in service.characteristics.iter().enumerate() {
-            let i = i as i32;
-            let uuid_str = env
-                .new_string(characteristic.uuid.0.to_string())
+            for (i, characteristic) in service.characteristics.iter().enumerate() {
+                let i = i as i32;
+                let uuid_str = env
+                    .new_string(characteristic.uuid.0.to_string())
+                    .map_err(|err| BleError::Gatt(err.to_string()))?;
+                env.set_object_array_element(&char_uuids, i, &uuid_str)
+                    .map_err(|err| BleError::Gatt(err.to_string()))?;
+                env.set_boolean_array_region(&readable, i, &[characteristic.readable as jboolean])
+                    .map_err(|err| BleError::Gatt(err.to_string()))?;
+                env.set_boolean_array_region(&writable, i, &[characteristic.writable as jboolean])
+                    .map_err(|err| BleError::Gatt(err.to_string()))?;
+                env.set_boolean_array_region(
+                    &notifiable,
+                    i,
+                    &[characteristic.notifiable as jboolean],
+                )
                 .map_err(|err| BleError::Gatt(err.to_string()))?;
-            env.set_object_array_element(&char_uuids, i, &uuid_str)
-                .map_err(|err| BleError::Gatt(err.to_string()))?;
-            env.set_boolean_array_region(&readable, i, &[characteristic.readable as jboolean])
-                .map_err(|err| BleError::Gatt(err.to_string()))?;
-            env.set_boolean_array_region(&writable, i, &[characteristic.writable as jboolean])
-                .map_err(|err| BleError::Gatt(err.to_string()))?;
-            env.set_boolean_array_region(&notifiable, i, &[characteristic.notifiable as jboolean])
-                .map_err(|err| BleError::Gatt(err.to_string()))?;
-            let value = env
-                .byte_array_from_slice(&characteristic.initial_value)
-                .map_err(|err| BleError::Gatt(err.to_string()))?;
-            env.set_object_array_element(&values, i, &value)
-                .map_err(|err| BleError::Gatt(err.to_string()))?;
-        }
+                let value = env
+                    .byte_array_from_slice(&characteristic.initial_value)
+                    .map_err(|err| BleError::Gatt(err.to_string()))?;
+                env.set_object_array_element(&values, i, &value)
+                    .map_err(|err| BleError::Gatt(err.to_string()))?;
+            }
 
-        let ad = AdvertisementArgs::new(&mut env, &service)?;
+            let ad = AdvertisementArgs::new(&mut env, &service)?;
 
-        let bridge = self.inner.bridge()?;
-        let _monitor = env.lock_obj(bridge.as_obj()).map_err(|err| BleError::Gatt(err.to_string()))?;
-        let (tx, rx) = oneshot::channel();
-        *self.inner.advertise_tx.lock().unwrap() = Some(PendingAdvertisement { sender: tx, service: None });
-        self.inner.call_void(
-            &mut env,
-            "startAdvertising",
-            "(Ljava/lang/String;[Ljava/lang/String;[Z[Z[Z[[B[I[[B[Ljava/lang/String;[[B[B)V",
-            &[
-                JValue::Object(&service_uuid),
-                JValue::Object(&char_uuids),
-                JValue::Object(&readable),
-                JValue::Object(&writable),
-                JValue::Object(&notifiable),
-                JValue::Object(&values),
-                JValue::Object(&ad.manufacturer_ids),
-                JValue::Object(&ad.manufacturer_values),
-                JValue::Object(&ad.service_data_uuids),
-                JValue::Object(&ad.service_data_values),
-                JValue::Object(&ad.scan_response_name),
-            ],
-        )?;
-        rx
+            let bridge = self.inner.bridge()?;
+            let _monitor = env
+                .lock_obj(bridge.as_obj())
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
+            let (tx, rx) = oneshot::channel();
+            *self.inner.advertise_tx.lock().unwrap() = Some(PendingAdvertisement {
+                sender: tx,
+                service: None,
+            });
+            self.inner.call_void(
+                &mut env,
+                "startAdvertising",
+                "(Ljava/lang/String;[Ljava/lang/String;[Z[Z[Z[[B[I[[B[Ljava/lang/String;[[B[B)V",
+                &[
+                    JValue::Object(&service_uuid),
+                    JValue::Object(&char_uuids),
+                    JValue::Object(&readable),
+                    JValue::Object(&writable),
+                    JValue::Object(&notifiable),
+                    JValue::Object(&values),
+                    JValue::Object(&ad.manufacturer_ids),
+                    JValue::Object(&ad.manufacturer_values),
+                    JValue::Object(&ad.service_data_uuids),
+                    JValue::Object(&ad.service_data_values),
+                    JValue::Object(&ad.scan_response_name),
+                ],
+            )?;
+            rx
         };
 
         drop(serialise);
@@ -893,12 +976,18 @@ impl Driver for AndroidDriver {
 
     /// Replace `characteristic.value` through `BleGattBridge.setCharacteristicValue`.
     /// The Kotlin read handler returns this stored value.
-    async fn set_characteristic_value(&self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
+    async fn set_characteristic_value(
+        &self,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
+    ) -> Result<()> {
         let mut env = self.inner.env()?;
         let uuid = env
             .new_string(characteristic.0.to_string())
             .map_err(|err| BleError::Gatt(err.to_string()))?;
-        let bytes = env.byte_array_from_slice(&value).map_err(|err| BleError::Gatt(err.to_string()))?;
+        let bytes = env
+            .byte_array_from_slice(&value)
+            .map_err(|err| BleError::Gatt(err.to_string()))?;
         let bridge = self.inner.bridge()?;
         let update_result = env
             .call_method(
@@ -944,9 +1033,14 @@ impl Driver for AndroidDriver {
                 .map_err(|err| BleError::Gatt(err.to_string()))?;
             let ad = AdvertisementArgs::new(&mut env, &service)?;
             let bridge = self.inner.bridge()?;
-            let _monitor = env.lock_obj(bridge.as_obj()).map_err(|err| BleError::Gatt(err.to_string()))?;
+            let _monitor = env
+                .lock_obj(bridge.as_obj())
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
             let (tx, rx) = oneshot::channel();
-            *self.inner.advertise_tx.lock().unwrap() = Some(PendingAdvertisement { sender: tx, service: Some(service) });
+            *self.inner.advertise_tx.lock().unwrap() = Some(PendingAdvertisement {
+                sender: tx,
+                service: Some(service),
+            });
             let result = self.inner.call_void(
                 &mut env,
                 "updateAdvertising",
@@ -978,26 +1072,40 @@ impl Driver for AndroidDriver {
                     "Android refused the updated advertisement (AdvertiseCallback error {code})"
                 )))
             }
-            Err(_) => Err(BleError::Gatt("advertisement update outcome was never reported".to_string())),
+            Err(_) => Err(BleError::Gatt(
+                "advertisement update outcome was never reported".to_string(),
+            )),
         }
     }
 
     async fn set_advertising_enabled(&self, enabled: bool) -> Result<()> {
         let _serialise = self.inner.advertise_lock.lock().await;
         if self.inner.served_service.lock().unwrap().is_none() {
-            return Err(BleError::Gatt("advertising visibility: nothing is served".into()));
+            return Err(BleError::Gatt(
+                "advertising visibility: nothing is served".into(),
+            ));
         }
         let rx = {
             let mut env = self.inner.env()?;
             if self.inner.call_int(&mut env, "bridgeAbiVersion", "()I")? != BRIDGE_ABI_VERSION {
-                return Err(BleError::Unsupported("advertising visibility requires Android bridge ABI 7".into()));
+                return Err(BleError::Unsupported(
+                    "advertising visibility requires Android bridge ABI 7".into(),
+                ));
             }
             let bridge = self.inner.bridge()?;
-            let _monitor = env.lock_obj(bridge.as_obj()).map_err(|err| BleError::Gatt(err.to_string()))?;
+            let _monitor = env
+                .lock_obj(bridge.as_obj())
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
             let (tx, rx) = oneshot::channel();
-            *self.inner.advertise_tx.lock().unwrap() = Some(PendingAdvertisement { sender: tx, service: None });
+            *self.inner.advertise_tx.lock().unwrap() = Some(PendingAdvertisement {
+                sender: tx,
+                service: None,
+            });
             if let Err(err) = self.inner.call_void(
-                &mut env, "setAdvertisingEnabled", "(Z)V", &[JValue::Bool(enabled as jboolean)],
+                &mut env,
+                "setAdvertisingEnabled",
+                "(Z)V",
+                &[JValue::Bool(enabled as jboolean)],
             ) {
                 self.inner.advertise_tx.lock().unwrap().take();
                 return Err(err);
@@ -1006,8 +1114,12 @@ impl Driver for AndroidDriver {
         };
         match rx.await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(code)) => Err(BleError::Gatt(format!("Android refused advertising visibility (error {code})"))),
-            Err(_) => Err(BleError::Gatt("advertising visibility outcome was not reported".into())),
+            Ok(Err(code)) => Err(BleError::Gatt(format!(
+                "Android refused advertising visibility (error {code})"
+            ))),
+            Err(_) => Err(BleError::Gatt(
+                "advertising visibility outcome was not reported".into(),
+            )),
         }
     }
 
@@ -1022,7 +1134,9 @@ impl Driver for AndroidDriver {
         let _serialise = self.inner.advertise_lock.lock().await;
         let mut env = self.inner.env()?;
         let bridge = self.inner.bridge()?;
-        let _monitor = env.lock_obj(bridge.as_obj()).map_err(|err| BleError::Gatt(err.to_string()))?;
+        let _monitor = env
+            .lock_obj(bridge.as_obj())
+            .map_err(|err| BleError::Gatt(err.to_string()))?;
         *self.inner.served_service.lock().unwrap() = None;
         // Resolve any advertise still waiting on Android's asynchronous
         // start result. Kotlin invalidates the server generation, so that
@@ -1033,7 +1147,8 @@ impl Driver for AndroidDriver {
             let _ = pending.send(Err(ADVERTISE_ERROR_STOPPED));
         }
         log::info!("advertise: stopping");
-        self.inner.call_void(&mut env, "stopAdvertising", "()V", &[])
+        self.inner
+            .call_void(&mut env, "stopAdvertising", "()V", &[])
     }
 
     async fn notify(&self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
@@ -1051,7 +1166,10 @@ impl Driver for AndroidDriver {
         let mut delivered = false;
         let mut last_error = None;
         for peer in subscribers {
-            match self.notify_peer(&peer, None, characteristic, value.clone()).await {
+            match self
+                .notify_peer(&peer, None, characteristic, value.clone())
+                .await
+            {
                 Ok(()) => delivered = true,
                 Err(err) => last_error = Some(err),
             }
@@ -1064,7 +1182,10 @@ impl Driver for AndroidDriver {
     }
 
     async fn notify_peer(
-        &self, peer: &PeerAddress, session: Option<u64>, characteristic: CharacteristicUuid,
+        &self,
+        peer: &PeerAddress,
+        session: Option<u64>,
+        characteristic: CharacteristicUuid,
         value: Vec<u8>,
     ) -> Result<()> {
         // The session is validated inside Kotlin, atomically with selecting
@@ -1074,16 +1195,23 @@ impl Driver for AndroidDriver {
         // monitor. 0 means "whichever session holds this address".
         let request_id = self.inner.next_notify_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.inner.notify_waiters.lock().unwrap().insert(request_id, tx);
+        self.inner
+            .notify_waiters
+            .lock()
+            .unwrap()
+            .insert(request_id, tx);
 
         let queued = (|| -> Result<bool> {
             let mut env = self.inner.env()?;
-            let address = env.new_string(&peer.0).map_err(|err| BleError::Gatt(err.to_string()))?;
+            let address = env
+                .new_string(&peer.0)
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
             let uuid = env
                 .new_string(characteristic.0.to_string())
                 .map_err(|err| BleError::Gatt(err.to_string()))?;
-            let bytes =
-                env.byte_array_from_slice(&value).map_err(|err| BleError::Gatt(err.to_string()))?;
+            let bytes = env
+                .byte_array_from_slice(&value)
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
             let bridge = self.inner.bridge()?;
             let result = env
                 .call_method(
@@ -1114,7 +1242,11 @@ impl Driver for AndroidDriver {
                     value.len(),
                     peer.0
                 );
-                self.inner.notify_waiters.lock().unwrap().remove(&request_id);
+                self.inner
+                    .notify_waiters
+                    .lock()
+                    .unwrap()
+                    .remove(&request_id);
                 queued?;
                 return Err(BleError::Gatt(format!(
                     "{} has no live notify session for this characteristic",
@@ -1133,7 +1265,11 @@ impl Driver for AndroidDriver {
                 Ok(())
             }
             Ok(false) => {
-                log::warn!("notify: {} bytes to {} failed in transmission", value.len(), peer.0);
+                log::warn!(
+                    "notify: {} bytes to {} failed in transmission",
+                    value.len(),
+                    peer.0
+                );
                 Err(BleError::Gatt(format!("notify to {} failed", peer.0)))
             }
             Err(_) => {
@@ -1173,12 +1309,14 @@ impl Driver for AndroidDriver {
 
     fn events(&self) -> BoxStream<GattEvent> {
         let rx = self.inner.server_events_tx.subscribe();
-        Box::pin(tokio_stream::wrappers::BroadcastStream::new(rx).map(|item| match item {
-            Ok(event) => event,
-            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-                GattEvent::Lagged { dropped: n }
-            }
-        }))
+        Box::pin(
+            tokio_stream::wrappers::BroadcastStream::new(rx).map(|item| match item {
+                Ok(event) => event,
+                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                    GattEvent::Lagged { dropped: n }
+                }
+            }),
+        )
     }
 
     async fn notify_max_len(&self, peer: &PeerAddress, session: Option<u64>) -> Option<usize> {
@@ -1226,7 +1364,8 @@ struct ScanStream {
 impl tokio_stream::Stream for ScanStream {
     type Item = Result<DiscoveredPeer>;
     fn poll_next(
-        mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         match std::pin::Pin::new(&mut self.rx).poll_next(cx) {
             // Queue drained. Every buffered result has been delivered, so
@@ -1274,12 +1413,15 @@ struct NotifyStream {
 impl tokio_stream::Stream for NotifyStream {
     type Item = Result<Vec<u8>>;
     fn poll_next(
-        mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         if self.overflow.swap(false, Ordering::SeqCst) {
             return std::task::Poll::Ready(Some(Err(crate::drivers::notification_receive_gap())));
         }
-        std::pin::Pin::new(&mut self.rx).poll_next(cx).map(|item| item.map(Ok))
+        std::pin::Pin::new(&mut self.rx)
+            .poll_next(cx)
+            .map(|item| item.map(Ok))
     }
 }
 
@@ -1371,7 +1513,9 @@ impl GattConnection for AndroidGattConnection {
         };
         {
             let mut env = self.inner.env()?;
-            let address = env.new_string(&self.address).map_err(|err| BleError::Gatt(err.to_string()))?;
+            let address = env
+                .new_string(&self.address)
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
             let uuid = env
                 .new_string(characteristic.0.to_string())
                 .map_err(|err| BleError::Gatt(err.to_string()))?;
@@ -1390,13 +1534,18 @@ impl GattConnection for AndroidGattConnection {
         // The guard covers every exit from here too, including a dropped
         // future, so a cancelled read cannot block later ones for the life
         // of the link.
-        let result = rx.await.map_err(|_| BleError::NotConnected(self.address.clone()));
+        let result = rx
+            .await
+            .map_err(|_| BleError::NotConnected(self.address.clone()));
         drop(guard);
         result?
     }
 
     async fn write_with_type(
-        &mut self, characteristic: CharacteristicUuid, value: Vec<u8>, write_type: WriteType,
+        &mut self,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
+        write_type: WriteType,
     ) -> Result<()> {
         let request_id = self.inner.next_op_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
@@ -1411,11 +1560,15 @@ impl GattConnection for AndroidGattConnection {
         };
         {
             let mut env = self.inner.env()?;
-            let address = env.new_string(&self.address).map_err(|err| BleError::Gatt(err.to_string()))?;
+            let address = env
+                .new_string(&self.address)
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
             let uuid = env
                 .new_string(characteristic.0.to_string())
                 .map_err(|err| BleError::Gatt(err.to_string()))?;
-            let bytes = env.byte_array_from_slice(&value).map_err(|err| BleError::Gatt(err.to_string()))?;
+            let bytes = env
+                .byte_array_from_slice(&value)
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
             let without_response = matches!(write_type, WriteType::WithoutResponse);
             self.inner.call_void(
                 &mut env,
@@ -1431,21 +1584,28 @@ impl GattConnection for AndroidGattConnection {
                 ],
             )?;
         }
-        let result = rx.await.map_err(|_| BleError::NotConnected(self.address.clone()));
+        let result = rx
+            .await
+            .map_err(|_| BleError::NotConnected(self.address.clone()));
         drop(guard);
         result?
     }
 
     async fn subscribe(
-        &mut self, characteristic: CharacteristicUuid,
+        &mut self,
+        characteristic: CharacteristicUuid,
     ) -> Result<BoxStream<Result<Vec<u8>>>> {
         let request_id = self.inner.next_op_id.fetch_add(1, Ordering::Relaxed);
         let (confirm_tx, confirm_rx) = oneshot::channel();
         let (notify_tx, notify_rx) = mpsc::channel(NOTIFY_QUEUE_DEPTH);
         let overflow = Arc::new(AtomicBool::new(false));
         self.with_session(|state| {
-            state.subscribe_tx.insert(characteristic, (request_id, confirm_tx));
-            state.notify_tx.insert(characteristic, (request_id, notify_tx, overflow.clone()));
+            state
+                .subscribe_tx
+                .insert(characteristic, (request_id, confirm_tx));
+            state
+                .notify_tx
+                .insert(characteristic, (request_id, notify_tx, overflow.clone()));
         })?;
         // Every unsuccessful exit — a peer rejecting the subscription, an
         // unknown UUID, a JNI failure, or this future being dropped — must
@@ -1461,7 +1621,9 @@ impl GattConnection for AndroidGattConnection {
         };
         {
             let mut env = self.inner.env()?;
-            let address = env.new_string(&self.address).map_err(|err| BleError::Gatt(err.to_string()))?;
+            let address = env
+                .new_string(&self.address)
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
             let uuid = env
                 .new_string(characteristic.0.to_string())
                 .map_err(|err| BleError::Gatt(err.to_string()))?;
@@ -1506,7 +1668,9 @@ impl GattConnection for AndroidGattConnection {
         };
         let outcome = {
             let mut env = self.inner.env()?;
-            let address = env.new_string(&self.address).map_err(|err| BleError::Gatt(err.to_string()))?;
+            let address = env
+                .new_string(&self.address)
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
             self.inner.call_int_with(
                 &mut env,
                 "requestConnectionPriority",
@@ -1536,7 +1700,9 @@ impl GattConnection for AndroidGattConnection {
         self.with_session(|state| state.disconnected_tx = Some(tx))?;
         {
             let mut env = self.inner.env()?;
-            let address = env.new_string(&self.address).map_err(|err| BleError::Gatt(err.to_string()))?;
+            let address = env
+                .new_string(&self.address)
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
             self.inner.call_void(
                 &mut env,
                 "disconnect",
@@ -1619,12 +1785,18 @@ fn describe_pending_exception(env: &mut JNIEnv) -> Option<String> {
 /// `Context.getClassLoader()`. Not the classloader of the context's class:
 /// the context is the Application, and an app without its own subclass has
 /// a plain `android.app.Application`, a framework class.
-fn load_app_class<'a>(env: &mut JNIEnv<'a>, context: &JObject, binary_name: &str) -> Result<JClass<'a>> {
+fn load_app_class<'a>(
+    env: &mut JNIEnv<'a>,
+    context: &JObject,
+    binary_name: &str,
+) -> Result<JClass<'a>> {
     let class_loader = env
         .call_method(context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
         .and_then(|v| v.l())
         .map_err(|err| BleError::Gatt(format!("getClassLoader failed: {err}")))?;
-    let name = env.new_string(binary_name).map_err(|err| BleError::Gatt(err.to_string()))?;
+    let name = env
+        .new_string(binary_name)
+        .map_err(|err| BleError::Gatt(err.to_string()))?;
     let class_obj = env
         .call_method(
             &class_loader,
@@ -1670,10 +1842,17 @@ fn read_byte_array_array(env: &mut JNIEnv, array: &JObjectArray, len: i32) -> Ve
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onPeerDiscovered<'local>(
-    mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, generation: jlong,
-    advertised_service_uuids: JObjectArray<'local>, address: JString<'local>,
-    name: JString<'local>, rssi: jint, manufacturer_ids: JIntArray<'local>,
-    manufacturer_values: JObjectArray<'local>, service_data_uuids: JObjectArray<'local>,
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    native_handle: jlong,
+    generation: jlong,
+    advertised_service_uuids: JObjectArray<'local>,
+    address: JString<'local>,
+    name: JString<'local>,
+    rssi: jint,
+    manufacturer_ids: JIntArray<'local>,
+    manufacturer_values: JObjectArray<'local>,
+    service_data_uuids: JObjectArray<'local>,
     service_data_values: JObjectArray<'local>,
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
@@ -1683,7 +1862,10 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onPeerDiscovered<'local>(
     let mut manufacturer_data = BTreeMap::new();
     if let Ok(len) = env.get_array_length(&manufacturer_ids) {
         let mut ids = vec![0i32; len as usize];
-        if env.get_int_array_region(&manufacturer_ids, 0, &mut ids).is_ok() {
+        if env
+            .get_int_array_region(&manufacturer_ids, 0, &mut ids)
+            .is_ok()
+        {
             let values = read_byte_array_array(&mut env, &manufacturer_values, len);
             for (id, value) in ids.into_iter().zip(values) {
                 manufacturer_data.insert(id as u16, value);
@@ -1760,7 +1942,10 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onPeerDiscovered<'local>(
 
 #[no_mangle]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onAdvertiseResult<'local>(
-    _env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, success: jboolean,
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    native_handle: jlong,
+    success: jboolean,
     error_code: jint,
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
@@ -1771,7 +1956,14 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onAdvertiseResult<'local>(
     }
     let pending = inner.advertise_tx.lock().unwrap().take();
     if let Some(pending) = pending {
-        pending.complete(if success != 0 { Ok(()) } else { Err(error_code) }, &inner.served_service);
+        pending.complete(
+            if success != 0 {
+                Ok(())
+            } else {
+                Err(error_code)
+            },
+            &inner.served_service,
+        );
     } else {
         log::warn!("jni onAdvertiseResult: no pending advertise request to complete");
     }
@@ -1779,7 +1971,10 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onAdvertiseResult<'local>(
 
 #[no_mangle]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onScanFailed<'local>(
-    _env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, generation: jlong,
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    native_handle: jlong,
+    generation: jlong,
     error_code: jint,
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
@@ -1808,7 +2003,10 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onScanFailed<'local>(
 
 #[no_mangle]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onMtuChanged<'local>(
-    mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, address: JString<'local>,
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    native_handle: jlong,
+    address: JString<'local>,
     mtu: jint,
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
@@ -1819,12 +2017,18 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onMtuChanged<'local>(
 
 #[no_mangle]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onConnected<'local>(
-    mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, address: JString<'local>,
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    native_handle: jlong,
+    address: JString<'local>,
     from_server: jboolean,
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
     let address = read_jstring(&mut env, &address);
-    log::info!("jni onConnected: {address} from_server={}", from_server != 0);
+    log::info!(
+        "jni onConnected: {address} from_server={}",
+        from_server != 0
+    );
     // Only the *client* path may resolve a pending outbound connect. A
     // server-side callback for the same address would otherwise complete it
     // before client-side service discovery had run, handing back a
@@ -1862,12 +2066,18 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onConnected<'local>(
 
 #[no_mangle]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onDisconnected<'local>(
-    mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, address: JString<'local>,
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    native_handle: jlong,
+    address: JString<'local>,
     from_server: jboolean,
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
     let address = read_jstring(&mut env, &address);
-    log::info!("jni onDisconnected: {address} from_server={}", from_server != 0);
+    log::info!(
+        "jni onDisconnected: {address} from_server={}",
+        from_server != 0
+    );
     let disconnected_session = if from_server != 0 {
         // Server-side peers carry the session minted when they subscribed.
         let session = inner.server_sessions.lock().unwrap().remove(&address);
@@ -1875,7 +2085,12 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onDisconnected<'local>(
         // our own outbound connection to this address is still live;
         // otherwise a later session from the address could inherit a larger
         // MTU it never negotiated and get oversized fragments.
-        let client_live = inner.connections.lock().unwrap().get(&address).is_some_and(|state| state.live);
+        let client_live = inner
+            .connections
+            .lock()
+            .unwrap()
+            .get(&address)
+            .is_some_and(|state| state.live);
         if !client_live {
             inner.att_mtus.lock().unwrap().remove(&address);
         }
@@ -1940,7 +2155,10 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onDisconnected<'local>(
 /// consumer (`PeerLink`) learns the radio's usability changed.
 #[no_mangle]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onRadioState<'local>(
-    mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, status: JString<'local>,
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    native_handle: jlong,
+    status: JString<'local>,
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
     let status = read_jstring(&mut env, &status);
@@ -1975,15 +2193,20 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onRadioState<'local>(
             let _ = pending.send(Err(ADVERTISE_ERROR_STOPPED));
         }
     }
-    let _ = inner
-        .server_events_tx
-        .send(GattEvent::RadioChanged { status: radio_status });
+    let _ = inner.server_events_tx.send(GattEvent::RadioChanged {
+        status: radio_status,
+    });
 }
 
 #[no_mangle]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onCharacteristicRead<'local>(
-    mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, request_id: jlong,
-    address: JString<'local>, _characteristic_uuid: JString<'local>, value: JByteArray<'local>,
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    native_handle: jlong,
+    request_id: jlong,
+    address: JString<'local>,
+    _characteristic_uuid: JString<'local>,
+    value: JByteArray<'local>,
     success: jboolean,
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
@@ -2011,8 +2234,13 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onCharacteristicRead<'local>(
 
 #[no_mangle]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onCharacteristicWriteResult<'local>(
-    mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, request_id: jlong,
-    address: JString<'local>, _characteristic_uuid: JString<'local>, success: jboolean,
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    native_handle: jlong,
+    request_id: jlong,
+    address: JString<'local>,
+    _characteristic_uuid: JString<'local>,
+    success: jboolean,
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
     let address = read_jstring(&mut env, &address);
@@ -2038,8 +2266,12 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onCharacteristicWriteResult<'lo
 
 #[no_mangle]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onCharacteristicChanged<'local>(
-    mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, address: JString<'local>,
-    characteristic_uuid: JString<'local>, value: JByteArray<'local>,
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    native_handle: jlong,
+    address: JString<'local>,
+    characteristic_uuid: JString<'local>,
+    value: JByteArray<'local>,
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
     let address = read_jstring(&mut env, &address);
@@ -2082,8 +2314,13 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onCharacteristicChanged<'local>
 
 #[no_mangle]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onServerCharacteristicWritten<'local>(
-    mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, address: JString<'local>,
-    characteristic_uuid: JString<'local>, value: JByteArray<'local>, session: jlong,
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    native_handle: jlong,
+    address: JString<'local>,
+    characteristic_uuid: JString<'local>,
+    value: JByteArray<'local>,
+    session: jlong,
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
     let address = read_jstring(&mut env, &address);
@@ -2117,18 +2354,24 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onServerCharacteristicWritten<'
         local_role: Role::Peripheral,
         session: Some(session),
     });
-    let _ = inner.server_events_tx.send(GattEvent::CharacteristicWritten {
-        peer: PeerAddress(address),
-        characteristic: CharacteristicUuid(uuid),
-        value: bytes,
-    });
+    let _ = inner
+        .server_events_tx
+        .send(GattEvent::CharacteristicWritten {
+            peer: PeerAddress(address),
+            characteristic: CharacteristicUuid(uuid),
+            value: bytes,
+        });
 }
 
 #[no_mangle]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onSubscribed<'local>(
-    mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, request_id: jlong,
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    native_handle: jlong,
+    request_id: jlong,
     address: JString<'local>,
-    characteristic_uuid: JString<'local>, success: jboolean,
+    characteristic_uuid: JString<'local>,
+    success: jboolean,
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
     let address = read_jstring(&mut env, &address);
@@ -2175,7 +2418,10 @@ fn _callback_class_name() -> &'static str {
 /// which a bare connection does not.
 #[no_mangle]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onServerSubscribed<'local>(
-    mut env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, address: JString<'local>,
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    native_handle: jlong,
+    address: JString<'local>,
     session: jlong,
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
@@ -2234,10 +2480,16 @@ impl Drop for PendingOpGuard {
         // before this ever runs, so the common path pays no extra JNI call.
         let still_pending = {
             let mut connections = self.inner.connections.lock().unwrap();
-            let Some(state) = connections.get_mut(&self.address) else { return };
+            let Some(state) = connections.get_mut(&self.address) else {
+                return;
+            };
             let still_pending = match self.op {
-                PendingOp::Read => state.read_tx.as_ref().map(|(id, _)| *id) == Some(self.request_id),
-                PendingOp::Write => state.write_tx.as_ref().map(|(id, _)| *id) == Some(self.request_id),
+                PendingOp::Read => {
+                    state.read_tx.as_ref().map(|(id, _)| *id) == Some(self.request_id)
+                }
+                PendingOp::Write => {
+                    state.write_tx.as_ref().map(|(id, _)| *id) == Some(self.request_id)
+                }
             };
             // A P1 review finding: clearing unconditionally here reset a
             // *replacement* request's slot too whenever this guard outlived
@@ -2434,11 +2686,18 @@ impl Drop for ConnectGuard {
 /// Completion of a queued server notification.
 #[no_mangle]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onNotifySent<'local>(
-    _env: JNIEnv<'local>, _class: JClass<'local>, native_handle: jlong, request_id: jlong,
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    native_handle: jlong,
+    request_id: jlong,
     success: jboolean,
 ) {
     let inner = unsafe { inner_from_handle(native_handle) };
-    let waiter = inner.notify_waiters.lock().unwrap().remove(&(request_id as u64));
+    let waiter = inner
+        .notify_waiters
+        .lock()
+        .unwrap()
+        .remove(&(request_id as u64));
     if let Some(tx) = waiter {
         let _ = tx.send(success != 0);
     }

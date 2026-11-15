@@ -3,7 +3,9 @@ use std::sync::Arc;
 use tokio_stream::StreamExt;
 
 use crate::entities::error::Result;
-use crate::entities::models::{CharacteristicUuid, GattEvent, GattServiceSpec, PeerAddress, RadioStatus};
+use crate::entities::models::{
+    CharacteristicUuid, GattEvent, GattServiceSpec, PeerAddress, RadioStatus,
+};
 use crate::hal::Driver;
 
 /// The peripheral role: hosts a GATT server that centrals connect to, and
@@ -43,9 +45,15 @@ impl Peripheral {
 
     /// Notifies one central, on one connection (`session`) if given.
     pub async fn notify_peer(
-        &self, peer: &PeerAddress, session: Option<u64>, characteristic: CharacteristicUuid, value: Vec<u8>,
+        &self,
+        peer: &PeerAddress,
+        session: Option<u64>,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
     ) -> Result<()> {
-        self.driver.notify_peer(peer, session, characteristic, value).await
+        self.driver
+            .notify_peer(peer, session, characteristic, value)
+            .await
     }
 
     /// Drops one central's connection to the server.
@@ -94,7 +102,9 @@ impl Drop for ServerHandle {
                     }
                 });
             }
-            Err(_) => log::warn!("GATT server handle dropped outside a Tokio runtime; it keeps running"),
+            Err(_) => {
+                log::warn!("GATT server handle dropped outside a Tokio runtime; it keeps running")
+            }
         }
     }
 }
@@ -111,17 +121,28 @@ impl Drop for ServerHandle {
 /// Fini was already calling by hand before the generation-race fix), and
 /// simpler than tracking whether a matching `Off` came first.
 fn spawn_recovery(
-    driver: Arc<dyn Driver>, service: GattServiceSpec, mut events: crate::hal::BoxStream<GattEvent>,
+    driver: Arc<dyn Driver>,
+    service: GattServiceSpec,
+    mut events: crate::hal::BoxStream<GattEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(event) = events.next().await {
-            if let GattEvent::RadioChanged { status: RadioStatus::On } = event {
+            if let GattEvent::RadioChanged {
+                status: RadioStatus::On,
+            } = event
+            {
                 // With the latest `update_advertisement`'s data, so an update
                 // survives a power cycle; nothing once it was stopped.
-                let Some(spec) = driver.served_service().filter(|served| served.same_service(&service)) else {
+                let Some(spec) = driver
+                    .served_service()
+                    .filter(|served| served.same_service(&service))
+                else {
                     continue;
                 };
-                log::info!("serve: radio recovered, re-registering service {}", service.uuid.0);
+                log::info!(
+                    "serve: radio recovered, re-registering service {}",
+                    service.uuid.0
+                );
                 if let Err(err) = driver.advertise(spec).await {
                     log::warn!("serve: failed to re-register after radio recovery: {err}");
                 }

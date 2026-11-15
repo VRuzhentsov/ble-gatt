@@ -62,7 +62,10 @@ fn every_kotlin_external_fun_has_a_rust_export_and_back() {
     let declared = names_after(&kotlin, "external fun ");
     let exported = names_after(&rust, &format!("fn {JNI_EXPORT_PREFIX}"));
     assert!(!declared.is_empty(), "no external funs found in Native.kt");
-    assert_eq!(declared, exported, "Native.kt externs (left) and Rust JNI exports (right) differ");
+    assert_eq!(
+        declared, exported,
+        "Native.kt externs (left) and Rust JNI exports (right) differ"
+    );
 }
 
 /// Source-level guard; compiled descriptors can also be checked with `javap`.
@@ -91,7 +94,10 @@ fn scan_start_status_and_abi_match_on_both_sides() {
     assert!(scan.contains("adapter?.bluetoothLeScanner ?: return SCAN_UNAVAILABLE"));
     assert!(scan.contains("return SCAN_STARTED"));
     assert!(scan.contains("if (scanCallback === callback) scanCallback = null"));
-    assert!(scan.contains("throw error"), "scan exceptions must reach JNI after ownership rollback");
+    assert!(
+        scan.contains("throw error"),
+        "scan exceptions must reach JNI after ownership rollback"
+    );
     assert!(rust.contains("const BRIDGE_ABI_VERSION: i32 = 7;"));
     assert!(kotlin.contains("fun bridgeAbiVersion(): Int = 7"));
 }
@@ -103,18 +109,24 @@ fn android_context_is_supplied_by_the_registered_plugin_not_tao_statics() {
     let manifest = read("Cargo.toml");
     let context = read("src/android_context.rs");
     let plugin = read(&format!("{KOTLIN_DIR}/BleGattPlugin.kt"));
-    assert!(!manifest.lines().any(|line| line.starts_with("tao =")),
-        "a plugin-local Tao dependency has Android statics distinct from the app runtime");
+    assert!(
+        !manifest.lines().any(|line| line.starts_with("tao =")),
+        "a plugin-local Tao dependency has Android statics distinct from the app runtime"
+    );
     assert!(!context.contains("main_android_context"));
     assert!(plugin.contains("initializeContext(activity.applicationContext)"));
-    assert!(plugin.contains("private external fun initializeContext(context: android.content.Context)"));
+    assert!(
+        plugin.contains("private external fun initializeContext(context: android.content.Context)")
+    );
     assert!(context.contains("fn Java_dev_blegatt_BleGattPlugin_initializeContext("));
     let compact: String = context.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(compact.contains("env.get_java_vm()"));
     assert!(compact.contains("env.new_global_ref(context)"));
     let initialize = context.split("fn initialize(").nth(1).unwrap();
-    assert!(!initialize.contains("initialize_android_context"),
-        "the runtime may already own ndk-context; plugin registration must not initialize it again");
+    assert!(
+        !initialize.contains("initialize_android_context"),
+        "the runtime may already own ndk-context; plugin registration must not initialize it again"
+    );
     let plugin_rust = read("src/lib.rs");
     assert!(plugin_rust.contains("AndroidDriver::with_context("));
     let driver = read(DRIVER);
@@ -136,7 +148,13 @@ fn every_bridge_method_rust_calls_exists_in_kotlin() {
     let rust = read(DRIVER);
     let defined = names_after(&kotlin, "fun ");
     let called = called_methods(&rust);
-    assert!(!called.is_empty(), "no JNI method calls found in the Android driver");
+    assert!(
+        !called.is_empty(),
+        "no JNI method calls found in the Android driver"
+    );
     let missing: Vec<_> = called.difference(&defined).collect();
-    assert!(missing.is_empty(), "Rust calls BleGattBridge methods Kotlin does not define: {missing:?}");
+    assert!(
+        missing.is_empty(),
+        "Rust calls BleGattBridge methods Kotlin does not define: {missing:?}"
+    );
 }

@@ -1,9 +1,8 @@
 # BLE APIs and peer ownership
 
 `ble-gatt` carries bytes. It does not authenticate or encrypt them.
-[ADR-0012](adr/0012-discovery-like-nearby.md) describes the managed protocol now
-implemented in the working tree. Integrated acceptance remains pending; this
-refactor is not published or hardware-accepted.
+[ADR-0012](adr/0012-discovery-like-nearby.md) describes the managed protocol
+implemented in this PR. Software checks do not establish hardware acceptance.
 
 ## Choose an API
 
@@ -94,14 +93,21 @@ five-second I/O bound; expiry ends the generation. Native end or generation
 cancellation interrupts pending admission without waiting for application capacity.
 Clones still share one receiver and one receive-gap signal.
 
-- `release(self).await` releases one scoped use. The last use awaits retirement.
+- `release(self).await` releases one scoped use. The last use awaits retirement,
+  including matching native cleanup that has already started.
   Dropping the last handle requests asynchronous retirement instead.
 - `channel.disconnect().await` invalidates that channel generation, including
-  its other handles. It cannot disconnect a later replacement generation.
-- `link.disconnect(endpoint).await` ends current attempts/channels for that core endpoint.
+  its other handles, and awaits its retirement. It cannot disconnect a later replacement generation.
+- `link.disconnect(endpoint).await` ends current attempts/channels for that core endpoint
+  and awaits their matching retirements, including those already in progress.
 - `set_advertising(false).await` hides the advertisement but retains serving,
   established sessions and subscriptions. It is not destructive server stop.
 - `close().await` ends worker communication and stops serving.
+
+A new request can report `AdapterBusy` while an earlier generation owns the
+address. Before reusing it, await that old local generation's last release or
+disconnect. A remote peer's completed disconnect is not a local cleanup barrier.
+These waits cover owned software cleanup, not physical OS/radio teardown.
 
 `close_reason()` is set before receive ends. Reasons are `LocalDisconnect`,
 `PeerDisconnect`, `LinkLost`, `ProtocolError`, `Released` and `Shutdown`.
@@ -136,7 +142,6 @@ authorize replacement. Unexpected `LinkLost` remains recoverable.
 A fresh explicit iroh connect with hooks, or a separately acquired and attached
 core channel, authorizes a replacement. Scoped release is not global disconnect.
 This is the existing authorization contract, not a new recovery mode.
-Integrated proof of the idle-close/new-authorization race remains pending.
 
 ## Raw APIs and lifetime limits
 

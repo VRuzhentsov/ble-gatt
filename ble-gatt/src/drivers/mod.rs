@@ -21,7 +21,8 @@ use crate::hal::Driver;
 /// failures and critical-port lag must not use this constructor.
 fn notification_receive_gap() -> crate::entities::error::BleError {
     crate::entities::error::BleError::ReceiveGap(
-        "notification queue overflowed: payloads were dropped and at least one message is lost".into(),
+        "notification queue overflowed: payloads were dropped and at least one message is lost"
+            .into(),
     )
 }
 

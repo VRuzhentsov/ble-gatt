@@ -8,16 +8,16 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use tokio::sync::mpsc;
 use crate::drivers::event_bus::EventBus;
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
-use crate::hal::BoxStream;
 use crate::entities::error::{BleError, Result};
 use crate::entities::models::{
     CharacteristicUuid, DiscoveredPeer, GattCharacteristicSpec, GattEvent, GattServiceSpec,
     PeerAddress, Role, ServiceUuid, WriteType,
 };
+use crate::hal::BoxStream;
 
 /// Live notify sessions for one characteristic, keyed by subscriber.
 type NotifySessions = HashMap<PeerAddress, mpsc::UnboundedSender<Result<Vec<u8>>>>;
@@ -79,10 +79,19 @@ impl LocalRadio {
         self.disconnect_log.lock().unwrap().clone()
     }
 
-    pub(crate) fn simulate_loss_for_session(&self, central: &PeerAddress, peer: &PeerAddress, session: u64) {
+    pub(crate) fn simulate_loss_for_session(
+        &self,
+        central: &PeerAddress,
+        peer: &PeerAddress,
+        session: u64,
+    ) {
         self.emit(
             central,
-            GattEvent::Disconnected { peer: peer.clone(), local_role: Role::Central, session: Some(session) },
+            GattEvent::Disconnected {
+                peer: peer.clone(),
+                local_role: Role::Central,
+                session: Some(session),
+            },
         );
     }
 
@@ -90,7 +99,11 @@ impl LocalRadio {
         self.emit(to, GattEvent::Lagged { dropped });
     }
 
-    pub(crate) fn simulate_notification_gap(&self, peripheral: &PeerAddress, central: &PeerAddress) {
+    pub(crate) fn simulate_notification_gap(
+        &self,
+        peripheral: &PeerAddress,
+        central: &PeerAddress,
+    ) {
         let peripherals = self.peripherals.lock().unwrap();
         if let Some(state) = peripherals.get(peripheral) {
             for peers in state.subscribers.values() {
@@ -111,17 +124,38 @@ impl LocalRadio {
         self.drop_subscriptions(peripheral, central);
         self.emit(
             peripheral,
-            GattEvent::Disconnected { peer: central.clone(), local_role: Role::Peripheral, session },
+            GattEvent::Disconnected {
+                peer: central.clone(),
+                local_role: Role::Peripheral,
+                session,
+            },
         );
     }
 
     /// Extracted verbatim from the old `MockDriver::simulate_peer_loss` body
     /// — `host` is the peripheral whose view of `peer` is being cleared.
     pub(crate) fn simulate_peer_loss(&self, host: &PeerAddress, peer: &PeerAddress) {
-        self.live_sessions.lock().unwrap().remove(&(peer.clone(), host.clone()));
+        self.live_sessions
+            .lock()
+            .unwrap()
+            .remove(&(peer.clone(), host.clone()));
         self.drop_subscriptions(host, peer);
-        self.emit(host, GattEvent::Disconnected { peer: peer.clone(), local_role: Role::Peripheral, session: None });
-        self.emit(peer, GattEvent::Disconnected { peer: host.clone(), local_role: Role::Central, session: None });
+        self.emit(
+            host,
+            GattEvent::Disconnected {
+                peer: peer.clone(),
+                local_role: Role::Peripheral,
+                session: None,
+            },
+        );
+        self.emit(
+            peer,
+            GattEvent::Disconnected {
+                peer: host.clone(),
+                local_role: Role::Central,
+                session: None,
+            },
+        );
     }
 
     pub(crate) fn stall_subscribe(&self, delay: std::time::Duration) {
@@ -129,7 +163,10 @@ impl LocalRadio {
     }
 
     pub(crate) fn stall_connect(&self, peer: &PeerAddress, delay: std::time::Duration) {
-        self.connect_delay.lock().unwrap().insert(peer.clone(), delay);
+        self.connect_delay
+            .lock()
+            .unwrap()
+            .insert(peer.clone(), delay);
     }
 
     pub(crate) fn arm_scan_failure(&self, message: impl Into<String>) {
@@ -137,8 +174,11 @@ impl LocalRadio {
     }
 
     pub(crate) fn set_advertisement_data(
-        &self, peer: &PeerAddress, manufacturer_data: BTreeMap<u16, Vec<u8>>,
-        service_data: BTreeMap<ServiceUuid, Vec<u8>>, rssi: Option<i16>,
+        &self,
+        peer: &PeerAddress,
+        manufacturer_data: BTreeMap<u16, Vec<u8>>,
+        service_data: BTreeMap<ServiceUuid, Vec<u8>>,
+        rssi: Option<i16>,
     ) {
         if let Some(state) = self.peripherals.lock().unwrap().get_mut(peer) {
             state.manufacturer_data = manufacturer_data;
@@ -177,14 +217,28 @@ impl LocalRadio {
             // entries to a receiver's lifetime), so this is diagnostic
             // evidence for the next investigation, not an asserted fault.
             if let Err(err) = tx.send(event) {
-                log::debug!("emit: {} has no live event receiver right now, discarding {:?}", to.0, err.0);
+                log::debug!(
+                    "emit: {} has no live event receiver right now, discarding {:?}",
+                    to.0,
+                    err.0
+                );
             }
         }
     }
 
     /// Refuse to act when a newer connection to this peer has superseded us.
-    fn ensure_current(&self, session: u64, central: &PeerAddress, peripheral: &PeerAddress) -> Result<()> {
-        let current = self.live_sessions.lock().unwrap().get(&(central.clone(), peripheral.clone())).copied();
+    fn ensure_current(
+        &self,
+        session: u64,
+        central: &PeerAddress,
+        peripheral: &PeerAddress,
+    ) -> Result<()> {
+        let current = self
+            .live_sessions
+            .lock()
+            .unwrap()
+            .get(&(central.clone(), peripheral.clone()))
+            .copied();
         match current {
             Some(now) if now == session => Ok(()),
             _ => Err(BleError::NotConnected(peripheral.0.clone())),
@@ -194,19 +248,29 @@ impl LocalRadio {
     /// Reject a characteristic the peripheral never advertised with the
     /// property this operation needs.
     fn require_property(
-        &self, peripheral: &PeerAddress, characteristic: CharacteristicUuid,
-        has: impl Fn(&GattCharacteristicSpec) -> bool, property: &str,
+        &self,
+        peripheral: &PeerAddress,
+        characteristic: CharacteristicUuid,
+        has: impl Fn(&GattCharacteristicSpec) -> bool,
+        property: &str,
     ) -> Result<()> {
         let peripherals = self.peripherals.lock().unwrap();
-        let state = peripherals.get(peripheral).ok_or_else(|| BleError::NotConnected(peripheral.0.clone()))?;
+        let state = peripherals
+            .get(peripheral)
+            .ok_or_else(|| BleError::NotConnected(peripheral.0.clone()))?;
         let spec = state
             .service
             .characteristics
             .iter()
             .find(|spec| spec.uuid == characteristic)
-            .ok_or_else(|| BleError::Gatt(format!("unknown characteristic {}", characteristic.0)))?;
+            .ok_or_else(|| {
+                BleError::Gatt(format!("unknown characteristic {}", characteristic.0))
+            })?;
         if !has(spec) {
-            return Err(BleError::Gatt(format!("characteristic {} is not {property}", characteristic.0)));
+            return Err(BleError::Gatt(format!(
+                "characteristic {} is not {property}",
+                characteristic.0
+            )));
         }
         Ok(())
     }
@@ -214,12 +278,16 @@ impl LocalRadio {
     // --- Driver/GattConnection-driving methods ---
 
     pub(crate) async fn scan(
-        &self, requester: &PeerAddress, service: ServiceUuid,
+        &self,
+        requester: &PeerAddress,
+        service: ServiceUuid,
     ) -> Result<(Vec<DiscoveredPeer>, Option<String>)> {
         let peripherals = self.peripherals.lock().unwrap();
         let matches: Vec<DiscoveredPeer> = peripherals
             .iter()
-            .filter(|(addr, state)| *addr != requester && state.service.uuid == service && state.advertising_enabled)
+            .filter(|(addr, state)| {
+                *addr != requester && state.service.uuid == service && state.advertising_enabled
+            })
             .map(|(addr, state)| DiscoveredPeer {
                 address: addr.clone(),
                 name: state.service.local_name.clone(),
@@ -242,20 +310,37 @@ impl LocalRadio {
             let peripherals = self.peripherals.lock().unwrap();
             peripherals
                 .get(peer)
-                .ok_or_else(|| BleError::ConnectFailed { peer: peer.0.clone(), reason: "peer is not advertising".to_string() })?;
+                .ok_or_else(|| BleError::ConnectFailed {
+                    peer: peer.0.clone(),
+                    reason: "peer is not advertising".to_string(),
+                })?;
         }
         // Only the central's own view is emitted here. The *peripheral*
         // learns about this peer from `subscribe`, matching both real
         // drivers: announcing at connection time would let `serve` yield a
         // channel before the notify path exists, so a server that greets
         // immediately would fail with "no live notify session".
-        self.emit(central, GattEvent::Connected { peer: peer.clone(), local_role: Role::Central, session: None });
+        self.emit(
+            central,
+            GattEvent::Connected {
+                peer: peer.clone(),
+                local_role: Role::Central,
+                session: None,
+            },
+        );
         let session = self.next_session.fetch_add(1, Ordering::Relaxed);
-        self.live_sessions.lock().unwrap().insert((central.clone(), peer.clone()), session);
+        self.live_sessions
+            .lock()
+            .unwrap()
+            .insert((central.clone(), peer.clone()), session);
         Ok(session)
     }
 
-    pub(crate) async fn advertise(&self, address: &PeerAddress, service: GattServiceSpec) -> Result<()> {
+    pub(crate) async fn advertise(
+        &self,
+        address: &PeerAddress,
+        service: GattServiceSpec,
+    ) -> Result<()> {
         let mut values = HashMap::new();
         let mut subscribers = HashMap::new();
         for characteristic in &service.characteristics {
@@ -283,11 +368,20 @@ impl LocalRadio {
 
     /// Swap the advertisement data only: values and subscribers stay, so
     /// every central keeps its subscription.
-    pub(crate) async fn update_advertisement(&self, address: &PeerAddress, service: GattServiceSpec) -> Result<()> {
+    pub(crate) async fn update_advertisement(
+        &self,
+        address: &PeerAddress,
+        service: GattServiceSpec,
+    ) -> Result<()> {
         let mut peripherals = self.peripherals.lock().unwrap();
-        let state = peripherals.get_mut(address).ok_or_else(|| BleError::Gatt("not advertising".to_string()))?;
+        let state = peripherals
+            .get_mut(address)
+            .ok_or_else(|| BleError::Gatt("not advertising".to_string()))?;
         if !state.service.same_service(&service) {
-            return Err(BleError::Gatt(format!("not serving service {} with these characteristics", service.uuid.0)));
+            return Err(BleError::Gatt(format!(
+                "not serving service {} with these characteristics",
+                service.uuid.0
+            )));
         }
         state.manufacturer_data = service.manufacturer_data.clone();
         state.service_data = service.service_data.clone();
@@ -297,21 +391,31 @@ impl LocalRadio {
 
     /// Replace the value returned by reads of `characteristic`. Keep existing subscriptions.
     pub(crate) async fn set_characteristic_value(
-        &self, address: &PeerAddress, characteristic: CharacteristicUuid, value: Vec<u8>,
+        &self,
+        address: &PeerAddress,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
     ) -> Result<()> {
         let mut peripherals = self.peripherals.lock().unwrap();
-        let state = peripherals.get_mut(address).ok_or_else(|| BleError::Gatt("not advertising".to_string()))?;
-        let stored_value = state
-            .values
-            .get_mut(&characteristic)
-            .ok_or_else(|| BleError::Gatt(format!("characteristic {} is not served", characteristic.0)))?;
+        let state = peripherals
+            .get_mut(address)
+            .ok_or_else(|| BleError::Gatt("not advertising".to_string()))?;
+        let stored_value = state.values.get_mut(&characteristic).ok_or_else(|| {
+            BleError::Gatt(format!("characteristic {} is not served", characteristic.0))
+        })?;
         *stored_value = value;
         Ok(())
     }
 
-    pub(crate) async fn set_advertising_enabled(&self, address: &PeerAddress, enabled: bool) -> Result<()> {
+    pub(crate) async fn set_advertising_enabled(
+        &self,
+        address: &PeerAddress,
+        enabled: bool,
+    ) -> Result<()> {
         let mut peripherals = self.peripherals.lock().unwrap();
-        let state = peripherals.get_mut(address).ok_or_else(|| BleError::Gatt("nothing is served".into()))?;
+        let state = peripherals
+            .get_mut(address)
+            .ok_or_else(|| BleError::Gatt("nothing is served".into()))?;
         state.advertising_enabled = enabled;
         Ok(())
     }
@@ -326,8 +430,11 @@ impl LocalRadio {
             let peripherals = self.peripherals.lock().unwrap();
             match peripherals.get(address) {
                 Some(state) => {
-                    let unique: HashSet<PeerAddress> =
-                        state.subscribers.values().flat_map(|peers| peers.keys().cloned()).collect();
+                    let unique: HashSet<PeerAddress> = state
+                        .subscribers
+                        .values()
+                        .flat_map(|peers| peers.keys().cloned())
+                        .collect();
                     unique.into_iter().collect()
                 }
                 None => Vec::new(),
@@ -335,16 +442,40 @@ impl LocalRadio {
         };
         self.peripherals.lock().unwrap().remove(address);
         for peer in served {
-            self.emit(address, GattEvent::Disconnected { peer: peer.clone(), local_role: Role::Peripheral, session: None });
-            self.emit(&peer, GattEvent::Disconnected { peer: address.clone(), local_role: Role::Central, session: None });
+            self.emit(
+                address,
+                GattEvent::Disconnected {
+                    peer: peer.clone(),
+                    local_role: Role::Peripheral,
+                    session: None,
+                },
+            );
+            self.emit(
+                &peer,
+                GattEvent::Disconnected {
+                    peer: address.clone(),
+                    local_role: Role::Central,
+                    session: None,
+                },
+            );
         }
         Ok(())
     }
 
-    pub(crate) async fn notify(&self, address: &PeerAddress, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
+    pub(crate) async fn notify(
+        &self,
+        address: &PeerAddress,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
+    ) -> Result<()> {
         let peripherals = self.peripherals.lock().unwrap();
-        let state = peripherals.get(address).ok_or_else(|| BleError::Gatt("not advertising".to_string()))?;
-        let peers = state.subscribers.get(&characteristic).ok_or_else(|| BleError::Gatt("unknown characteristic".to_string()))?;
+        let state = peripherals
+            .get(address)
+            .ok_or_else(|| BleError::Gatt("not advertising".to_string()))?;
+        let peers = state
+            .subscribers
+            .get(&characteristic)
+            .ok_or_else(|| BleError::Gatt("unknown characteristic".to_string()))?;
         let mut delivered = false;
         for tx in peers.values() {
             if tx.send(Ok(value.clone())).is_ok() {
@@ -358,63 +489,129 @@ impl LocalRadio {
     }
 
     pub(crate) async fn notify_peer(
-        &self, address: &PeerAddress, peer: &PeerAddress, session: Option<u64>,
-        characteristic: CharacteristicUuid, value: Vec<u8>,
+        &self,
+        address: &PeerAddress,
+        peer: &PeerAddress,
+        session: Option<u64>,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
     ) -> Result<()> {
         if let Some(session) = session {
-            let live = self.live_sessions.lock().unwrap().get(&(peer.clone(), address.clone())).copied();
+            let live = self
+                .live_sessions
+                .lock()
+                .unwrap()
+                .get(&(peer.clone(), address.clone()))
+                .copied();
             if live != Some(session) {
                 return Err(BleError::NotConnected(peer.0.clone()));
             }
         }
         let peripherals = self.peripherals.lock().unwrap();
-        let state = peripherals.get(address).ok_or_else(|| BleError::Gatt("not advertising".to_string()))?;
-        let peers = state.subscribers.get(&characteristic).ok_or_else(|| BleError::Gatt("unknown characteristic".to_string()))?;
-        let tx = peers.get(peer).ok_or_else(|| BleError::Gatt(format!("{} has no live notify session", peer.0)))?;
-        tx.send(Ok(value)).map_err(|_| BleError::Gatt(format!("{} has no live notify session", peer.0)))
+        let state = peripherals
+            .get(address)
+            .ok_or_else(|| BleError::Gatt("not advertising".to_string()))?;
+        let peers = state
+            .subscribers
+            .get(&characteristic)
+            .ok_or_else(|| BleError::Gatt("unknown characteristic".to_string()))?;
+        let tx = peers
+            .get(peer)
+            .ok_or_else(|| BleError::Gatt(format!("{} has no live notify session", peer.0)))?;
+        tx.send(Ok(value))
+            .map_err(|_| BleError::Gatt(format!("{} has no live notify session", peer.0)))
     }
 
-    pub(crate) async fn disconnect_peer(&self, address: &PeerAddress, peer: &PeerAddress, session: Option<u64>) -> Result<()> {
+    pub(crate) async fn disconnect_peer(
+        &self,
+        address: &PeerAddress,
+        peer: &PeerAddress,
+        session: Option<u64>,
+    ) -> Result<()> {
         if let Some(session) = session {
-            let live = self.live_sessions.lock().unwrap().get(&(peer.clone(), address.clone())).copied();
+            let live = self
+                .live_sessions
+                .lock()
+                .unwrap()
+                .get(&(peer.clone(), address.clone()))
+                .copied();
             if live != Some(session) {
                 return Ok(());
             }
         }
-        self.emit(peer, GattEvent::Disconnected { peer: address.clone(), local_role: Role::Central, session: None });
-        self.emit(address, GattEvent::Disconnected { peer: peer.clone(), local_role: Role::Peripheral, session: None });
+        self.emit(
+            peer,
+            GattEvent::Disconnected {
+                peer: address.clone(),
+                local_role: Role::Central,
+                session: None,
+            },
+        );
+        self.emit(
+            address,
+            GattEvent::Disconnected {
+                peer: peer.clone(),
+                local_role: Role::Peripheral,
+                session: None,
+            },
+        );
         self.drop_subscriptions(address, peer);
-        self.live_sessions.lock().unwrap().remove(&(peer.clone(), address.clone()));
+        self.live_sessions
+            .lock()
+            .unwrap()
+            .remove(&(peer.clone(), address.clone()));
         Ok(())
     }
 
     pub(crate) async fn read(
-        &self, session: u64, central: &PeerAddress, peripheral: &PeerAddress, characteristic: CharacteristicUuid,
+        &self,
+        session: u64,
+        central: &PeerAddress,
+        peripheral: &PeerAddress,
+        characteristic: CharacteristicUuid,
     ) -> Result<Vec<u8>> {
         self.ensure_current(session, central, peripheral)?;
         self.require_property(peripheral, characteristic, |spec| spec.readable, "readable")?;
         let peripherals = self.peripherals.lock().unwrap();
-        let state = peripherals.get(peripheral).ok_or_else(|| BleError::NotConnected(peripheral.0.clone()))?;
-        state.values.get(&characteristic).cloned().ok_or_else(|| BleError::Gatt("unknown characteristic".to_string()))
+        let state = peripherals
+            .get(peripheral)
+            .ok_or_else(|| BleError::NotConnected(peripheral.0.clone()))?;
+        state
+            .values
+            .get(&characteristic)
+            .cloned()
+            .ok_or_else(|| BleError::Gatt("unknown characteristic".to_string()))
     }
 
     pub(crate) async fn write_with_type(
-        &self, session: u64, central: &PeerAddress, peripheral: &PeerAddress, characteristic: CharacteristicUuid,
-        value: Vec<u8>, _write_type: WriteType,
+        &self,
+        session: u64,
+        central: &PeerAddress,
+        peripheral: &PeerAddress,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
+        _write_type: WriteType,
     ) -> Result<()> {
         self.ensure_current(session, central, peripheral)?;
         // Validate against the advertised spec before mutating anything.
         {
             let peripherals = self.peripherals.lock().unwrap();
-            let state = peripherals.get(peripheral).ok_or_else(|| BleError::NotConnected(peripheral.0.clone()))?;
+            let state = peripherals
+                .get(peripheral)
+                .ok_or_else(|| BleError::NotConnected(peripheral.0.clone()))?;
             let spec = state
                 .service
                 .characteristics
                 .iter()
                 .find(|spec| spec.uuid == characteristic)
-                .ok_or_else(|| BleError::Gatt(format!("unknown characteristic {}", characteristic.0)))?;
+                .ok_or_else(|| {
+                    BleError::Gatt(format!("unknown characteristic {}", characteristic.0))
+                })?;
             if !spec.writable {
-                return Err(BleError::Gatt(format!("characteristic {} is not writable", characteristic.0)));
+                return Err(BleError::Gatt(format!(
+                    "characteristic {} is not writable",
+                    characteristic.0
+                )));
             }
         }
         // The mock delivers both write types identically: it has no real
@@ -422,7 +619,9 @@ impl LocalRadio {
         // would invent a failure mode rather than reproduce one.
         {
             let mut peripherals = self.peripherals.lock().unwrap();
-            let state = peripherals.get_mut(peripheral).ok_or_else(|| BleError::NotConnected(peripheral.0.clone()))?;
+            let state = peripherals
+                .get_mut(peripheral)
+                .ok_or_else(|| BleError::NotConnected(peripheral.0.clone()))?;
             state.values.insert(characteristic, value.clone());
         }
         // Mirrors what the real drivers do: both re-emit `Connected` ahead
@@ -430,17 +629,29 @@ impl LocalRadio {
         // signal.
         self.emit(
             peripheral,
-            GattEvent::Connected { peer: central.clone(), local_role: Role::Peripheral, session: Some(session) },
+            GattEvent::Connected {
+                peer: central.clone(),
+                local_role: Role::Peripheral,
+                session: Some(session),
+            },
         );
         self.emit(
             peripheral,
-            GattEvent::CharacteristicWritten { peer: central.clone(), characteristic, value },
+            GattEvent::CharacteristicWritten {
+                peer: central.clone(),
+                characteristic,
+                value,
+            },
         );
         Ok(())
     }
 
     pub(crate) async fn subscribe(
-        &self, session: u64, central: &PeerAddress, peripheral: &PeerAddress, characteristic: CharacteristicUuid,
+        &self,
+        session: u64,
+        central: &PeerAddress,
+        peripheral: &PeerAddress,
+        characteristic: CharacteristicUuid,
     ) -> Result<BoxStream<Result<Vec<u8>>>> {
         self.ensure_current(session, central, peripheral)?;
         let delay = *self.subscribe_delay.lock().unwrap();
@@ -457,14 +668,24 @@ impl LocalRadio {
         // Lock order is `live_sessions` then `peripherals`, matching
         // `disconnect`; taking them the other way round here would have been
         // a deadlock rather than a fix.
-        self.require_property(peripheral, characteristic, |spec| spec.notifiable, "notifiable")?;
+        self.require_property(
+            peripheral,
+            characteristic,
+            |spec| spec.notifiable,
+            "notifiable",
+        )?;
         let live = self.live_sessions.lock().unwrap();
         if live.get(&(central.clone(), peripheral.clone())).copied() != Some(session) {
             return Err(BleError::NotConnected(peripheral.0.clone()));
         }
         let mut peripherals = self.peripherals.lock().unwrap();
-        let state = peripherals.get_mut(peripheral).ok_or_else(|| BleError::NotConnected(peripheral.0.clone()))?;
-        let peers = state.subscribers.get_mut(&characteristic).ok_or_else(|| BleError::Gatt("unknown characteristic".to_string()))?;
+        let state = peripherals
+            .get_mut(peripheral)
+            .ok_or_else(|| BleError::NotConnected(peripheral.0.clone()))?;
+        let peers = state
+            .subscribers
+            .get_mut(&characteristic)
+            .ok_or_else(|| BleError::Gatt("unknown characteristic".to_string()))?;
         let (tx, rx) = mpsc::unbounded_channel();
         peers.insert(central.clone(), tx);
         drop(peripherals);
@@ -474,18 +695,44 @@ impl LocalRadio {
         // notify path back to this central exists.
         self.emit(
             peripheral,
-            GattEvent::Connected { peer: central.clone(), local_role: Role::Peripheral, session: Some(session) },
+            GattEvent::Connected {
+                peer: central.clone(),
+                local_role: Role::Peripheral,
+                session: Some(session),
+            },
         );
         Ok(Box::pin(UnboundedReceiverStream::new(rx)))
     }
 
-    pub(crate) async fn disconnect(&self, session: u64, central: &PeerAddress, peripheral: &PeerAddress) -> Result<()> {
+    pub(crate) async fn disconnect(
+        &self,
+        session: u64,
+        central: &PeerAddress,
+        peripheral: &PeerAddress,
+    ) -> Result<()> {
         self.ensure_current(session, central, peripheral)?;
-        self.live_sessions.lock().unwrap().remove(&(central.clone(), peripheral.clone()));
+        self.live_sessions
+            .lock()
+            .unwrap()
+            .remove(&(central.clone(), peripheral.clone()));
         self.drop_subscriptions(peripheral, central);
         self.disconnect_log.lock().unwrap().push(peripheral.clone());
-        self.emit(peripheral, GattEvent::Disconnected { peer: central.clone(), local_role: Role::Peripheral, session: None });
-        self.emit(central, GattEvent::Disconnected { peer: peripheral.clone(), local_role: Role::Central, session: None });
+        self.emit(
+            peripheral,
+            GattEvent::Disconnected {
+                peer: central.clone(),
+                local_role: Role::Peripheral,
+                session: None,
+            },
+        );
+        self.emit(
+            central,
+            GattEvent::Disconnected {
+                peer: peripheral.clone(),
+                local_role: Role::Central,
+                session: None,
+            },
+        );
         Ok(())
     }
 
@@ -500,13 +747,33 @@ impl LocalRadio {
         let _ = self.stop_advertising(address).await;
         let sessions: Vec<(PeerAddress, PeerAddress)> = {
             let live = self.live_sessions.lock().unwrap();
-            live.keys().filter(|(central, _peripheral)| central == address).cloned().collect()
+            live.keys()
+                .filter(|(central, _peripheral)| central == address)
+                .cloned()
+                .collect()
         };
         for (central, peripheral) in sessions {
             self.drop_subscriptions(&peripheral, &central);
-            self.live_sessions.lock().unwrap().remove(&(central.clone(), peripheral.clone()));
-            self.emit(&peripheral, GattEvent::Disconnected { peer: central.clone(), local_role: Role::Peripheral, session: None });
-            self.emit(&central, GattEvent::Disconnected { peer: peripheral.clone(), local_role: Role::Central, session: None });
+            self.live_sessions
+                .lock()
+                .unwrap()
+                .remove(&(central.clone(), peripheral.clone()));
+            self.emit(
+                &peripheral,
+                GattEvent::Disconnected {
+                    peer: central.clone(),
+                    local_role: Role::Peripheral,
+                    session: None,
+                },
+            );
+            self.emit(
+                &central,
+                GattEvent::Disconnected {
+                    peer: peripheral.clone(),
+                    local_role: Role::Central,
+                    session: None,
+                },
+            );
         }
     }
 }

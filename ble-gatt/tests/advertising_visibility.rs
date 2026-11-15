@@ -1,21 +1,45 @@
 use ble_gatt::drivers::mock::{MockDriver, MockNetwork};
-use ble_gatt::{CapabilityReport, CharacteristicUuid, Driver, GattCharacteristicSpec, GattServiceSpec, PeerAddress, ServiceUuid};
+use ble_gatt::{
+    CapabilityReport, CharacteristicUuid, Driver, GattCharacteristicSpec, GattServiceSpec,
+    PeerAddress, ServiceUuid,
+};
 use std::sync::Arc;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 async fn preserves_sessions(network: Arc<MockNetwork>) {
-    let capabilities = CapabilityReport { central: true, peripheral: true };
-    let peripheral = MockDriver::new(PeerAddress("visibility-server".into()), network.clone(), capabilities);
-    let central = MockDriver::new(PeerAddress("visibility-client".into()), network, capabilities);
+    let capabilities = CapabilityReport {
+        central: true,
+        peripheral: true,
+    };
+    let peripheral = MockDriver::new(
+        PeerAddress("visibility-server".into()),
+        network.clone(),
+        capabilities,
+    );
+    let central = MockDriver::new(
+        PeerAddress("visibility-client".into()),
+        network,
+        capabilities,
+    );
     let service = ServiceUuid(Uuid::new_v4());
     let characteristic = CharacteristicUuid(Uuid::new_v4());
-    let spec = GattServiceSpec::new(service, vec![GattCharacteristicSpec {
-        uuid: characteristic, readable: true, writable: true, notifiable: true, initial_value: vec![1],
-    }]);
+    let spec = GattServiceSpec::new(
+        service,
+        vec![GattCharacteristicSpec {
+            uuid: characteristic,
+            readable: true,
+            writable: true,
+            notifiable: true,
+            initial_value: vec![1],
+        }],
+    );
     assert!(peripheral.set_advertising_enabled(true).await.is_err());
     peripheral.advertise(spec).await.unwrap();
-    let mut connection = central.connect(&PeerAddress("visibility-server".into())).await.unwrap();
+    let mut connection = central
+        .connect(&PeerAddress("visibility-server".into()))
+        .await
+        .unwrap();
     let session = connection.session();
     let mut notifications = connection.subscribe(characteristic).await.unwrap();
     peripheral.set_advertising_enabled(false).await.unwrap();
@@ -28,7 +52,15 @@ async fn preserves_sessions(network: Arc<MockNetwork>) {
     assert!(central.scan(service).await.unwrap().next().await.is_none());
     connection.write(characteristic, vec![2]).await.unwrap();
     assert_eq!(connection.read(characteristic).await.unwrap(), vec![2]);
-    peripheral.notify_peer(&PeerAddress("visibility-client".into()), session, characteristic, vec![3]).await.unwrap();
+    peripheral
+        .notify_peer(
+            &PeerAddress("visibility-client".into()),
+            session,
+            characteristic,
+            vec![3],
+        )
+        .await
+        .unwrap();
     assert_eq!(notifications.next().await.unwrap().unwrap(), vec![3]);
     peripheral.set_advertising_enabled(true).await.unwrap();
     assert!(central.scan(service).await.unwrap().next().await.is_some());

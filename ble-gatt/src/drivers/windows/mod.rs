@@ -32,8 +32,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use crate::drivers::event_bus::EventBus;
+use async_trait::async_trait;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use windows::core::{IInspectable, Ref};
@@ -43,12 +43,12 @@ use windows::Foundation::TypedEventHandler;
 
 use crate::entities::error::{BleError, Result};
 use crate::entities::models::{
-    CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress, RadioStatus,
-    Role, ServiceUuid,
+    CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress,
+    RadioStatus, Role, ServiceUuid,
 };
 use crate::hal::{BoxStream, Driver, GattConnection};
 
-use peripheral::{ServerPeer, Server};
+use peripheral::{Server, ServerPeer};
 use utils::{parse_address, radio_status_of};
 
 /// Scan results buffered for a slow consumer before new ones are dropped.
@@ -114,7 +114,9 @@ impl WindowsDriver {
     pub async fn new() -> Result<Self> {
         let adapter = default_adapter().await?;
         if !adapter.IsLowEnergySupported().unwrap_or(false) {
-            return Err(BleError::AdapterUnavailable("the Bluetooth adapter has no Bluetooth LE".into()));
+            return Err(BleError::AdapterUnavailable(
+                "the Bluetooth adapter has no Bluetooth LE".into(),
+            ));
         }
         let radio = match adapter.GetRadioAsync() {
             Ok(op) => op.await.ok(),
@@ -125,7 +127,10 @@ impl WindowsDriver {
             events_tx,
             next_id: AtomicU64::new(1),
             address_types: StdMutex::new(HashMap::new()),
-            scan: StdMutex::new(ScanState { generation: 0, active: false }),
+            scan: StdMutex::new(ScanState {
+                generation: 0,
+                active: false,
+            }),
             central_links: StdMutex::new(HashMap::new()),
             central_cleanup: StdMutex::new(HashMap::new()),
             server_lock: tokio::sync::Mutex::new(()),
@@ -138,21 +143,25 @@ impl WindowsDriver {
         let radio_token = inner.radio.as_ref().and_then(|radio| {
             let weak = Arc::downgrade(&inner);
             let last = StdMutex::new(radio_status_of(radio.State()));
-            let handler = TypedEventHandler::new(move |sender: Ref<Radio>, _: Ref<IInspectable>| {
-                let status = radio_status_of(sender.ok()?.State());
-                let mut last = last.lock().unwrap();
-                if *last != status {
-                    *last = status;
-                    if let Some(inner) = weak.upgrade() {
-                        log::info!("radio: {status:?}");
-                        let _ = inner.events_tx.send(GattEvent::RadioChanged { status });
+            let handler =
+                TypedEventHandler::new(move |sender: Ref<Radio>, _: Ref<IInspectable>| {
+                    let status = radio_status_of(sender.ok()?.State());
+                    let mut last = last.lock().unwrap();
+                    if *last != status {
+                        *last = status;
+                        if let Some(inner) = weak.upgrade() {
+                            log::info!("radio: {status:?}");
+                            let _ = inner.events_tx.send(GattEvent::RadioChanged { status });
+                        }
                     }
-                }
-                Ok(())
-            });
+                    Ok(())
+                });
             radio.StateChanged(&handler).ok()
         });
-        log::info!("windows driver: ready, radio {:?}", inner.radio.as_ref().map(|r| radio_status_of(r.State())));
+        log::info!(
+            "windows driver: ready, radio {:?}",
+            inner.radio.as_ref().map(|r| radio_status_of(r.State()))
+        );
         Ok(Self { inner, radio_token })
     }
 }
@@ -169,11 +178,13 @@ impl Drop for WindowsDriver {
 }
 
 async fn default_adapter() -> Result<BluetoothAdapter> {
-    let op = BluetoothAdapter::GetDefaultAsync()
-        .map_err(|err| BleError::AdapterUnavailable(format!("BluetoothAdapter::GetDefaultAsync: {err}")))?;
+    let op = BluetoothAdapter::GetDefaultAsync().map_err(|err| {
+        BleError::AdapterUnavailable(format!("BluetoothAdapter::GetDefaultAsync: {err}"))
+    })?;
     // WinRT returns a null adapter, which `windows` reports as an error,
     // when the computer has no Bluetooth adapter.
-    op.await.map_err(|err| BleError::AdapterUnavailable(format!("no Bluetooth adapter: {err}")))
+    op.await
+        .map_err(|err| BleError::AdapterUnavailable(format!("no Bluetooth adapter: {err}")))
 }
 
 #[async_trait]
@@ -191,9 +202,15 @@ impl Driver for WindowsDriver {
         };
         let supports_low_energy = adapter.IsLowEnergySupported().unwrap_or(false);
         let central = supports_low_energy && adapter.IsCentralRoleSupported().unwrap_or(false);
-        let peripheral = supports_low_energy && adapter.IsPeripheralRoleSupported().unwrap_or(false);
-        log::info!("capabilities: le={supports_low_energy} central={central} peripheral={peripheral}");
-        CapabilityReport { central, peripheral }
+        let peripheral =
+            supports_low_energy && adapter.IsPeripheralRoleSupported().unwrap_or(false);
+        log::info!(
+            "capabilities: le={supports_low_energy} central={central} peripheral={peripheral}"
+        );
+        CapabilityReport {
+            central,
+            peripheral,
+        }
     }
 
     // --- Central role ---
@@ -202,7 +219,9 @@ impl Driver for WindowsDriver {
         let generation = {
             let mut scan = self.inner.scan.lock().unwrap();
             if scan.active {
-                return Err(BleError::Gatt("a scan is already active; concurrent scans are not supported".into()));
+                return Err(BleError::Gatt(
+                    "a scan is already active; concurrent scans are not supported".into(),
+                ));
             }
             scan.active = true;
             scan.generation += 1;
@@ -210,7 +229,10 @@ impl Driver for WindowsDriver {
         };
         match watcher::start(&self.inner, service, generation) {
             Ok(stream) => {
-                log::info!("scan: started for service {} generation={generation}", service.0);
+                log::info!(
+                    "scan: started for service {} generation={generation}",
+                    service.0
+                );
                 Ok(Box::pin(stream))
             }
             Err(err) => {
@@ -224,34 +246,59 @@ impl Driver for WindowsDriver {
     }
 
     async fn connect(&self, peer: &PeerAddress) -> Result<Box<dyn GattConnection>> {
-        let failed = |reason: String| BleError::ConnectFailed { peer: peer.0.clone(), reason };
-        let address = parse_address(&peer.0).ok_or_else(|| failed("not a Bluetooth address".into()))?;
+        let failed = |reason: String| BleError::ConnectFailed {
+            peer: peer.0.clone(),
+            reason,
+        };
+        let address =
+            parse_address(&peer.0).ok_or_else(|| failed("not a Bluetooth address".into()))?;
         let session = self.inner.next_id();
         {
             let mut links = self.inner.central_links.lock().unwrap();
             if links.contains_key(&peer.0) {
-                return Err(failed("a connection to this peer is already open or in progress".into()));
+                return Err(failed(
+                    "a connection to this peer is already open or in progress".into(),
+                ));
             }
             links.insert(peer.0.clone(), session);
         }
         // Release the pending connection slot on failure or cancellation.
-        let mut pending_link_guard =
-            device::LinkGuard { inner: self.inner.clone(), address: peer.0.clone(), session, armed: true };
+        let mut pending_link_guard = device::LinkGuard {
+            inner: self.inner.clone(),
+            address: peer.0.clone(),
+            session,
+            armed: true,
+        };
 
-        let address_type = self.inner.address_types.lock().unwrap().get(&address).copied();
-        let link = match tokio::time::timeout(CONNECT_TIMEOUT, device::open(address, address_type)).await {
+        let address_type = self
+            .inner
+            .address_types
+            .lock()
+            .unwrap()
+            .get(&address)
+            .copied();
+        let link = match tokio::time::timeout(CONNECT_TIMEOUT, device::open(address, address_type))
+            .await
+        {
             Err(_) => return Err(failed(format!("no answer in {CONNECT_TIMEOUT:?}"))),
             Ok(Err(reason)) => return Err(failed(reason)),
             Ok(Ok(link)) => link,
         };
-        let connection = device::WindowsGattConnection::new(self.inner.clone(), peer.0.clone(), session, link);
+        let connection =
+            device::WindowsGattConnection::new(self.inner.clone(), peer.0.clone(), session, link);
         let links = self.inner.central_links.lock().unwrap();
         if links.get(&peer.0) != Some(&session) {
             drop(links);
-            return Err(failed("the connection acquisition was cancelled by close".into()));
+            return Err(failed(
+                "the connection acquisition was cancelled by close".into(),
+            ));
         }
         pending_link_guard.armed = false;
-        log::info!("connect: {} connected session={session} mtu={}", peer.0, connection.mtu());
+        log::info!(
+            "connect: {} connected session={session} mtu={}",
+            peer.0,
+            connection.mtu()
+        );
         let _ = self.inner.events_tx.send(GattEvent::Connected {
             peer: peer.clone(),
             local_role: Role::Central,
@@ -282,10 +329,19 @@ impl Driver for WindowsDriver {
     async fn update_advertisement(&self, service: GattServiceSpec) -> Result<()> {
         service.validate()?;
         let _server_guard = self.inner.server_lock.lock().await;
-        let not_advertising = || BleError::Gatt("update_advertisement: nothing is being advertised".into());
-        let served = self.inner.served_service.lock().unwrap().clone().ok_or_else(not_advertising)?;
+        let not_advertising =
+            || BleError::Gatt("update_advertisement: nothing is being advertised".into());
+        let served = self
+            .inner
+            .served_service
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(not_advertising)?;
         if !served.same_service(&service) {
-            return Err(BleError::Gatt("update_advertisement: the spec describes a different service".into()));
+            return Err(BleError::Gatt(
+                "update_advertisement: the spec describes a different service".into(),
+            ));
         }
         let (provider, desired_visibility) = {
             let server = self.inner.server.lock().unwrap();
@@ -295,9 +351,12 @@ impl Driver for WindowsDriver {
         // Restart the provider advertisement only when its service data changes.
         // The GATT advertisement carries manufacturer data on Windows (ADR-0012).
         if desired_visibility
-            && peripheral::provider_service_data(&served) != peripheral::provider_service_data(&service)
+            && peripheral::provider_service_data(&served)
+                != peripheral::provider_service_data(&service)
         {
-            provider.StopAdvertising().map_err(|err| utils::win_err("StopAdvertising", err))?;
+            provider
+                .StopAdvertising()
+                .map_err(|err| utils::win_err("StopAdvertising", err))?;
             peripheral::start_provider_advertising(&provider, &service).await?;
         }
         *self.inner.served_service.lock().unwrap() = Some(service);
@@ -309,7 +368,11 @@ impl Driver for WindowsDriver {
         self.inner.served_service.lock().unwrap().clone()
     }
 
-    async fn set_characteristic_value(&self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
+    async fn set_characteristic_value(
+        &self,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
+    ) -> Result<()> {
         let _server_guard = self.inner.server_lock.lock().await;
         let server = self.inner.server.lock().unwrap();
         server
@@ -320,19 +383,29 @@ impl Driver for WindowsDriver {
 
     async fn set_advertising_enabled(&self, enabled: bool) -> Result<()> {
         let _server_guard = self.inner.server_lock.lock().await;
-        let service = self.inner.served_service.lock().unwrap().clone()
+        let service = self
+            .inner
+            .served_service
+            .lock()
+            .unwrap()
+            .clone()
             .ok_or_else(|| BleError::Gatt("advertising visibility: nothing is served".into()))?;
         let provider = {
             let mut server = self.inner.server.lock().unwrap();
-            let server = server.as_mut()
+            let server = server
+                .as_mut()
                 .ok_or_else(|| BleError::Gatt("advertising visibility: no GATT server".into()))?;
-            if enabled { server.desired_visibility = true; }
+            if enabled {
+                server.desired_visibility = true;
+            }
             server.provider.clone()
         };
         if enabled {
             peripheral::start_provider_advertising(&provider, &service).await
         } else {
-            provider.StopAdvertising().map_err(|err| utils::win_err("StopAdvertising", err))?;
+            provider
+                .StopAdvertising()
+                .map_err(|err| utils::win_err("StopAdvertising", err))?;
             if let Some(server) = self.inner.server.lock().unwrap().as_mut() {
                 server.desired_visibility = false;
             }
@@ -354,7 +427,14 @@ impl Driver for WindowsDriver {
     async fn close(&self) -> Result<()> {
         let stopped = self.stop_advertising().await;
         self.inner.central_links.lock().unwrap().clear();
-        let cleanup: Vec<_> = self.inner.central_cleanup.lock().unwrap().drain().map(|(_, cleanup)| cleanup).collect();
+        let cleanup: Vec<_> = self
+            .inner
+            .central_cleanup
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, cleanup)| cleanup)
+            .collect();
         for release in cleanup {
             release();
         }
@@ -370,28 +450,46 @@ impl Driver for WindowsDriver {
             if self.inner.is_excluded(&address) {
                 continue;
             }
-            if peripheral::notify_client(&local, &value, &client).await.is_ok() {
+            if peripheral::notify_client(&local, &value, &client)
+                .await
+                .is_ok()
+            {
                 delivered += 1;
             }
         }
         if delivered == 0 {
-            return Err(BleError::Gatt(format!("notify {}: no subscribed central received it", characteristic.0)));
+            return Err(BleError::Gatt(format!(
+                "notify {}: no subscribed central received it",
+                characteristic.0
+            )));
         }
         Ok(())
     }
 
     async fn notify_peer(
-        &self, peer: &PeerAddress, session: Option<u64>, characteristic: CharacteristicUuid, value: Vec<u8>,
+        &self,
+        peer: &PeerAddress,
+        session: Option<u64>,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
     ) -> Result<()> {
         let _server_guard = self.inner.server_lock.lock().await;
         {
             let peers = self.inner.server_peers.lock().unwrap();
-            let current = peers.get(&peer.0).ok_or_else(|| BleError::NotConnected(peer.0.clone()))?;
+            let current = peers
+                .get(&peer.0)
+                .ok_or_else(|| BleError::NotConnected(peer.0.clone()))?;
             if session.is_some_and(|session| session != current.session) {
-                return Err(BleError::NotConnected(format!("{} (session {session:?} has ended)", peer.0)));
+                return Err(BleError::NotConnected(format!(
+                    "{} (session {session:?} has ended)",
+                    peer.0
+                )));
             }
             if current.excluded {
-                return Err(BleError::NotConnected(format!("{} (excluded by this server)", peer.0)));
+                return Err(BleError::NotConnected(format!(
+                    "{} (excluded by this server)",
+                    peer.0
+                )));
             }
         }
         let client = self
@@ -400,7 +498,12 @@ impl Driver for WindowsDriver {
             .into_iter()
             .find(|(address, _)| *address == peer.0)
             .map(|(_, client)| client)
-            .ok_or_else(|| BleError::NotConnected(format!("{} is not subscribed to {}", peer.0, characteristic.0)))?;
+            .ok_or_else(|| {
+                BleError::NotConnected(format!(
+                    "{} is not subscribed to {}",
+                    peer.0, characteristic.0
+                ))
+            })?;
         let local = self.inner.local_characteristic(characteristic)?;
         peripheral::notify_client(&local, &value, &client).await
     }
@@ -450,12 +553,13 @@ impl Driver for WindowsDriver {
     }
 
     fn events(&self) -> BoxStream<GattEvent> {
-        let stream = BroadcastStream::new(self.inner.events_tx.subscribe()).map(|item| match item {
-            Ok(event) => event,
-            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(dropped)) => {
-                GattEvent::Lagged { dropped }
-            }
-        });
+        let stream =
+            BroadcastStream::new(self.inner.events_tx.subscribe()).map(|item| match item {
+                Ok(event) => event,
+                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(dropped)) => {
+                    GattEvent::Lagged { dropped }
+                }
+            });
         Box::pin(stream)
     }
 

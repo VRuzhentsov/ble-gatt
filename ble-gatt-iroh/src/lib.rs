@@ -1986,6 +1986,8 @@ mod tests {
             .unwrap()
             .unwrap();
         // A has closed its receive queue but cannot finish scoped release yet.
+        // Drain the client's generation without resuming the old server adapter task.
+        old_remote.release().await.unwrap();
         let (remote, new) = tokio::join!(
             async {
                 client

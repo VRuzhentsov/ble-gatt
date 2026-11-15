@@ -2,8 +2,8 @@
 
 The shared design is [ADR-0012](adr/0012-discovery-like-nearby.md).
 [ADR-0011](adr/0011-windows-winrt-driver.md) owns Windows-native choices.
-The managed core and iroh migration exist in the working tree. Final integrated
-verification is pending; this refactor is not published or hardware-accepted.
+The managed core and iroh migration are implemented in this PR. Software checks
+do not establish native hardware acceptance.
 
 ## Workspace boundaries
 

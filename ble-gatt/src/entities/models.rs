@@ -279,12 +279,16 @@ impl GattServiceSpec {
     pub(crate) fn same_service(&self, other: &GattServiceSpec) -> bool {
         self.uuid == other.uuid
             && self.characteristics.len() == other.characteristics.len()
-            && self.characteristics.iter().zip(&other.characteristics).all(|(current, proposed)| {
-                current.uuid == proposed.uuid
-                    && current.readable == proposed.readable
-                    && current.writable == proposed.writable
-                    && current.notifiable == proposed.notifiable
-            })
+            && self
+                .characteristics
+                .iter()
+                .zip(&other.characteristics)
+                .all(|(current, proposed)| {
+                    current.uuid == proposed.uuid
+                        && current.readable == proposed.readable
+                        && current.writable == proposed.writable
+                        && current.notifiable == proposed.notifiable
+                })
     }
 }
 
@@ -318,7 +322,9 @@ pub fn truncate_name(name: &str, max: usize) -> &str {
 /// device (a phone's system name), and reports that until the scan
 /// response arrives.
 pub fn advertised_name(
-    service: ServiceUuid, service_data: &BTreeMap<ServiceUuid, Vec<u8>>, platform_name: Option<String>,
+    service: ServiceUuid,
+    service_data: &BTreeMap<ServiceUuid, Vec<u8>>,
+    platform_name: Option<String>,
 ) -> Option<String> {
     service_data
         .get(&service)
@@ -334,19 +340,35 @@ mod tests {
     #[test]
     fn a_name_is_truncated_on_a_character_boundary() {
         assert_eq!(truncate_name("short", NAME_SERVICE_DATA_MAX_LEN), "short");
-        assert_eq!(truncate_name("Living room desktop", NAME_SERVICE_DATA_MAX_LEN), "Living room d");
+        assert_eq!(
+            truncate_name("Living room desktop", NAME_SERVICE_DATA_MAX_LEN),
+            "Living room d"
+        );
         // "é" is two bytes; cutting at 13 would split the one at 12..14.
-        assert_eq!(truncate_name("aaaaaaaaaaaaé", NAME_SERVICE_DATA_MAX_LEN), "aaaaaaaaaaaa");
+        assert_eq!(
+            truncate_name("aaaaaaaaaaaaé", NAME_SERVICE_DATA_MAX_LEN),
+            "aaaaaaaaaaaa"
+        );
     }
 
     #[test]
     fn the_service_data_name_wins_over_the_platform_name() {
         let service = ServiceUuid(uuid::Uuid::from_u128(1));
         let mut data = BTreeMap::new();
-        assert_eq!(advertised_name(service, &data, Some("cached".into())), Some("cached".into()));
+        assert_eq!(
+            advertised_name(service, &data, Some("cached".into())),
+            Some("cached".into())
+        );
         data.insert(service, b"Phone".to_vec());
-        assert_eq!(advertised_name(service, &data, Some("cached".into())), Some("Phone".into()));
+        assert_eq!(
+            advertised_name(service, &data, Some("cached".into())),
+            Some("Phone".into())
+        );
         data.insert(service, vec![0xFF, 0xFE]);
-        assert_eq!(advertised_name(service, &data, None), None, "not UTF-8: not a name");
+        assert_eq!(
+            advertised_name(service, &data, None),
+            None,
+            "not UTF-8: not a name"
+        );
     }
 }

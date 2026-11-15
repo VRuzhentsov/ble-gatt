@@ -7,8 +7,8 @@ checks, not passed scenarios.
 ## Status and scope
 
 The shared iroh diagnostic now uses core managed discovery, requests and
-independent incoming acceptance. Final integrated verification remains pending;
-this refactor is not published or hardware-accepted. Old candidate-model results
+independent incoming acceptance. Hardware acceptance remains pending;
+software checks are separate. Old candidate-model results
 do not certify the new protocol. Windows acceptance is listed in
 [ADR-0011](adr/0011-windows-winrt-driver.md#verification-and-known-limits).
 

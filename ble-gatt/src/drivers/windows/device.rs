@@ -33,9 +33,9 @@ use uuid::Uuid;
 use windows::core::{IInspectable, Ref};
 use windows::Devices::Bluetooth::GenericAttributeProfile::{
     GattCharacteristic, GattCharacteristicProperties, GattCharacteristicsResult,
-    GattClientCharacteristicConfigurationDescriptorValue, GattCommunicationStatus, GattDeviceService,
-    GattDeviceServicesResult, GattSession, GattSessionStatus, GattSessionStatusChangedEventArgs,
-    GattValueChangedEventArgs, GattWriteOption,
+    GattClientCharacteristicConfigurationDescriptorValue, GattCommunicationStatus,
+    GattDeviceService, GattDeviceServicesResult, GattSession, GattSessionStatus,
+    GattSessionStatusChangedEventArgs, GattValueChangedEventArgs, GattWriteOption,
 };
 use windows::Devices::Bluetooth::{
     BluetoothAddressType, BluetoothCacheMode, BluetoothConnectionStatus, BluetoothLEDevice,
@@ -47,7 +47,9 @@ use windows::Foundation::TypedEventHandler;
 use super::utils::{communication_error, from_buffer, from_guid, to_buffer, win_err};
 use super::{Inner, NOTIFY_QUEUE_DEPTH};
 use crate::entities::error::{BleError, Result};
-use crate::entities::models::{CharacteristicUuid, ConnectionPriority, GattEvent, PeerAddress, Role, WriteType};
+use crate::entities::models::{
+    CharacteristicUuid, ConnectionPriority, GattEvent, PeerAddress, Role, WriteType,
+};
 use crate::hal::{BoxStream, GattConnection, DEFAULT_ATT_MTU};
 
 /// How long an uncached discovery may take before the cached result is used
@@ -89,18 +91,32 @@ impl Drop for AcquiringLink {
 /// characteristic. WinRT opens the radio link lazily, at the first GATT
 /// request, so service discovery is what actually connects.
 pub(super) async fn open(
-    address: u64, address_type: Option<BluetoothAddressType>,
+    address: u64,
+    address_type: Option<BluetoothAddressType>,
 ) -> std::result::Result<OpenedLink, String> {
     let device_op = match address_type {
-        Some(kind) => BluetoothLEDevice::FromBluetoothAddressWithBluetoothAddressTypeAsync(address, kind),
+        Some(kind) => {
+            BluetoothLEDevice::FromBluetoothAddressWithBluetoothAddressTypeAsync(address, kind)
+        }
         None => BluetoothLEDevice::FromBluetoothAddressAsync(address),
     }
     .map_err(|err| format!("FromBluetoothAddressAsync: {err}"))?;
-    let device = device_op.await.map_err(|err| format!("unknown device: {err}"))?;
-    let mut acquired = AcquiringLink { device: Some(device.clone()), gatt_session: None, services: Vec::new() };
-    let device_id = device.BluetoothDeviceId().map_err(|err| format!("BluetoothDeviceId: {err}"))?;
-    let session_op = GattSession::FromDeviceIdAsync(&device_id).map_err(|err| format!("GattSession: {err}"))?;
-    let gatt_session = session_op.await.map_err(|err| format!("GattSession: {err}"))?;
+    let device = device_op
+        .await
+        .map_err(|err| format!("unknown device: {err}"))?;
+    let mut acquired = AcquiringLink {
+        device: Some(device.clone()),
+        gatt_session: None,
+        services: Vec::new(),
+    };
+    let device_id = device
+        .BluetoothDeviceId()
+        .map_err(|err| format!("BluetoothDeviceId: {err}"))?;
+    let session_op =
+        GattSession::FromDeviceIdAsync(&device_id).map_err(|err| format!("GattSession: {err}"))?;
+    let gatt_session = session_op
+        .await
+        .map_err(|err| format!("GattSession: {err}"))?;
     acquired.gatt_session = Some(gatt_session.clone());
     gatt_session
         .SetMaintainConnection(true)
@@ -117,18 +133,29 @@ pub(super) async fn open(
     }
     acquired.device.take();
     acquired.gatt_session.take();
-    Ok(OpenedLink { device, gatt_session, services: std::mem::take(&mut acquired.services), characteristics })
+    Ok(OpenedLink {
+        device,
+        gatt_session,
+        services: std::mem::take(&mut acquired.services),
+        characteristics,
+    })
 }
 
 async fn services_with_cache_mode(
-    device: &BluetoothLEDevice, mode: BluetoothCacheMode,
+    device: &BluetoothLEDevice,
+    mode: BluetoothCacheMode,
 ) -> windows::core::Result<GattDeviceServicesResult> {
     device.GetGattServicesWithCacheModeAsync(mode)?.await
 }
 
-async fn discover_services(device: &BluetoothLEDevice) -> std::result::Result<Vec<GattDeviceService>, String> {
-    let uncached =
-        tokio::time::timeout(GATT_CACHE_TIMEOUT, services_with_cache_mode(device, BluetoothCacheMode::Uncached)).await;
+async fn discover_services(
+    device: &BluetoothLEDevice,
+) -> std::result::Result<Vec<GattDeviceService>, String> {
+    let uncached = tokio::time::timeout(
+        GATT_CACHE_TIMEOUT,
+        services_with_cache_mode(device, BluetoothCacheMode::Uncached),
+    )
+    .await;
     let result = match uncached {
         Ok(result) => result,
         Err(_) => {
@@ -137,7 +164,9 @@ async fn discover_services(device: &BluetoothLEDevice) -> std::result::Result<Ve
         }
     }
     .map_err(|err| format!("GetGattServicesAsync: {err}"))?;
-    let status = result.Status().map_err(|err| format!("GetGattServicesAsync: {err}"))?;
+    let status = result
+        .Status()
+        .map_err(|err| format!("GetGattServicesAsync: {err}"))?;
     // Check the status first. An empty `Services` list can also mean discovery failed.
     if status != GattCommunicationStatus::Success {
         return Err(match status {
@@ -147,35 +176,51 @@ async fn discover_services(device: &BluetoothLEDevice) -> std::result::Result<Ve
         });
     }
     // Collected into a `Vec`: the WinRT list view is not `Send`.
-    Ok(result.Services().map_err(|err| format!("Services: {err}"))?.into_iter().collect())
+    Ok(result
+        .Services()
+        .map_err(|err| format!("Services: {err}"))?
+        .into_iter()
+        .collect())
 }
 
 async fn characteristics_with_cache_mode(
-    service: &GattDeviceService, mode: BluetoothCacheMode,
+    service: &GattDeviceService,
+    mode: BluetoothCacheMode,
 ) -> windows::core::Result<GattCharacteristicsResult> {
-    service.GetCharacteristicsWithCacheModeAsync(mode)?.into_future().await
+    service
+        .GetCharacteristicsWithCacheModeAsync(mode)?
+        .into_future()
+        .await
 }
 
 /// Every characteristic of `service`, or none when Windows cannot list
 /// them. btleplug also skips such a service instead of failing the
 /// connection.
 async fn discover_characteristics(service: &GattDeviceService) -> Vec<GattCharacteristic> {
-    let uncached =
-        tokio::time::timeout(GATT_CACHE_TIMEOUT, characteristics_with_cache_mode(service, BluetoothCacheMode::Uncached))
-            .await;
+    let uncached = tokio::time::timeout(
+        GATT_CACHE_TIMEOUT,
+        characteristics_with_cache_mode(service, BluetoothCacheMode::Uncached),
+    )
+    .await;
     let result = match uncached {
         Ok(result) => result,
         Err(_) => {
-            log::warn!("connect: uncached characteristic discovery timed out, using the Windows cache");
+            log::warn!(
+                "connect: uncached characteristic discovery timed out, using the Windows cache"
+            );
             characteristics_with_cache_mode(service, BluetoothCacheMode::Cached).await
         }
     };
     match result {
-        Ok(result) if result.Status() == Ok(GattCommunicationStatus::Success) => {
-            result.Characteristics().map(|list| list.into_iter().collect()).unwrap_or_default()
-        }
+        Ok(result) if result.Status() == Ok(GattCommunicationStatus::Success) => result
+            .Characteristics()
+            .map(|list| list.into_iter().collect())
+            .unwrap_or_default(),
         Ok(result) => {
-            log::debug!("connect: characteristics not listed (status {:?})", result.Status().map(|s| s.0));
+            log::debug!(
+                "connect: characteristics not listed (status {:?})",
+                result.Status().map(|s| s.0)
+            );
             Vec::new()
         }
         Err(err) => {
@@ -246,14 +291,16 @@ impl WindowsGattConnection {
             let weak = Arc::downgrade(&inner);
             let closed = closed.clone();
             let watched = address.clone();
-            let handler = TypedEventHandler::new(move |sender: Ref<BluetoothLEDevice>, _: Ref<IInspectable>| {
-                if sender.ok()?.ConnectionStatus()? == BluetoothConnectionStatus::Disconnected {
-                    if let Some(inner) = weak.upgrade() {
-                        link_closed(&inner, &watched, session, &closed);
+            let handler = TypedEventHandler::new(
+                move |sender: Ref<BluetoothLEDevice>, _: Ref<IInspectable>| {
+                    if sender.ok()?.ConnectionStatus()? == BluetoothConnectionStatus::Disconnected {
+                        if let Some(inner) = weak.upgrade() {
+                            link_closed(&inner, &watched, session, &closed);
+                        }
                     }
-                }
-                Ok(())
-            });
+                    Ok(())
+                },
+            );
             link.device.ConnectionStatusChanged(&handler).ok()
         };
         // A second signal: the session closes when Windows gives up on the
@@ -282,33 +329,38 @@ impl WindowsGattConnection {
         let services = link.services;
         let registered = subscriptions.clone();
         let released = closed.clone();
-        let priority_request = Arc::new(StdMutex::new(None::<BluetoothLEPreferredConnectionParametersRequest>));
+        let priority_request = Arc::new(StdMutex::new(
+            None::<BluetoothLEPreferredConnectionParametersRequest>,
+        ));
         let priority_cleanup = priority_request.clone();
-        inner.central_cleanup.lock().unwrap().insert(session, Box::new(move || {
-            if let Some(request) = priority_cleanup.lock().unwrap().take() {
-                let _ = request.Close();
-            }
-            for (_, characteristic, token) in registered.lock().unwrap().drain(..) {
-                let _ = characteristic.RemoveValueChanged(token);
-            }
-            if let Some(token) = connection_token {
-                let _ = device.RemoveConnectionStatusChanged(token);
-            }
-            if let Some(token) = session_token {
-                let _ = gatt_session.RemoveSessionStatusChanged(token);
-            }
-            let _ = gatt_session.SetMaintainConnection(false);
-            let _ = gatt_session.Close();
-            for service in services {
-                let _ = service.Close();
-            }
-            let _ = device.Close();
-            if let Some(inner) = weak.upgrade() {
-                link_closed(&inner, &watched, session, &released);
-            } else {
-                released.store(true, Ordering::SeqCst);
-            }
-        }));
+        inner.central_cleanup.lock().unwrap().insert(
+            session,
+            Box::new(move || {
+                if let Some(request) = priority_cleanup.lock().unwrap().take() {
+                    let _ = request.Close();
+                }
+                for (_, characteristic, token) in registered.lock().unwrap().drain(..) {
+                    let _ = characteristic.RemoveValueChanged(token);
+                }
+                if let Some(token) = connection_token {
+                    let _ = device.RemoveConnectionStatusChanged(token);
+                }
+                if let Some(token) = session_token {
+                    let _ = gatt_session.RemoveSessionStatusChanged(token);
+                }
+                let _ = gatt_session.SetMaintainConnection(false);
+                let _ = gatt_session.Close();
+                for service in services {
+                    let _ = service.Close();
+                }
+                let _ = device.Close();
+                if let Some(inner) = weak.upgrade() {
+                    link_closed(&inner, &watched, session, &released);
+                } else {
+                    released.store(true, Ordering::SeqCst);
+                }
+            }),
+        );
         Self {
             inner,
             address,
@@ -323,7 +375,10 @@ impl WindowsGattConnection {
     }
 
     pub(super) fn mtu(&self) -> u16 {
-        self.gatt_session.MaxPduSize().unwrap_or(DEFAULT_ATT_MTU).max(DEFAULT_ATT_MTU)
+        self.gatt_session
+            .MaxPduSize()
+            .unwrap_or(DEFAULT_ATT_MTU)
+            .max(DEFAULT_ATT_MTU)
     }
 
     fn characteristic(&self, characteristic: CharacteristicUuid) -> Result<&GattCharacteristic> {
@@ -332,13 +387,21 @@ impl WindowsGattConnection {
         {
             return Err(BleError::NotConnected(self.address.clone()));
         }
-        self.characteristics
-            .get(&characteristic.0)
-            .ok_or_else(|| BleError::Gatt(format!("characteristic {} not found on peer", characteristic.0)))
+        self.characteristics.get(&characteristic.0).ok_or_else(|| {
+            BleError::Gatt(format!(
+                "characteristic {} not found on peer",
+                characteristic.0
+            ))
+        })
     }
 
     fn release(&mut self) {
-        let cleanup = self.inner.central_cleanup.lock().unwrap().remove(&self.session);
+        let cleanup = self
+            .inner
+            .central_cleanup
+            .lock()
+            .unwrap()
+            .remove(&self.session);
         if let Some(release) = cleanup {
             release();
         }
@@ -359,7 +422,9 @@ fn subscription_descriptor_value(
 ) -> GattClientCharacteristicConfigurationDescriptorValue {
     if (properties & GattCharacteristicProperties::Notify) != GattCharacteristicProperties::None {
         GattClientCharacteristicConfigurationDescriptorValue::Notify
-    } else if (properties & GattCharacteristicProperties::Indicate) != GattCharacteristicProperties::None {
+    } else if (properties & GattCharacteristicProperties::Indicate)
+        != GattCharacteristicProperties::None
+    {
         GattClientCharacteristicConfigurationDescriptorValue::Indicate
     } else {
         GattClientCharacteristicConfigurationDescriptorValue::None
@@ -388,16 +453,25 @@ impl GattConnection for WindowsGattConnection {
             .ReadValueWithCacheModeAsync(BluetoothCacheMode::Uncached)
             .map_err(|err| win_err("ReadValueAsync", err))?;
         let result = op.await.map_err(|err| win_err("ReadValueAsync", err))?;
-        let status = result.Status().map_err(|err| win_err("ReadValueAsync", err))?;
+        let status = result
+            .Status()
+            .map_err(|err| win_err("ReadValueAsync", err))?;
         if status != GattCommunicationStatus::Success {
             return Err(communication_error("read", status, &self.address));
         }
-        from_buffer(&result.Value().map_err(|err| win_err("ReadValueAsync", err))?)
-            .map_err(|err| win_err("ReadValueAsync", err))
+        from_buffer(
+            &result
+                .Value()
+                .map_err(|err| win_err("ReadValueAsync", err))?,
+        )
+        .map_err(|err| win_err("ReadValueAsync", err))
     }
 
     async fn write_with_type(
-        &mut self, characteristic: CharacteristicUuid, value: Vec<u8>, write_type: WriteType,
+        &mut self,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
+        write_type: WriteType,
     ) -> Result<()> {
         let target = self.characteristic(characteristic)?.clone();
         let option = match write_type {
@@ -409,19 +483,30 @@ impl GattConnection for WindowsGattConnection {
             .WriteValueWithResultAndOptionAsync(&to_buffer(&value)?, option)
             .map_err(|err| win_err("WriteValueAsync", err))?;
         let result = op.await.map_err(|err| win_err("WriteValueAsync", err))?;
-        let status = result.Status().map_err(|err| win_err("WriteValueAsync", err))?;
+        let status = result
+            .Status()
+            .map_err(|err| win_err("WriteValueAsync", err))?;
         if status != GattCommunicationStatus::Success {
             return Err(communication_error("write", status, &self.address));
         }
         Ok(())
     }
 
-    async fn subscribe(&mut self, characteristic: CharacteristicUuid) -> Result<BoxStream<Result<Vec<u8>>>> {
+    async fn subscribe(
+        &mut self,
+        characteristic: CharacteristicUuid,
+    ) -> Result<BoxStream<Result<Vec<u8>>>> {
         let target = self.characteristic(characteristic)?.clone();
-        let config =
-            subscription_descriptor_value(target.CharacteristicProperties().map_err(|err| win_err("subscribe", err))?);
+        let config = subscription_descriptor_value(
+            target
+                .CharacteristicProperties()
+                .map_err(|err| win_err("subscribe", err))?,
+        );
         if config == GattClientCharacteristicConfigurationDescriptorValue::None {
-            return Err(BleError::Gatt(format!("characteristic {} has neither notify nor indicate", characteristic.0)));
+            return Err(BleError::Gatt(format!(
+                "characteristic {} has neither notify nor indicate",
+                characteristic.0
+            )));
         }
         // A new subscription replaces the old one: never two handlers.
         {
@@ -442,21 +527,28 @@ impl GattConnection for WindowsGattConnection {
         // object is not `Send`; only its token outlives this block.
         let token = {
             let overflow = overflow.clone();
-            let handler =
-                TypedEventHandler::new(move |_: Ref<GattCharacteristic>, args: Ref<GattValueChangedEventArgs>| {
+            let handler = TypedEventHandler::new(
+                move |_: Ref<GattCharacteristic>, args: Ref<GattValueChangedEventArgs>| {
                     let bytes = from_buffer(&args.ok()?.CharacteristicValue()?)?;
                     if tx.try_send(bytes).is_err() {
                         overflow.store(true, Ordering::SeqCst);
                     }
                     Ok(())
-                });
-            target.ValueChanged(&handler).map_err(|err| win_err("ValueChanged", err))?
+                },
+            );
+            target
+                .ValueChanged(&handler)
+                .map_err(|err| win_err("ValueChanged", err))?
         };
-        let mut registration = ValueChangedGuard { characteristic: target.clone(), token: Some(token) };
-        let subscription_status = match target.WriteClientCharacteristicConfigurationDescriptorWithResultAsync(config) {
-            Ok(op) => op.await.and_then(|result| result.Status()),
-            Err(err) => Err(err),
+        let mut registration = ValueChangedGuard {
+            characteristic: target.clone(),
+            token: Some(token),
         };
+        let subscription_status =
+            match target.WriteClientCharacteristicConfigurationDescriptorWithResultAsync(config) {
+                Ok(op) => op.await.and_then(|result| result.Status()),
+                Err(err) => Err(err),
+            };
         match subscription_status {
             Ok(GattCommunicationStatus::Success) => {}
             Ok(status) => {
@@ -471,7 +563,10 @@ impl GattConnection for WindowsGattConnection {
         if self.closed.load(Ordering::SeqCst) || links.get(&self.address) != Some(&self.session) {
             return Err(BleError::NotConnected(self.address.clone()));
         }
-        self.subscriptions.lock().unwrap().push((characteristic.0, target.clone(), token));
+        self.subscriptions
+            .lock()
+            .unwrap()
+            .push((characteristic.0, target.clone(), token));
         registration.token.take();
         drop(links);
         Ok(Box::pin(NotifyStream {
@@ -496,14 +591,23 @@ impl GattConnection for WindowsGattConnection {
         if self.closed.load(Ordering::SeqCst) || links.get(&self.address) != Some(&self.session) {
             return Err(BleError::NotConnected(self.address.clone()));
         }
-        let unsupported = |err: windows::core::Error| BleError::Unsupported(format!("connection priority on this Windows: {err}"));
+        let unsupported = |err: windows::core::Error| {
+            BleError::Unsupported(format!("connection priority on this Windows: {err}"))
+        };
         let parameters = match priority {
-            ConnectionPriority::LowPower => BluetoothLEPreferredConnectionParameters::PowerOptimized(),
+            ConnectionPriority::LowPower => {
+                BluetoothLEPreferredConnectionParameters::PowerOptimized()
+            }
             ConnectionPriority::Balanced => BluetoothLEPreferredConnectionParameters::Balanced(),
-            ConnectionPriority::High => BluetoothLEPreferredConnectionParameters::ThroughputOptimized(),
+            ConnectionPriority::High => {
+                BluetoothLEPreferredConnectionParameters::ThroughputOptimized()
+            }
         }
         .map_err(unsupported)?;
-        let request = self.device.RequestPreferredConnectionParameters(&parameters).map_err(unsupported)?;
+        let request = self
+            .device
+            .RequestPreferredConnectionParameters(&parameters)
+            .map_err(unsupported)?;
         let status = match request.Status() {
             Ok(status) => status,
             Err(error) => {
@@ -513,7 +617,10 @@ impl GattConnection for WindowsGattConnection {
         };
         if status != BluetoothLEPreferredConnectionParametersRequestStatus::Success {
             let _ = request.Close();
-            return Err(BleError::Unsupported(format!("connection priority refused (status {})", status.0)));
+            return Err(BleError::Unsupported(format!(
+                "connection priority refused (status {})",
+                status.0
+            )));
         }
         if let Some(previous) = self.priority_request.lock().unwrap().replace(request) {
             let _ = previous.Close();
@@ -549,12 +656,15 @@ impl tokio_stream::Stream for NotifyStream {
     type Item = Result<Vec<u8>>;
 
     fn poll_next(
-        mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         if self.overflow.swap(false, Ordering::SeqCst) {
             return std::task::Poll::Ready(Some(Err(crate::drivers::notification_receive_gap())));
         }
-        std::pin::Pin::new(&mut self.rx).poll_next(cx).map(|item| item.map(Ok))
+        std::pin::Pin::new(&mut self.rx)
+            .poll_next(cx)
+            .map(|item| item.map(Ok))
     }
 }
 

@@ -91,7 +91,6 @@ Retransmissions do not invoke `before_connect`. Adding a user to a healthy carri
 Without hooks, use explicit core acquisition and attachment to resume after terminal closure.
 
 This is the existing authorization contract, not a new recovery mode.
-Integrated proof of the idle-close/new-authorization race remains pending.
 
 Authorization is shared by users of the address, not inferred from packet headers.
 Once the application authorizes a replacement, existing users may also send through it.

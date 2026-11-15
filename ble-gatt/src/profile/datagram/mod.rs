@@ -377,7 +377,9 @@ impl Drop for DatagramChannel {
         // Taken now when the sink is free. A `DatagramSender` mid-send
         // holds it; then a task waits for it rather than leaving the
         // connection open.
-        if self.managed_cleanup { return; }
+        if self.managed_cleanup {
+            return;
+        }
         let peer = self.peer.clone();
         let connection = match self.sink.try_lock() {
             Ok(mut sink) => match &mut *sink {
@@ -931,7 +933,10 @@ impl Drop for PendingConnection {
         let Some(mut connection) = self.connection.take() else {
             return; // setup succeeded; ownership moved on
         };
-        if self.managed_cleanup { drop(connection); return; }
+        if self.managed_cleanup {
+            drop(connection);
+            return;
+        }
         let peer = self.peer.clone();
         tokio::spawn(async move {
             log::info!("connect: tearing down {} after abandoned setup", peer.0);
@@ -965,13 +970,18 @@ pub(crate) async fn connect_driver(
 }
 
 pub(crate) async fn connect_managed(
-    driver: Arc<dyn Driver>, peer: &PeerAddress, config: &DatagramConfig,
+    driver: Arc<dyn Driver>,
+    peer: &PeerAddress,
+    config: &DatagramConfig,
 ) -> Result<DatagramChannel> {
     connect_owned(driver, peer, config, true).await
 }
 
 async fn connect_owned(
-    driver: Arc<dyn Driver>, peer: &PeerAddress, config: &DatagramConfig, managed_cleanup: bool,
+    driver: Arc<dyn Driver>,
+    peer: &PeerAddress,
+    config: &DatagramConfig,
+    managed_cleanup: bool,
 ) -> Result<DatagramChannel> {
     config.validate()?;
     log::info!("connect: dialling {} service={}", peer.0, config.service.0);
@@ -1790,7 +1800,10 @@ mod inbound_error_tests {
         tokio::time::timeout(Duration::from_millis(300), ended.cancelled())
             .await
             .expect("a native failure must terminate, not report recoverable loss");
-        assert!(!overflow.take(), "a native failure is not a known payload gap");
+        assert!(
+            !overflow.take(),
+            "a native failure is not a known payload gap"
+        );
         let first = received.recv().await;
         if buffered {
             assert!(matches!(first, Some(Ok(payload)) if payload == vec![1]));

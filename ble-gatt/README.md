@@ -6,10 +6,10 @@ can use the [managed example](../docs/interface.md#minimal-outgoing-use) directl
 
 ## Working-tree status
 
-[ADR-0012](../docs/adr/0012-discovery-like-nearby.md) is implemented in the current
-working tree: explicit requests, mutual acceptance, endpoint/nonce arbitration,
-scoped channels and keepalive records. Final integrated verification remains
-pending. This refactor is not published or hardware-accepted.
+[ADR-0012](../docs/adr/0012-discovery-like-nearby.md) is implemented in this PR:
+explicit requests, mutual acceptance, endpoint/nonce arbitration,
+scoped channels and keepalive records. Software checks and hardware acceptance
+are separate.
 
 ## Public surfaces
 

@@ -40,8 +40,8 @@ use uuid::Uuid;
 
 use crate::entities::error::{BleError, Result};
 use crate::entities::models::{
-    advertised_name, CharacteristicUuid, DiscoveredPeer, GattCharacteristicSpec, GattServiceSpec, PeerAddress,
-    ServiceUuid,
+    advertised_name, CharacteristicUuid, DiscoveredPeer, GattCharacteristicSpec, GattServiceSpec,
+    PeerAddress, ServiceUuid,
 };
 use crate::hal::{BoxStream, Driver, MAX_ATT_ATTRIBUTE_LEN};
 
@@ -93,8 +93,13 @@ impl GattAdvertisement {
     pub fn encode(&self) -> Vec<u8> {
         let mut encoded = vec![FORMAT_VERSION];
         let mut append_structure = |kind: u8, data: Vec<u8>| {
-            if data.len() > AD_MAX_DATA_LEN || encoded.len() + 2 + data.len() > MAX_ATT_ATTRIBUTE_LEN {
-                log::warn!("gatt advertisement: omit AD type {kind:#04x} ({} bytes): size limit exceeded", data.len());
+            if data.len() > AD_MAX_DATA_LEN
+                || encoded.len() + 2 + data.len() > MAX_ATT_ATTRIBUTE_LEN
+            {
+                log::warn!(
+                    "gatt advertisement: omit AD type {kind:#04x} ({} bytes): size limit exceeded",
+                    data.len()
+                );
                 return;
             }
             encoded.push((data.len() + 1) as u8);
@@ -119,10 +124,13 @@ impl GattAdvertisement {
 
     /// Read a characteristic value [`encode`](Self::encode) wrote.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let (&version, mut rest) =
-            bytes.split_first().ok_or_else(|| BleError::Gatt("gatt advertisement: empty value".into()))?;
+        let (&version, mut rest) = bytes
+            .split_first()
+            .ok_or_else(|| BleError::Gatt("gatt advertisement: empty value".into()))?;
         if version != FORMAT_VERSION {
-            return Err(BleError::Gatt(format!("gatt advertisement: unsupported version {version}")));
+            return Err(BleError::Gatt(format!(
+                "gatt advertisement: unsupported version {version}"
+            )));
         }
         let mut out = Self::default();
         while let Some((&len, tail)) = rest.split_first() {
@@ -132,7 +140,9 @@ impl GattAdvertisement {
                 break;
             }
             if tail.len() < len {
-                return Err(BleError::Gatt("gatt advertisement: truncated AD structure".into()));
+                return Err(BleError::Gatt(
+                    "gatt advertisement: truncated AD structure".into(),
+                ));
             }
             let (structure, next) = tail.split_at(len);
             rest = next;
@@ -140,7 +150,8 @@ impl GattAdvertisement {
             match kind {
                 AD_MANUFACTURER_DATA => {
                     if let Some((company, value)) = data.split_first_chunk::<2>() {
-                        out.manufacturer_data.insert(u16::from_le_bytes(*company), value.to_vec());
+                        out.manufacturer_data
+                            .insert(u16::from_le_bytes(*company), value.to_vec());
                     }
                 }
                 AD_SERVICE_DATA_16 | AD_SERVICE_DATA_32 | AD_SERVICE_DATA_128 => {
@@ -161,10 +172,14 @@ impl GattAdvertisement {
     /// computer's Bluetooth name rather than the one the peer chose.
     pub fn merge_into(&self, service: ServiceUuid, mut peer: DiscoveredPeer) -> DiscoveredPeer {
         for (company, value) in &self.manufacturer_data {
-            peer.manufacturer_data.entry(*company).or_insert_with(|| value.clone());
+            peer.manufacturer_data
+                .entry(*company)
+                .or_insert_with(|| value.clone());
         }
         for (uuid, value) in &self.service_data {
-            peer.service_data.entry(*uuid).or_insert_with(|| value.clone());
+            peer.service_data
+                .entry(*uuid)
+                .or_insert_with(|| value.clone());
         }
         peer.name = self
             .local_name
@@ -175,7 +190,8 @@ impl GattAdvertisement {
 }
 
 fn service_data_entry(kind: u8, data: &[u8]) -> Option<(ServiceUuid, Vec<u8>)> {
-    let expand_short_uuid = |value: u32| Uuid::from_u128(BLUETOOTH_BASE_UUID | ((value as u128) << 96));
+    let expand_short_uuid =
+        |value: u32| Uuid::from_u128(BLUETOOTH_BASE_UUID | ((value as u128) << 96));
     let (uuid, rest) = match kind {
         AD_SERVICE_DATA_16 => {
             let (bytes, rest) = data.split_first_chunk::<2>()?;
@@ -216,11 +232,18 @@ pub async fn read(driver: &dyn Driver, peer: &PeerAddress) -> Result<GattAdverti
     read_owned(driver, peer, false).await
 }
 
-pub(crate) async fn read_managed(driver: &dyn Driver, peer: &PeerAddress) -> Result<GattAdvertisement> {
+pub(crate) async fn read_managed(
+    driver: &dyn Driver,
+    peer: &PeerAddress,
+) -> Result<GattAdvertisement> {
     read_owned(driver, peer, true).await
 }
 
-async fn read_owned(driver: &dyn Driver, peer: &PeerAddress, managed_cleanup: bool) -> Result<GattAdvertisement> {
+async fn read_owned(
+    driver: &dyn Driver,
+    peer: &PeerAddress,
+    managed_cleanup: bool,
+) -> Result<GattAdvertisement> {
     // Subscribe before connecting so the connection observes events from its driver session.
     let events = driver.lifecycle_events();
     let connection = driver.connect(peer).await?;
@@ -229,7 +252,9 @@ async fn read_owned(driver: &dyn Driver, peer: &PeerAddress, managed_cleanup: bo
     } else {
         crate::connection::Connection::new(connection, events)
     };
-    let read_result = owned_connection.read(GATT_ADVERTISEMENT_CHARACTERISTIC).await;
+    let read_result = owned_connection
+        .read(GATT_ADVERTISEMENT_CHARACTERISTIC)
+        .await;
     // Disconnect the owned connection even if the read fails.
     // Cancellation after acquisition drops this handle and schedules disconnect of its owned driver session.
     // The driver handles cancellation while connect is pending.
@@ -257,7 +282,12 @@ pub struct GattAdvertisementPolicy {
 
 impl Default for GattAdvertisementPolicy {
     fn default() -> Self {
-        Self { refresh: Duration::from_secs(10), timeout: Duration::from_secs(10), max_failures: 3, max_peers: 64 }
+        Self {
+            refresh: Duration::from_secs(10),
+            timeout: Duration::from_secs(10),
+            max_failures: 3,
+            max_peers: 64,
+        }
     }
 }
 
@@ -343,7 +373,9 @@ fn next_read(
 ) -> Option<(PeerAddress, Instant)> {
     tracked
         .iter()
-        .filter(|(_, entry)| entry.consecutive_failures == 0 || entry.consecutive_failures < max_failures)
+        .filter(|(_, entry)| {
+            entry.consecutive_failures == 0 || entry.consecutive_failures < max_failures
+        })
         // After the scan ends, read only peers not yet reported.
         .filter(|(_, entry)| scan_active || !entry.has_been_reported)
         .min_by_key(|(_, entry)| entry.next_read_at)
@@ -416,8 +448,12 @@ mod tests {
 
     fn sample() -> GattAdvertisement {
         let mut advertisement = GattAdvertisement::default();
-        advertisement.manufacturer_data.insert(0xFFFF, vec![0x01, 0xAA, 0xBB, 0xCC, 0xDD]);
-        advertisement.service_data.insert(ServiceUuid(Uuid::from_u128(7)), vec![9, 9]);
+        advertisement
+            .manufacturer_data
+            .insert(0xFFFF, vec![0x01, 0xAA, 0xBB, 0xCC, 0xDD]);
+        advertisement
+            .service_data
+            .insert(ServiceUuid(Uuid::from_u128(7)), vec![9, 9]);
         advertisement.local_name = Some("Desktop".into());
         advertisement
     }
@@ -438,8 +474,14 @@ mod tests {
         bytes.extend_from_slice(&[3, 0x42, 1, 2]);
         assert_eq!(GattAdvertisement::decode(&bytes).unwrap(), sample());
         assert!(GattAdvertisement::decode(&[]).is_err(), "empty");
-        assert!(GattAdvertisement::decode(&[2, 1, 0xFF]).is_err(), "unknown version");
-        assert!(GattAdvertisement::decode(&[FORMAT_VERSION, 9, AD_MANUFACTURER_DATA]).is_err(), "truncated");
+        assert!(
+            GattAdvertisement::decode(&[2, 1, 0xFF]).is_err(),
+            "unknown version"
+        );
+        assert!(
+            GattAdvertisement::decode(&[FORMAT_VERSION, 9, AD_MANUFACTURER_DATA]).is_err(),
+            "truncated"
+        );
     }
 
     #[test]

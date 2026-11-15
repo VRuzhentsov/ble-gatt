@@ -91,18 +91,19 @@ const DISCOVERY_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 const ADVERTISING_INSTANCE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How often that wait reads BlueZ's free instance count.
-const ADVERTISING_INSTANCE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+const ADVERTISING_INSTANCE_CHECK_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(20);
 
+use crate::drivers::event_bus::EventBus;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex as AsyncMutex;
-use crate::drivers::event_bus::EventBus;
 
-use crate::hal::{Driver, BoxStream, GattConnection};
 use crate::entities::error::{BleError, Result};
 use crate::entities::models::{
-    advertised_name, truncate_name, CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattEvent,
-    GattServiceSpec, PeerAddress, Role, ServiceUuid, WriteType, LOCAL_NAME_MAX_LEN,
+    advertised_name, truncate_name, CapabilityReport, CharacteristicUuid, DiscoveredPeer,
+    GattEvent, GattServiceSpec, PeerAddress, Role, ServiceUuid, WriteType, LOCAL_NAME_MAX_LEN,
 };
+use crate::hal::{BoxStream, Driver, GattConnection};
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 
@@ -309,7 +310,8 @@ impl DiscoveryBus {
             let err = resource.await;
             log::warn!("scan: discovery D-Bus connection lost: {err}");
         });
-        let adapter_path = dbus::Path::new(format!("/org/bluez/{}", adapter.name())).map_err(unavailable)?;
+        let adapter_path =
+            dbus::Path::new(format!("/org/bluez/{}", adapter.name())).map_err(unavailable)?;
         Ok(Self {
             conn,
             io_task,
@@ -321,9 +323,16 @@ impl DiscoveryBus {
     }
 
     async fn call(&self, method: &str, args: impl dbus::arg::AppendAll) -> bluer::Result<()> {
-        let proxy =
-            dbus::nonblock::Proxy::new("org.bluez", &self.adapter_path, DISCOVERY_CALL_TIMEOUT, &*self.conn);
-        proxy.method_call::<(), _, _, _>("org.bluez.Adapter1", method, args).await.map_err(bluer::Error::from)
+        let proxy = dbus::nonblock::Proxy::new(
+            "org.bluez",
+            &self.adapter_path,
+            DISCOVERY_CALL_TIMEOUT,
+            &*self.conn,
+        );
+        proxy
+            .method_call::<(), _, _, _>("org.bluez.Adapter1", method, args)
+            .await
+            .map_err(bluer::Error::from)
     }
 
     /// `SetDiscoveryFilter` + `StartDiscovery`: any UUID, LE only.
@@ -580,25 +589,39 @@ pub struct LinuxDriver {
 }
 
 impl LinuxDriver {
-    async fn release_advertisement(&self, handle: &mut Option<bluer::adv::AdvertisementHandle>) -> Result<()> {
-        let released = advertisement_release::release(handle, &self.advertisement_release,
+    async fn release_advertisement(
+        &self,
+        handle: &mut Option<bluer::adv::AdvertisementHandle>,
+    ) -> Result<()> {
+        let released = advertisement_release::release(
+            handle,
+            &self.advertisement_release,
             || self.adapter.supported_advertising_instances(),
-            ADVERTISING_INSTANCE_WAIT, ADVERTISING_INSTANCE_CHECK_INTERVAL).await
-            .map_err(|err| BleError::Gatt(err.to_string()))?;
+            ADVERTISING_INSTANCE_WAIT,
+            ADVERTISING_INSTANCE_CHECK_INTERVAL,
+        )
+        .await
+        .map_err(|err| BleError::Gatt(err.to_string()))?;
         Self::check_advertisement_release(released)
     }
 
     async fn wait_advertisement_release(&self) -> Result<()> {
-        let released = advertisement_release::wait(&self.advertisement_release,
+        let released = advertisement_release::wait(
+            &self.advertisement_release,
             || self.adapter.supported_advertising_instances(),
-            ADVERTISING_INSTANCE_WAIT, ADVERTISING_INSTANCE_CHECK_INTERVAL).await
-            .map_err(|err| BleError::Gatt(err.to_string()))?;
+            ADVERTISING_INSTANCE_WAIT,
+            ADVERTISING_INSTANCE_CHECK_INTERVAL,
+        )
+        .await
+        .map_err(|err| BleError::Gatt(err.to_string()))?;
         Self::check_advertisement_release(released)
     }
 
     fn check_advertisement_release(released: bool) -> Result<()> {
         if !released {
-            return Err(BleError::Gatt("advertisement unregister was not confirmed before the deadline".into()));
+            return Err(BleError::Gatt(
+                "advertisement unregister was not confirmed before the deadline".into(),
+            ));
         }
         Ok(())
     }
@@ -620,7 +643,13 @@ impl LinuxDriver {
     /// disconnect watcher again.
     async fn release_served_peers(&self, why: &str) {
         let mut writers = self.notify_writers.lock().await;
-        let served: Vec<PeerAddress> = self.served_peers.lock().unwrap().drain().map(|(peer, _)| peer).collect();
+        let served: Vec<PeerAddress> = self
+            .served_peers
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(peer, _)| peer)
+            .collect();
         self.announce_released(served, why);
         writers.clear();
     }
@@ -697,11 +726,15 @@ impl DialLocks {
 /// Returns once the subscription is in place, so no restart is missed
 /// between this call and the watch starting.
 async fn spawn_bluez_restart_watch(
-    conn: Arc<dbus::nonblock::SyncConnection>, adapter: Adapter, events_tx: EventBus,
+    conn: Arc<dbus::nonblock::SyncConnection>,
+    adapter: Adapter,
+    events_tx: EventBus,
 ) {
     let rule = dbus::message::MatchRule::new_signal("org.freedesktop.DBus", "NameOwnerChanged");
     let Ok(matched) = conn.add_match(rule).await else {
-        log::warn!("bluez watch: could not subscribe to NameOwnerChanged; restart recovery is disabled");
+        log::warn!(
+            "bluez watch: could not subscribe to NameOwnerChanged; restart recovery is disabled"
+        );
         return;
     };
     tokio::spawn(async move {
@@ -734,7 +767,9 @@ async fn spawn_bluez_restart_watch(
                 );
                 continue;
             }
-            log::info!("bluez watch: bluetoothd is back and the adapter is powered, reporting radio On");
+            log::info!(
+                "bluez watch: bluetoothd is back and the adapter is powered, reporting radio On"
+            );
             let _ = events_tx.send(GattEvent::RadioChanged {
                 status: crate::entities::models::RadioStatus::On,
             });
@@ -812,7 +847,9 @@ impl LinuxDriver {
             dialed: Arc::new(StdMutex::new(HashMap::new())),
             pending_cleanup: Arc::new(StdMutex::new(HashSet::new())),
             in_flight: Arc::new(StdMutex::new(HashSet::new())),
-            cleanup_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CLEANUP_DISCONNECTS)),
+            cleanup_permits: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_CLEANUP_DISCONNECTS,
+            )),
             discovery,
             swept: StdMutex::new(HashSet::new()),
         })
@@ -834,7 +871,9 @@ impl LinuxDriver {
         };
         for address in addresses {
             let peer = PeerAddress(address.to_string());
-            if self.dialed.lock().unwrap().contains_key(&peer) || self.served_peers.lock().unwrap().contains_key(&peer) {
+            if self.dialed.lock().unwrap().contains_key(&peer)
+                || self.served_peers.lock().unwrap().contains_key(&peer)
+            {
                 continue;
             }
             let Ok(device) = self.adapter.device(address) else {
@@ -843,7 +882,12 @@ impl LinuxDriver {
             if !device.is_connected().await.unwrap_or(false) {
                 continue;
             }
-            let offers = device.uuids().await.ok().flatten().is_some_and(|uuids| uuids.contains(&service.0));
+            let offers = device
+                .uuids()
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|uuids| uuids.contains(&service.0));
             if !offers {
                 continue;
             }
@@ -856,7 +900,10 @@ impl LinuxDriver {
             match tokio::time::timeout(CLEANUP_DISCONNECT_TIMEOUT, device.disconnect()).await {
                 Ok(Ok(())) => log::info!("startup: {} disconnected", peer.0),
                 Ok(Err(err)) => log::warn!("startup: disconnecting {} failed: {err}", peer.0),
-                Err(_) => log::warn!("startup: disconnecting {} timed out after {CLEANUP_DISCONNECT_TIMEOUT:?}", peer.0),
+                Err(_) => log::warn!(
+                    "startup: disconnecting {} timed out after {CLEANUP_DISCONNECT_TIMEOUT:?}",
+                    peer.0
+                ),
             }
         }
     }
@@ -871,9 +918,12 @@ impl LinuxDriver {
         if !self.discovery.state.lock().unwrap().idle_running() {
             return;
         }
-        if tokio::time::timeout(DISCOVERY_STOP_TIMEOUT, self.discovery.stop_if_idle("before dialling"))
-            .await
-            .is_err()
+        if tokio::time::timeout(
+            DISCOVERY_STOP_TIMEOUT,
+            self.discovery.stop_if_idle("before dialling"),
+        )
+        .await
+        .is_err()
         {
             log::warn!("connect: discovery did not stop within {DISCOVERY_STOP_TIMEOUT:?}; dialling anyway");
         }
@@ -897,8 +947,10 @@ impl LinuxDriver {
 /// tear down a channel that is working — and would clear a `dialed` entry
 /// that now belongs to the new connection.
 fn report_central_loss(
-    events_tx: &EventBus, dialed: &Arc<StdMutex<HashMap<PeerAddress, u64>>>,
-    peer: &PeerAddress, generation: u64,
+    events_tx: &EventBus,
+    dialed: &Arc<StdMutex<HashMap<PeerAddress, u64>>>,
+    peer: &PeerAddress,
+    generation: u64,
 ) {
     let mut dialed = dialed.lock().unwrap();
     if dialed.get(peer) != Some(&generation) {
@@ -918,12 +970,16 @@ fn report_central_loss(
 
 #[allow(clippy::too_many_arguments)]
 async fn watch_notify_sessions(
-    mut control: CharacteristicControl, uuid: CharacteristicUuid,
+    mut control: CharacteristicControl,
+    uuid: CharacteristicUuid,
     writers: Arc<AsyncMutex<HashMap<CharacteristicUuid, Vec<CharacteristicWriter>>>>,
     events_tx: EventBus,
-    served_peers: Arc<StdMutex<HashMap<PeerAddress, u64>>>, adapter: Adapter,
-    next_session: Arc<AtomicU64>, watchers: Arc<StdMutex<Vec<tokio::task::AbortHandle>>>,
-    advertise_generation: Arc<StdMutex<u64>>, this_generation: u64,
+    served_peers: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
+    adapter: Adapter,
+    next_session: Arc<AtomicU64>,
+    watchers: Arc<StdMutex<Vec<tokio::task::AbortHandle>>>,
+    advertise_generation: Arc<StdMutex<u64>>,
+    this_generation: u64,
 ) {
     while let Some(event) = control.next().await {
         let CharacteristicControlEvent::Notify(writer) = event else {
@@ -955,7 +1011,9 @@ async fn watch_notify_sessions(
         let mut polls = 0;
         let mut writers_guard = loop {
             let guard = writers.lock().await;
-            if *advertise_generation.lock().unwrap() >= this_generation || polls >= GENERATION_PUBLISH_MAX_POLLS {
+            if *advertise_generation.lock().unwrap() >= this_generation
+                || polls >= GENERATION_PUBLISH_MAX_POLLS
+            {
                 break guard;
             }
             drop(guard);
@@ -1022,7 +1080,9 @@ async fn watch_notify_sessions(
 /// ignored.
 #[allow(clippy::too_many_arguments)]
 fn spawn_peripheral_disconnect_watch(
-    adapter: Adapter, address: bluer::Address, peer: PeerAddress,
+    adapter: Adapter,
+    address: bluer::Address,
+    peer: PeerAddress,
     events_tx: EventBus,
     served_peers: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
     writers: Arc<AsyncMutex<HashMap<CharacteristicUuid, Vec<CharacteristicWriter>>>>,
@@ -1125,7 +1185,10 @@ async fn has_live_session(
     let mut live = false;
     for sessions in writers.values_mut() {
         sessions.retain(|w| !w.is_closed().unwrap_or(true));
-        if sessions.iter().any(|w| w.device_address().to_string() == peer.0) {
+        if sessions
+            .iter()
+            .any(|w| w.device_address().to_string() == peer.0)
+        {
             live = true;
         }
     }
@@ -1139,8 +1202,11 @@ impl LinuxDriver {
     /// mid-write. Reaching nobody is an error: a reliable `send` must never
     /// be told a dropped payload was delivered.
     async fn notify_matching(
-        &self, characteristic: CharacteristicUuid, value: Vec<u8>,
-        owner: Option<(&PeerAddress, u64)>, want: impl Fn(&CharacteristicWriter) -> bool,
+        &self,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
+        owner: Option<(&PeerAddress, u64)>,
+        want: impl Fn(&CharacteristicWriter) -> bool,
         nobody: &str,
     ) -> Result<()> {
         // Only an addressed call (`owner: Some`, i.e. `notify_peer`) waits.
@@ -1187,9 +1253,11 @@ impl LinuxDriver {
             // immediately once the real prune ran a few lines down —
             // silently turning the bound-wait into a no-op for precisely
             // the reconnect case it exists to cover.
-            let has_match = writers
-                .get(&characteristic)
-                .is_some_and(|sessions| sessions.iter().any(|w| !w.is_closed().unwrap_or(true) && want(w)));
+            let has_match = writers.get(&characteristic).is_some_and(|sessions| {
+                sessions
+                    .iter()
+                    .any(|w| !w.is_closed().unwrap_or(true) && want(w))
+            });
             if !has_match {
                 if let Some(deadline) = deadline {
                     if tokio::time::Instant::now() < deadline {
@@ -1201,7 +1269,9 @@ impl LinuxDriver {
             }
             let Some(sessions) = writers.get_mut(&characteristic) else {
                 log::warn!("notify: no active notify session on {}", characteristic.0);
-                return Err(BleError::Gatt("no active notify session for characteristic".to_string()));
+                return Err(BleError::Gatt(
+                    "no active notify session for characteristic".to_string(),
+                ));
             };
             sessions.retain(|w| !w.is_closed().unwrap_or(true));
 
@@ -1219,13 +1289,21 @@ impl LinuxDriver {
             sessions.retain(|w| !w.is_closed().unwrap_or(true));
 
             if !delivered {
-                log::warn!("notify: {} bytes on {} reached {nobody}", value.len(), characteristic.0);
+                log::warn!(
+                    "notify: {} bytes on {} reached {nobody}",
+                    value.len(),
+                    characteristic.0
+                );
                 return Err(BleError::Gatt(match last_error {
                     Some(err) => format!("notify reached {nobody}: {err}"),
                     None => format!("notify reached {nobody}"),
                 }));
             }
-            log::trace!("notify: {} bytes delivered on {}", value.len(), characteristic.0);
+            log::trace!(
+                "notify: {} bytes delivered on {}",
+                value.len(),
+                characteristic.0
+            );
             return Ok(());
         }
     }
@@ -1311,7 +1389,10 @@ impl Drop for LinuxConnectGuard {
         // genuinely in flight the instant this guard drops; nothing has
         // confirmed otherwise yet, so the quarantine cannot wait for that
         // confirmation either.
-        self.pending_cleanup.lock().unwrap().insert(self.peer.clone());
+        self.pending_cleanup
+            .lock()
+            .unwrap()
+            .insert(self.peer.clone());
         let adapter = self.adapter.clone();
         let address = self.address;
         let dial_lock = self.dial_lock.clone();
@@ -1401,7 +1482,9 @@ impl Drop for LinuxConnectGuard {
                 // bounded, not the attempt: on a timeout the spawned task
                 // keeps running in the background and is polled again next
                 // iteration, never abandoned for a fresh one.
-                let outcome = tokio::time::timeout(CLEANUP_DISCONNECT_TIMEOUT, handle.as_mut().unwrap()).await;
+                let outcome =
+                    tokio::time::timeout(CLEANUP_DISCONNECT_TIMEOUT, handle.as_mut().unwrap())
+                        .await;
                 match outcome {
                     Ok(Ok(Ok(()))) => {
                         log::info!("connect: {} cleanup disconnect completed", peer.0);
@@ -1490,7 +1573,11 @@ enum ScannedPeer {
 /// that does not advertise the target costs one `UUIDs` read per tick.
 const SCAN_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
-async fn read_scanned_peer(adapter: &Adapter, address: bluer::Address, target: uuid::Uuid) -> ScannedPeer {
+async fn read_scanned_peer(
+    adapter: &Adapter,
+    address: bluer::Address,
+    target: uuid::Uuid,
+) -> ScannedPeer {
     let Ok(device) = adapter.device(address) else {
         return ScannedPeer::Unknown;
     };
@@ -1578,19 +1665,22 @@ impl Driver for LinuxDriver {
         let scan_guard = self.discovery.begin_scan().await?;
         // The same stream `bluer::Adapter::discover_devices` built: already
         // known devices first, then adapter events until discovery stops.
-        let changes = adapter.events().await.map_err(|err| BleError::AdapterUnavailable(err.to_string()))?;
+        let changes = adapter
+            .events()
+            .await
+            .map_err(|err| BleError::AdapterUnavailable(err.to_string()))?;
         let known = adapter
             .device_addresses()
             .await
             .map_err(|err| BleError::AdapterUnavailable(err.to_string()))?;
-        let events = futures::stream::iter(known).map(AdapterEvent::DeviceAdded).chain(changes.take_while(
-            |event| {
+        let events = futures::stream::iter(known)
+            .map(AdapterEvent::DeviceAdded)
+            .chain(changes.take_while(|event| {
                 std::future::ready(!matches!(
                     event,
                     AdapterEvent::PropertyChanged(bluer::AdapterProperty::Discovering(false))
                 ))
-            },
-        ));
+            }));
         let target = service.0;
 
         // Events are handled in a task that owns the discovery guard and ends
@@ -1641,7 +1731,8 @@ impl Driver for LinuxDriver {
                     // Reported without manufacturer data too, so an advertiser
                     // that never sends any is still found, then again once the
                     // data arrives.
-                    let (peer, complete) = match read_scanned_peer(&adapter, address, target).await {
+                    let (peer, complete) = match read_scanned_peer(&adapter, address, target).await
+                    {
                         ScannedPeer::Complete(peer) => (peer, true),
                         ScannedPeer::NoManufacturerData(peer) => (peer, false),
                         _ => continue,
@@ -1671,10 +1762,13 @@ impl Driver for LinuxDriver {
             peer: peer.0.clone(),
             reason: "invalid Bluetooth address".to_string(),
         })?;
-        let device = self.adapter.device(address).map_err(|err| BleError::ConnectFailed {
-            peer: peer.0.clone(),
-            reason: err.to_string(),
-        })?;
+        let device = self
+            .adapter
+            .device(address)
+            .map_err(|err| BleError::ConnectFailed {
+                peer: peer.0.clone(),
+                reason: err.to_string(),
+            })?;
         // A previous cancelled attempt's cleanup Disconnect to this exact
         // address may still be genuinely in flight on BlueZ's side — see
         // `LinuxConnectGuard::drop`'s doc comment. Dialling in now would
@@ -1684,7 +1778,8 @@ impl Driver for LinuxDriver {
         if self.pending_cleanup.lock().unwrap().contains(peer) {
             return Err(BleError::ConnectFailed {
                 peer: peer.0.clone(),
-                reason: "a previous cancelled connect attempt is still being cleaned up".to_string(),
+                reason: "a previous cancelled connect attempt is still being cleaned up"
+                    .to_string(),
             });
         }
         // Refuse outright rather than queue behind `dial_lock`: a caller
@@ -1695,7 +1790,10 @@ impl Driver for LinuxDriver {
         // same way this check already knows it will. Checked before
         // `dial_lock` for the same reason the quarantine check above is.
         if !self.in_flight.lock().unwrap().insert(peer.clone()) {
-            log::warn!("connect: {} refused — a dial to this peer is already in flight", peer.0);
+            log::warn!(
+                "connect: {} refused — a dial to this peer is already in flight",
+                peer.0
+            );
             return Err(BleError::ConnectFailed {
                 peer: peer.0.clone(),
                 reason: "a connect attempt to this peer is already in flight".to_string(),
@@ -1705,7 +1803,10 @@ impl Driver for LinuxDriver {
         // and here — so a cancellation from this point on, including one
         // that arrives while merely queued for `dial_lock` below, always
         // has something alive to release the entry it just claimed.
-        let _in_flight_guard = InFlightGuard { in_flight: self.in_flight.clone(), peer: peer.clone() };
+        let _in_flight_guard = InFlightGuard {
+            in_flight: self.in_flight.clone(),
+            peer: peer.clone(),
+        };
         // Before `dial_lock`: this can wait up to `DISCOVERY_STOP_TIMEOUT`,
         // which must not hold up GATT operations on other links.
         self.settle_discovery().await;
@@ -1736,14 +1837,18 @@ impl Driver for LinuxDriver {
             // manual cleanup needed here.
             return Err(BleError::ConnectFailed {
                 peer: peer.0.clone(),
-                reason: "a previous cancelled connect attempt is still being cleaned up".to_string(),
+                reason: "a previous cancelled connect attempt is still being cleaned up"
+                    .to_string(),
             });
         }
         // The generation distinguishes successive dials to the same address,
         // so a watcher from a previous connection cannot report a disconnect
         // for the one that replaced it.
         let dial_generation = self.next_session.fetch_add(1, Ordering::Relaxed);
-        self.dialed.lock().unwrap().insert(peer.clone(), dial_generation);
+        self.dialed
+            .lock()
+            .unwrap()
+            .insert(peer.clone(), dial_generation);
         // Reserved *before* `device.connect()` below is ever issued, not
         // lazily once cleanup begins — see `MAX_CONCURRENT_CLEANUP_DISCONNECTS`'s
         // doc comment (Codex P1, "reserve cleanup capacity before issuing
@@ -1837,7 +1942,10 @@ impl Driver for LinuxDriver {
                 reason: err.to_string(),
             });
         }
-        log::info!("connect: link established to {} session={dial_generation}", peer.0);
+        log::info!(
+            "connect: link established to {} session={dial_generation}",
+            peer.0
+        );
         let _ = self.events_tx.send(GattEvent::Connected {
             peer: peer.clone(),
             local_role: Role::Central,
@@ -1936,7 +2044,10 @@ impl Driver for LinuxDriver {
         let mut local_characteristics = Vec::with_capacity(service.characteristics.len());
         for spec in &service.characteristics {
             let uuid = spec.uuid;
-            values.lock().unwrap().insert(uuid, spec.initial_value.clone());
+            values
+                .lock()
+                .unwrap()
+                .insert(uuid, spec.initial_value.clone());
 
             let read = spec.readable.then(|| {
                 let values = values.clone();
@@ -1945,7 +2056,12 @@ impl Driver for LinuxDriver {
                     fun: Box::new(move |_req| {
                         let values = values.clone();
                         Box::pin(async move {
-                            let value = values.lock().unwrap().get(&uuid).cloned().unwrap_or_default();
+                            let value = values
+                                .lock()
+                                .unwrap()
+                                .get(&uuid)
+                                .cloned()
+                                .unwrap_or_default();
                             ReqResult::Ok(value)
                         })
                     }),
@@ -2047,8 +2163,7 @@ impl Driver for LinuxDriver {
                                 match served.get(&peer) {
                                     Some(existing) => (*existing, false),
                                     None => {
-                                        let session =
-                                            next_session.fetch_add(1, Ordering::Relaxed);
+                                        let session = next_session.fetch_add(1, Ordering::Relaxed);
                                         served.insert(peer.clone(), session);
                                         (session, true)
                                     }
@@ -2091,7 +2206,8 @@ impl Driver for LinuxDriver {
             // `Io` rather than `Fun`: BlueZ passes the subscribing device's
             // address to `AcquireNotify` but not to `StartNotify`, so this is
             // the only notify mode on Linux that says *who* subscribed.
-            let (control, control_handle) = spec.notifiable
+            let (control, control_handle) = spec
+                .notifiable
                 .then(bluer::gatt::local::characteristic_control)
                 .map(|(c, h)| (Some(c), h))
                 .unwrap_or_else(|| (None, Default::default()));
@@ -2137,10 +2253,14 @@ impl Driver for LinuxDriver {
             ..Default::default()
         };
 
-        let app_handle = self.adapter.serve_gatt_application(app).await.map_err(|err| {
-            log::warn!("advertise: BlueZ rejected the GATT application: {err}");
-            BleError::Gatt(err.to_string())
-        })?;
+        let app_handle = self
+            .adapter
+            .serve_gatt_application(app)
+            .await
+            .map_err(|err| {
+                log::warn!("advertise: BlueZ rejected the GATT application: {err}");
+                BleError::Gatt(err.to_string())
+            })?;
         // Switch over the moment BlueZ serves the new application: from now
         // on it dispatches writes and subscriptions to the new handlers, so
         // they must be current even while the advertisement below is still
@@ -2160,16 +2280,25 @@ impl Driver for LinuxDriver {
             let released: Vec<PeerAddress> = {
                 let mut current = advertise_generation.lock().unwrap();
                 *current = this_generation;
-                self.served_peers.lock().unwrap().drain().map(|(peer, _)| peer).collect()
+                self.served_peers
+                    .lock()
+                    .unwrap()
+                    .drain()
+                    .map(|(peer, _)| peer)
+                    .collect()
             };
             self.announce_released(released, "re-advertise");
             writers.clear();
         }
 
-        let adv_handle = self.adapter.advertise(advertisement(&service)).await.map_err(|err| {
-            log::warn!("advertise: BlueZ rejected the advertisement: {err}");
-            BleError::Gatt(err.to_string())
-        })?;
+        let adv_handle = self
+            .adapter
+            .advertise(advertisement(&service))
+            .await
+            .map_err(|err| {
+                log::warn!("advertise: BlueZ rejected the advertisement: {err}");
+                BleError::Gatt(err.to_string())
+            })?;
 
         *self.adv_handle.lock().await = Some(adv_handle);
         *self.served_service.lock().unwrap() = Some(service);
@@ -2198,11 +2327,23 @@ impl Driver for LinuxDriver {
     }
 
     /// Replace the stored value that the characteristic's read handler returns.
-    async fn set_characteristic_value(&self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
+    async fn set_characteristic_value(
+        &self,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
+    ) -> Result<()> {
         let served = self.served_service.lock().unwrap().clone();
-        let served = served.ok_or_else(|| BleError::Gatt("set_characteristic_value: nothing is served".into()))?;
-        if !served.characteristics.iter().any(|served_characteristic| served_characteristic.uuid == characteristic) {
-            return Err(BleError::Gatt(format!("characteristic {} is not served", characteristic.0)));
+        let served = served
+            .ok_or_else(|| BleError::Gatt("set_characteristic_value: nothing is served".into()))?;
+        if !served
+            .characteristics
+            .iter()
+            .any(|served_characteristic| served_characteristic.uuid == characteristic)
+        {
+            return Err(BleError::Gatt(format!(
+                "characteristic {} is not served",
+                characteristic.0
+            )));
         }
         self.values.lock().unwrap().insert(characteristic, value);
         Ok(())
@@ -2235,7 +2376,13 @@ impl Driver for LinuxDriver {
             *self.served_service.lock().unwrap() = Some(service);
             return Ok(());
         }
-        if self.adapter.supported_advertising_instances().await.map_err(|err| BleError::Gatt(err.to_string()))? == 0 {
+        if self
+            .adapter
+            .supported_advertising_instances()
+            .await
+            .map_err(|err| BleError::Gatt(err.to_string()))?
+            == 0
+        {
             self.release_advertisement(&mut adv_handle).await?;
         }
         let registered = self.adapter.advertise(advertisement(&service)).await;
@@ -2258,14 +2405,20 @@ impl Driver for LinuxDriver {
 
     async fn set_advertising_enabled(&self, enabled: bool) -> Result<()> {
         let _serialise = self.advertise_lock.lock().await;
-        let service = self.served_service.lock().unwrap().clone()
-            .ok_or_else(|| BleError::Gatt("advertising visibility: nothing is served".into()))?;
+        let service =
+            self.served_service.lock().unwrap().clone().ok_or_else(|| {
+                BleError::Gatt("advertising visibility: nothing is served".into())
+            })?;
         let mut handle = self.adv_handle.lock().await;
         if enabled {
             if handle.is_none() {
                 self.wait_advertisement_release().await?;
-                *handle = Some(self.adapter.advertise(advertisement(&service)).await
-                    .map_err(|err| BleError::Gatt(err.to_string()))?);
+                *handle = Some(
+                    self.adapter
+                        .advertise(advertisement(&service))
+                        .await
+                        .map_err(|err| BleError::Gatt(err.to_string()))?,
+                );
             }
         } else {
             self.release_advertisement(&mut handle).await?;
@@ -2309,7 +2462,10 @@ impl Driver for LinuxDriver {
                 Ok(Ok(())) => log::info!("close: {} disconnected", peer.0),
                 Ok(Err(err)) if is_not_connected(&err) => {}
                 Ok(Err(err)) => log::warn!("close: disconnecting {} failed: {err}", peer.0),
-                Err(_) => log::warn!("close: disconnecting {} timed out after {CLEANUP_DISCONNECT_TIMEOUT:?}", peer.0),
+                Err(_) => log::warn!(
+                    "close: disconnecting {} timed out after {CLEANUP_DISCONNECT_TIMEOUT:?}",
+                    peer.0
+                ),
             }
         }
         Ok(())
@@ -2321,7 +2477,10 @@ impl Driver for LinuxDriver {
     }
 
     async fn notify_peer(
-        &self, peer: &PeerAddress, session: Option<u64>, characteristic: CharacteristicUuid,
+        &self,
+        peer: &PeerAddress,
+        session: Option<u64>,
+        characteristic: CharacteristicUuid,
         value: Vec<u8>,
     ) -> Result<()> {
         let wanted = peer.0.clone();
@@ -2376,13 +2535,12 @@ impl Driver for LinuxDriver {
     fn events(&self) -> BoxStream<GattEvent> {
         let rx = self.events_tx.subscribe();
         Box::pin(
-            tokio_stream::wrappers::BroadcastStream::new(rx)
-                .map(|item| match item {
-                    Ok(event) => event,
-                    Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-                        GattEvent::Lagged { dropped: n }
-                    }
-                }),
+            tokio_stream::wrappers::BroadcastStream::new(rx).map(|item| match item {
+                Ok(event) => event,
+                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                    GattEvent::Lagged { dropped: n }
+                }
+            }),
         )
     }
 
@@ -2448,7 +2606,8 @@ struct LinuxGattConnection {
 
 impl LinuxGattConnection {
     async fn find_characteristic(
-        &self, characteristic: CharacteristicUuid,
+        &self,
+        characteristic: CharacteristicUuid,
     ) -> Result<bluer::gatt::remote::Characteristic> {
         let services = self
             .device
@@ -2456,15 +2615,24 @@ impl LinuxGattConnection {
             .await
             .map_err(|err| BleError::Gatt(err.to_string()))?;
         for service in services {
-            let chars = service.characteristics().await.map_err(|err| BleError::Gatt(err.to_string()))?;
+            let chars = service
+                .characteristics()
+                .await
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
             for candidate in chars {
-                let uuid = candidate.uuid().await.map_err(|err| BleError::Gatt(err.to_string()))?;
+                let uuid = candidate
+                    .uuid()
+                    .await
+                    .map_err(|err| BleError::Gatt(err.to_string()))?;
                 if uuid == characteristic.0 {
                     return Ok(candidate);
                 }
             }
         }
-        Err(BleError::Gatt(format!("characteristic {} not found on peer", characteristic.0)))
+        Err(BleError::Gatt(format!(
+            "characteristic {} not found on peer",
+            characteristic.0
+        )))
     }
 }
 
@@ -2513,18 +2681,29 @@ impl GattConnection for LinuxGattConnection {
         match target.read().await {
             Ok(value) => Ok(value),
             Err(err) if is_transient_gatt_error(&err) => {
-                log::warn!("read: {} on {} rejected, possibly transient: {err}", characteristic.0, self.peer.0);
+                log::warn!(
+                    "read: {} on {} rejected, possibly transient: {err}",
+                    characteristic.0,
+                    self.peer.0
+                );
                 Err(BleError::GattBusy(err.to_string()))
             }
             Err(err) => {
-                log::warn!("read: {} on {} failed: {err}", characteristic.0, self.peer.0);
+                log::warn!(
+                    "read: {} on {} failed: {err}",
+                    characteristic.0,
+                    self.peer.0
+                );
                 Err(BleError::Gatt(err.to_string()))
             }
         }
     }
 
     async fn write_with_type(
-        &mut self, characteristic: CharacteristicUuid, value: Vec<u8>, write_type: WriteType,
+        &mut self,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
+        write_type: WriteType,
     ) -> Result<()> {
         let request = bluer::gatt::remote::CharacteristicWriteRequest {
             op_type: match write_type {
@@ -2544,22 +2723,36 @@ impl GattConnection for LinuxGattConnection {
         if let Ok(mtu) = target.mtu().await {
             self.att_mtu.store(mtu as u16, Ordering::Relaxed);
         }
-        log::trace!("write: {} bytes to {} on {} ({write_type:?})", value.len(), characteristic.0, self.peer.0);
+        log::trace!(
+            "write: {} bytes to {} on {} ({write_type:?})",
+            value.len(),
+            characteristic.0,
+            self.peer.0
+        );
         match target.write_ext(&value, &request).await {
             Ok(()) => Ok(()),
             Err(err) if is_transient_gatt_error(&err) => {
-                log::warn!("write: {} bytes to {} rejected, possibly transient: {err}", value.len(), self.peer.0);
+                log::warn!(
+                    "write: {} bytes to {} rejected, possibly transient: {err}",
+                    value.len(),
+                    self.peer.0
+                );
                 Err(BleError::GattBusy(err.to_string()))
             }
             Err(err) => {
-                log::warn!("write: {} bytes to {} failed: {err}", value.len(), self.peer.0);
+                log::warn!(
+                    "write: {} bytes to {} failed: {err}",
+                    value.len(),
+                    self.peer.0
+                );
                 Err(BleError::Gatt(err.to_string()))
             }
         }
     }
 
     async fn subscribe(
-        &mut self, characteristic: CharacteristicUuid,
+        &mut self,
+        characteristic: CharacteristicUuid,
     ) -> Result<BoxStream<Result<Vec<u8>>>> {
         let _dial = self.dial_lock.lock(&self.peer).await;
         self.ensure_current()?;
@@ -2586,7 +2779,11 @@ impl GattConnection for LinuxGattConnection {
             log::warn!("subscribe: notify failed on {}: {err}", characteristic.0);
             BleError::Gatt(err.to_string())
         })?;
-        log::info!("subscribe: {} subscribed to {}", self.peer.0, characteristic.0);
+        log::info!(
+            "subscribe: {} subscribed to {}",
+            self.peer.0,
+            characteristic.0
+        );
         // BlueZ delivers notifications over a socket this stream reads
         // directly, so there is no library-side queue to overflow — nothing
         // here can silently drop a payload.
@@ -2602,10 +2799,18 @@ impl GattConnection for LinuxGattConnection {
         // call, so a reconnect cannot slip in between them. Checking and
         // then awaiting was still a check-then-act, just with a smaller
         // window.
-        log::debug!("disconnect: {} session={} requested", self.peer.0, self.session);
+        log::debug!(
+            "disconnect: {} session={} requested",
+            self.peer.0,
+            self.session
+        );
         let _dial = self.dial_lock.lock(&self.peer).await;
         if let Err(err) = self.ensure_current() {
-            log::debug!("disconnect: {} session={} not current: {err}", self.peer.0, self.session);
+            log::debug!(
+                "disconnect: {} session={} not current: {err}",
+                self.peer.0,
+                self.session
+            );
             return Err(err);
         }
 
@@ -2630,14 +2835,29 @@ impl GattConnection for LinuxGattConnection {
         // ACL ~2s after the call, which no lock here can cover.
         let _admission = self.notify_writers.lock().await;
         if self.served_peers.lock().unwrap().contains_key(&self.peer) {
-            log::debug!("disconnect: {} is also served here; leaving the shared link up", self.peer.0);
+            log::debug!(
+                "disconnect: {} is also served here; leaving the shared link up",
+                self.peer.0
+            );
             report_central_loss(&self.events_tx, &self.dialed, &self.peer, self.session);
             return Ok(());
         }
 
-        log::debug!("disconnect: {} session={} asking BlueZ to disconnect", self.peer.0, self.session);
-        let result = self.device.disconnect().await.map_err(|err| BleError::Gatt(err.to_string()));
-        log::debug!("disconnect: {} session={} BlueZ answered: {result:?}", self.peer.0, self.session);
+        log::debug!(
+            "disconnect: {} session={} asking BlueZ to disconnect",
+            self.peer.0,
+            self.session
+        );
+        let result = self
+            .device
+            .disconnect()
+            .await
+            .map_err(|err| BleError::Gatt(err.to_string()));
+        log::debug!(
+            "disconnect: {} session={} BlueZ answered: {result:?}",
+            self.peer.0,
+            self.session
+        );
         result
     }
 }
@@ -2649,10 +2869,19 @@ mod tests {
 
     #[test]
     fn in_progress_maps_to_adapter_busy_not_unavailable() {
-        let busy = bluer::Error { kind: bluer::ErrorKind::InProgress, message: "Operation already in progress".into() };
+        let busy = bluer::Error {
+            kind: bluer::ErrorKind::InProgress,
+            message: "Operation already in progress".into(),
+        };
         assert!(matches!(discovery_error(busy), BleError::AdapterBusy(_)));
-        let off = bluer::Error { kind: bluer::ErrorKind::NotReady, message: "Resource Not Ready".into() };
-        assert!(matches!(discovery_error(off), BleError::AdapterUnavailable(_)));
+        let off = bluer::Error {
+            kind: bluer::ErrorKind::NotReady,
+            message: "Resource Not Ready".into(),
+        };
+        assert!(matches!(
+            discovery_error(off),
+            BleError::AdapterUnavailable(_)
+        ));
     }
 
     #[test]
@@ -2710,14 +2939,18 @@ mod tests {
             .spawn()
             .ok()?;
         let mut address = String::new();
-        std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut address).unwrap();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut address)
+            .unwrap();
         let bus = PrivateBus(child);
         // Only this module's tests touch the system bus.
         std::env::set_var("DBUS_SYSTEM_BUS_ADDRESS", address.trim());
 
         let (resource, conn) = dbus_tokio::connection::new_system_sync().unwrap();
         tokio::spawn(resource);
-        conn.request_name("org.bluez", false, true, false).await.unwrap();
+        conn.request_name("org.bluez", false, true, false)
+            .await
+            .unwrap();
         let fake = Fake::default();
         let mut cr = dbus_crossroads::Crossroads::new();
         cr.set_async_support(Some((
@@ -2726,42 +2959,58 @@ mod tests {
                 tokio::spawn(task);
             }),
         )));
-        let iface = cr.register("org.bluez.Adapter1", |b: &mut dbus_crossroads::IfaceBuilder<Fake>| {
-            b.property::<bool, _>("Discovering").get(|_, fake| Ok(!fake.lock().unwrap().clients.is_empty()));
-            b.property::<bool, _>("Powered").get(|_, fake| Ok(fake.lock().unwrap().powered));
-            b.method("SetDiscoveryFilter", ("filter",), (), |_, _, (_filter,): (dbus::arg::PropMap,)| Ok(()));
-            // Async so `start_delay` holds only this reply, not a runtime
-            // thread.
-            b.method_with_cr_async("StartDiscovery", (), (), |mut ctx, cr, ()| {
-                let fake: Fake = cr.data_mut::<Fake>(ctx.path()).unwrap().clone();
-                let sender = ctx.message().sender().unwrap().to_string();
-                async move {
-                    let delay = fake.lock().unwrap().start_delay;
-                    tokio::time::sleep(delay).await;
-                    let result = {
-                        let mut fake = fake.lock().unwrap();
-                        if fake.clients.insert(sender) {
-                            fake.starts += 1;
-                            Ok(())
-                        } else {
-                            Err(("org.bluez.Error.InProgress", "Operation already in progress").into())
-                        }
-                    };
-                    ctx.reply(result)
-                }
-            });
-            b.method("StopDiscovery", (), (), |ctx, fake, ()| {
-                let sender = ctx.message().sender().unwrap().to_string();
-                let mut fake = fake.lock().unwrap();
-                if std::mem::take(&mut fake.fail_next_stop) {
-                    return Err(("org.bluez.Error.Failed", "injected StopDiscovery failure").into());
-                }
-                if !fake.clients.remove(&sender) {
-                    return Err(("org.bluez.Error.Failed", "No discovery started").into());
-                }
-                Ok(())
-            });
-        });
+        let iface = cr.register(
+            "org.bluez.Adapter1",
+            |b: &mut dbus_crossroads::IfaceBuilder<Fake>| {
+                b.property::<bool, _>("Discovering")
+                    .get(|_, fake| Ok(!fake.lock().unwrap().clients.is_empty()));
+                b.property::<bool, _>("Powered")
+                    .get(|_, fake| Ok(fake.lock().unwrap().powered));
+                b.method(
+                    "SetDiscoveryFilter",
+                    ("filter",),
+                    (),
+                    |_, _, (_filter,): (dbus::arg::PropMap,)| Ok(()),
+                );
+                // Async so `start_delay` holds only this reply, not a runtime
+                // thread.
+                b.method_with_cr_async("StartDiscovery", (), (), |mut ctx, cr, ()| {
+                    let fake: Fake = cr.data_mut::<Fake>(ctx.path()).unwrap().clone();
+                    let sender = ctx.message().sender().unwrap().to_string();
+                    async move {
+                        let delay = fake.lock().unwrap().start_delay;
+                        tokio::time::sleep(delay).await;
+                        let result = {
+                            let mut fake = fake.lock().unwrap();
+                            if fake.clients.insert(sender) {
+                                fake.starts += 1;
+                                Ok(())
+                            } else {
+                                Err((
+                                    "org.bluez.Error.InProgress",
+                                    "Operation already in progress",
+                                )
+                                    .into())
+                            }
+                        };
+                        ctx.reply(result)
+                    }
+                });
+                b.method("StopDiscovery", (), (), |ctx, fake, ()| {
+                    let sender = ctx.message().sender().unwrap().to_string();
+                    let mut fake = fake.lock().unwrap();
+                    if std::mem::take(&mut fake.fail_next_stop) {
+                        return Err(
+                            ("org.bluez.Error.Failed", "injected StopDiscovery failure").into()
+                        );
+                    }
+                    if !fake.clients.remove(&sender) {
+                        return Err(("org.bluez.Error.Failed", "No discovery started").into());
+                    }
+                    Ok(())
+                });
+            },
+        );
         cr.insert("/org/bluez/hci0", &[iface], fake.clone());
         let bluez = conn.clone();
         conn.start_receive(
@@ -2797,26 +3046,45 @@ mod tests {
         let second = discovery.begin_scan().await.unwrap();
         assert_eq!(fake.lock().unwrap().starts, 1);
         drop(first);
-        assert!(!discovery.state.lock().unwrap().idle_running(), "a live scan still needs discovery");
+        assert!(
+            !discovery.state.lock().unwrap().idle_running(),
+            "a live scan still needs discovery"
+        );
 
         // The last scan ends and its StopDiscovery fails: wedged, and the
         // stop must stay owed.
         fake.lock().unwrap().fail_next_stop = true;
         drop(second);
         discovery.stop_if_idle("test").await;
-        assert_eq!(fake.lock().unwrap().clients.len(), 1, "fake must now be wedged");
-        assert!(discovery.state.lock().unwrap().idle_running(), "a failed stop must stay owed");
+        assert_eq!(
+            fake.lock().unwrap().clients.len(),
+            1,
+            "fake must now be wedged"
+        );
+        assert!(
+            discovery.state.lock().unwrap().idle_running(),
+            "a failed stop must stay owed"
+        );
 
         // What `connect()` awaits: the owed stop is retried, and discovery
         // has really stopped once it returns.
         discovery.stop_if_idle("test").await;
-        assert!(fake.lock().unwrap().clients.is_empty(), "discovery must be stopped before a dial");
+        assert!(
+            fake.lock().unwrap().clients.is_empty(),
+            "discovery must be stopped before a dial"
+        );
         assert!(!discovery.state.lock().unwrap().running);
 
         // Our state loses track of a client BlueZ still lists: the next scan
         // gets `InProgress`, and must recover instead of failing.
-        fake.lock().unwrap().clients.insert(session_unique_name(&discovery));
-        let third = discovery.begin_scan().await.expect("scan must recover from the wedge");
+        fake.lock()
+            .unwrap()
+            .clients
+            .insert(session_unique_name(&discovery));
+        let third = discovery
+            .begin_scan()
+            .await
+            .expect("scan must recover from the wedge");
         assert_eq!(fake.lock().unwrap().clients.len(), 1);
         assert_eq!(fake.lock().unwrap().starts, 2);
         drop(third);
@@ -2828,15 +3096,26 @@ mod tests {
         // instead of dialling into it (Codex P1 on PR #21).
         fake.lock().unwrap().start_delay = std::time::Duration::from_millis(300);
         let cancelled =
-            tokio::time::timeout(std::time::Duration::from_millis(50), discovery.begin_scan()).await;
+            tokio::time::timeout(std::time::Duration::from_millis(50), discovery.begin_scan())
+                .await;
         assert!(cancelled.is_err(), "the scan must be cancelled mid-start");
         // Let the fake finish accepting the start.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         fake.lock().unwrap().start_delay = std::time::Duration::ZERO;
-        assert_eq!(fake.lock().unwrap().clients.len(), 1, "BlueZ accepted the start");
-        assert!(discovery.state.lock().unwrap().idle_running(), "the stop must be owed");
+        assert_eq!(
+            fake.lock().unwrap().clients.len(),
+            1,
+            "BlueZ accepted the start"
+        );
+        assert!(
+            discovery.state.lock().unwrap().idle_running(),
+            "the stop must be owed"
+        );
         discovery.stop_if_idle("test").await;
-        assert!(fake.lock().unwrap().clients.is_empty(), "discovery must be stopped before a dial");
+        assert!(
+            fake.lock().unwrap().clients.is_empty(),
+            "discovery must be stopped before a dial"
+        );
 
         // bluetoothd restarting: `org.bluez` leaves the bus, then comes back.
         // `Off` must be reported, and `On` only once the adapter is powered.
@@ -2846,32 +3125,58 @@ mod tests {
         let next = |events: &mut tokio::sync::broadcast::Receiver<GattEvent>, wait_ms| {
             let wait = std::time::Duration::from_millis(wait_ms);
             let mut events = events.resubscribe();
-            async move { tokio::time::timeout(wait, events.recv()).await.ok().and_then(|e| e.ok()) }
+            async move {
+                tokio::time::timeout(wait, events.recv())
+                    .await
+                    .ok()
+                    .and_then(|e| e.ok())
+            }
         };
         let off = next(&mut events, 2000);
         bluez.release_name("org.bluez").await.unwrap();
         assert!(
-            matches!(off.await, Some(GattEvent::RadioChanged { status: crate::entities::models::RadioStatus::Off })),
+            matches!(
+                off.await,
+                Some(GattEvent::RadioChanged {
+                    status: crate::entities::models::RadioStatus::Off
+                })
+            ),
             "bluetoothd leaving the bus must report the radio Off"
         );
 
         let early = next(&mut events, 800);
-        bluez.request_name("org.bluez", false, true, false).await.unwrap();
-        assert!(early.await.is_none(), "On must wait until the restarted adapter is powered");
+        bluez
+            .request_name("org.bluez", false, true, false)
+            .await
+            .unwrap();
+        assert!(
+            early.await.is_none(),
+            "On must wait until the restarted adapter is powered"
+        );
 
         let on = next(&mut events, 3000);
         fake.lock().unwrap().powered = true;
         assert!(
-            matches!(on.await, Some(GattEvent::RadioChanged { status: crate::entities::models::RadioStatus::On })),
+            matches!(
+                on.await,
+                Some(GattEvent::RadioChanged {
+                    status: crate::entities::models::RadioStatus::On
+                })
+            ),
             "bluetoothd back with a powered adapter must report the radio On"
         );
     }
 
     #[test]
     fn only_a_definite_start_failure_clears_the_owed_stop() {
-        let err = |kind| bluer::Error { kind, message: String::new() };
+        let err = |kind| bluer::Error {
+            kind,
+            message: String::new(),
+        };
         assert!(start_proved_not_running(&err(bluer::ErrorKind::NotReady)));
-        assert!(!start_proved_not_running(&err(bluer::ErrorKind::InProgress)));
+        assert!(!start_proved_not_running(&err(
+            bluer::ErrorKind::InProgress
+        )));
         assert!(!start_proved_not_running(&err(bluer::ErrorKind::Internal(
             bluer::InternalErrorKind::DBus("org.freedesktop.DBus.Error.NoReply".into())
         ))));

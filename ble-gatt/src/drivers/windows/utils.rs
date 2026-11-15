@@ -60,7 +60,10 @@ pub(super) fn from_buffer(buffer: &IBuffer) -> windows::core::Result<Vec<u8>> {
 /// drivers report.
 pub(super) fn format_address(address: u64) -> String {
     let bytes = address.to_be_bytes();
-    format!("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}", bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7])
+    format!(
+        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+        bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]
+    )
 }
 
 pub(super) fn parse_address(address: &str) -> Option<u64> {
@@ -68,9 +71,11 @@ pub(super) fn parse_address(address: &str) -> Option<u64> {
     if parts.len() != 6 {
         return None;
     }
-    parts
-        .iter()
-        .try_fold(0u64, |acc, part| u8::from_str_radix(part, 16).ok().map(|byte| (acc << 8) | byte as u64))
+    parts.iter().try_fold(0u64, |acc, part| {
+        u8::from_str_radix(part, 16)
+            .ok()
+            .map(|byte| (acc << 8) | byte as u64)
+    })
 }
 
 /// The remote address in a WinRT Bluetooth LE device id
@@ -88,13 +93,16 @@ pub(super) fn address_from_device_id(id: &str) -> String {
 }
 
 pub(super) fn session_address(session: &GattSession) -> windows::core::Result<String> {
-    Ok(address_from_device_id(&session.DeviceId()?.Id()?.to_string()))
+    Ok(address_from_device_id(
+        &session.DeviceId()?.Id()?.to_string(),
+    ))
 }
 
 /// One service data AD structure: its UUID (little-endian, 16, 32 or 128
 /// bits) and the bytes after it. `None` for other AD types.
 pub(super) fn parse_service_data(data_type: u8, data: &[u8]) -> Option<(ServiceUuid, Vec<u8>)> {
-    let expand_short_uuid = |value: u32| Uuid::from_u128(BLUETOOTH_BASE_UUID | ((value as u128) << 96));
+    let expand_short_uuid =
+        |value: u32| Uuid::from_u128(BLUETOOTH_BASE_UUID | ((value as u128) << 96));
     let (uuid, rest) = match data_type {
         AD_SERVICE_DATA_16 => {
             let (bytes, rest) = data.split_first_chunk::<2>()?;
@@ -128,7 +136,11 @@ pub(super) fn service_data_of(
         .collect()
 }
 
-pub(super) fn communication_error(context: &str, status: GattCommunicationStatus, peer: &str) -> BleError {
+pub(super) fn communication_error(
+    context: &str,
+    status: GattCommunicationStatus,
+    peer: &str,
+) -> BleError {
     if status == GattCommunicationStatus::Unreachable {
         BleError::NotConnected(peer.to_string())
     } else if status == GattCommunicationStatus::AccessDenied {
@@ -155,7 +167,10 @@ mod tests {
     fn an_address_round_trips() {
         assert_eq!(format_address(0x1122_3344_55AB), "11:22:33:44:55:AB");
         assert_eq!(parse_address("11:22:33:44:55:AB"), Some(0x1122_3344_55AB));
-        assert_eq!(parse_address(&format_address(0xC0FF_EE00_0001)), Some(0xC0FF_EE00_0001));
+        assert_eq!(
+            parse_address(&format_address(0xC0FF_EE00_0001)),
+            Some(0xC0FF_EE00_0001)
+        );
         assert_eq!(parse_address("11:22:33"), None);
     }
 
@@ -178,7 +193,10 @@ mod tests {
     fn service_data_is_parsed_for_every_uuid_size() {
         // 16-bit 0x180F (Battery Service), value 0x64.
         let (uuid, value) = parse_service_data(AD_SERVICE_DATA_16, &[0x0F, 0x18, 0x64]).unwrap();
-        assert_eq!(uuid.0, Uuid::parse_str("0000180f-0000-1000-8000-00805f9b34fb").unwrap());
+        assert_eq!(
+            uuid.0,
+            Uuid::parse_str("0000180f-0000-1000-8000-00805f9b34fb").unwrap()
+        );
         assert_eq!(value, vec![0x64]);
 
         let full = Uuid::parse_str("6e400001-b5a3-f393-e0a9-e50e24dcca9e").unwrap();
@@ -188,7 +206,13 @@ mod tests {
         assert_eq!(uuid.0, full);
         assert_eq!(value, b"Phone".to_vec());
 
-        assert!(parse_service_data(AD_SERVICE_DATA_128, &[0x01, 0x02]).is_none(), "too short");
-        assert!(parse_service_data(0xFF, &[0x01, 0x02, 0x03]).is_none(), "not service data");
+        assert!(
+            parse_service_data(AD_SERVICE_DATA_128, &[0x01, 0x02]).is_none(),
+            "too short"
+        );
+        assert!(
+            parse_service_data(0xFF, &[0x01, 0x02, 0x03]).is_none(),
+            "not service data"
+        );
     }
 }

@@ -40,8 +40,8 @@ and caller-owned channels. A standalone CLI can use the
 [minimal managed example](docs/interface.md#minimal-outgoing-use) without iroh or Tauri.
 The Tauri plugin supplies host setup; external iroh supplies QUIC and security.
 
-**Final integrated verification is pending. This refactor is not published or
-hardware-accepted.** [ADR-0011](docs/adr/0011-windows-winrt-driver.md) owns native
+**This PR implements the managed refactor. Software checks do not establish
+native hardware acceptance.** [ADR-0011](docs/adr/0011-windows-winrt-driver.md) owns native
 Windows choices. Neither ADR claims Google Nearby wire interoperability.
 
 ### Using the plugin from a Rust application

@@ -1,5 +1,27 @@
 //! Source regressions supplement cross-compilation. They do not exercise a native Bluetooth stack.
 
+// Allow formatting whitespace between exact fragments, including quoted JNI
+// literals. Keep literal contents and source-order assertions unchanged.
+fn find_sequence(source: &str, fragments: &[&str]) -> Option<usize> {
+    let (first, tail) = fragments.split_first()?;
+    source.match_indices(*first).find_map(|(offset, _)| {
+        let mut rest = &source[offset + first.len()..];
+        for fragment in tail {
+            rest = rest.trim_start().strip_prefix(*fragment)?;
+        }
+        Some(offset)
+    })
+}
+
+#[test]
+fn source_sequences_allow_layout_but_preserve_exact_literals_and_order() {
+    let fragments = ["\"setAdvertisingEnabled\"", ",", "\"(Z)V\""];
+    assert!(find_sequence("\"setAdvertisingEnabled\",\n  \"(Z)V\"", &fragments).is_some());
+    assert!(find_sequence("\"set AdvertisingEnabled\", \"(Z)V\"", &fragments).is_none());
+    assert!(find_sequence("\"setAdvertisingEnabled\", \"(Z)I\"", &fragments).is_none());
+    assert!(find_sequence("\"(Z)V\", \"setAdvertisingEnabled\"", &fragments).is_none());
+}
+
 fn body<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     source
         .split_once(start)
@@ -42,13 +64,13 @@ fn android_visibility_jni_and_abi_are_coherent() {
         "async fn set_advertising_enabled(",
         "async fn stop_advertising(",
     );
-    assert!(toggle.contains("\"setAdvertisingEnabled\", \"(Z)V\""));
+    assert!(find_sequence(toggle, &["\"setAdvertisingEnabled\"", ",", "\"(Z)V\""]).is_some());
     assert!(toggle.contains("rx.await"));
     assert!(toggle.contains("bridgeAbiVersion"));
     let stop = body(rust, "async fn stop_advertising(", "async fn notify(");
     assert!(
-        stop.find("env.lock_obj").unwrap()
-            < stop.find("served_service.lock().unwrap() = None").unwrap()
+        find_sequence(stop, &["env", ".lock_obj"]).unwrap()
+            < find_sequence(stop, &["served_service", ".lock()", ".unwrap() = None"]).unwrap()
     );
     assert!(rust.contains("pending.complete("));
     let toggle = body(
@@ -89,7 +111,10 @@ fn windows_acquisition_owns_resources_before_awaits() {
         "pub(super) async fn start_server(",
         "pub(super) async fn start_provider_advertising(",
     );
-    assert!(startup.find("let mut server = Server").unwrap() < startup.find("op.await").unwrap());
+    assert!(
+        find_sequence(startup, &["let mut server =", "Server"]).unwrap()
+            < find_sequence(startup, &["op", ".await"]).unwrap()
+    );
 }
 
 #[test]
@@ -125,25 +150,39 @@ fn windows_close_releases_owned_central_resources() {
     assert!(close.contains("central_cleanup"));
     assert!(close.contains("drain()"));
     let device = include_str!("../src/drivers/windows/device.rs");
-    assert!(device.contains("central_cleanup.lock().unwrap().insert(session"));
-    assert!(device.contains("central_cleanup.lock().unwrap().remove(&self.session)"));
+    assert!(find_sequence(
+        device,
+        &[
+            "central_cleanup",
+            ".lock()",
+            ".unwrap()",
+            ".insert(",
+            "session"
+        ]
+    )
+    .is_some());
+    assert!(find_sequence(
+        device,
+        &[
+            "central_cleanup",
+            ".lock()",
+            ".unwrap()",
+            ".remove(&self.session)"
+        ]
+    )
+    .is_some());
     assert!(device.contains(
         "priority_request: Arc<StdMutex<Option<BluetoothLEPreferredConnectionParametersRequest>>>"
     ));
     let subscribe = body(device, "async fn subscribe(", "async fn disconnect(");
     assert!(subscribe.contains("let links = self.inner.central_links.lock().unwrap();"));
-    assert!(
-        subscribe.find("let links =").unwrap()
-            < subscribe
-                .find("self.subscriptions.lock().unwrap().push")
-                .unwrap()
-    );
-    assert!(
-        subscribe
-            .find("self.subscriptions.lock().unwrap().push")
-            .unwrap()
-            < subscribe.find("drop(links)").unwrap()
-    );
+    let registration = find_sequence(
+        subscribe,
+        &["self.subscriptions", ".lock()", ".unwrap()", ".push"],
+    )
+    .unwrap();
+    assert!(subscribe.find("let links =").unwrap() < registration);
+    assert!(registration < subscribe.find("drop(links)").unwrap());
 }
 
 #[test]

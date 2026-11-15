@@ -10,9 +10,9 @@
 //! (feature off) build is exactly today's in-process-only behavior, with
 //! zero new dependencies.
 
-mod local;
 #[cfg(feature = "mock-broker")]
 mod broker;
+mod local;
 #[cfg(feature = "mock-broker")]
 mod remote;
 #[cfg(feature = "mock-broker")]
@@ -21,17 +21,17 @@ mod wire;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use crate::drivers::event_bus::EventBus;
+use async_trait::async_trait;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
-use crate::hal::{Driver, BoxStream, GattConnection};
 use crate::entities::error::{BleError, Result};
 use crate::entities::models::{
     CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress,
     ServiceUuid, WriteType,
 };
+use crate::hal::{BoxStream, Driver, GattConnection};
 use local::LocalRadio;
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
@@ -119,8 +119,14 @@ impl MockNetwork {
     }
 
     /// Emit a central-role loss for a *specific* session.
-    pub fn simulate_loss_for_session(&self, central: &PeerAddress, peer: &PeerAddress, session: u64) {
-        self.as_local().simulate_loss_for_session(central, peer, session)
+    pub fn simulate_loss_for_session(
+        &self,
+        central: &PeerAddress,
+        peer: &PeerAddress,
+        session: u64,
+    ) {
+        self.as_local()
+            .simulate_loss_for_session(central, peer, session)
     }
 
     /// The lifecycle event stream dropped `dropped` events before a
@@ -131,7 +137,8 @@ impl MockNetwork {
 
     /// The driver reports that it dropped notifications for `central`.
     pub fn simulate_notification_gap(&self, peripheral: &PeerAddress, central: &PeerAddress) {
-        self.as_local().simulate_notification_gap(peripheral, central)
+        self.as_local()
+            .simulate_notification_gap(peripheral, central)
     }
 
     /// A central drops its notify subscription without disconnecting.
@@ -154,10 +161,14 @@ impl MockNetwork {
     /// Attach advertisement payload to an already-advertising peer, so
     /// scanners see it in `DiscoveredPeer`.
     pub fn set_advertisement_data(
-        &self, peer: &PeerAddress, manufacturer_data: BTreeMap<u16, Vec<u8>>,
-        service_data: BTreeMap<ServiceUuid, Vec<u8>>, rssi: Option<i16>,
+        &self,
+        peer: &PeerAddress,
+        manufacturer_data: BTreeMap<u16, Vec<u8>>,
+        service_data: BTreeMap<ServiceUuid, Vec<u8>>,
+        rssi: Option<i16>,
     ) {
-        self.as_local().set_advertisement_data(peer, manufacturer_data, service_data, rssi)
+        self.as_local()
+            .set_advertisement_data(peer, manufacturer_data, service_data, rssi)
     }
 
     // --- Dispatch to Local or Remote, identically ---
@@ -170,7 +181,11 @@ impl MockNetwork {
         }
     }
 
-    async fn scan(&self, requester: &PeerAddress, service: ServiceUuid) -> Result<(Vec<DiscoveredPeer>, Option<String>)> {
+    async fn scan(
+        &self,
+        requester: &PeerAddress,
+        service: ServiceUuid,
+    ) -> Result<(Vec<DiscoveredPeer>, Option<String>)> {
         match &self.0 {
             Radio::Local(r) => r.scan(requester, service).await,
             #[cfg(feature = "mock-broker")]
@@ -194,7 +209,11 @@ impl MockNetwork {
         }
     }
 
-    async fn update_advertisement(&self, address: &PeerAddress, service: GattServiceSpec) -> Result<()> {
+    async fn update_advertisement(
+        &self,
+        address: &PeerAddress,
+        service: GattServiceSpec,
+    ) -> Result<()> {
         match &self.0 {
             Radio::Local(r) => r.update_advertisement(address, service).await,
             #[cfg(feature = "mock-broker")]
@@ -203,12 +222,21 @@ impl MockNetwork {
     }
 
     async fn set_characteristic_value(
-        &self, address: &PeerAddress, characteristic: CharacteristicUuid, value: Vec<u8>,
+        &self,
+        address: &PeerAddress,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
     ) -> Result<()> {
         match &self.0 {
-            Radio::Local(r) => r.set_characteristic_value(address, characteristic, value).await,
+            Radio::Local(r) => {
+                r.set_characteristic_value(address, characteristic, value)
+                    .await
+            }
             #[cfg(feature = "mock-broker")]
-            Radio::Remote(r) => r.set_characteristic_value(address, characteristic, value).await,
+            Radio::Remote(r) => {
+                r.set_characteristic_value(address, characteristic, value)
+                    .await
+            }
         }
     }
 
@@ -228,7 +256,12 @@ impl MockNetwork {
         }
     }
 
-    async fn notify(&self, address: &PeerAddress, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
+    async fn notify(
+        &self,
+        address: &PeerAddress,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
+    ) -> Result<()> {
         match &self.0 {
             Radio::Local(r) => r.notify(address, characteristic, value).await,
             #[cfg(feature = "mock-broker")]
@@ -237,17 +270,32 @@ impl MockNetwork {
     }
 
     async fn notify_peer(
-        &self, address: &PeerAddress, peer: &PeerAddress, session: Option<u64>,
-        characteristic: CharacteristicUuid, value: Vec<u8>,
+        &self,
+        address: &PeerAddress,
+        peer: &PeerAddress,
+        session: Option<u64>,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
     ) -> Result<()> {
         match &self.0 {
-            Radio::Local(r) => r.notify_peer(address, peer, session, characteristic, value).await,
+            Radio::Local(r) => {
+                r.notify_peer(address, peer, session, characteristic, value)
+                    .await
+            }
             #[cfg(feature = "mock-broker")]
-            Radio::Remote(r) => r.notify_peer(address, peer, session, characteristic, value).await,
+            Radio::Remote(r) => {
+                r.notify_peer(address, peer, session, characteristic, value)
+                    .await
+            }
         }
     }
 
-    async fn disconnect_peer(&self, address: &PeerAddress, peer: &PeerAddress, session: Option<u64>) -> Result<()> {
+    async fn disconnect_peer(
+        &self,
+        address: &PeerAddress,
+        peer: &PeerAddress,
+        session: Option<u64>,
+    ) -> Result<()> {
         match &self.0 {
             Radio::Local(r) => r.disconnect_peer(address, peer, session).await,
             #[cfg(feature = "mock-broker")]
@@ -256,7 +304,11 @@ impl MockNetwork {
     }
 
     async fn read(
-        &self, session: u64, central: &PeerAddress, peripheral: &PeerAddress, characteristic: CharacteristicUuid,
+        &self,
+        session: u64,
+        central: &PeerAddress,
+        peripheral: &PeerAddress,
+        characteristic: CharacteristicUuid,
     ) -> Result<Vec<u8>> {
         match &self.0 {
             Radio::Local(r) => r.read(session, central, peripheral, characteristic).await,
@@ -266,27 +318,67 @@ impl MockNetwork {
     }
 
     async fn write_with_type(
-        &self, session: u64, central: &PeerAddress, peripheral: &PeerAddress, characteristic: CharacteristicUuid,
-        value: Vec<u8>, write_type: WriteType,
+        &self,
+        session: u64,
+        central: &PeerAddress,
+        peripheral: &PeerAddress,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
+        write_type: WriteType,
     ) -> Result<()> {
         match &self.0 {
-            Radio::Local(r) => r.write_with_type(session, central, peripheral, characteristic, value, write_type).await,
+            Radio::Local(r) => {
+                r.write_with_type(
+                    session,
+                    central,
+                    peripheral,
+                    characteristic,
+                    value,
+                    write_type,
+                )
+                .await
+            }
             #[cfg(feature = "mock-broker")]
-            Radio::Remote(r) => r.write_with_type(session, central, peripheral, characteristic, value, write_type).await,
+            Radio::Remote(r) => {
+                r.write_with_type(
+                    session,
+                    central,
+                    peripheral,
+                    characteristic,
+                    value,
+                    write_type,
+                )
+                .await
+            }
         }
     }
 
     async fn subscribe(
-        &self, session: u64, central: &PeerAddress, peripheral: &PeerAddress, characteristic: CharacteristicUuid,
+        &self,
+        session: u64,
+        central: &PeerAddress,
+        peripheral: &PeerAddress,
+        characteristic: CharacteristicUuid,
     ) -> Result<BoxStream<Result<Vec<u8>>>> {
         match &self.0 {
-            Radio::Local(r) => r.subscribe(session, central, peripheral, characteristic).await,
+            Radio::Local(r) => {
+                r.subscribe(session, central, peripheral, characteristic)
+                    .await
+            }
             #[cfg(feature = "mock-broker")]
-            Radio::Remote(r) => r.subscribe(session, central, peripheral, characteristic).await,
+            Radio::Remote(r) => {
+                r.subscribe(session, central, peripheral, characteristic)
+                    .await
+            }
         }
     }
 
-    async fn disconnect(&self, session: u64, central: &PeerAddress, peripheral: &PeerAddress) -> Result<()> {
+    async fn disconnect(
+        &self,
+        session: u64,
+        central: &PeerAddress,
+        peripheral: &PeerAddress,
+    ) -> Result<()> {
         match &self.0 {
             Radio::Local(r) => r.disconnect(session, central, peripheral).await,
             #[cfg(feature = "mock-broker")]
@@ -308,10 +400,20 @@ impl MockDriver {
     /// `capabilities` lets tests simulate a peer that can't do peripheral
     /// mode (e.g. most Android devices) without a second driver impl — see
     /// the plan's role-assignment-with-capability-fallback decision.
-    pub fn new(address: PeerAddress, network: Arc<MockNetwork>, capabilities: CapabilityReport) -> Self {
+    pub fn new(
+        address: PeerAddress,
+        network: Arc<MockNetwork>,
+        capabilities: CapabilityReport,
+    ) -> Self {
         let events_tx = EventBus::new(EVENT_CHANNEL_CAPACITY);
         network.register_events_sender(address.clone(), events_tx.clone());
-        Self { address, network, capabilities, events_tx, served: std::sync::Mutex::new(None) }
+        Self {
+            address,
+            network,
+            capabilities,
+            events_tx,
+            served: std::sync::Mutex::new(None),
+        }
     }
 
     /// Simulate the peer dropping the link without warning — out of range,
@@ -319,7 +421,9 @@ impl MockDriver {
     /// involved, which is exactly the case `Driver::events()` exists to
     /// surface; tests use this to prove a consumer learns about it.
     pub fn simulate_peer_loss(&self, peer: &PeerAddress) {
-        self.network.as_local().simulate_peer_loss(&self.address, peer);
+        self.network
+            .as_local()
+            .simulate_peer_loss(&self.address, peer);
     }
 
     /// Simulate the local radio being toggled off / on (or found absent).
@@ -355,7 +459,10 @@ impl Driver for MockDriver {
         // armed failure is delivered as an error *item*, after any peers
         // already matched, rather than as an error from `scan` itself.
         if let Some(message) = armed_failure {
-            let items = matches.into_iter().map(Ok).chain(std::iter::once(Err(BleError::Gatt(message))));
+            let items = matches
+                .into_iter()
+                .map(Ok)
+                .chain(std::iter::once(Err(BleError::Gatt(message))));
             return Ok(Box::pin(tokio_stream::iter(items)));
         }
         Ok(Box::pin(tokio_stream::iter(matches.into_iter().map(Ok))))
@@ -377,14 +484,18 @@ impl Driver for MockDriver {
         }
         service.validate()?;
         *self.served.lock().unwrap() = None;
-        self.network.advertise(&self.address, service.clone()).await?;
+        self.network
+            .advertise(&self.address, service.clone())
+            .await?;
         *self.served.lock().unwrap() = Some(service);
         Ok(())
     }
 
     async fn update_advertisement(&self, service: GattServiceSpec) -> Result<()> {
         service.validate()?;
-        self.network.update_advertisement(&self.address, service.clone()).await?;
+        self.network
+            .update_advertisement(&self.address, service.clone())
+            .await?;
         *self.served.lock().unwrap() = Some(service);
         Ok(())
     }
@@ -393,12 +504,20 @@ impl Driver for MockDriver {
         self.served.lock().unwrap().clone()
     }
 
-    async fn set_characteristic_value(&self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
-        self.network.set_characteristic_value(&self.address, characteristic, value).await
+    async fn set_characteristic_value(
+        &self,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
+    ) -> Result<()> {
+        self.network
+            .set_characteristic_value(&self.address, characteristic, value)
+            .await
     }
 
     async fn set_advertising_enabled(&self, enabled: bool) -> Result<()> {
-        self.network.set_advertising_enabled(&self.address, enabled).await
+        self.network
+            .set_advertising_enabled(&self.address, enabled)
+            .await
     }
 
     async fn stop_advertising(&self) -> Result<()> {
@@ -407,17 +526,27 @@ impl Driver for MockDriver {
     }
 
     async fn notify(&self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
-        self.network.notify(&self.address, characteristic, value).await
+        self.network
+            .notify(&self.address, characteristic, value)
+            .await
     }
 
     async fn disconnect_peer(&self, peer: &PeerAddress, session: Option<u64>) -> Result<()> {
-        self.network.disconnect_peer(&self.address, peer, session).await
+        self.network
+            .disconnect_peer(&self.address, peer, session)
+            .await
     }
 
     async fn notify_peer(
-        &self, peer: &PeerAddress, session: Option<u64>, characteristic: CharacteristicUuid, value: Vec<u8>,
+        &self,
+        peer: &PeerAddress,
+        session: Option<u64>,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
     ) -> Result<()> {
-        self.network.notify_peer(&self.address, peer, session, characteristic, value).await
+        self.network
+            .notify_peer(&self.address, peer, session, characteristic, value)
+            .await
     }
 
     fn lifecycle_events(&self) -> BoxStream<GattEvent> {
@@ -433,7 +562,9 @@ impl Driver for MockDriver {
         let rx = self.events_tx.subscribe();
         Box::pin(BroadcastStream::new(rx).map(|item| match item {
             Ok(event) => event,
-            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => GattEvent::Lagged { dropped: n },
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                GattEvent::Lagged { dropped: n }
+            }
         }))
     }
 }
@@ -460,20 +591,51 @@ impl GattConnection for MockGattConnection {
     }
 
     async fn read(&mut self, characteristic: CharacteristicUuid) -> Result<Vec<u8>> {
-        self.network.read(self.session, &self.central, &self.peripheral, characteristic).await
-    }
-
-    async fn write_with_type(&mut self, characteristic: CharacteristicUuid, value: Vec<u8>, write_type: WriteType) -> Result<()> {
         self.network
-            .write_with_type(self.session, &self.central, &self.peripheral, characteristic, value, write_type)
+            .read(
+                self.session,
+                &self.central,
+                &self.peripheral,
+                characteristic,
+            )
             .await
     }
 
-    async fn subscribe(&mut self, characteristic: CharacteristicUuid) -> Result<BoxStream<Result<Vec<u8>>>> {
-        self.network.subscribe(self.session, &self.central, &self.peripheral, characteristic).await
+    async fn write_with_type(
+        &mut self,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
+        write_type: WriteType,
+    ) -> Result<()> {
+        self.network
+            .write_with_type(
+                self.session,
+                &self.central,
+                &self.peripheral,
+                characteristic,
+                value,
+                write_type,
+            )
+            .await
+    }
+
+    async fn subscribe(
+        &mut self,
+        characteristic: CharacteristicUuid,
+    ) -> Result<BoxStream<Result<Vec<u8>>>> {
+        self.network
+            .subscribe(
+                self.session,
+                &self.central,
+                &self.peripheral,
+                characteristic,
+            )
+            .await
     }
 
     async fn disconnect(&mut self) -> Result<()> {
-        self.network.disconnect(self.session, &self.central, &self.peripheral).await
+        self.network
+            .disconnect(self.session, &self.central, &self.peripheral)
+            .await
     }
 }

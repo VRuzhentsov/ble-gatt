@@ -26,10 +26,10 @@ impl Driver for ManagedDriver {
     }
     async fn connect(&self, peer: &PeerAddress) -> Result<Box<dyn GattConnection>> {
         let mut acquired = self.cleanup.own(self.inner.connect(peer).await?);
-        if !self.validate_metadata { return Ok(Box::new(acquired)); }
-        let bytes = acquired
-            .read(GATT_ADVERTISEMENT_CHARACTERISTIC)
-            .await?;
+        if !self.validate_metadata {
+            return Ok(Box::new(acquired));
+        }
+        let bytes = acquired.read(GATT_ADVERTISEMENT_CHARACTERISTIC).await?;
         let advertisement = GattAdvertisement::decode(&bytes)?;
         let bytes = advertisement
             .service_data

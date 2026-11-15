@@ -22,7 +22,10 @@ use uuid::Uuid;
 const COMPANY: u16 = 0xFFFF;
 
 fn both_roles() -> CapabilityReport {
-    CapabilityReport { central: true, peripheral: true }
+    CapabilityReport {
+        central: true,
+        peripheral: true,
+    }
 }
 
 fn config(flag: u8) -> DatagramConfig {
@@ -30,13 +33,19 @@ fn config(flag: u8) -> DatagramConfig {
         ServiceUuid(Uuid::from_u128(0xb1e6a000_f101_4000_8000_00805f9b34fb)),
         CharacteristicUuid(Uuid::from_u128(0xb1e6a001_f101_4000_8000_00805f9b34fb)),
     );
-    config.advertised_manufacturer_data.insert(COMPANY, vec![flag, 0xAA, 0xBB, 0xCC, 0xDD]);
+    config
+        .advertised_manufacturer_data
+        .insert(COMPANY, vec![flag, 0xAA, 0xBB, 0xCC, 0xDD]);
     config.advertised_local_name = Some("Desktop".into());
     config
 }
 
 fn driver(network: &Arc<MockNetwork>, name: &str) -> Arc<MockDriver> {
-    Arc::new(MockDriver::new(PeerAddress(name.into()), network.clone(), both_roles()))
+    Arc::new(MockDriver::new(
+        PeerAddress(name.into()),
+        network.clone(),
+        both_roles(),
+    ))
 }
 
 #[tokio::test]
@@ -53,13 +62,23 @@ async fn a_peer_without_advertised_data_is_completed_from_its_gatt_advertisement
     windows.advertise(spec).await.unwrap();
 
     let scan = phone.scan(config.service).await.unwrap();
-    let mut peers =
-        advertisement::complete(phone.clone(), config.service, scan, GattAdvertisementPolicy::default());
+    let mut peers = advertisement::complete(
+        phone.clone(),
+        config.service,
+        scan,
+        GattAdvertisementPolicy::default(),
+    );
     let peer = peers.next().await.expect("a peer").expect("no scan error");
     assert_eq!(peer.address, PeerAddress("windows".into()));
-    assert_eq!(peer.manufacturer_data.get(&COMPANY), Some(&vec![0x01, 0xAA, 0xBB, 0xCC, 0xDD]));
+    assert_eq!(
+        peer.manufacturer_data.get(&COMPANY),
+        Some(&vec![0x01, 0xAA, 0xBB, 0xCC, 0xDD])
+    );
     assert_eq!(peer.name.as_deref(), Some("Desktop"));
-    assert!(peers.next().await.is_none(), "the scan ended and the peer was read once");
+    assert!(
+        peers.next().await.is_none(),
+        "the scan ended and the peer was read once"
+    );
 }
 
 #[tokio::test]
@@ -70,14 +89,22 @@ async fn a_peer_that_advertises_its_data_is_not_read() {
     let config = config(0x00);
     // Served without the GATT advertisement characteristic: a read would fail.
     let mut spec = config.service_spec();
-    spec.characteristics.retain(|c| c.uuid != GATT_ADVERTISEMENT_CHARACTERISTIC);
+    spec.characteristics
+        .retain(|c| c.uuid != GATT_ADVERTISEMENT_CHARACTERISTIC);
     linux.advertise(spec).await.unwrap();
 
     let scan = phone.scan(config.service).await.unwrap();
-    let mut peers =
-        advertisement::complete(phone.clone(), config.service, scan, GattAdvertisementPolicy::default());
+    let mut peers = advertisement::complete(
+        phone.clone(),
+        config.service,
+        scan,
+        GattAdvertisementPolicy::default(),
+    );
     let peer = peers.next().await.expect("a peer").expect("no scan error");
-    assert_eq!(peer.manufacturer_data.get(&COMPANY).map(|v| v[0]), Some(0x00));
+    assert_eq!(
+        peer.manufacturer_data.get(&COMPANY).map(|v| v[0]),
+        Some(0x00)
+    );
 }
 
 #[tokio::test]
@@ -88,11 +115,20 @@ async fn an_advertisement_update_changes_the_gatt_advertisement() {
     let adapter = Adapter::new(windows.clone()).await;
 
     let _channels = datagram::serve(&adapter, &config(0x00)).await.unwrap();
-    let before = advertisement::read(phone.as_ref(), &PeerAddress("windows".into())).await.unwrap();
-    assert_eq!(before.manufacturer_data.get(&COMPANY).map(|v| v[0]), Some(0x00));
+    let before = advertisement::read(phone.as_ref(), &PeerAddress("windows".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        before.manufacturer_data.get(&COMPANY).map(|v| v[0]),
+        Some(0x00)
+    );
 
-    datagram::update_advertisement(&adapter, &config(0x01)).await.unwrap();
-    let after = advertisement::read(phone.as_ref(), &PeerAddress("windows".into())).await.unwrap();
+    datagram::update_advertisement(&adapter, &config(0x01))
+        .await
+        .unwrap();
+    let after = advertisement::read(phone.as_ref(), &PeerAddress("windows".into()))
+        .await
+        .unwrap();
     assert_eq!(
         after.manufacturer_data.get(&COMPANY).map(|v| v[0]),
         Some(0x01),
@@ -118,14 +154,21 @@ async fn dropping_the_completed_stream_ends_the_scan_at_once() {
         std::task::Poll::Pending
     }));
 
-    let peers =
-        advertisement::complete(phone.clone(), config.service, scan, GattAdvertisementPolicy::default());
+    let peers = advertisement::complete(
+        phone.clone(),
+        config.service,
+        scan,
+        GattAdvertisementPolicy::default(),
+    );
     // Let the forwarding task reach its wait for the next advertisement.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     drop(peers);
 
     let ended = tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx).await;
-    assert!(ended.is_ok(), "the scan was still held after the completed stream was dropped");
+    assert!(
+        ended.is_ok(),
+        "the scan was still held after the completed stream was dropped"
+    );
 }
 
 #[derive(Default)]
@@ -188,12 +231,19 @@ impl Driver for ReadDriver {
         both_roles()
     }
     async fn connect(&self, peer: &PeerAddress) -> ble_gatt::Result<Box<dyn GattConnection>> {
-        Ok(Box::new(ReadConnection { state: self.state.clone(), blocked: self.blocked, peer: peer.clone() }))
+        Ok(Box::new(ReadConnection {
+            state: self.state.clone(),
+            blocked: self.blocked,
+            peer: peer.clone(),
+        }))
     }
     fn events(&self) -> BoxStream<GattEvent> {
         Box::pin(tokio_stream::pending())
     }
-    async fn scan(&self, _: ServiceUuid) -> ble_gatt::Result<BoxStream<ble_gatt::Result<DiscoveredPeer>>> {
+    async fn scan(
+        &self,
+        _: ServiceUuid,
+    ) -> ble_gatt::Result<BoxStream<ble_gatt::Result<DiscoveredPeer>>> {
         unreachable!()
     }
     async fn advertise(&self, _: GattServiceSpec) -> ble_gatt::Result<()> {
@@ -202,7 +252,11 @@ impl Driver for ReadDriver {
     fn served_service(&self) -> Option<GattServiceSpec> {
         None
     }
-    async fn set_characteristic_value(&self, _: CharacteristicUuid, _: Vec<u8>) -> ble_gatt::Result<()> {
+    async fn set_characteristic_value(
+        &self,
+        _: CharacteristicUuid,
+        _: Vec<u8>,
+    ) -> ble_gatt::Result<()> {
         unreachable!()
     }
     async fn stop_advertising(&self) -> ble_gatt::Result<()> {
@@ -239,9 +293,15 @@ fn empty_peer() -> DiscoveredPeer {
 #[tokio::test]
 async fn a_read_timeout_disconnects_the_acquired_connection() {
     let state = Arc::new(ReadState::default());
-    let driver = Arc::new(ReadDriver { state: state.clone(), blocked: true });
+    let driver = Arc::new(ReadDriver {
+        state: state.clone(),
+        blocked: true,
+    });
     let scan = Box::pin(tokio_stream::iter([Ok(empty_peer())]));
-    let policy = GattAdvertisementPolicy { timeout: Duration::from_millis(20), ..Default::default() };
+    let policy = GattAdvertisementPolicy {
+        timeout: Duration::from_millis(20),
+        ..Default::default()
+    };
     let mut peers = advertisement::complete(driver, config(0).service, scan, policy);
     assert!(peers.next().await.unwrap().is_ok());
     tokio::time::timeout(Duration::from_secs(1), state.disconnected.notified())
@@ -253,15 +313,27 @@ async fn a_read_timeout_disconnects_the_acquired_connection() {
 #[tokio::test]
 async fn dropping_output_during_a_read_releases_the_scan_and_connection() {
     let state = Arc::new(ReadState::default());
-    let driver = Arc::new(ReadDriver { state: state.clone(), blocked: true });
+    let driver = Arc::new(ReadDriver {
+        state: state.clone(),
+        blocked: true,
+    });
     let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel::<()>();
     let mut first = Some(Ok(empty_peer()));
     let scan = Box::pin(futures::stream::poll_fn(move |_| {
         let _held_until_drop = &dropped_tx;
-        first.take().map_or(std::task::Poll::Pending, |peer| std::task::Poll::Ready(Some(peer)))
+        first.take().map_or(std::task::Poll::Pending, |peer| {
+            std::task::Poll::Ready(Some(peer))
+        })
     }));
-    let peers = advertisement::complete(driver, config(0).service, scan, GattAdvertisementPolicy::default());
-    tokio::time::timeout(Duration::from_secs(1), state.started.notified()).await.unwrap();
+    let peers = advertisement::complete(
+        driver,
+        config(0).service,
+        scan,
+        GattAdvertisementPolicy::default(),
+    );
+    tokio::time::timeout(Duration::from_secs(1), state.started.notified())
+        .await
+        .unwrap();
     drop(peers);
     tokio::time::timeout(Duration::from_secs(1), dropped_rx)
         .await
@@ -275,7 +347,10 @@ async fn dropping_output_during_a_read_releases_the_scan_and_connection() {
 #[tokio::test]
 async fn later_sightings_do_not_reset_the_read_failure_limit() {
     let state = Arc::new(ReadState::default());
-    let driver = Arc::new(ReadDriver { state: state.clone(), blocked: false });
+    let driver = Arc::new(ReadDriver {
+        state: state.clone(),
+        blocked: false,
+    });
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     let scan = Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
     let policy = GattAdvertisementPolicy {
@@ -291,7 +366,11 @@ async fn later_sightings_do_not_reset_the_read_failure_limit() {
         tx.send(Ok(empty_peer())).await.unwrap();
     }
     tokio::time::sleep(Duration::from_millis(30)).await;
-    assert_eq!(state.reads.load(Ordering::SeqCst), 1, "the failure limit applies to the whole scan");
+    assert_eq!(
+        state.reads.load(Ordering::SeqCst),
+        1,
+        "the failure limit applies to the whole scan"
+    );
     let mut extra = empty_peer();
     extra.address = PeerAddress("extra".into());
     tx.send(Ok(extra.clone())).await.unwrap();
@@ -301,7 +380,10 @@ async fn later_sightings_do_not_reset_the_read_failure_limit() {
         "a full tracking table passes other peers through"
     );
     drop(tx);
-    assert!(peers.next().await.is_none(), "stopped peers must not prevent drainage");
+    assert!(
+        peers.next().await.is_none(),
+        "stopped peers must not prevent drainage"
+    );
 }
 
 #[tokio::test]
@@ -314,13 +396,18 @@ async fn refresh_reports_changed_data_once_and_drains_after_the_scan() {
     peripheral.advertise(spec).await.unwrap();
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     let scan = Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
-    let policy = GattAdvertisementPolicy { refresh: Duration::from_millis(5), ..Default::default() };
+    let policy = GattAdvertisementPolicy {
+        refresh: Duration::from_millis(5),
+        ..Default::default()
+    };
     let mut peers = advertisement::complete(central, config(0).service, scan, policy);
     tx.send(Ok(empty_peer())).await.unwrap();
     let first = peers.next().await.unwrap().unwrap();
     assert_eq!(first.manufacturer_data[&COMPANY][0], 0);
     assert!(
-        tokio::time::timeout(Duration::from_millis(30), peers.next()).await.is_err(),
+        tokio::time::timeout(Duration::from_millis(30), peers.next())
+            .await
+            .is_err(),
         "unchanged refreshes must not be reported"
     );
     peripheral
@@ -330,7 +417,11 @@ async fn refresh_reports_changed_data_once_and_drains_after_the_scan() {
         )
         .await
         .unwrap();
-    let changed = tokio::time::timeout(Duration::from_secs(1), peers.next()).await.unwrap().unwrap().unwrap();
+    let changed = tokio::time::timeout(Duration::from_secs(1), peers.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert_eq!(changed.manufacturer_data[&COMPANY][0], 1);
     drop(tx);
     assert!(peers.next().await.is_none());
