@@ -40,8 +40,12 @@ Put behavior on the type that owns its state, rules or protocol.
   until a separate implementation change updates them.
 
 Load [the code-style skill](../.agents/skills/ble-gatt-code-style/SKILL.md)
-before writing or reviewing code. This is a design rule, not a claim that all
-existing free functions have been moved.
+before writing or reviewing code.
+
+This PR puts acquisition and packet accounting on the iroh adapter's `Inner`.
+`ManagedMetadata` owns profile metadata encoding and decoding; `Record` owns
+managed records. Native codecs own SDK value conversion. Existing public free
+functions and JNI entry points delegate to these owners without duplicating behavior.
 
 ## Ownership map
 

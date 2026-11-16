@@ -47,7 +47,7 @@ async fn windows_cancelled_pending_start_is_stopped_before_metadata_commit() {
     let pending_a = AtomicBool::new(true);
     let result = tokio::time::timeout(
         Duration::from_millis(10),
-        advertising_start::confirm(
+        advertising_start::PendingStart::confirm(
             || Ok::<_, ()>(false),
             || pending_a.store(false, Ordering::SeqCst),
             Duration::from_secs(1),
@@ -67,7 +67,7 @@ async fn windows_confirmed_start_transfers_ownership_but_errors_stop() {
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     let stopped = AtomicBool::new(false);
     let polls = AtomicUsize::new(0);
-    assert!(advertising_start::confirm(
+    assert!(advertising_start::PendingStart::confirm(
         || Ok::<_, ()>(polls.fetch_add(1, Ordering::SeqCst) >= 2),
         || stopped.store(true, Ordering::SeqCst),
         Duration::from_secs(1),
@@ -76,7 +76,7 @@ async fn windows_confirmed_start_transfers_ownership_but_errors_stop() {
     .await
     .unwrap());
     assert!(!stopped.load(Ordering::SeqCst));
-    assert!(advertising_start::confirm(
+    assert!(advertising_start::PendingStart::confirm(
         || Err::<bool, _>(()),
         || stopped.store(true, Ordering::SeqCst),
         Duration::from_secs(1),
@@ -108,35 +108,34 @@ impl Drop for DelayedRegistration {
 async fn bluez_hide_waits_for_delayed_one_slot_unregister() {
     let available = Arc::new(AtomicU8::new(0));
     let mut handle = Some(DelayedRegistration(available.clone()));
-    let pending = Mutex::new(None);
-    let released = advertisement_release::release(
-        &mut handle,
-        &pending,
-        || std::future::ready(Ok::<_, ()>(available.load(Ordering::SeqCst))),
-        Duration::from_secs(1),
-        Duration::from_millis(5),
-    )
-    .await
-    .unwrap();
+    let pending = advertisement_release::AdvertisementRelease::default();
+    let released = pending
+        .release(
+            &mut handle,
+            || std::future::ready(Ok::<_, ()>(available.load(Ordering::SeqCst))),
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+        )
+        .await
+        .unwrap();
     assert!(released);
     assert_eq!(
         available.load(Ordering::SeqCst),
         1,
         "hide must confirm native capacity release before show"
     );
-    assert_eq!(*pending.lock().unwrap(), None);
+    assert_eq!(*pending.target.lock().unwrap(), None);
 }
 
 #[tokio::test]
 async fn bluez_cancelled_hide_keeps_release_barrier_for_show() {
     let available = Arc::new(AtomicU8::new(0));
     let mut handle = Some(DelayedRegistration(available.clone()));
-    let pending = Mutex::new(None);
+    let pending = advertisement_release::AdvertisementRelease::default();
     let result = tokio::time::timeout(
         Duration::from_millis(10),
-        advertisement_release::release(
+        pending.release(
             &mut handle,
-            &pending,
             || std::future::ready(Ok::<_, ()>(available.load(Ordering::SeqCst))),
             Duration::from_secs(1),
             Duration::from_millis(5),
@@ -148,30 +147,30 @@ async fn bluez_cancelled_hide_keeps_release_barrier_for_show() {
         "hide must remain pending until unregister completes"
     );
     assert!(handle.is_none());
-    assert_eq!(*pending.lock().unwrap(), Some(1));
-    assert!(advertisement_release::wait(
-        &pending,
-        || std::future::ready(Ok::<_, ()>(available.load(Ordering::SeqCst))),
-        Duration::from_secs(1),
-        Duration::from_millis(5)
-    )
-    .await
-    .unwrap());
+    assert_eq!(*pending.target.lock().unwrap(), Some(1));
+    assert!(pending
+        .wait(
+            || std::future::ready(Ok::<_, ()>(available.load(Ordering::SeqCst))),
+            Duration::from_secs(1),
+            Duration::from_millis(5)
+        )
+        .await
+        .unwrap());
     assert_eq!(available.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
 async fn bluez_release_timeout_does_not_confirm_hide() {
     let mut handle = Some(());
-    let pending = Mutex::new(None);
-    assert!(!advertisement_release::release(
-        &mut handle,
-        &pending,
-        || std::future::ready(Ok::<_, ()>(0)),
-        Duration::from_millis(10),
-        Duration::from_millis(2)
-    )
-    .await
-    .unwrap());
-    assert_eq!(*pending.lock().unwrap(), Some(1));
+    let pending = advertisement_release::AdvertisementRelease::default();
+    assert!(!pending
+        .release(
+            &mut handle,
+            || std::future::ready(Ok::<_, ()>(0)),
+            Duration::from_millis(10),
+            Duration::from_millis(2)
+        )
+        .await
+        .unwrap());
+    assert_eq!(*pending.target.lock().unwrap(), Some(1));
 }

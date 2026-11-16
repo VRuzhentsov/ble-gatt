@@ -49,7 +49,7 @@ use crate::entities::models::{
 use crate::hal::{BoxStream, Driver, GattConnection};
 
 use peripheral::{Server, ServerPeer};
-use utils::{parse_address, radio_status_of};
+use utils::WindowsCodec;
 
 /// Scan results buffered for a slow consumer before new ones are dropped.
 /// Same depth as the Android driver.
@@ -112,7 +112,7 @@ impl WindowsDriver {
     /// Fails with [`BleError::AdapterUnavailable`] when the computer has no
     /// Bluetooth adapter or the adapter has no Bluetooth LE.
     pub async fn new() -> Result<Self> {
-        let adapter = default_adapter().await?;
+        let adapter = Self::default_adapter().await?;
         if !adapter.IsLowEnergySupported().unwrap_or(false) {
             return Err(BleError::AdapterUnavailable(
                 "the Bluetooth adapter has no Bluetooth LE".into(),
@@ -142,10 +142,10 @@ impl WindowsDriver {
         });
         let radio_token = inner.radio.as_ref().and_then(|radio| {
             let weak = Arc::downgrade(&inner);
-            let last = StdMutex::new(radio_status_of(radio.State()));
+            let last = StdMutex::new(RadioStatus::from_windows(radio.State()));
             let handler =
                 TypedEventHandler::new(move |sender: Ref<Radio>, _: Ref<IInspectable>| {
-                    let status = radio_status_of(sender.ok()?.State());
+                    let status = RadioStatus::from_windows(sender.ok()?.State());
                     let mut last = last.lock().unwrap();
                     if *last != status {
                         *last = status;
@@ -160,7 +160,10 @@ impl WindowsDriver {
         });
         log::info!(
             "windows driver: ready, radio {:?}",
-            inner.radio.as_ref().map(|r| radio_status_of(r.State()))
+            inner
+                .radio
+                .as_ref()
+                .map(|r| RadioStatus::from_windows(r.State()))
         );
         Ok(Self { inner, radio_token })
     }
@@ -177,14 +180,16 @@ impl Drop for WindowsDriver {
     }
 }
 
-async fn default_adapter() -> Result<BluetoothAdapter> {
-    let op = BluetoothAdapter::GetDefaultAsync().map_err(|err| {
-        BleError::AdapterUnavailable(format!("BluetoothAdapter::GetDefaultAsync: {err}"))
-    })?;
-    // WinRT returns a null adapter, which `windows` reports as an error,
-    // when the computer has no Bluetooth adapter.
-    op.await
-        .map_err(|err| BleError::AdapterUnavailable(format!("no Bluetooth adapter: {err}")))
+impl WindowsDriver {
+    async fn default_adapter() -> Result<BluetoothAdapter> {
+        let op = BluetoothAdapter::GetDefaultAsync().map_err(|err| {
+            BleError::AdapterUnavailable(format!("BluetoothAdapter::GetDefaultAsync: {err}"))
+        })?;
+        // WinRT returns a null adapter, which `windows` reports as an error,
+        // when the computer has no Bluetooth adapter.
+        op.await
+            .map_err(|err| BleError::AdapterUnavailable(format!("no Bluetooth adapter: {err}")))
+    }
 }
 
 #[async_trait]
@@ -193,7 +198,7 @@ impl Driver for WindowsDriver {
     /// `IsPeripheralRoleSupported`), and `false` for both when there is no
     /// adapter or no Bluetooth LE (ADR-0011 D2).
     async fn capabilities(&self) -> CapabilityReport {
-        let adapter = match default_adapter().await {
+        let adapter = match Self::default_adapter().await {
             Ok(adapter) => adapter,
             Err(err) => {
                 log::error!("capabilities: {err}");
@@ -227,7 +232,7 @@ impl Driver for WindowsDriver {
             scan.generation += 1;
             scan.generation
         };
-        match watcher::start(&self.inner, service, generation) {
+        match watcher::ScanStream::start(&self.inner, service, generation) {
             Ok(stream) => {
                 log::info!(
                     "scan: started for service {} generation={generation}",
@@ -250,8 +255,8 @@ impl Driver for WindowsDriver {
             peer: peer.0.clone(),
             reason,
         };
-        let address =
-            parse_address(&peer.0).ok_or_else(|| failed("not a Bluetooth address".into()))?;
+        let address = WindowsCodec::parse_address(&peer.0)
+            .ok_or_else(|| failed("not a Bluetooth address".into()))?;
         let session = self.inner.next_id();
         {
             let mut links = self.inner.central_links.lock().unwrap();
@@ -277,8 +282,11 @@ impl Driver for WindowsDriver {
             .unwrap()
             .get(&address)
             .copied();
-        let link = match tokio::time::timeout(CONNECT_TIMEOUT, device::open(address, address_type))
-            .await
+        let link = match tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            device::OpenedLink::open(address, address_type),
+        )
+        .await
         {
             Err(_) => return Err(failed(format!("no answer in {CONNECT_TIMEOUT:?}"))),
             Ok(Err(reason)) => return Err(failed(reason)),
@@ -319,7 +327,7 @@ impl Driver for WindowsDriver {
         self.inner.forget_server_peers();
         *self.inner.served_service.lock().unwrap() = None;
 
-        let server = peripheral::start_server(&self.inner, &service).await?;
+        let server = self.inner.start_server(&service).await?;
         *self.inner.server.lock().unwrap() = Some(server);
         *self.inner.served_service.lock().unwrap() = Some(service.clone());
         log::info!("advertise: serving {}", service.uuid.0);
@@ -350,14 +358,11 @@ impl Driver for WindowsDriver {
         };
         // Restart the provider advertisement only when its service data changes.
         // The GATT advertisement carries manufacturer data on Windows (ADR-0012).
-        if desired_visibility
-            && peripheral::provider_service_data(&served)
-                != peripheral::provider_service_data(&service)
-        {
+        if desired_visibility && served.provider_service_data() != service.provider_service_data() {
             provider
                 .StopAdvertising()
-                .map_err(|err| utils::win_err("StopAdvertising", err))?;
-            peripheral::start_provider_advertising(&provider, &service).await?;
+                .map_err(|err| BleError::windows_error("StopAdvertising", err))?;
+            Server::start_provider_advertising(&provider, &service).await?;
         }
         *self.inner.served_service.lock().unwrap() = Some(service);
         log::info!("update_advertisement: applied");
@@ -401,11 +406,11 @@ impl Driver for WindowsDriver {
             server.provider.clone()
         };
         if enabled {
-            peripheral::start_provider_advertising(&provider, &service).await
+            Server::start_provider_advertising(&provider, &service).await
         } else {
             provider
                 .StopAdvertising()
-                .map_err(|err| utils::win_err("StopAdvertising", err))?;
+                .map_err(|err| BleError::windows_error("StopAdvertising", err))?;
             if let Some(server) = self.inner.server.lock().unwrap().as_mut() {
                 server.desired_visibility = false;
             }
@@ -450,7 +455,7 @@ impl Driver for WindowsDriver {
             if self.inner.is_excluded(&address) {
                 continue;
             }
-            if peripheral::notify_client(&local, &value, &client)
+            if ServerPeer::notify_client(&local, &value, &client)
                 .await
                 .is_ok()
             {
@@ -505,7 +510,7 @@ impl Driver for WindowsDriver {
                 ))
             })?;
         let local = self.inner.local_characteristic(characteristic)?;
-        peripheral::notify_client(&local, &value, &client).await
+        ServerPeer::notify_client(&local, &value, &client).await
     }
 
     /// Excludes the central: WinRT has no call that drops a central from a
@@ -565,7 +570,7 @@ impl Driver for WindowsDriver {
 
     async fn radio_status(&self) -> RadioStatus {
         match &self.inner.radio {
-            Some(radio) => radio_status_of(radio.State()),
+            Some(radio) => RadioStatus::from_windows(radio.State()),
             None => RadioStatus::Unsupported,
         }
     }

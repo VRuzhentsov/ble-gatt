@@ -35,7 +35,8 @@ impl Driver for ManagedDriver {
             .service_data
             .get(&self.service)
             .ok_or_else(|| BleError::Protocol("missing managed profile".into()))?;
-        *self.endpoint.lock().unwrap() = Some(managed_codec::endpoint(bytes)?);
+        *self.endpoint.lock().unwrap() =
+            Some(managed_codec::ManagedMetadata::decode(bytes)?.endpoint);
         Ok(Box::new(acquired))
     }
     async fn advertise(&self, spec: GattServiceSpec) -> Result<()> {

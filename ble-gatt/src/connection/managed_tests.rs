@@ -1,7 +1,7 @@
 //! Executable managed lifecycle regressions over the unchanged raw datagram API.
 use super::managed_codec::{self, Record};
 use crate::{
-    datagram::{self, DatagramChannel, DatagramConfig},
+    datagram::{DatagramChannel, DatagramConfig},
     drivers::mock::{MockDriver, MockNetwork},
     CapabilityReport, CharacteristicUuid, ConnectionRequest, Driver, EndpointId, PeerAddress,
     PeerChannel, PeerChannelCloseReason, PeerLink, PeerLinkConfig, ServiceUuid,
@@ -38,9 +38,10 @@ async fn raw_request(
     );
     let mut incoming = managed.incoming().unwrap();
     managed.set_advertising(true).await.unwrap();
-    let mut raw = datagram::connect_driver(raw_driver, &PeerAddress("managed".into()), &config)
-        .await
-        .unwrap();
+    let mut raw =
+        DatagramChannel::connect_driver(raw_driver, &PeerAddress("managed".into()), &config)
+            .await
+            .unwrap();
     raw.send(
         Record::Request {
             sender: EndpointId::from_bytes([1; 16]),
@@ -602,7 +603,7 @@ fn records_reject_truncation_extensions_unsupported_versions_and_oversize_data()
     .is_err());
     assert!(Record::decode(&[255; 9], 4).is_err());
     for bytes in [vec![], vec![b'B', b'G', 0, 1], vec![0; 20]] {
-        assert!(managed_codec::endpoint(&bytes).is_err());
+        assert!(managed_codec::ManagedMetadata::decode(&bytes).is_err());
     }
 }
 #[tokio::test]
@@ -857,7 +858,7 @@ async fn raw_legacy_and_wrong_version_peers_never_enter_managed_incoming() {
         let mut incoming = managed.incoming().unwrap();
         managed.set_advertising(true).await.unwrap();
         let mut raw =
-            datagram::connect_driver(raw_driver, &PeerAddress("managed".into()), &config())
+            DatagramChannel::connect_driver(raw_driver, &PeerAddress("managed".into()), &config())
                 .await
                 .unwrap();
         let mut bytes = if legacy {

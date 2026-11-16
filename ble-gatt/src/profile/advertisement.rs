@@ -155,7 +155,7 @@ impl GattAdvertisement {
                     }
                 }
                 AD_SERVICE_DATA_16 | AD_SERVICE_DATA_32 | AD_SERVICE_DATA_128 => {
-                    if let Some((uuid, value)) = service_data_entry(kind, data) {
+                    if let Some((uuid, value)) = Self::service_data_entry(kind, data) {
                         out.service_data.insert(uuid, value);
                     }
                 }
@@ -189,77 +189,93 @@ impl GattAdvertisement {
     }
 }
 
-fn service_data_entry(kind: u8, data: &[u8]) -> Option<(ServiceUuid, Vec<u8>)> {
-    let expand_short_uuid =
-        |value: u32| Uuid::from_u128(BLUETOOTH_BASE_UUID | ((value as u128) << 96));
-    let (uuid, rest) = match kind {
-        AD_SERVICE_DATA_16 => {
-            let (bytes, rest) = data.split_first_chunk::<2>()?;
-            (expand_short_uuid(u16::from_le_bytes(*bytes) as u32), rest)
-        }
-        AD_SERVICE_DATA_32 => {
-            let (bytes, rest) = data.split_first_chunk::<4>()?;
-            (expand_short_uuid(u32::from_le_bytes(*bytes)), rest)
-        }
-        _ => {
-            let (bytes, rest) = data.split_first_chunk::<16>()?;
-            (Uuid::from_u128(u128::from_le_bytes(*bytes)), rest)
-        }
-    };
-    Some((ServiceUuid(uuid), rest.to_vec()))
+impl GattAdvertisement {
+    fn service_data_entry(kind: u8, data: &[u8]) -> Option<(ServiceUuid, Vec<u8>)> {
+        let expand_short_uuid =
+            |value: u32| Uuid::from_u128(BLUETOOTH_BASE_UUID | ((value as u128) << 96));
+        let (uuid, rest) = match kind {
+            AD_SERVICE_DATA_16 => {
+                let (bytes, rest) = data.split_first_chunk::<2>()?;
+                (expand_short_uuid(u16::from_le_bytes(*bytes) as u32), rest)
+            }
+            AD_SERVICE_DATA_32 => {
+                let (bytes, rest) = data.split_first_chunk::<4>()?;
+                (expand_short_uuid(u32::from_le_bytes(*bytes)), rest)
+            }
+            _ => {
+                let (bytes, rest) = data.split_first_chunk::<16>()?;
+                (Uuid::from_u128(u128::from_le_bytes(*bytes)), rest)
+            }
+        };
+        Some((ServiceUuid(uuid), rest.to_vec()))
+    }
 }
 
 /// The characteristic a peripheral adds to its service to serve `spec`'s
 /// advertisement data: readable only.
 pub fn characteristic_spec(spec: &GattServiceSpec) -> GattCharacteristicSpec {
-    GattCharacteristicSpec {
-        uuid: GATT_ADVERTISEMENT_CHARACTERISTIC,
-        readable: true,
-        writable: false,
-        notifiable: false,
-        initial_value: GattAdvertisement::of(spec).encode(),
+    GattAdvertisement::characteristic_spec(spec)
+}
+
+impl GattAdvertisement {
+    pub(crate) fn characteristic_spec(spec: &GattServiceSpec) -> GattCharacteristicSpec {
+        GattCharacteristicSpec {
+            uuid: GATT_ADVERTISEMENT_CHARACTERISTIC,
+            readable: true,
+            writable: false,
+            notifiable: false,
+            initial_value: GattAdvertisement::of(spec).encode(),
+        }
     }
 }
 
 /// Whether a scanner should read `peer`'s GATT advertisement: its radio
 /// advertisement carried no manufacturer and no service data.
 pub fn needs_gatt_advertisement(peer: &DiscoveredPeer) -> bool {
-    peer.manufacturer_data.is_empty() && peer.service_data.is_empty()
+    peer.needs_gatt_advertisement()
+}
+
+impl DiscoveredPeer {
+    pub(crate) fn needs_gatt_advertisement(&self) -> bool {
+        self.manufacturer_data.is_empty() && self.service_data.is_empty()
+    }
 }
 
 /// Connect to `peer`, read its GATT advertisement and disconnect.
 pub async fn read(driver: &dyn Driver, peer: &PeerAddress) -> Result<GattAdvertisement> {
-    read_owned(driver, peer, false).await
+    GattAdvertisement::read_owned(driver, peer, false).await
 }
 
-pub(crate) async fn read_managed(
-    driver: &dyn Driver,
-    peer: &PeerAddress,
-) -> Result<GattAdvertisement> {
-    read_owned(driver, peer, true).await
-}
+impl GattAdvertisement {
+    pub(crate) async fn read_managed(
+        driver: &dyn Driver,
+        peer: &PeerAddress,
+    ) -> Result<GattAdvertisement> {
+        Self::read_owned(driver, peer, true).await
+    }
 
-async fn read_owned(
-    driver: &dyn Driver,
-    peer: &PeerAddress,
-    managed_cleanup: bool,
-) -> Result<GattAdvertisement> {
-    // Subscribe before connecting so the connection observes events from its driver session.
-    let events = driver.lifecycle_events();
-    let connection = driver.connect(peer).await?;
-    let mut owned_connection = if managed_cleanup {
-        crate::connection::Connection::new_managed(connection, events)
-    } else {
-        crate::connection::Connection::new(connection, events)
-    };
-    let read_result = owned_connection
-        .read(GATT_ADVERTISEMENT_CHARACTERISTIC)
-        .await;
-    // Disconnect the owned connection even if the read fails.
-    // Cancellation after acquisition drops this handle and schedules disconnect of its owned driver session.
-    // The driver handles cancellation while connect is pending.
-    let _ = owned_connection.disconnect().await;
-    GattAdvertisement::decode(&read_result?)
+    async fn read_owned(
+        driver: &dyn Driver,
+        peer: &PeerAddress,
+        managed_cleanup: bool,
+    ) -> Result<GattAdvertisement> {
+        // Subscribe before connecting so the connection observes events from its driver session.
+        let events = driver.lifecycle_events();
+        let connection = driver.connect(peer).await?;
+        let mut owned_connection = if managed_cleanup {
+            crate::connection::Connection::new_managed(connection, events)
+        } else {
+            crate::connection::Connection::new(connection, events)
+        };
+        let read_result = owned_connection
+            .read(GATT_ADVERTISEMENT_CHARACTERISTIC)
+            .await;
+        // Disconnect the owned connection even if the read fails.
+        // Cancellation after acquisition drops this handle and schedules disconnect of its owned driver session.
+        // The driver handles cancellation while connect is pending.
+        let _ = owned_connection.disconnect().await;
+        GattAdvertisement::decode(&read_result?)
+    }
 }
 
 /// How [`complete`] reads GATT advertisements.
@@ -314,99 +330,117 @@ pub fn complete(
     scan: BoxStream<Result<DiscoveredPeer>>,
     policy: GattAdvertisementPolicy,
 ) -> BoxStream<Result<DiscoveredPeer>> {
-    let (sender, receiver) = mpsc::channel(64);
-    tokio::spawn(async move {
-        // Dropping the output cancels this scan and its active read.
-        // The read's connection handle owns cleanup after acquisition.
-        tokio::select! {
-            result = complete_scan(driver.as_ref(), service, scan, policy, &sender) => {
-                if let Err(err) = result {
-                    let _ = sender.send(Err(err)).await;
-                }
-            }
-            () = sender.closed() => {}
-        }
-    });
-    Box::pin(ReceiverStream::new(receiver))
+    policy.complete(driver, service, scan)
 }
 
-async fn complete_scan(
-    driver: &dyn Driver,
-    service: ServiceUuid,
-    mut scan: BoxStream<Result<DiscoveredPeer>>,
-    policy: GattAdvertisementPolicy,
-    sender: &mpsc::Sender<Result<DiscoveredPeer>>,
-) -> Result<()> {
-    let mut tracked = HashMap::new();
-    let mut scan_active = true;
-    loop {
-        let scheduled_read = next_read(&tracked, scan_active, policy.max_failures);
-        if !scan_active && scheduled_read.is_none() {
-            return Ok(());
-        }
-        let peer = tokio::select! {
-            item = scan.next(), if scan_active => match item {
-                None => { scan_active = false; None }
-                Some(item) => track_peer(&mut tracked, item?, policy.max_peers),
-            },
-            _ = tokio::time::sleep_until(scheduled_read.as_ref().map(|(_, at)| *at).unwrap_or_else(Instant::now)), if scheduled_read.is_some() => {
-                let (address, _) = scheduled_read.expect("a read is due");
-                let result = tokio::time::timeout(policy.timeout, read(driver, &address)).await
-                    .unwrap_or_else(|_| Err(BleError::Gatt(format!("no answer in {:?}", policy.timeout))));
-                let entry = tracked.get_mut(&address).expect("the peer stays tracked");
-                entry.next_read_at = Instant::now() + policy.refresh;
-                entry.record_read(service, result)
+impl GattAdvertisementPolicy {
+    fn complete(
+        self,
+        driver: Arc<dyn Driver>,
+        service: ServiceUuid,
+        scan: BoxStream<Result<DiscoveredPeer>>,
+    ) -> BoxStream<Result<DiscoveredPeer>> {
+        let (sender, receiver) = mpsc::channel(64);
+        tokio::spawn(async move {
+            // Dropping the output cancels this scan and its active read.
+            // The read's connection handle owns cleanup after acquisition.
+            tokio::select! {
+                result = AdvertisementScan::new(self).complete_scan(driver.as_ref(), service, scan, &sender) => {
+                    if let Err(err) = result {
+                        let _ = sender.send(Err(err)).await;
+                    }
+                }
+                () = sender.closed() => {}
             }
-        };
-        if let Some(peer) = peer {
-            if sender.send(Ok(peer)).await.is_err() {
+        });
+        Box::pin(ReceiverStream::new(receiver))
+    }
+}
+
+/// The bounded metadata table and read schedule for one raw scan.
+struct AdvertisementScan {
+    tracked: HashMap<PeerAddress, TrackedPeer>,
+    scan_active: bool,
+    policy: GattAdvertisementPolicy,
+}
+
+impl AdvertisementScan {
+    fn new(policy: GattAdvertisementPolicy) -> Self {
+        Self {
+            tracked: HashMap::new(),
+            scan_active: true,
+            policy,
+        }
+    }
+    async fn complete_scan(
+        mut self,
+        driver: &dyn Driver,
+        service: ServiceUuid,
+        mut scan: BoxStream<Result<DiscoveredPeer>>,
+        sender: &mpsc::Sender<Result<DiscoveredPeer>>,
+    ) -> Result<()> {
+        loop {
+            let scheduled_read = self.next_read();
+            if !self.scan_active && scheduled_read.is_none() {
                 return Ok(());
             }
+            let peer = tokio::select! {
+                item = scan.next(), if self.scan_active => match item {
+                    None => { self.scan_active = false; None }
+                    Some(item) => self.track_peer(item?),
+                },
+                _ = tokio::time::sleep_until(scheduled_read.as_ref().map(|(_, at)| *at).unwrap_or_else(Instant::now)), if scheduled_read.is_some() => {
+                    let (address, _) = scheduled_read.expect("a read is due");
+                    let result = tokio::time::timeout(self.policy.timeout, read(driver, &address)).await
+                        .unwrap_or_else(|_| Err(BleError::Gatt(format!("no answer in {:?}", self.policy.timeout))));
+                    let entry = self.tracked.get_mut(&address).expect("the peer stays tracked");
+                    entry.next_read_at = Instant::now() + self.policy.refresh;
+                    entry.record_read(service, result)
+                }
+            };
+            if let Some(peer) = peer {
+                if sender.send(Ok(peer)).await.is_err() {
+                    return Ok(());
+                }
+            }
         }
     }
-}
 
-fn next_read(
-    tracked: &HashMap<PeerAddress, TrackedPeer>,
-    scan_active: bool,
-    max_failures: u32,
-) -> Option<(PeerAddress, Instant)> {
-    tracked
-        .iter()
-        .filter(|(_, entry)| {
-            entry.consecutive_failures == 0 || entry.consecutive_failures < max_failures
-        })
-        // After the scan ends, read only peers not yet reported.
-        .filter(|(_, entry)| scan_active || !entry.has_been_reported)
-        .min_by_key(|(_, entry)| entry.next_read_at)
-        .map(|(address, entry)| (address.clone(), entry.next_read_at))
-}
+    fn next_read(&self) -> Option<(PeerAddress, Instant)> {
+        self.tracked
+            .iter()
+            .filter(|(_, entry)| {
+                entry.consecutive_failures == 0
+                    || entry.consecutive_failures < self.policy.max_failures
+            })
+            // After the scan ends, read only peers not yet reported.
+            .filter(|(_, entry)| self.scan_active || !entry.has_been_reported)
+            .min_by_key(|(_, entry)| entry.next_read_at)
+            .map(|(address, entry)| (address.clone(), entry.next_read_at))
+    }
 
-fn track_peer(
-    tracked: &mut HashMap<PeerAddress, TrackedPeer>,
-    peer: DiscoveredPeer,
-    max_peers: usize,
-) -> Option<DiscoveredPeer> {
-    if !needs_gatt_advertisement(&peer) {
-        return Some(peer);
+    fn track_peer(&mut self, peer: DiscoveredPeer) -> Option<DiscoveredPeer> {
+        if !needs_gatt_advertisement(&peer) {
+            return Some(peer);
+        }
+        if let Some(entry) = self.tracked.get_mut(&peer.address) {
+            entry.peer = peer;
+        } else if self.tracked.len() < self.policy.max_peers {
+            self.tracked.insert(
+                peer.address.clone(),
+                TrackedPeer {
+                    peer,
+                    next_read_at: Instant::now(),
+                    last_advertisement: None,
+                    consecutive_failures: 0,
+                    has_been_reported: false,
+                },
+            );
+        } else {
+            return Some(peer);
+        }
+        None
     }
-    if let Some(entry) = tracked.get_mut(&peer.address) {
-        entry.peer = peer;
-    } else if tracked.len() < max_peers {
-        tracked.insert(
-            peer.address.clone(),
-            TrackedPeer {
-                peer,
-                next_read_at: Instant::now(),
-                last_advertisement: None,
-                consecutive_failures: 0,
-                has_been_reported: false,
-            },
-        );
-    } else {
-        return Some(peer);
-    }
-    None
 }
 
 impl TrackedPeer {

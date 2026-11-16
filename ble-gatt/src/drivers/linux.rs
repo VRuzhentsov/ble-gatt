@@ -192,54 +192,56 @@ const MAX_CONCURRENT_CLEANUP_DISCONNECTS: usize = 4;
 /// the like — is never worth retrying, so only the generic `Failed` kind
 /// (BlueZ's own catch-all for a transient, momentary rejection) is treated
 /// as busy.
-fn is_transient_gatt_error(err: &bluer::Error) -> bool {
-    err.kind == bluer::ErrorKind::Failed
-}
-
-/// True when `err` is BlueZ reporting `org.bluez.Error.NotConnected` — a
-/// D-Bus error name with no dedicated `bluer::ErrorKind` variant, so it
-/// surfaces as `ErrorKind::Internal(InternalErrorKind::DBus(name))` with
-/// the original D-Bus error name preserved verbatim in `name` (see
-/// `bluer::Error`'s `From<dbus::Error>` impl). Matched structurally on that
-/// name rather than on `err.message()`'s free-form text, which BlueZ does
-/// not guarantee stays stable.
-fn is_not_connected(err: &bluer::Error) -> bool {
-    matches!(
-        &err.kind,
-        bluer::ErrorKind::Internal(bluer::InternalErrorKind::DBus(name))
-            if name == "org.bluez.Error.NotConnected"
-    )
-}
-
-/// True when `err` is BlueZ's `org.bluez.Error.InProgress` — which
-/// `StartDiscovery` returns when the calling D-Bus client is *already* in
-/// BlueZ's discovery list.
-fn is_in_progress(err: &bluer::Error) -> bool {
-    err.kind == bluer::ErrorKind::InProgress
-}
-
-/// Maps a failure to start discovery. A busy adapter is not a missing one:
-/// only `InProgress` becomes `AdapterBusy`, everything else keeps the
-/// existing `AdapterUnavailable` mapping.
-fn discovery_error(err: bluer::Error) -> BleError {
-    if is_in_progress(&err) {
-        BleError::AdapterBusy(err.to_string())
-    } else {
-        BleError::AdapterUnavailable(err.to_string())
+impl BleError {
+    fn bluez_transient(err: &bluer::Error) -> bool {
+        err.kind == bluer::ErrorKind::Failed
     }
-}
 
-/// True when a failed `StartDiscovery` proves this client is not
-/// discovering. Not for `InProgress` (BlueZ still lists the client) nor for
-/// a reply timeout (`org.freedesktop.DBus.Error.NoReply`: BlueZ may have
-/// accepted it) — in both, a stop stays owed.
-fn start_proved_not_running(err: &bluer::Error) -> bool {
-    let no_reply = matches!(
-        &err.kind,
-        bluer::ErrorKind::Internal(bluer::InternalErrorKind::DBus(name))
-            if name == "org.freedesktop.DBus.Error.NoReply"
-    );
-    !is_in_progress(err) && !no_reply
+    /// True when `err` is BlueZ reporting `org.bluez.Error.NotConnected` — a
+    /// D-Bus error name with no dedicated `bluer::ErrorKind` variant, so it
+    /// surfaces as `ErrorKind::Internal(InternalErrorKind::DBus(name))` with
+    /// the original D-Bus error name preserved verbatim in `name` (see
+    /// `bluer::Error`'s `From<dbus::Error>` impl). Matched structurally on that
+    /// name rather than on `err.message()`'s free-form text, which BlueZ does
+    /// not guarantee stays stable.
+    fn bluez_not_connected(err: &bluer::Error) -> bool {
+        matches!(
+            &err.kind,
+            bluer::ErrorKind::Internal(bluer::InternalErrorKind::DBus(name))
+                if name == "org.bluez.Error.NotConnected"
+        )
+    }
+
+    /// True when `err` is BlueZ's `org.bluez.Error.InProgress` — which
+    /// `StartDiscovery` returns when the calling D-Bus client is *already* in
+    /// BlueZ's discovery list.
+    fn bluez_in_progress(err: &bluer::Error) -> bool {
+        err.kind == bluer::ErrorKind::InProgress
+    }
+
+    /// Maps a failure to start discovery. A busy adapter is not a missing one:
+    /// only `InProgress` becomes `AdapterBusy`, everything else keeps the
+    /// existing `AdapterUnavailable` mapping.
+    fn bluez_discovery(err: bluer::Error) -> BleError {
+        if BleError::bluez_in_progress(&err) {
+            BleError::AdapterBusy(err.to_string())
+        } else {
+            BleError::AdapterUnavailable(err.to_string())
+        }
+    }
+
+    /// True when a failed `StartDiscovery` proves this client is not
+    /// discovering. Not for `InProgress` (BlueZ still lists the client) nor for
+    /// a reply timeout (`org.freedesktop.DBus.Error.NoReply`: BlueZ may have
+    /// accepted it) — in both, a stop stays owed.
+    fn bluez_start_not_running(err: &bluer::Error) -> bool {
+        let no_reply = matches!(
+            &err.kind,
+            bluer::ErrorKind::Internal(bluer::InternalErrorKind::DBus(name))
+                if name == "org.freedesktop.DBus.Error.NoReply"
+        );
+        !BleError::bluez_in_progress(err) && !no_reply
+    }
 }
 
 /// This driver's own view of its discovery. Only touched briefly, never
@@ -373,7 +375,7 @@ impl DiscoveryBus {
                 // BlueZ says this client is already discovering although we
                 // have not started it: a previous `StopDiscovery` failed or
                 // BlueZ never saw it. Clear it and retry once.
-                Err(err) if is_in_progress(&err) => {
+                Err(err) if BleError::bluez_in_progress(&err) => {
                     log::warn!(
                         "scan: discovery failed to start: {err} — BlueZ still counts this client as \
                          discovering; sending StopDiscovery and retrying once"
@@ -391,10 +393,10 @@ impl DiscoveryBus {
                 }
             };
             if let Err(err) = result {
-                if start_proved_not_running(&err) {
+                if BleError::bluez_start_not_running(&err) {
                     self.state.lock().unwrap().running = false;
                 }
-                return Err(discovery_error(err));
+                return Err(BleError::bluez_discovery(err));
             }
         }
         let mut state = self.state.lock().unwrap();
@@ -495,7 +497,7 @@ pub struct LinuxDriver {
     events_tx: EventBus,
     app_handle: AsyncMutex<Option<ApplicationHandle>>,
     adv_handle: AsyncMutex<Option<bluer::adv::AdvertisementHandle>>,
-    advertisement_release: StdMutex<Option<u8>>,
+    advertisement_release: advertisement_release::AdvertisementRelease,
     /// The spec the live application and advertisement were built from, so
     /// `update_advertisement` can tell whether a spec is for the served
     /// service. `None` while nothing is fully registered.
@@ -593,27 +595,29 @@ impl LinuxDriver {
         &self,
         handle: &mut Option<bluer::adv::AdvertisementHandle>,
     ) -> Result<()> {
-        let released = advertisement_release::release(
-            handle,
-            &self.advertisement_release,
-            || self.adapter.supported_advertising_instances(),
-            ADVERTISING_INSTANCE_WAIT,
-            ADVERTISING_INSTANCE_CHECK_INTERVAL,
-        )
-        .await
-        .map_err(|err| BleError::Gatt(err.to_string()))?;
+        let released = self
+            .advertisement_release
+            .release(
+                handle,
+                || self.adapter.supported_advertising_instances(),
+                ADVERTISING_INSTANCE_WAIT,
+                ADVERTISING_INSTANCE_CHECK_INTERVAL,
+            )
+            .await
+            .map_err(|err| BleError::Gatt(err.to_string()))?;
         Self::check_advertisement_release(released)
     }
 
     async fn wait_advertisement_release(&self) -> Result<()> {
-        let released = advertisement_release::wait(
-            &self.advertisement_release,
-            || self.adapter.supported_advertising_instances(),
-            ADVERTISING_INSTANCE_WAIT,
-            ADVERTISING_INSTANCE_CHECK_INTERVAL,
-        )
-        .await
-        .map_err(|err| BleError::Gatt(err.to_string()))?;
+        let released = self
+            .advertisement_release
+            .wait(
+                || self.adapter.supported_advertising_instances(),
+                ADVERTISING_INSTANCE_WAIT,
+                ADVERTISING_INSTANCE_CHECK_INTERVAL,
+            )
+            .await
+            .map_err(|err| BleError::Gatt(err.to_string()))?;
         Self::check_advertisement_release(released)
     }
 
@@ -668,23 +672,25 @@ impl LinuxDriver {
 
 /// The BlueZ advertisement for `service`, shared by `advertise` and
 /// `update_advertisement`.
-fn advertisement(service: &GattServiceSpec) -> Advertisement {
-    Advertisement {
-        service_uuids: [service.uuid.0].into_iter().collect(),
-        discoverable: Some(true),
-        manufacturer_data: service.manufacturer_data.clone(),
-        service_data: service
-            .service_data
-            .iter()
-            .map(|(uuid, value)| (uuid.0, value.clone()))
-            .collect(),
-        // BlueZ sends LocalName in the scan response. Truncated here so a
-        // long name is cut on a character boundary, not by BlueZ.
-        local_name: service
-            .local_name
-            .as_deref()
-            .map(|name| truncate_name(name, LOCAL_NAME_MAX_LEN).to_string()),
-        ..Default::default()
+impl GattServiceSpec {
+    fn bluez_advertisement(&self) -> Advertisement {
+        Advertisement {
+            service_uuids: [self.uuid.0].into_iter().collect(),
+            discoverable: Some(true),
+            manufacturer_data: self.manufacturer_data.clone(),
+            service_data: self
+                .service_data
+                .iter()
+                .map(|(uuid, value)| (uuid.0, value.clone()))
+                .collect(),
+            // BlueZ sends LocalName in the scan response. Truncated here so a
+            // long name is cut on a character boundary, not by BlueZ.
+            local_name: self
+                .local_name
+                .as_deref()
+                .map(|name| truncate_name(name, LOCAL_NAME_MAX_LEN).to_string()),
+            ..Default::default()
+        }
     }
 }
 
@@ -725,59 +731,59 @@ impl DialLocks {
 ///
 /// Returns once the subscription is in place, so no restart is missed
 /// between this call and the watch starting.
-async fn spawn_bluez_restart_watch(
-    conn: Arc<dbus::nonblock::SyncConnection>,
-    adapter: Adapter,
-    events_tx: EventBus,
-) {
-    let rule = dbus::message::MatchRule::new_signal("org.freedesktop.DBus", "NameOwnerChanged");
-    let Ok(matched) = conn.add_match(rule).await else {
-        log::warn!(
+impl LinuxDriver {
+    async fn watch_bluez_restart(
+        conn: Arc<dbus::nonblock::SyncConnection>,
+        adapter: Adapter,
+        events_tx: EventBus,
+    ) {
+        let rule = dbus::message::MatchRule::new_signal("org.freedesktop.DBus", "NameOwnerChanged");
+        let Ok(matched) = conn.add_match(rule).await else {
+            log::warn!(
             "bluez watch: could not subscribe to NameOwnerChanged; restart recovery is disabled"
         );
-        return;
-    };
-    tokio::spawn(async move {
-        let (_token, mut stream) = matched.msg_stream();
-        while let Some(msg) = stream.next().await {
-            let (name, _old_owner, new_owner) = msg.get3::<&str, &str, &str>();
-            if name != Some("org.bluez") {
-                continue;
-            }
-            if new_owner.is_none_or(|owner| owner.is_empty()) {
-                log::warn!("bluez watch: bluetoothd left the bus, reporting radio Off");
-                let _ = events_tx.send(GattEvent::RadioChanged {
-                    status: crate::entities::models::RadioStatus::Off,
-                });
-                continue;
-            }
-            // bluetoothd claims its bus name before it has exported and
-            // powered the adapter, and `On` tells consumers to re-register
-            // right away — so wait until it is usable.
-            let ready = tokio::time::timeout(BLUEZ_RESTART_READY_TIMEOUT, async {
-                while !adapter.is_powered().await.unwrap_or(false) {
-                    tokio::time::sleep(BLUEZ_RESTART_READY_POLL).await;
+            return;
+        };
+        tokio::spawn(async move {
+            let (_token, mut stream) = matched.msg_stream();
+            while let Some(msg) = stream.next().await {
+                let (name, _old_owner, new_owner) = msg.get3::<&str, &str, &str>();
+                if name != Some("org.bluez") {
+                    continue;
                 }
-            })
-            .await;
-            if ready.is_err() {
-                log::warn!(
-                    "bluez watch: bluetoothd is back but the adapter is not powered after \
+                if new_owner.is_none_or(|owner| owner.is_empty()) {
+                    log::warn!("bluez watch: bluetoothd left the bus, reporting radio Off");
+                    let _ = events_tx.send(GattEvent::RadioChanged {
+                        status: crate::entities::models::RadioStatus::Off,
+                    });
+                    continue;
+                }
+                // bluetoothd claims its bus name before it has exported and
+                // powered the adapter, and `On` tells consumers to re-register
+                // right away — so wait until it is usable.
+                let ready = tokio::time::timeout(BLUEZ_RESTART_READY_TIMEOUT, async {
+                    while !adapter.is_powered().await.unwrap_or(false) {
+                        tokio::time::sleep(BLUEZ_RESTART_READY_POLL).await;
+                    }
+                })
+                .await;
+                if ready.is_err() {
+                    log::warn!(
+                        "bluez watch: bluetoothd is back but the adapter is not powered after \
                      {BLUEZ_RESTART_READY_TIMEOUT:?}; leaving radio Off"
-                );
-                continue;
-            }
-            log::info!(
+                    );
+                    continue;
+                }
+                log::info!(
                 "bluez watch: bluetoothd is back and the adapter is powered, reporting radio On"
             );
-            let _ = events_tx.send(GattEvent::RadioChanged {
-                status: crate::entities::models::RadioStatus::On,
-            });
-        }
-    });
-}
+                let _ = events_tx.send(GattEvent::RadioChanged {
+                    status: crate::entities::models::RadioStatus::On,
+                });
+            }
+        });
+    }
 
-impl LinuxDriver {
     pub async fn new() -> Result<Self> {
         let session = Session::new()
             .await
@@ -825,7 +831,12 @@ impl LinuxDriver {
             });
         }
 
-        spawn_bluez_restart_watch(discovery.conn.clone(), adapter.clone(), events_tx.clone()).await;
+        LinuxDriver::watch_bluez_restart(
+            discovery.conn.clone(),
+            adapter.clone(),
+            events_tx.clone(),
+        )
+        .await;
 
         Ok(Self {
             _session: session,
@@ -841,7 +852,7 @@ impl LinuxDriver {
             events_tx,
             app_handle: AsyncMutex::new(None),
             adv_handle: AsyncMutex::new(None),
-            advertisement_release: StdMutex::new(None),
+            advertisement_release: Default::default(),
             served_service: StdMutex::new(None),
             server_watch: Arc::new(StdMutex::new(Vec::new())),
             dialed: Arc::new(StdMutex::new(HashMap::new())),
@@ -946,163 +957,166 @@ impl LinuxDriver {
 /// disconnect for the *replacement* link — whose datagram watcher would then
 /// tear down a channel that is working — and would clear a `dialed` entry
 /// that now belongs to the new connection.
-fn report_central_loss(
-    events_tx: &EventBus,
-    dialed: &Arc<StdMutex<HashMap<PeerAddress, u64>>>,
-    peer: &PeerAddress,
-    generation: u64,
-) {
-    let mut dialed = dialed.lock().unwrap();
-    if dialed.get(peer) != Some(&generation) {
-        return;
+impl LinuxGattConnection {
+    fn report_loss(
+        events_tx: &EventBus,
+        dialed: &Arc<StdMutex<HashMap<PeerAddress, u64>>>,
+        peer: &PeerAddress,
+        generation: u64,
+    ) {
+        let mut dialed = dialed.lock().unwrap();
+        if dialed.get(peer) != Some(&generation) {
+            return;
+        }
+        // Stop suppressing inbound reports for this address: a later connection
+        // from it may genuinely be an inbound one.
+        dialed.remove(peer);
+        drop(dialed);
+        log::info!("link lost: {} session={generation} (central role)", peer.0);
+        let _ = events_tx.send(GattEvent::Disconnected {
+            peer: peer.clone(),
+            local_role: Role::Central,
+            session: Some(generation),
+        });
     }
-    // Stop suppressing inbound reports for this address: a later connection
-    // from it may genuinely be an inbound one.
-    dialed.remove(peer);
-    drop(dialed);
-    log::info!("link lost: {} session={generation} (central role)", peer.0);
-    let _ = events_tx.send(GattEvent::Disconnected {
-        peer: peer.clone(),
-        local_role: Role::Central,
-        session: Some(generation),
-    });
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn watch_notify_sessions(
-    mut control: CharacteristicControl,
-    uuid: CharacteristicUuid,
-    writers: Arc<AsyncMutex<HashMap<CharacteristicUuid, Vec<CharacteristicWriter>>>>,
-    events_tx: EventBus,
-    served_peers: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
-    adapter: Adapter,
-    next_session: Arc<AtomicU64>,
-    watchers: Arc<StdMutex<Vec<tokio::task::AbortHandle>>>,
-    advertise_generation: Arc<StdMutex<u64>>,
-    this_generation: u64,
-) {
-    while let Some(event) = control.next().await {
-        let CharacteristicControlEvent::Notify(writer) = event else {
-            continue;
-        };
-        let address = writer.device_address();
-        let peer = PeerAddress(address.to_string());
+impl LinuxDriver {
+    #[allow(clippy::too_many_arguments)]
+    async fn watch_notifications(
+        mut control: CharacteristicControl,
+        uuid: CharacteristicUuid,
+        writers: Arc<AsyncMutex<HashMap<CharacteristicUuid, Vec<CharacteristicWriter>>>>,
+        events_tx: EventBus,
+        served_peers: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
+        adapter: Adapter,
+        next_session: Arc<AtomicU64>,
+        watchers: Arc<StdMutex<Vec<tokio::task::AbortHandle>>>,
+        advertise_generation: Arc<StdMutex<u64>>,
+        this_generation: u64,
+    ) {
+        while let Some(event) = control.next().await {
+            let CharacteristicControlEvent::Notify(writer) = event else {
+                continue;
+            };
+            let address = writer.device_address();
+            let peer = PeerAddress(address.to_string());
 
-        // Aborting this task's handle does not interrupt a poll already in
-        // progress, so a watcher can resume after a stop/restart and push a
-        // dead writer into the replacement's map, claim a `served_peers`
-        // slot and announce a peer the new server never accepted — which
-        // then refuses the legitimate central.
-        //
-        // The async lock on `writers` is taken *first*, so that from the
-        // generation check onward there is no await and every effect below
-        // is indivisible with it.
-        // A subscription can reach this generation's handlers in the instant
-        // between BlueZ serving the application and `advertise` publishing
-        // the generation. That is "not yet current", not stale: wait for the
-        // publish instead of returning, which would end this watcher and
-        // ignore every later subscription. `advertise` publishes while
-        // holding `writers`, so once the generation is current here it
-        // cannot change before the check below.
-        // Bounded: an `advertise` cancelled between serving and publishing
-        // never publishes, and this watcher must not wait for it forever.
-        // Generations are never reused, so once a later one is published
-        // this one reads as stale below and the watcher ends.
-        let mut polls = 0;
-        let mut writers_guard = loop {
-            let guard = writers.lock().await;
-            if *advertise_generation.lock().unwrap() >= this_generation
-                || polls >= GENERATION_PUBLISH_MAX_POLLS
-            {
-                break guard;
-            }
-            drop(guard);
-            polls += 1;
-            tokio::time::sleep(GENERATION_PUBLISH_POLL).await;
-        };
-        let session = {
-            let current = advertise_generation.lock().unwrap();
-            if *current != this_generation {
-                log::warn!(
+            // Aborting this task's handle does not interrupt a poll already in
+            // progress, so a watcher can resume after a stop/restart and push a
+            // dead writer into the replacement's map, claim a `served_peers`
+            // slot and announce a peer the new server never accepted — which
+            // then refuses the legitimate central.
+            //
+            // The async lock on `writers` is taken *first*, so that from the
+            // generation check onward there is no await and every effect below
+            // is indivisible with it.
+            // A subscription can reach this generation's handlers in the instant
+            // between BlueZ serving the application and `advertise` publishing
+            // the generation. That is "not yet current", not stale: wait for the
+            // publish instead of returning, which would end this watcher and
+            // ignore every later subscription. `advertise` publishes while
+            // holding `writers`, so once the generation is current here it
+            // cannot change before the check below.
+            // Bounded: an `advertise` cancelled between serving and publishing
+            // never publishes, and this watcher must not wait for it forever.
+            // Generations are never reused, so once a later one is published
+            // this one reads as stale below and the watcher ends.
+            let mut polls = 0;
+            let mut writers_guard = loop {
+                let guard = writers.lock().await;
+                if *advertise_generation.lock().unwrap() >= this_generation
+                    || polls >= GENERATION_PUBLISH_MAX_POLLS
+                {
+                    break guard;
+                }
+                drop(guard);
+                polls += 1;
+                tokio::time::sleep(GENERATION_PUBLISH_POLL).await;
+            };
+            let session = {
+                let current = advertise_generation.lock().unwrap();
+                if *current != this_generation {
+                    log::warn!(
                     "notify session: dropping a subscribe from {} for stale generation {this_generation} \
                      (current {current})",
                     peer.0
                 );
-                return;
-            }
+                    return;
+                }
 
-            let sessions = writers_guard.entry(uuid).or_default();
-            sessions.retain(|w| !w.is_closed().unwrap_or(true));
-            sessions.push(writer);
+                let sessions = writers_guard.entry(uuid).or_default();
+                sessions.retain(|w| !w.is_closed().unwrap_or(true));
+                sessions.push(writer);
 
-            let mut served = served_peers.lock().unwrap();
-            if served.contains_key(&peer) {
-                continue;
-            }
-            let session = next_session.fetch_add(1, Ordering::Relaxed);
-            served.insert(peer.clone(), session);
+                let mut served = served_peers.lock().unwrap();
+                if served.contains_key(&peer) {
+                    continue;
+                }
+                let session = next_session.fetch_add(1, Ordering::Relaxed);
+                served.insert(peer.clone(), session);
 
-            log::info!(
-                "notify session: central {} subscribed to {} session={session}",
-                peer.0,
-                uuid.0
+                log::info!(
+                    "notify session: central {} subscribed to {} session={session}",
+                    peer.0,
+                    uuid.0
+                );
+                let _ = events_tx.send(GattEvent::Connected {
+                    peer: peer.clone(),
+                    local_role: Role::Peripheral,
+                    session: Some(session),
+                });
+                session
+            };
+            drop(writers_guard);
+
+            let handle = LinuxDriver::watch_peripheral_disconnect(
+                adapter.clone(),
+                address,
+                peer,
+                events_tx.clone(),
+                served_peers.clone(),
+                writers.clone(),
+                session,
             );
-            let _ = events_tx.send(GattEvent::Connected {
-                peer: peer.clone(),
-                local_role: Role::Peripheral,
-                session: Some(session),
-            });
-            session
-        };
-        drop(writers_guard);
-
-        let handle = spawn_peripheral_disconnect_watch(
-            adapter.clone(),
-            address,
-            peer,
-            events_tx.clone(),
-            served_peers.clone(),
-            writers.clone(),
-            session,
-        );
-        // Registered so `stop_advertising` cancels it; previously these were
-        // detached and outlived the server that created them.
-        watchers.lock().unwrap().push(handle.abort_handle());
+            // Registered so `stop_advertising` cancels it; previously these were
+            // detached and outlived the server that created them.
+            watchers.lock().unwrap().push(handle.abort_handle());
+        }
     }
-}
 
-/// Emit `Disconnected { local_role: Peripheral }` once `address` drops its
-/// connection, then forget it so a later reconnect re-arms a fresh watcher.
-///
-/// Separate from the central-role watcher in `connect` because the two carry
-/// different roles and different cleanup: `datagram::serve` filters strictly
-/// on `local_role`, so emitting the central variant here would be silently
-/// ignored.
-#[allow(clippy::too_many_arguments)]
-fn spawn_peripheral_disconnect_watch(
-    adapter: Adapter,
-    address: bluer::Address,
-    peer: PeerAddress,
-    events_tx: EventBus,
-    served_peers: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
-    writers: Arc<AsyncMutex<HashMap<CharacteristicUuid, Vec<CharacteristicWriter>>>>,
-    session: u64,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        // This session's own writer may still be mid-`AcquireNotify` — see
-        // `NOTIFY_WRITER_ACQUIRE_TIMEOUT`'s doc comment on `notify_matching`.
-        // Without this grace period, this watcher's first poll (500ms,
-        // `NOTIFY_SESSION_POLL`) fires well before that 3s window has any
-        // chance to complete: a session this young genuinely having no live
-        // writer yet is indistinguishable from one that never will, so
-        // `has_live_session` alone would race ahead of `notify_matching`'s
-        // own wait, remove `served_peers` first, and turn the first reply's
-        // "no live notify session" into "session has been superseded" —
-        // still a failure, just reported by a different code path.
-        let spawned_at = tokio::time::Instant::now();
-        // Any exit path must clear the guard, or a peer that failed to be
-        // watched once could never be watched again.
-        let _ = async {
+    /// Emit `Disconnected { local_role: Peripheral }` once `address` drops its
+    /// connection, then forget it so a later reconnect re-arms a fresh watcher.
+    ///
+    /// Separate from the central-role watcher in `connect` because the two carry
+    /// different roles and different cleanup: `datagram::serve` filters strictly
+    /// on `local_role`, so emitting the central variant here would be silently
+    /// ignored.
+    #[allow(clippy::too_many_arguments)]
+    fn watch_peripheral_disconnect(
+        adapter: Adapter,
+        address: bluer::Address,
+        peer: PeerAddress,
+        events_tx: EventBus,
+        served_peers: Arc<StdMutex<HashMap<PeerAddress, u64>>>,
+        writers: Arc<AsyncMutex<HashMap<CharacteristicUuid, Vec<CharacteristicWriter>>>>,
+        session: u64,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            // This session's own writer may still be mid-`AcquireNotify` — see
+            // `NOTIFY_WRITER_ACQUIRE_TIMEOUT`'s doc comment on `notify_matching`.
+            // Without this grace period, this watcher's first poll (500ms,
+            // `NOTIFY_SESSION_POLL`) fires well before that 3s window has any
+            // chance to complete: a session this young genuinely having no live
+            // writer yet is indistinguishable from one that never will, so
+            // `has_live_session` alone would race ahead of `notify_matching`'s
+            // own wait, remove `served_peers` first, and turn the first reply's
+            // "no live notify session" into "session has been superseded" —
+            // still a failure, just reported by a different code path.
+            let spawned_at = tokio::time::Instant::now();
+            // Any exit path must clear the guard, or a peer that failed to be
+            // watched once could never be watched again.
+            let _ = async {
             let device = adapter.device(address).ok()?;
             let mut changes = device.events().await.ok()?;
             // Poll once after subscribing, as the central-role watcher does.
@@ -1137,7 +1151,7 @@ fn spawn_peripheral_disconnect_watch(
                         _ = tokio::time::sleep(NOTIFY_SESSION_POLL) => {
                             let past_acquire_grace =
                                 spawned_at.elapsed() >= NOTIFY_WRITER_ACQUIRE_TIMEOUT;
-                            if past_acquire_grace && !has_live_session(&writers, &peer).await {
+                            if past_acquire_grace && !LinuxDriver::has_notification_session(&writers, &peer).await {
                                 break;
                             }
                         }
@@ -1147,55 +1161,54 @@ fn spawn_peripheral_disconnect_watch(
             Some(())
         }
         .await;
-        // Only if this watcher still owns the session. The same address can
-        // have reconnected and been served afresh while this task was
-        // finishing; emitting then would tear down the replacement channel
-        // and erase its spawn guard, and the entry it removed would be the
-        // new session's.
-        //
-        // The writers lock is taken first, matching `notify_matching` and
-        // `watch_notify_sessions`: one order everywhere, so a notify in
-        // flight cannot observe a session this removal is about to retire.
-        let _writers = writers.lock().await;
-        let mut served = served_peers.lock().unwrap();
-        if served.get(&peer) != Some(&session) {
-            return;
-        }
-        served.remove(&peer);
-        drop(served);
-        log::info!("link lost: {} session={session} (peripheral role)", peer.0);
-        let _ = events_tx.send(GattEvent::Disconnected {
-            peer: peer.clone(),
-            local_role: Role::Peripheral,
-            session: Some(session),
-        });
-    })
-}
-
-/// Whether `peer` still holds any open notify session.
-///
-/// Polled rather than awaited on `CharacteristicWriter::closed()` because the
-/// writers live in a shared map that `notify` needs concurrent access to —
-/// taking one out to await its closure would block sends to everyone else.
-async fn has_live_session(
-    writers: &Arc<AsyncMutex<HashMap<CharacteristicUuid, Vec<CharacteristicWriter>>>>,
-    peer: &PeerAddress,
-) -> bool {
-    let mut writers = writers.lock().await;
-    let mut live = false;
-    for sessions in writers.values_mut() {
-        sessions.retain(|w| !w.is_closed().unwrap_or(true));
-        if sessions
-            .iter()
-            .any(|w| w.device_address().to_string() == peer.0)
-        {
-            live = true;
-        }
+            // Only if this watcher still owns the session. The same address can
+            // have reconnected and been served afresh while this task was
+            // finishing; emitting then would tear down the replacement channel
+            // and erase its spawn guard, and the entry it removed would be the
+            // new session's.
+            //
+            // The writers lock is taken first, matching `notify_matching` and
+            // `watch_notify_sessions`: one order everywhere, so a notify in
+            // flight cannot observe a session this removal is about to retire.
+            let _writers = writers.lock().await;
+            let mut served = served_peers.lock().unwrap();
+            if served.get(&peer) != Some(&session) {
+                return;
+            }
+            served.remove(&peer);
+            drop(served);
+            log::info!("link lost: {} session={session} (peripheral role)", peer.0);
+            let _ = events_tx.send(GattEvent::Disconnected {
+                peer: peer.clone(),
+                local_role: Role::Peripheral,
+                session: Some(session),
+            });
+        })
     }
-    live
-}
 
-impl LinuxDriver {
+    /// Whether `peer` still holds any open notify session.
+    ///
+    /// Polled rather than awaited on `CharacteristicWriter::closed()` because the
+    /// writers live in a shared map that `notify` needs concurrent access to —
+    /// taking one out to await its closure would block sends to everyone else.
+    async fn has_notification_session(
+        writers: &Arc<AsyncMutex<HashMap<CharacteristicUuid, Vec<CharacteristicWriter>>>>,
+        peer: &PeerAddress,
+    ) -> bool {
+        let mut writers = writers.lock().await;
+        let mut live = false;
+        for sessions in writers.values_mut() {
+            sessions.retain(|w| !w.is_closed().unwrap_or(true));
+            if sessions
+                .iter()
+                .any(|w| w.device_address().to_string() == peer.0)
+            {
+                live = true;
+            }
+        }
+        live
+    }
+
     /// Deliver to every live notify session matching `want`.
     ///
     /// Sessions are pruned before *and* after writing, because one can close
@@ -1499,7 +1512,7 @@ impl Drop for LinuxConnectGuard {
                     // exists to reach — not connected — is already true, so
                     // treat it exactly like a successful disconnect rather
                     // than an error to retry past.
-                    Ok(Ok(Err(err))) if is_not_connected(&err) => {
+                    Ok(Ok(Err(err))) if BleError::bluez_not_connected(&err) => {
                         log::info!(
                             "connect: {} cleanup disconnect reports not connected; treating as already clean",
                             peer.0
@@ -1573,69 +1586,67 @@ enum ScannedPeer {
 /// that does not advertise the target costs one `UUIDs` read per tick.
 const SCAN_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
-async fn read_scanned_peer(
-    adapter: &Adapter,
-    address: bluer::Address,
-    target: uuid::Uuid,
-) -> ScannedPeer {
-    let Ok(device) = adapter.device(address) else {
-        return ScannedPeer::Unknown;
-    };
-    let uuids = device.uuids().await.ok().flatten().unwrap_or_default();
-    if uuids.is_empty() {
-        return ScannedPeer::Unknown;
-    }
-    if !uuids.contains(&target) {
-        log::trace!(
-            "scan: ignoring {address} — advertises {} service(s), none matching",
-            uuids.len()
-        );
-        return ScannedPeer::NotTarget;
-    }
-    // BlueZ keeps device objects for addresses it heard in earlier scans and
-    // hands them to every new scan; it sets RSSI only once this discovery
-    // actually hears the device. Reporting a device without RSSI sent callers
-    // to addresses a phone had already rotated away from (Android picks a new
-    // private address each time it restarts advertising): 21 of 24 reports in
-    // one hardware session, each costing a 20s dial timeout. Treated as not yet
-    // known, so the completion watcher reports it once it is really heard.
-    let Some(rssi) = device.rssi().await.ok().flatten() else {
-        log::debug!("scan: {address} is cached but not heard in this scan yet");
-        return ScannedPeer::Unknown;
-    };
-    let platform_name = device.name().await.ok().flatten();
-    let manufacturer_data: std::collections::BTreeMap<u16, Vec<u8>> = device
-        .manufacturer_data()
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-    let service_data = device
-        .service_data()
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(uuid, data)| (ServiceUuid(uuid), data))
-        .collect();
-    let name = advertised_name(ServiceUuid(target), &service_data, platform_name);
-    let complete = !manufacturer_data.is_empty();
-    let rssi = Some(rssi);
-    let peer = DiscoveredPeer {
-        address: PeerAddress(address.to_string()),
-        name,
-        services: uuids.into_iter().map(ServiceUuid).collect(),
-        manufacturer_data,
-        service_data,
-        rssi,
-    };
-    if complete {
-        ScannedPeer::Complete(peer)
-    } else {
-        ScannedPeer::NoManufacturerData(peer)
+impl ScannedPeer {
+    async fn read(adapter: &Adapter, address: bluer::Address, target: uuid::Uuid) -> ScannedPeer {
+        let Ok(device) = adapter.device(address) else {
+            return ScannedPeer::Unknown;
+        };
+        let uuids = device.uuids().await.ok().flatten().unwrap_or_default();
+        if uuids.is_empty() {
+            return ScannedPeer::Unknown;
+        }
+        if !uuids.contains(&target) {
+            log::trace!(
+                "scan: ignoring {address} — advertises {} service(s), none matching",
+                uuids.len()
+            );
+            return ScannedPeer::NotTarget;
+        }
+        // BlueZ keeps device objects for addresses it heard in earlier scans and
+        // hands them to every new scan; it sets RSSI only once this discovery
+        // actually hears the device. Reporting a device without RSSI sent callers
+        // to addresses a phone had already rotated away from (Android picks a new
+        // private address each time it restarts advertising): 21 of 24 reports in
+        // one hardware session, each costing a 20s dial timeout. Treated as not yet
+        // known, so the completion watcher reports it once it is really heard.
+        let Some(rssi) = device.rssi().await.ok().flatten() else {
+            log::debug!("scan: {address} is cached but not heard in this scan yet");
+            return ScannedPeer::Unknown;
+        };
+        let platform_name = device.name().await.ok().flatten();
+        let manufacturer_data: std::collections::BTreeMap<u16, Vec<u8>> = device
+            .manufacturer_data()
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let service_data = device
+            .service_data()
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(uuid, data)| (ServiceUuid(uuid), data))
+            .collect();
+        let name = advertised_name(ServiceUuid(target), &service_data, platform_name);
+        let complete = !manufacturer_data.is_empty();
+        let rssi = Some(rssi);
+        let peer = DiscoveredPeer {
+            address: PeerAddress(address.to_string()),
+            name,
+            services: uuids.into_iter().map(ServiceUuid).collect(),
+            manufacturer_data,
+            service_data,
+            rssi,
+        };
+        if complete {
+            ScannedPeer::Complete(peer)
+        } else {
+            ScannedPeer::NoManufacturerData(peer)
+        }
     }
 }
 
@@ -1731,7 +1742,7 @@ impl Driver for LinuxDriver {
                     // Reported without manufacturer data too, so an advertiser
                     // that never sends any is still found, then again once the
                     // data arrives.
-                    let (peer, complete) = match read_scanned_peer(&adapter, address, target).await
+                    let (peer, complete) = match ScannedPeer::read(&adapter, address, target).await
                     {
                         ScannedPeer::Complete(peer) => (peer, true),
                         ScannedPeer::NoManufacturerData(peer) => (peer, false),
@@ -1973,7 +1984,7 @@ impl Driver for LinuxDriver {
             // `Disconnected` is ever emitted — leaving `dialed` stale and a
             // datagram receiver blocked forever.
             if !watch_device.is_connected().await.unwrap_or(false) {
-                report_central_loss(&events_tx, &dialed, &watch_peer, generation);
+                LinuxGattConnection::report_loss(&events_tx, &dialed, &watch_peer, generation);
                 return;
             }
             while let Some(event) = changes.next().await {
@@ -1982,7 +1993,7 @@ impl Driver for LinuxDriver {
                 else {
                     continue;
                 };
-                report_central_loss(&events_tx, &dialed, &watch_peer, generation);
+                LinuxGattConnection::report_loss(&events_tx, &dialed, &watch_peer, generation);
                 return;
             }
         });
@@ -2177,7 +2188,7 @@ impl Driver for LinuxDriver {
                             });
 
                             if newly_served {
-                                let handle = spawn_peripheral_disconnect_watch(
+                                let handle = LinuxDriver::watch_peripheral_disconnect(
                                     adapter,
                                     address,
                                     peer.clone(),
@@ -2219,7 +2230,7 @@ impl Driver for LinuxDriver {
             });
 
             if let Some(control) = control {
-                notify_sessions.push(tokio::spawn(watch_notify_sessions(
+                notify_sessions.push(tokio::spawn(LinuxDriver::watch_notifications(
                     control,
                     uuid,
                     notify_writers.clone(),
@@ -2293,7 +2304,7 @@ impl Driver for LinuxDriver {
 
         let adv_handle = self
             .adapter
-            .advertise(advertisement(&service))
+            .advertise(service.bluez_advertisement())
             .await
             .map_err(|err| {
                 log::warn!("advertise: BlueZ rejected the advertisement: {err}");
@@ -2385,7 +2396,7 @@ impl Driver for LinuxDriver {
         {
             self.release_advertisement(&mut adv_handle).await?;
         }
-        let registered = self.adapter.advertise(advertisement(&service)).await;
+        let registered = self.adapter.advertise(service.bluez_advertisement()).await;
         match registered {
             Ok(handle) => {
                 *adv_handle = Some(handle);
@@ -2415,7 +2426,7 @@ impl Driver for LinuxDriver {
                 self.wait_advertisement_release().await?;
                 *handle = Some(
                     self.adapter
-                        .advertise(advertisement(&service))
+                        .advertise(service.bluez_advertisement())
                         .await
                         .map_err(|err| BleError::Gatt(err.to_string()))?,
                 );
@@ -2460,7 +2471,7 @@ impl Driver for LinuxDriver {
             let _dial = self.dial_lock.lock(&peer).await;
             match tokio::time::timeout(CLEANUP_DISCONNECT_TIMEOUT, device.disconnect()).await {
                 Ok(Ok(())) => log::info!("close: {} disconnected", peer.0),
-                Ok(Err(err)) if is_not_connected(&err) => {}
+                Ok(Err(err)) if BleError::bluez_not_connected(&err) => {}
                 Ok(Err(err)) => log::warn!("close: disconnecting {} failed: {err}", peer.0),
                 Err(_) => log::warn!(
                     "close: disconnecting {} timed out after {CLEANUP_DISCONNECT_TIMEOUT:?}",
@@ -2680,7 +2691,7 @@ impl GattConnection for LinuxGattConnection {
         // does so itself, sized to its own timeout.
         match target.read().await {
             Ok(value) => Ok(value),
-            Err(err) if is_transient_gatt_error(&err) => {
+            Err(err) if BleError::bluez_transient(&err) => {
                 log::warn!(
                     "read: {} on {} rejected, possibly transient: {err}",
                     characteristic.0,
@@ -2731,7 +2742,7 @@ impl GattConnection for LinuxGattConnection {
         );
         match target.write_ext(&value, &request).await {
             Ok(()) => Ok(()),
-            Err(err) if is_transient_gatt_error(&err) => {
+            Err(err) if BleError::bluez_transient(&err) => {
                 log::warn!(
                     "write: {} bytes to {} rejected, possibly transient: {err}",
                     value.len(),
@@ -2839,7 +2850,12 @@ impl GattConnection for LinuxGattConnection {
                 "disconnect: {} is also served here; leaving the shared link up",
                 self.peer.0
             );
-            report_central_loss(&self.events_tx, &self.dialed, &self.peer, self.session);
+            LinuxGattConnection::report_loss(
+                &self.events_tx,
+                &self.dialed,
+                &self.peer,
+                self.session,
+            );
             return Ok(());
         }
 
@@ -2873,13 +2889,16 @@ mod tests {
             kind: bluer::ErrorKind::InProgress,
             message: "Operation already in progress".into(),
         };
-        assert!(matches!(discovery_error(busy), BleError::AdapterBusy(_)));
+        assert!(matches!(
+            BleError::bluez_discovery(busy),
+            BleError::AdapterBusy(_)
+        ));
         let off = bluer::Error {
             kind: bluer::ErrorKind::NotReady,
             message: "Resource Not Ready".into(),
         };
         assert!(matches!(
-            discovery_error(off),
+            BleError::bluez_discovery(off),
             BleError::AdapterUnavailable(_)
         ));
     }
@@ -3121,7 +3140,7 @@ mod tests {
         // `Off` must be reported, and `On` only once the adapter is powered.
         let events_tx = EventBus::new(8);
         let mut events = events_tx.subscribe();
-        spawn_bluez_restart_watch(discovery.conn.clone(), adapter.clone(), events_tx).await;
+        LinuxDriver::watch_bluez_restart(discovery.conn.clone(), adapter.clone(), events_tx).await;
         let next = |events: &mut tokio::sync::broadcast::Receiver<GattEvent>, wait_ms| {
             let wait = std::time::Duration::from_millis(wait_ms);
             let mut events = events.resubscribe();
@@ -3173,13 +3192,17 @@ mod tests {
             kind,
             message: String::new(),
         };
-        assert!(start_proved_not_running(&err(bluer::ErrorKind::NotReady)));
-        assert!(!start_proved_not_running(&err(
+        assert!(BleError::bluez_start_not_running(&err(
+            bluer::ErrorKind::NotReady
+        )));
+        assert!(!BleError::bluez_start_not_running(&err(
             bluer::ErrorKind::InProgress
         )));
-        assert!(!start_proved_not_running(&err(bluer::ErrorKind::Internal(
-            bluer::InternalErrorKind::DBus("org.freedesktop.DBus.Error.NoReply".into())
-        ))));
+        assert!(!BleError::bluez_start_not_running(&err(
+            bluer::ErrorKind::Internal(bluer::InternalErrorKind::DBus(
+                "org.freedesktop.DBus.Error.NoReply".into()
+            ))
+        )));
     }
 
     fn session_unique_name(discovery: &DiscoveryBus) -> String {

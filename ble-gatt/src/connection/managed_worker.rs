@@ -1,7 +1,7 @@
 //! One worker owns managed attempt state and native channel use.
 use super::{
-    acquired_cleanup::{copy_error, Cleanup},
-    managed_codec::{self, Record},
+    acquired_cleanup::Cleanup,
+    managed_codec::{self, ManagedMetadata, Record},
     managed_driver::ManagedDriver,
     peer_link::*,
 };
@@ -241,7 +241,7 @@ impl Worker {
                                         if let Some(attempt) = self.attempts.values().find(|attempt| attempt.peer == peer.address) {
                                             // A pending dial may not have validated metadata yet. Defer it.
                                             let Some(endpoint) = attempt.endpoint else { continue; };
-                                            peer.service_data.insert(service, managed_codec::metadata(endpoint));
+                                            peer.service_data.insert(service, ManagedMetadata { endpoint }.encode());
                                         } else {
                                             // One bounded read per address per discovery. Never replace an owned session.
                                             if probed.len() >= 64 || self.acquired.contains_key(&peer.address) || self.probing.contains_key(&peer.address) || self.address_retiring(&peer.address) || !probed.insert(peer.address.clone()) { continue; }
@@ -258,20 +258,20 @@ impl Worker {
                                                 let read = tokio::select! {
                                                     _ = shutdown.cancelled() => Err(AttemptError::Cancelled.into()),
                                                     _ = output.closed() => Err(AttemptError::Cancelled.into()),
-                                                    result = tokio::time::timeout(IO_BOUND, crate::advertisement::read_managed(driver.as_ref(), &peer.address)) => result.unwrap_or(Err(AttemptError::TimedOut.into())),
+                                                    result = tokio::time::timeout(IO_BOUND, crate::advertisement::GattAdvertisement::read_managed(driver.as_ref(), &peer.address)) => result.unwrap_or(Err(AttemptError::TimedOut.into())),
                                                 };
                                                 let result = read.and_then(|metadata| {
                                                     let peer = metadata.merge_into(service, peer);
-                                                    peer.service_data.get(&service).ok_or_else(|| failed("missing managed profile"))
-                                                        .and_then(|bytes| managed_codec::endpoint(bytes)).map(|endpoint| (endpoint, peer))
+                                                    peer.service_data.get(&service).ok_or_else(|| PeerLink::protocol_error("missing managed profile"))
+                                                        .and_then(|bytes| ManagedMetadata::decode(bytes)).map(|metadata| (metadata.endpoint, peer))
                                                 });
                                                 Operation::Probe(generation, address, output, result)
                                             });
                                             continue;
                                         }
                                     }
-                                    peer.service_data.get(&service).ok_or_else(|| failed("missing managed profile"))
-                                        .and_then(|bytes| managed_codec::endpoint(bytes)).map(|endpoint| (endpoint, peer))
+                                    peer.service_data.get(&service).ok_or_else(|| PeerLink::protocol_error("missing managed profile"))
+                                        .and_then(|bytes| ManagedMetadata::decode(bytes)).map(|metadata| (metadata.endpoint, peer))
                                 }
                                 Err(error) => Err(error),
                             };
@@ -295,14 +295,14 @@ impl Worker {
                             advertising_pending = true;
                             let startup = served.is_none() && enabled;
                             let mut config = self.config.datagram.clone();
-                            config.advertised_service_data.insert(config.service, managed_codec::metadata(self.endpoint));
+                            config.advertised_service_data.insert(config.service, ManagedMetadata { endpoint: self.endpoint }.encode());
                             let driver = driver.clone();
                             let shutdown = self.shutdown.clone();
                             self.operations.spawn(async move {
                                 let result = tokio::select! {
                                     _ = shutdown.cancelled() => Err(AttemptError::Cancelled.into()),
                                     result = tokio::time::timeout(IO_BOUND, async {
-                                        if startup { datagram::serve_driver(driver.clone(), &config).await.map(Some) }
+                                        if startup { config.serve_driver(driver.clone()).await.map(Some) }
                                         else { driver.set_advertising_enabled(enabled).await.map(|()| None) }
                                     }) => result.unwrap_or(Err(AttemptError::TimedOut.into())),
                                 };
@@ -320,7 +320,7 @@ impl Worker {
                                 attempt.local_accept = true; attempt.accepted = Some(reply);
                                 Self::send(attempt, Record::Decision { attempt: attempt.wire_attempt, action: 0 });
                                 self.establish(generation);
-                            } else { let _ = reply.send(Err(closed())); }
+                            } else { let _ = reply.send(Err(PeerLink::closed_error())); }
                         }
                         Command::Reject(generation, reply) => self.retire(vec![generation], AttemptError::Rejected, Some(reply)),
                         Command::Disconnect(endpoint, reply) => {
@@ -374,7 +374,7 @@ impl Worker {
                     }
                     Ok(Operation::Retired(targets, result)) => {
                         if let Err(error) = &result {
-                            teardown = Err(copy_error(error));
+                            teardown = Err(error.copy_error());
                         }
                         self.retired(targets, result);
                     }
@@ -461,7 +461,7 @@ impl Worker {
         self.acquired.remove(&peer);
         if let Err(error) = result {
             if let Some(retirement) = self.retiring.get_mut(&(peer.clone(), generation)) {
-                retirement.error = Some(copy_error(&error));
+                retirement.error = Some(error.copy_error());
             }
             self.cleanup_failure = Some(error);
         }
@@ -472,7 +472,7 @@ impl Worker {
             if let Some(retirement) = self.retiring.get_mut(&(peer.clone(), generation)) {
                 retirement.complete = true;
                 if let Err(error) = &result {
-                    retirement.error = Some(copy_error(error));
+                    retirement.error = Some(error.copy_error());
                 }
             }
             self.release_retirement(&peer, generation);
@@ -494,7 +494,7 @@ impl Worker {
             for waiter in retirement.waiters {
                 let mut waiter = waiter.lock().unwrap();
                 if let Some(error) = &retirement.error {
-                    waiter.error = Some(copy_error(error));
+                    waiter.error = Some(error.copy_error());
                 }
                 waiter.remaining -= 1;
                 if waiter.remaining == 0 {
@@ -689,13 +689,13 @@ impl Worker {
                 cleanup,
                 validate_metadata: true,
             });
-            let result = datagram::connect_managed(driver, &peer, &config)
+            let result = DatagramChannel::connect_managed(driver, &peer, &config)
                 .await
                 .and_then(|channel| {
                     let endpoint = endpoint
                         .lock()
                         .unwrap()
-                        .ok_or_else(|| failed("missing managed endpoint"))?;
+                        .ok_or_else(|| PeerLink::protocol_error("missing managed endpoint"))?;
                     Ok((channel, endpoint))
                 });
             let _ = commands.send(Command::Dialed(generation, result)).await;
@@ -804,8 +804,8 @@ impl Worker {
                         admission = Some(Box::pin(async move {
                             tokio::time::timeout(IO_BOUND, async {
                                 let (reply, receiver) = oneshot::channel();
-                                commands.send(Command::Wire(generation, record, Some(reply))).await.map_err(|_| closed())?;
-                                if let Some(admit) = receiver.await.map_err(|_| closed())? { admit.await?; }
+                                commands.send(Command::Wire(generation, record, Some(reply))).await.map_err(|_| PeerLink::closed_error())?;
+                                if let Some(admit) = receiver.await.map_err(|_| PeerLink::closed_error())? { admit.await?; }
                                 Ok(())
                             }).await.unwrap_or(Err(AttemptError::TimedOut.into()))
                         }));
@@ -816,7 +816,7 @@ impl Worker {
                             let sender = channel.sender();
                             sending = Some(Box::pin(async move {
                                 tokio::time::timeout(IO_BOUND, sender.send(record.encode()))
-                                    .await.unwrap_or_else(|_| Err(failed("managed send expired")))
+                                    .await.unwrap_or_else(|_| Err(PeerLink::protocol_error("managed send expired")))
                             }));
                             send_reply = reply;
                         }
@@ -998,7 +998,10 @@ impl Worker {
                 // generation's existing pump. There is at most one pending record.
                 if let Some(messages) = attempt.messages.clone() {
                     admission = Some(Box::pin(async move {
-                        messages.send(Ok(payload)).await.map_err(|_| closed())
+                        messages
+                            .send(Ok(payload))
+                            .await
+                            .map_err(|_| PeerLink::closed_error())
                     }));
                 } else {
                     failure = Some(AttemptError::Released);
@@ -1140,8 +1143,8 @@ impl Worker {
                     transport
                         .send(TransportCommand::Send(record, Some(reply)))
                         .await
-                        .map_err(|_| closed())?;
-                    receiver.await.map_err(|_| closed())??;
+                        .map_err(|_| PeerLink::closed_error())?;
+                    receiver.await.map_err(|_| PeerLink::closed_error())??;
                     let (reply, receiver) = oneshot::channel();
                     let confirmation =
                         if reason == AttemptError::Rejected && !attempt.rejection_received {
@@ -1169,8 +1172,8 @@ impl Worker {
                             confirmation,
                         })
                         .await
-                        .map_err(|_| closed())?;
-                    receiver.await.map_err(|_| closed())?
+                        .map_err(|_| PeerLink::closed_error())?;
+                    receiver.await.map_err(|_| PeerLink::closed_error())?
                 })
                 .await
                 .unwrap_or(Err(AttemptError::TimedOut.into()))
@@ -1497,14 +1500,11 @@ mod teardown_tests {
                     caps,
                 ));
                 let remote = Arc::new(MockDriver::new(peer.clone(), network, caps));
-                servers.push(
-                    datagram::serve_driver(remote, &worker.config.datagram)
+                servers.push(worker.config.datagram.serve_driver(remote).await.unwrap());
+                let channel =
+                    DatagramChannel::connect_driver(local, &peer, &worker.config.datagram)
                         .await
-                        .unwrap(),
-                );
-                let channel = datagram::connect_driver(local, &peer, &worker.config.datagram)
-                    .await
-                    .unwrap();
+                        .unwrap();
                 worker.inbound(channel);
                 assert!(worker.attempts.is_empty());
                 assert_eq!(
@@ -1824,9 +1824,9 @@ mod teardown_tests {
             crate::ServiceUuid(uuid::Uuid::from_u128(11)),
             crate::CharacteristicUuid(uuid::Uuid::from_u128(12)),
         ));
-        let _served = datagram::serve_driver(b, &config.datagram).await.unwrap();
+        let _served = config.datagram.serve_driver(b).await.unwrap();
         let peer = PeerAddress("cleanup-b".into());
-        let channel = datagram::connect_driver(a.clone(), &peer, &config.datagram)
+        let channel = DatagramChannel::connect_driver(a.clone(), &peer, &config.datagram)
             .await
             .unwrap();
         let (commands, receiver) = mpsc::channel(4);
@@ -1960,8 +1960,8 @@ mod teardown_tests {
             crate::CharacteristicUuid(uuid::Uuid::from_u128(12)),
         ));
         config.max_links = MaxLinks(1);
-        let _served = datagram::serve_driver(b, &config.datagram).await.unwrap();
-        let channel = datagram::connect_driver(
+        let _served = config.datagram.serve_driver(b).await.unwrap();
+        let channel = DatagramChannel::connect_driver(
             a.clone(),
             &PeerAddress("admission-b".into()),
             &config.datagram,

@@ -302,14 +302,20 @@ pub const LOCAL_NAME_MAX_LEN: usize = 29;
 
 /// `name` cut to at most `max` bytes without splitting a UTF-8 character.
 pub fn truncate_name(name: &str, max: usize) -> &str {
-    if name.len() <= max {
-        return name;
+    GattServiceSpec::truncate_name(name, max)
+}
+
+impl GattServiceSpec {
+    pub(crate) fn truncate_name(name: &str, max: usize) -> &str {
+        if name.len() <= max {
+            return name;
+        }
+        let mut end = max;
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        &name[..end]
     }
-    let mut end = max;
-    while !name.is_char_boundary(end) {
-        end -= 1;
-    }
-    &name[..end]
 }
 
 /// The name a scanner reports for a peer advertising `service`: the
@@ -326,11 +332,21 @@ pub fn advertised_name(
     service_data: &BTreeMap<ServiceUuid, Vec<u8>>,
     platform_name: Option<String>,
 ) -> Option<String> {
-    service_data
-        .get(&service)
-        .filter(|bytes| !bytes.is_empty())
-        .and_then(|bytes| String::from_utf8(bytes.clone()).ok())
-        .or(platform_name)
+    DiscoveredPeer::advertised_name(service, service_data, platform_name)
+}
+
+impl DiscoveredPeer {
+    pub(crate) fn advertised_name(
+        service: ServiceUuid,
+        service_data: &BTreeMap<ServiceUuid, Vec<u8>>,
+        platform_name: Option<String>,
+    ) -> Option<String> {
+        service_data
+            .get(&service)
+            .filter(|bytes| !bytes.is_empty())
+            .and_then(|bytes| String::from_utf8(bytes.clone()).ok())
+            .or(platform_name)
+    }
 }
 
 #[cfg(test)]

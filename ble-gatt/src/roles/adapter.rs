@@ -37,7 +37,7 @@ impl Adapter {
         // the two is not lost.
         let events = driver.lifecycle_events();
         let (status_tx, status) = watch::channel(driver.radio_status().await);
-        let watcher = tokio::spawn(publish_status(events, status_tx));
+        let watcher = tokio::spawn(Self::publish_status(events, status_tx));
         Self {
             inner: Arc::new(Inner {
                 driver,
@@ -98,16 +98,19 @@ impl Adapter {
     pub async fn close(&self) -> crate::Result<()> {
         self.inner.driver.close().await
     }
-}
 
-async fn publish_status(mut events: BoxStream<GattEvent>, status_tx: watch::Sender<RadioStatus>) {
-    while let Some(event) = events.next().await {
-        if let GattEvent::RadioChanged { status } = event {
-            status_tx.send_if_modified(|current| {
-                let changed = *current != status;
-                *current = status;
-                changed
-            });
+    async fn publish_status(
+        mut events: BoxStream<GattEvent>,
+        status_tx: watch::Sender<RadioStatus>,
+    ) {
+        while let Some(event) = events.next().await {
+            if let GattEvent::RadioChanged { status } = event {
+                status_tx.send_if_modified(|current| {
+                    let changed = *current != status;
+                    *current = status;
+                    changed
+                });
+            }
         }
     }
 }

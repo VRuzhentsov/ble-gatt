@@ -14,36 +14,38 @@ pub(crate) mod event_bus;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
-use crate::entities::error::Result;
+use crate::entities::error::{BleError, Result};
 use crate::hal::Driver;
 
 /// Only a known dropped notification payload is recoverable. Native operation
 /// failures and critical-port lag must not use this constructor.
-fn notification_receive_gap() -> crate::entities::error::BleError {
-    crate::entities::error::BleError::ReceiveGap(
-        "notification queue overflowed: payloads were dropped and at least one message is lost"
-            .into(),
-    )
-}
+impl BleError {
+    pub(crate) fn notification_receive_gap() -> Self {
+        crate::entities::error::BleError::ReceiveGap(
+            "notification queue overflowed: payloads were dropped and at least one message is lost"
+                .into(),
+        )
+    }
 
-/// Decode the `BleGattBridge.startScan` result, not asynchronous Android `ScanCallback` error codes.
-/// This function needs no radio, so host tests can check the JNI contract.
-#[cfg(any(target_os = "android", test))]
-fn android_scan_start_result(status: i32) -> Result<()> {
-    use crate::entities::error::BleError;
+    /// Decode the `BleGattBridge.startScan` result, not asynchronous Android `ScanCallback` error codes.
+    /// This function needs no radio, so host tests can check the JNI contract.
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn android_scan_start_result(status: i32) -> Result<()> {
+        use crate::entities::error::BleError;
 
-    // Keep in sync with BleGattBridge's SCAN_* constants (bridge ABI v6).
-    match status {
-        0 => Ok(()),
-        1 => Err(BleError::AdapterBusy(
-            "a scan is already active; concurrent scans are not supported".to_string(),
-        )),
-        2 => Err(BleError::AdapterUnavailable(
-            "Android Bluetooth LE scanner is unavailable".to_string(),
-        )),
-        _ => Err(BleError::Gatt(format!(
-            "startScan returned unknown status {status}"
-        ))),
+        // Keep in sync with BleGattBridge's SCAN_* constants (bridge ABI v6).
+        match status {
+            0 => Ok(()),
+            1 => Err(BleError::AdapterBusy(
+                "a scan is already active; concurrent scans are not supported".to_string(),
+            )),
+            2 => Err(BleError::AdapterUnavailable(
+                "Android Bluetooth LE scanner is unavailable".to_string(),
+            )),
+            _ => Err(BleError::Gatt(format!(
+                "startScan returned unknown status {status}"
+            ))),
+        }
     }
 }
 
@@ -69,23 +71,23 @@ pub async fn platform() -> Result<std::sync::Arc<dyn Driver>> {
 
 #[cfg(test)]
 mod android_scan_tests {
-    use super::android_scan_start_result;
+
     use crate::entities::error::BleError;
 
     #[test]
     fn only_an_explicitly_busy_scan_is_adapter_busy() {
-        assert!(android_scan_start_result(0).is_ok());
+        assert!(BleError::android_scan_start_result(0).is_ok());
         assert!(matches!(
-            android_scan_start_result(1),
+            BleError::android_scan_start_result(1),
             Err(BleError::AdapterBusy(_))
         ));
         assert!(matches!(
-            android_scan_start_result(2),
+            BleError::android_scan_start_result(2),
             Err(BleError::AdapterUnavailable(_))
         ));
         for unknown in [-1, 3, i32::MAX] {
             assert!(matches!(
-                android_scan_start_result(unknown),
+                BleError::android_scan_start_result(unknown),
                 Err(BleError::Gatt(_))
             ));
         }

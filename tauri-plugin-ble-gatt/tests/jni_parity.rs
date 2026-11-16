@@ -75,7 +75,7 @@ fn scan_start_status_and_abi_match_on_both_sides() {
     let rust = read(DRIVER);
     assert!(kotlin.contains("fun startScan(serviceUuid: String, generation: Long): Int"));
     assert!(rust.contains("\"(Ljava/lang/String;J)I\""));
-    assert!(rust.contains("super::android_scan_start_result(status)?"));
+    assert!(rust.contains("BleError::android_scan_start_result(status)?"));
     for (name, value) in [
         ("SCAN_STARTED", 0),
         ("SCAN_BUSY", 1),

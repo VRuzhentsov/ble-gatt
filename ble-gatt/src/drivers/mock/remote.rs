@@ -19,7 +19,7 @@ use crate::entities::models::{
 };
 use crate::hal::BoxStream;
 
-use super::wire::{read_frame, write_frame, Envelope, Frame, Push, Request, Response};
+use super::wire::{Envelope, Frame, Push, Request, Response};
 
 /// `closed` lives under the *same* lock as the waiter map, not as a
 /// separate flag — see `RemoteClient::call`'s doc comment for why that
@@ -100,7 +100,7 @@ impl RemoteClient {
         mut rx: mpsc::UnboundedReceiver<Envelope>,
     ) {
         while let Some(env) = rx.recv().await {
-            if write_frame(&mut write_half, &env).await.is_err() {
+            if env.write_frame(&mut write_half).await.is_err() {
                 break;
             }
         }
@@ -113,7 +113,7 @@ impl RemoteClient {
         subscriptions: SubscriptionsMap,
     ) {
         loop {
-            let env = match read_frame(&mut read_half).await {
+            let env = match Envelope::read_frame(&mut read_half).await {
                 Ok(env) => env,
                 Err(_) => break,
             };

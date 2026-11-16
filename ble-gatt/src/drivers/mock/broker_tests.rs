@@ -13,12 +13,11 @@ async fn broker_source_payload_overflow_does_not_become_critical_lag() {
     });
     let address = PeerAddress("server".into());
     let central = PeerAddress("client".into());
-    dispatch(
+    conn.dispatch(
         Request::RegisterAddress {
             address: address.clone(),
         },
         &radio,
-        &conn,
     )
     .await;
     let characteristic = CharacteristicUuid(uuid::Uuid::new_v4());
@@ -91,12 +90,11 @@ async fn stalled_broker_writer_bounds_critical_storage_and_reports_real_lag() {
     });
     let address = PeerAddress("server".into());
     let central = PeerAddress("client".into());
-    dispatch(
+    conn.dispatch(
         Request::RegisterAddress {
             address: address.clone(),
         },
         &radio,
-        &conn,
     )
     .await;
     radio

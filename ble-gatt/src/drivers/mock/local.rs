@@ -108,7 +108,7 @@ impl LocalRadio {
         if let Some(state) = peripherals.get(peripheral) {
             for peers in state.subscribers.values() {
                 if let Some(tx) = peers.get(central) {
-                    let _ = tx.send(Err(crate::drivers::notification_receive_gap()));
+                    let _ = tx.send(Err(BleError::notification_receive_gap()));
                 }
             }
         }

@@ -30,9 +30,7 @@ use windows::Devices::Bluetooth::GenericAttributeProfile::{
 };
 use windows::Foundation::TypedEventHandler;
 
-use super::utils::{
-    communication_error, from_buffer, session_address, to_buffer, to_guid, win_buffer, win_err,
-};
+use super::utils::WindowsCodec;
 use super::{Inner, ADVERTISE_START_TIMEOUT, STATUS_POLL_INTERVAL};
 use crate::entities::error::{BleError, Result};
 use crate::entities::models::{
@@ -150,7 +148,7 @@ impl Inner {
         if *current != generation {
             return None;
         }
-        let address = match session_address(gatt_session) {
+        let address = match WindowsCodec::session_address(gatt_session) {
             Ok(address) => address,
             Err(err) => {
                 log::warn!("server: cannot read the central's device id: {err}");
@@ -275,13 +273,13 @@ impl Inner {
         let local = self.local_characteristic(characteristic)?;
         let clients = local
             .SubscribedClients()
-            .map_err(|err| win_err("SubscribedClients", err))?;
+            .map_err(|err| BleError::windows_error("SubscribedClients", err))?;
         Ok(clients
             .into_iter()
             .filter_map(|client| {
                 let address = client
                     .Session()
-                    .and_then(|session| session_address(&session))
+                    .and_then(|session| WindowsCodec::session_address(&session))
                     .ok()?;
                 Some((address, client))
             })
@@ -294,213 +292,230 @@ impl Inner {
 /// `validate` rejects specifications that supply both.
 /// Windows omits data that cannot fit with a 128-bit UUID
 /// (`StartedWithoutAllAdvertisementData`). The GATT advertisement carries it instead.
-pub(super) fn provider_service_data(spec: &GattServiceSpec) -> Option<Vec<u8>> {
-    match &spec.local_name {
-        Some(name) => Some(
-            truncate_name(name, NAME_SERVICE_DATA_MAX_LEN)
-                .as_bytes()
-                .to_vec(),
-        ),
-        None => spec.service_data.get(&spec.uuid).cloned(),
+impl GattServiceSpec {
+    pub(super) fn provider_service_data(&self) -> Option<Vec<u8>> {
+        match &self.local_name {
+            Some(name) => Some(
+                truncate_name(name, NAME_SERVICE_DATA_MAX_LEN)
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            None => self.service_data.get(&self.uuid).cloned(),
+        }
     }
 }
 
-fn server_error(context: &str, error: BluetoothError) -> BleError {
-    if error == BluetoothError::RadioNotAvailable || error == BluetoothError::DisabledByUser {
-        BleError::AdapterUnavailable(format!("{context}: the Bluetooth radio is off"))
-    } else if error == BluetoothError::NotSupported {
-        BleError::PeripheralUnsupported
-    } else {
-        BleError::Gatt(format!("{context}: Bluetooth error {}", error.0))
+impl BleError {
+    fn server_error(context: &str, error: BluetoothError) -> BleError {
+        if error == BluetoothError::RadioNotAvailable || error == BluetoothError::DisabledByUser {
+            BleError::AdapterUnavailable(format!("{context}: the Bluetooth radio is off"))
+        } else if error == BluetoothError::NotSupported {
+            BleError::PeripheralUnsupported
+        } else {
+            BleError::Gatt(format!("{context}: Bluetooth error {}", error.0))
+        }
     }
 }
 
-pub(super) async fn start_server(inner: &Arc<Inner>, spec: &GattServiceSpec) -> Result<Server> {
-    if !spec.manufacturer_data.is_empty() || spec.service_data.keys().any(|uuid| *uuid != spec.uuid)
-    {
-        log::info!(
-            "advertise: Windows omits manufacturer data and data for other services; \
+impl Inner {
+    pub(super) async fn start_server(self: &Arc<Self>, spec: &GattServiceSpec) -> Result<Server> {
+        if !spec.manufacturer_data.is_empty()
+            || spec.service_data.keys().any(|uuid| *uuid != spec.uuid)
+        {
+            log::info!(
+                "advertise: Windows omits manufacturer data and data for other services; \
              scanners use the GATT advertisement (ADR-0012)"
-        );
-    }
-    let created = GattServiceProvider::CreateAsync(to_guid(spec.uuid.0))
-        .map_err(|err| win_err("GattServiceProvider::CreateAsync", err))?;
-    let result = created
-        .await
-        .map_err(|err| win_err("GattServiceProvider::CreateAsync", err))?;
-    let error = result
-        .Error()
-        .map_err(|err| win_err("GattServiceProvider::CreateAsync", err))?;
-    if error != BluetoothError::Success {
-        return Err(server_error("GattServiceProvider::CreateAsync", error));
-    }
-    let provider = result
-        .ServiceProvider()
-        .map_err(|err| win_err("ServiceProvider", err))?;
-    let local_service = provider
-        .Service()
-        .map_err(|err| win_err("GattServiceProvider::Service", err))?;
-
-    let (requests_tx, requests_rx) = mpsc::unbounded_channel::<ServerRequest>();
-    let values = Arc::new(StdMutex::new(HashMap::new()));
-    let generation = inner.next_id();
-    *inner.server_generation.lock().unwrap() = generation;
-    let mut server = Server {
-        inner: Arc::downgrade(inner),
-        generation,
-        provider: provider.clone(),
-        characteristics: HashMap::new(),
-        values: values.clone(),
-        desired_visibility: true,
-        tokens: Vec::new(),
-        request_task: None,
-    };
-    for characteristic_spec in &spec.characteristics {
-        let parameters = GattLocalCharacteristicParameters::new()
-            .map_err(|err| win_err("CharacteristicParameters", err))?;
-        let mut properties = GattCharacteristicProperties::None;
-        if characteristic_spec.readable {
-            properties |= GattCharacteristicProperties::Read;
+            );
         }
-        if characteristic_spec.writable {
-            properties |= GattCharacteristicProperties::Write
-                | GattCharacteristicProperties::WriteWithoutResponse;
-        }
-        if characteristic_spec.notifiable {
-            properties |= GattCharacteristicProperties::Notify;
-        }
-        let configure_characteristic = || -> windows::core::Result<()> {
-            parameters.SetCharacteristicProperties(properties)?;
-            parameters.SetReadProtectionLevel(GattProtectionLevel::Plain)?;
-            parameters.SetWriteProtectionLevel(GattProtectionLevel::Plain)?;
-            Ok(())
-        };
-        configure_characteristic().map_err(|err| win_err("CharacteristicParameters", err))?;
-        let op = local_service
-            .CreateCharacteristicAsync(to_guid(characteristic_spec.uuid.0), &parameters)
-            .map_err(|err| win_err("CreateCharacteristicAsync", err))?;
-        drop(parameters);
-        let created = op
+        let created = GattServiceProvider::CreateAsync(WindowsCodec::to_guid(spec.uuid.0))
+            .map_err(|err| BleError::windows_error("GattServiceProvider::CreateAsync", err))?;
+        let result = created
             .await
-            .map_err(|err| win_err("CreateCharacteristicAsync", err))?;
-        let error = created
+            .map_err(|err| BleError::windows_error("GattServiceProvider::CreateAsync", err))?;
+        let error = result
             .Error()
-            .map_err(|err| win_err("CreateCharacteristicAsync", err))?;
+            .map_err(|err| BleError::windows_error("GattServiceProvider::CreateAsync", err))?;
         if error != BluetoothError::Success {
-            return Err(server_error("CreateCharacteristicAsync", error));
+            return Err(BleError::server_error(
+                "GattServiceProvider::CreateAsync",
+                error,
+            ));
         }
-        let local = created
-            .Characteristic()
-            .map_err(|err| win_err("Characteristic", err))?;
-        let uuid = characteristic_spec.uuid;
-        // Register each token in its owner before the next fallible acquisition.
-        let token_index = server.tokens.len();
-        server.tokens.push((local.clone(), None, None, None));
+        let provider = result
+            .ServiceProvider()
+            .map_err(|err| BleError::windows_error("ServiceProvider", err))?;
+        let local_service = provider
+            .Service()
+            .map_err(|err| BleError::windows_error("GattServiceProvider::Service", err))?;
 
-        // Answered from `values` rather than a `StaticValue`, so
-        // `set_characteristic_value` can change it while serving.
-        server.tokens[token_index].1 = if characteristic_spec.readable {
-            values
-                .lock()
-                .unwrap()
-                .insert(uuid, characteristic_spec.initial_value.clone());
-            let requests_tx = requests_tx.clone();
-            let handler = TypedEventHandler::new(
-                move |_: Ref<GattLocalCharacteristic>, args: Ref<GattReadRequestedEventArgs>| {
-                    let _ = requests_tx.send(ServerRequest::Read(uuid, args.ok()?.clone()));
-                    Ok(())
-                },
-            );
-            Some(
-                local
-                    .ReadRequested(&handler)
-                    .map_err(|err| win_err("ReadRequested", err))?,
-            )
-        } else {
-            None
+        let (requests_tx, requests_rx) = mpsc::unbounded_channel::<ServerRequest>();
+        let values = Arc::new(StdMutex::new(HashMap::new()));
+        let generation = self.next_id();
+        *self.server_generation.lock().unwrap() = generation;
+        let mut server = Server {
+            inner: Arc::downgrade(self),
+            generation,
+            provider: provider.clone(),
+            characteristics: HashMap::new(),
+            values: values.clone(),
+            desired_visibility: true,
+            tokens: Vec::new(),
+            request_task: None,
         };
-        server.tokens[token_index].2 = if characteristic_spec.writable {
-            let requests_tx = requests_tx.clone();
-            let handler = TypedEventHandler::new(
-                move |_: Ref<GattLocalCharacteristic>, args: Ref<GattWriteRequestedEventArgs>| {
-                    // Queued in arrival order and handled on one task, so
-                    // the fragments of a datagram stay in order.
-                    let _ = requests_tx.send(ServerRequest::Write(uuid, args.ok()?.clone()));
-                    Ok(())
-                },
-            );
-            Some(
-                local
-                    .WriteRequested(&handler)
-                    .map_err(|err| win_err("WriteRequested", err))?,
-            )
-        } else {
-            None
-        };
-        server.tokens[token_index].3 = if characteristic_spec.notifiable {
-            let weak = Arc::downgrade(inner);
-            let handler = TypedEventHandler::new(
-                move |sender: Ref<GattLocalCharacteristic>, _: Ref<IInspectable>| {
-                    let Some(inner) = weak.upgrade() else {
-                        return Ok(());
-                    };
-                    for client in sender.ok()?.SubscribedClients()? {
-                        if let Ok(session) = client.Session() {
-                            inner.note_server_peer(&session, generation);
+        for characteristic_spec in &spec.characteristics {
+            let parameters = GattLocalCharacteristicParameters::new()
+                .map_err(|err| BleError::windows_error("CharacteristicParameters", err))?;
+            let mut properties = GattCharacteristicProperties::None;
+            if characteristic_spec.readable {
+                properties |= GattCharacteristicProperties::Read;
+            }
+            if characteristic_spec.writable {
+                properties |= GattCharacteristicProperties::Write
+                    | GattCharacteristicProperties::WriteWithoutResponse;
+            }
+            if characteristic_spec.notifiable {
+                properties |= GattCharacteristicProperties::Notify;
+            }
+            let configure_characteristic = || -> windows::core::Result<()> {
+                parameters.SetCharacteristicProperties(properties)?;
+                parameters.SetReadProtectionLevel(GattProtectionLevel::Plain)?;
+                parameters.SetWriteProtectionLevel(GattProtectionLevel::Plain)?;
+                Ok(())
+            };
+            configure_characteristic()
+                .map_err(|err| BleError::windows_error("CharacteristicParameters", err))?;
+            let op = local_service
+                .CreateCharacteristicAsync(
+                    WindowsCodec::to_guid(characteristic_spec.uuid.0),
+                    &parameters,
+                )
+                .map_err(|err| BleError::windows_error("CreateCharacteristicAsync", err))?;
+            drop(parameters);
+            let created = op
+                .await
+                .map_err(|err| BleError::windows_error("CreateCharacteristicAsync", err))?;
+            let error = created
+                .Error()
+                .map_err(|err| BleError::windows_error("CreateCharacteristicAsync", err))?;
+            if error != BluetoothError::Success {
+                return Err(BleError::server_error("CreateCharacteristicAsync", error));
+            }
+            let local = created
+                .Characteristic()
+                .map_err(|err| BleError::windows_error("Characteristic", err))?;
+            let uuid = characteristic_spec.uuid;
+            // Register each token in its owner before the next fallible acquisition.
+            let token_index = server.tokens.len();
+            server.tokens.push((local.clone(), None, None, None));
+
+            // Answered from `values` rather than a `StaticValue`, so
+            // `set_characteristic_value` can change it while serving.
+            server.tokens[token_index].1 = if characteristic_spec.readable {
+                values
+                    .lock()
+                    .unwrap()
+                    .insert(uuid, characteristic_spec.initial_value.clone());
+                let requests_tx = requests_tx.clone();
+                let handler = TypedEventHandler::new(
+                    move |_: Ref<GattLocalCharacteristic>,
+                          args: Ref<GattReadRequestedEventArgs>| {
+                        let _ = requests_tx.send(ServerRequest::Read(uuid, args.ok()?.clone()));
+                        Ok(())
+                    },
+                );
+                Some(
+                    local
+                        .ReadRequested(&handler)
+                        .map_err(|err| BleError::windows_error("ReadRequested", err))?,
+                )
+            } else {
+                None
+            };
+            server.tokens[token_index].2 = if characteristic_spec.writable {
+                let requests_tx = requests_tx.clone();
+                let handler = TypedEventHandler::new(
+                    move |_: Ref<GattLocalCharacteristic>,
+                          args: Ref<GattWriteRequestedEventArgs>| {
+                        // Queued in arrival order and handled on one task, so
+                        // the fragments of a datagram stay in order.
+                        let _ = requests_tx.send(ServerRequest::Write(uuid, args.ok()?.clone()));
+                        Ok(())
+                    },
+                );
+                Some(
+                    local
+                        .WriteRequested(&handler)
+                        .map_err(|err| BleError::windows_error("WriteRequested", err))?,
+                )
+            } else {
+                None
+            };
+            server.tokens[token_index].3 = if characteristic_spec.notifiable {
+                let weak = Arc::downgrade(self);
+                let handler = TypedEventHandler::new(
+                    move |sender: Ref<GattLocalCharacteristic>, _: Ref<IInspectable>| {
+                        let Some(inner) = weak.upgrade() else {
+                            return Ok(());
+                        };
+                        for client in sender.ok()?.SubscribedClients()? {
+                            if let Ok(session) = client.Session() {
+                                inner.note_server_peer(&session, generation);
+                            }
                         }
-                    }
-                    Ok(())
-                },
-            );
-            Some(
-                local
-                    .SubscribedClientsChanged(&handler)
-                    .map_err(|err| win_err("SubscribedClientsChanged", err))?,
-            )
-        } else {
-            None
-        };
-        server.characteristics.insert(uuid, local);
-    }
-    drop(requests_tx);
+                        Ok(())
+                    },
+                );
+                Some(
+                    local
+                        .SubscribedClientsChanged(&handler)
+                        .map_err(|err| BleError::windows_error("SubscribedClientsChanged", err))?,
+                )
+            } else {
+                None
+            };
+            server.characteristics.insert(uuid, local);
+        }
+        drop(requests_tx);
 
-    server.request_task = Some(tokio::spawn(drain_requests(
-        Arc::downgrade(inner),
-        generation,
-        values.clone(),
-        requests_rx,
-    )));
-    start_provider_advertising(&provider, spec).await?;
-    Ok(server)
+        server.request_task = Some(tokio::spawn(ServerRequest::drain_requests(
+            Arc::downgrade(self),
+            generation,
+            values.clone(),
+            requests_rx,
+        )));
+        Server::start_provider_advertising(&provider, spec).await?;
+        Ok(server)
+    }
 }
 
-pub(super) async fn start_provider_advertising(
-    provider: &GattServiceProvider,
-    spec: &GattServiceSpec,
-) -> Result<()> {
-    {
-        let parameters = GattServiceProviderAdvertisingParameters::new()
-            .map_err(|err| win_err("AdvertisingParameters", err))?;
-        parameters
-            .SetIsConnectable(true)
-            .map_err(|err| win_err("SetIsConnectable", err))?;
-        parameters
-            .SetIsDiscoverable(true)
-            .map_err(|err| win_err("SetIsDiscoverable", err))?;
-        if let Some(data) = provider_service_data(spec) {
+impl Server {
+    pub(super) async fn start_provider_advertising(
+        provider: &GattServiceProvider,
+        spec: &GattServiceSpec,
+    ) -> Result<()> {
+        {
+            let parameters = GattServiceProviderAdvertisingParameters::new()
+                .map_err(|err| BleError::windows_error("AdvertisingParameters", err))?;
             parameters
-                .SetServiceData(&to_buffer(&data)?)
-                .map_err(|err| win_err("SetServiceData", err))?;
+                .SetIsConnectable(true)
+                .map_err(|err| BleError::windows_error("SetIsConnectable", err))?;
+            parameters
+                .SetIsDiscoverable(true)
+                .map_err(|err| BleError::windows_error("SetIsDiscoverable", err))?;
+            if let Some(data) = spec.provider_service_data() {
+                parameters
+                    .SetServiceData(&WindowsCodec::to_buffer(&data)?)
+                    .map_err(|err| BleError::windows_error("SetServiceData", err))?;
+            }
+            provider
+                .StartAdvertisingWithParameters(&parameters)
+                .map_err(|err| BleError::windows_error("StartAdvertising", err))?;
         }
-        provider
-            .StartAdvertisingWithParameters(&parameters)
-            .map_err(|err| win_err("StartAdvertising", err))?;
-    }
-    // On the Windows 11 test computer with an Intel adapter, `Aborted` without an error preceded `Started`.
-    // Accept a started status immediately. Otherwise, wait until the deadline before reporting failure.
-    // Google Nearby's Windows GATT server waits the same way.
-    let confirmed = advertising_start::confirm(|| -> Result<bool> {
-        let status = provider.AdvertisementStatus().map_err(|err| win_err("AdvertisementStatus", err))?;
+        // On the Windows 11 test computer with an Intel adapter, `Aborted` without an error preceded `Started`.
+        // Accept a started status immediately. Otherwise, wait until the deadline before reporting failure.
+        // Google Nearby's Windows GATT server waits the same way.
+        let confirmed = advertising_start::PendingStart::confirm(|| -> Result<bool> {
+        let status = provider.AdvertisementStatus().map_err(|err| BleError::windows_error("AdvertisementStatus", err))?;
         if status == GattServiceProviderAdvertisementStatus::Started {
             return Ok(true);
         }
@@ -514,137 +529,150 @@ pub(super) async fn start_provider_advertising(
             log::warn!("advertise: pending start cleanup failed: {err}");
         }
     }, ADVERTISE_START_TIMEOUT, STATUS_POLL_INTERVAL).await?;
-    if !confirmed {
-        return Err(BleError::Gatt(format!(
-            "advertise: not started after {ADVERTISE_START_TIMEOUT:?}"
-        )));
+        if !confirmed {
+            return Err(BleError::Gatt(format!(
+                "advertise: not started after {ADVERTISE_START_TIMEOUT:?}"
+            )));
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Answers inbound reads and writes in the order they arrived; writes are
 /// published as `CharacteristicWritten`.
-async fn drain_requests(
-    inner: Weak<Inner>,
-    generation: u64,
-    values: Arc<StdMutex<HashMap<CharacteristicUuid, Vec<u8>>>>,
-    mut requests: mpsc::UnboundedReceiver<ServerRequest>,
-) {
-    while let Some(request) = requests.recv().await {
-        let Some(inner) = inner.upgrade() else { return };
-        let (characteristic, outcome) = match &request {
-            ServerRequest::Write(characteristic, args) => (
-                *characteristic,
-                handle_write(&inner, generation, *characteristic, args).await,
-            ),
-            ServerRequest::Read(characteristic, args) => (
-                *characteristic,
-                handle_read(&values, *characteristic, args).await,
-            ),
-        };
-        if let Err(err) = outcome {
-            log::warn!("server: request on {} failed: {err}", characteristic.0);
+impl ServerRequest {
+    async fn drain_requests(
+        inner: Weak<Inner>,
+        generation: u64,
+        values: Arc<StdMutex<HashMap<CharacteristicUuid, Vec<u8>>>>,
+        mut requests: mpsc::UnboundedReceiver<ServerRequest>,
+    ) {
+        while let Some(request) = requests.recv().await {
+            let Some(inner) = inner.upgrade() else { return };
+            let (characteristic, outcome) = match &request {
+                ServerRequest::Write(characteristic, args) => (
+                    *characteristic,
+                    inner.handle_write(generation, *characteristic, args).await,
+                ),
+                ServerRequest::Read(characteristic, args) => (
+                    *characteristic,
+                    Self::handle_read(&values, *characteristic, args).await,
+                ),
+            };
+            if let Err(err) = outcome {
+                log::warn!("server: request on {} failed: {err}", characteristic.0);
+            }
         }
+    }
+
+    /// Answer reads from `values`, including long reads that use `Offset`.
+    /// Do not emit `Connected` for a read: a scanner can read the GATT advertisement
+    /// without becoming a datagram peer.
+    /// Android and Linux use the same rule.
+    async fn handle_read(
+        values: &StdMutex<HashMap<CharacteristicUuid, Vec<u8>>>,
+        characteristic: CharacteristicUuid,
+        args: &GattReadRequestedEventArgs,
+    ) -> windows::core::Result<()> {
+        let deferral = args.GetDeferral()?;
+        let outcome = async {
+            let request = args.GetRequestAsync()?.await?;
+            let offset = request.Offset()? as usize;
+            let value = values
+                .lock()
+                .unwrap()
+                .get(&characteristic)
+                .cloned()
+                .unwrap_or_default();
+            if offset > value.len() {
+                return request.RespondWithProtocolError(ATT_INVALID_OFFSET);
+            }
+            request.RespondWithValue(&WindowsCodec::encode_buffer(&value[offset..])?)
+        }
+        .await;
+        deferral.Complete()?;
+        outcome
     }
 }
 
-/// Answer reads from `values`, including long reads that use `Offset`.
-/// Do not emit `Connected` for a read: a scanner can read the GATT advertisement
-/// without becoming a datagram peer.
-/// Android and Linux use the same rule.
-async fn handle_read(
-    values: &StdMutex<HashMap<CharacteristicUuid, Vec<u8>>>,
-    characteristic: CharacteristicUuid,
-    args: &GattReadRequestedEventArgs,
-) -> windows::core::Result<()> {
-    let deferral = args.GetDeferral()?;
-    let outcome = async {
-        let request = args.GetRequestAsync()?.await?;
-        let offset = request.Offset()? as usize;
-        let value = values
-            .lock()
-            .unwrap()
-            .get(&characteristic)
-            .cloned()
-            .unwrap_or_default();
-        if offset > value.len() {
-            return request.RespondWithProtocolError(ATT_INVALID_OFFSET);
+impl Inner {
+    async fn handle_write(
+        self: &Arc<Self>,
+        generation: u64,
+        characteristic: CharacteristicUuid,
+        args: &GattWriteRequestedEventArgs,
+    ) -> windows::core::Result<()> {
+        let deferral = args.GetDeferral()?;
+        let outcome = async {
+            let session = args.Session()?;
+            let request = args.GetRequestAsync()?.await?;
+            let with_response = request.Option()? == GattWriteOption::WriteWithResponse;
+            let address = WindowsCodec::session_address(&session)?;
+            if self.is_excluded(&address) {
+                if with_response {
+                    request.RespondWithProtocolError(ATT_WRITE_NOT_PERMITTED)?;
+                }
+                return Ok(());
+            }
+            let Some((address, _)) = self.note_server_peer(&session, generation) else {
+                if with_response {
+                    request.RespondWithProtocolError(ATT_WRITE_NOT_PERMITTED)?;
+                }
+                return Ok(());
+            };
+            // Serialize event publication with server replacement. No native await occurs under this lock.
+            let current = self.server_generation.lock().unwrap();
+            if *current != generation || self.is_excluded(&address) {
+                if with_response {
+                    request.RespondWithProtocolError(ATT_WRITE_NOT_PERMITTED)?;
+                }
+                return Ok(());
+            }
+            let value = WindowsCodec::from_buffer(&request.Value()?)?;
+            if with_response {
+                request.Respond()?;
+            }
+            log::debug!(
+                "server: {} bytes from {address} on {}",
+                value.len(),
+                characteristic.0
+            );
+            let _ = self.events_tx.send(GattEvent::CharacteristicWritten {
+                peer: PeerAddress(address),
+                characteristic,
+                value,
+            });
+            Ok(())
         }
-        request.RespondWithValue(&win_buffer(&value[offset..])?)
+        .await;
+        deferral.Complete()?;
+        outcome
     }
-    .await;
-    deferral.Complete()?;
-    outcome
 }
 
-async fn handle_write(
-    inner: &Arc<Inner>,
-    generation: u64,
-    characteristic: CharacteristicUuid,
-    args: &GattWriteRequestedEventArgs,
-) -> windows::core::Result<()> {
-    let deferral = args.GetDeferral()?;
-    let outcome = async {
-        let session = args.Session()?;
-        let request = args.GetRequestAsync()?.await?;
-        let with_response = request.Option()? == GattWriteOption::WriteWithResponse;
-        let address = session_address(&session)?;
-        if inner.is_excluded(&address) {
-            if with_response {
-                request.RespondWithProtocolError(ATT_WRITE_NOT_PERMITTED)?;
-            }
-            return Ok(());
+impl ServerPeer {
+    pub(super) async fn notify_client(
+        local: &GattLocalCharacteristic,
+        value: &[u8],
+        client: &GattSubscribedClient,
+    ) -> Result<()> {
+        // `IBuffer` is not `Send`, so it must be gone before the `.await`.
+        let op = local
+            .NotifyValueForSubscribedClientAsync(&WindowsCodec::to_buffer(value)?, client)
+            .map_err(|err| BleError::windows_error("NotifyValueAsync", err))?;
+        let result = op
+            .await
+            .map_err(|err| BleError::windows_error("NotifyValueAsync", err))?;
+        let status = result
+            .Status()
+            .map_err(|err| BleError::windows_error("NotifyValueAsync", err))?;
+        if status != GattCommunicationStatus::Success {
+            return Err(BleError::communication_error(
+                "notify",
+                status,
+                "subscribed central",
+            ));
         }
-        let Some((address, _)) = inner.note_server_peer(&session, generation) else {
-            if with_response {
-                request.RespondWithProtocolError(ATT_WRITE_NOT_PERMITTED)?;
-            }
-            return Ok(());
-        };
-        // Serialize event publication with server replacement. No native await occurs under this lock.
-        let current = inner.server_generation.lock().unwrap();
-        if *current != generation || inner.is_excluded(&address) {
-            if with_response {
-                request.RespondWithProtocolError(ATT_WRITE_NOT_PERMITTED)?;
-            }
-            return Ok(());
-        }
-        let value = from_buffer(&request.Value()?)?;
-        if with_response {
-            request.Respond()?;
-        }
-        log::debug!(
-            "server: {} bytes from {address} on {}",
-            value.len(),
-            characteristic.0
-        );
-        let _ = inner.events_tx.send(GattEvent::CharacteristicWritten {
-            peer: PeerAddress(address),
-            characteristic,
-            value,
-        });
         Ok(())
     }
-    .await;
-    deferral.Complete()?;
-    outcome
-}
-
-pub(super) async fn notify_client(
-    local: &GattLocalCharacteristic,
-    value: &[u8],
-    client: &GattSubscribedClient,
-) -> Result<()> {
-    // `IBuffer` is not `Send`, so it must be gone before the `.await`.
-    let op = local
-        .NotifyValueForSubscribedClientAsync(&to_buffer(value)?, client)
-        .map_err(|err| win_err("NotifyValueAsync", err))?;
-    let result = op.await.map_err(|err| win_err("NotifyValueAsync", err))?;
-    let status = result
-        .Status()
-        .map_err(|err| win_err("NotifyValueAsync", err))?;
-    if status != GattCommunicationStatus::Success {
-        return Err(communication_error("notify", status, "subscribed central"));
-    }
-    Ok(())
 }

@@ -40,7 +40,7 @@ impl Cleanup {
                 };
                 let outcome = outcome.map_err(Arc::new);
                 result.send_replace(Some(outcome.clone()));
-                outcome.map_err(|error| copy_error(&error))
+                outcome.map_err(|error| error.copy_error())
             },
         )
     }
@@ -60,7 +60,7 @@ impl Cleanup {
                 return outcome
                     .as_ref()
                     .map(|_| ())
-                    .map_err(|error| copy_error(error));
+                    .map_err(|error| error.copy_error());
             }
             result
                 .changed()
@@ -82,23 +82,25 @@ impl Cleanup {
 
 // Both the worker and the awaiting connection observe one native result.
 // Keep its typed contract without changing the public BleError API.
-pub(super) fn copy_error(error: &BleError) -> BleError {
-    match error {
-        BleError::Attempt(reason) => BleError::Attempt(*reason),
-        BleError::Protocol(message) => BleError::Protocol(message.clone()),
-        BleError::AdapterUnavailable(message) => BleError::AdapterUnavailable(message.clone()),
-        BleError::AdapterBusy(message) => BleError::AdapterBusy(message.clone()),
-        BleError::PeripheralUnsupported => BleError::PeripheralUnsupported,
-        BleError::Unsupported(message) => BleError::Unsupported(message.clone()),
-        BleError::ConnectFailed { peer, reason } => BleError::ConnectFailed {
-            peer: peer.clone(),
-            reason: reason.clone(),
-        },
-        BleError::Gatt(message) => BleError::Gatt(message.clone()),
-        BleError::ReceiveGap(message) => BleError::ReceiveGap(message.clone()),
-        BleError::GattBusy(message) => BleError::GattBusy(message.clone()),
-        BleError::NotConnected(message) => BleError::NotConnected(message.clone()),
-        BleError::Transport(message) => BleError::Transport(message.clone()),
+impl BleError {
+    pub(super) fn copy_error(&self) -> BleError {
+        match self {
+            BleError::Attempt(reason) => BleError::Attempt(*reason),
+            BleError::Protocol(message) => BleError::Protocol(message.clone()),
+            BleError::AdapterUnavailable(message) => BleError::AdapterUnavailable(message.clone()),
+            BleError::AdapterBusy(message) => BleError::AdapterBusy(message.clone()),
+            BleError::PeripheralUnsupported => BleError::PeripheralUnsupported,
+            BleError::Unsupported(message) => BleError::Unsupported(message.clone()),
+            BleError::ConnectFailed { peer, reason } => BleError::ConnectFailed {
+                peer: peer.clone(),
+                reason: reason.clone(),
+            },
+            BleError::Gatt(message) => BleError::Gatt(message.clone()),
+            BleError::ReceiveGap(message) => BleError::ReceiveGap(message.clone()),
+            BleError::GattBusy(message) => BleError::GattBusy(message.clone()),
+            BleError::NotConnected(message) => BleError::NotConnected(message.clone()),
+            BleError::Transport(message) => BleError::Transport(message.clone()),
+        }
     }
 }
 

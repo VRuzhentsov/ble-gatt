@@ -22,44 +22,60 @@ use tokio_stream::StreamExt;
 const ALPN: &[u8] = b"ble-gatt/example/either-peer/1";
 const COMPANY: u16 = 0xffff;
 
-fn scheduled_delay(start_at: u64, now: Duration) -> Duration {
-    // Keep the fractional part: truncating `now` schedules each peer at
-    // start_at plus its own discovery-time fraction, up to one second apart.
-    Duration::from_secs(start_at).saturating_sub(now)
+impl Options {
+    fn scheduled_delay(start_at: u64, now: Duration) -> Duration {
+        // Keep the fractional part: truncating `now` schedules each peer at
+        // start_at plus its own discovery-time fraction, up to one second apart.
+        Duration::from_secs(start_at).saturating_sub(now)
+    }
 }
 
 pub fn mark(line: impl std::fmt::Display) {
-    log::info!("EITHERPEER: {line}");
+    Options::mark(line)
+}
+
+impl Options {
+    fn mark(line: impl std::fmt::Display) {
+        log::info!("EITHERPEER: {line}");
+    }
 }
 
 pub fn payload(sender: EndpointId, round: u8) -> Vec<u8> {
-    let mut bytes: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
-    bytes[..32].copy_from_slice(sender.as_bytes());
-    bytes[32] = round;
-    bytes
+    Echo::payload(sender, round)
+}
+
+impl Echo {
+    fn payload(sender: EndpointId, round: u8) -> Vec<u8> {
+        let mut bytes: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        bytes[..32].copy_from_slice(sender.as_bytes());
+        bytes[32] = round;
+        bytes
+    }
 }
 
 // Five bytes fit alongside flags + 128-bit service UUID in legacy advertising.
 // A discovery hint only: TLS authenticates the full out-of-band peer key.
-fn hint(id: EndpointId) -> Vec<u8> {
-    let mut bytes = vec![1];
-    bytes.extend_from_slice(&id.as_bytes()[..4]);
-    bytes
-}
+impl Options {
+    fn hint(id: EndpointId) -> Vec<u8> {
+        let mut bytes = vec![1];
+        bytes.extend_from_slice(&id.as_bytes()[..4]);
+        bytes
+    }
 
-fn config(id: EndpointId) -> DatagramConfig {
-    let mut config = DatagramConfig::new(
-        ServiceUuid(uuid::Uuid::from_u128(
-            0xb1e6a110_f101_4000_8000_00805f9b34fb,
-        )),
-        CharacteristicUuid(uuid::Uuid::from_u128(
-            0xb1e6a111_f101_4000_8000_00805f9b34fb,
-        )),
-    );
-    config
-        .advertised_manufacturer_data
-        .insert(COMPANY, hint(id));
-    config
+    fn config(id: EndpointId) -> DatagramConfig {
+        let mut config = DatagramConfig::new(
+            ServiceUuid(uuid::Uuid::from_u128(
+                0xb1e6a110_f101_4000_8000_00805f9b34fb,
+            )),
+            CharacteristicUuid(uuid::Uuid::from_u128(
+                0xb1e6a111_f101_4000_8000_00805f9b34fb,
+            )),
+        );
+        config
+            .advertised_manufacturer_data
+            .insert(COMPANY, Options::hint(id));
+        config
+    }
 }
 
 pub struct Options {
@@ -73,14 +89,20 @@ pub struct Options {
 }
 
 pub fn mode(side: &str, mode: &str) -> Result<(bool, bool), String> {
-    if !matches!(side, "phone" | "linux") {
-        return Err("side must be phone or linux".into());
-    }
-    match mode {
-        "both" => Ok((true, true)),
-        "phone-initiate" => Ok((side == "phone", side != "phone")),
-        "linux-initiate" => Ok((side == "linux", side != "linux")),
-        _ => Err("mode must be phone-initiate, linux-initiate or both".into()),
+    Options::mode(side, mode)
+}
+
+impl Options {
+    fn mode(side: &str, mode: &str) -> Result<(bool, bool), String> {
+        if !matches!(side, "phone" | "linux") {
+            return Err("side must be phone or linux".into());
+        }
+        match mode {
+            "both" => Ok((true, true)),
+            "phone-initiate" => Ok((side == "phone", side != "phone")),
+            "linux-initiate" => Ok((side == "linux", side != "linux")),
+            _ => Err("mode must be phone-initiate, linux-initiate or both".into()),
+        }
     }
 }
 
@@ -172,25 +194,30 @@ impl ProtocolHandler for Echo {
     }
 }
 
-async fn probe(connection: &Connection, local: EndpointId, round: u8) -> Result<(), String> {
-    let bytes = payload(local, round);
-    let (mut send, mut recv) = connection.open_bi().await.map_err(|e| e.to_string())?;
-    send.write_all(&bytes).await.map_err(|e| e.to_string())?;
-    send.finish().map_err(|e| e.to_string())?;
-    let echoed = recv.read_to_end(4096).await.map_err(|e| e.to_string())?;
-    if echoed != bytes {
-        return Err("synthetic payload mismatch".into());
+impl Echo {
+    async fn probe(connection: &Connection, local: EndpointId, round: u8) -> Result<(), String> {
+        let bytes = payload(local, round);
+        let (mut send, mut recv) = connection.open_bi().await.map_err(|e| e.to_string())?;
+        send.write_all(&bytes).await.map_err(|e| e.to_string())?;
+        send.finish().map_err(|e| e.to_string())?;
+        let echoed = recv.read_to_end(4096).await.map_err(|e| e.to_string())?;
+        if echoed != bytes {
+            return Err("synthetic payload mismatch".into());
+        }
+        mark(format!(
+            "PAYLOAD matched peer={} handle={} round={round} bytes={}",
+            connection.remote_id(),
+            connection.stable_id(),
+            bytes.len()
+        ));
+        Ok(())
     }
-    mark(format!(
-        "PAYLOAD matched peer={} handle={} round={round} bytes={}",
-        connection.remote_id(),
-        connection.stable_id(),
-        bytes.len()
-    ));
-    Ok(())
 }
 
-type CarrierTasks = Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>;
+#[derive(Clone, Default)]
+struct CarrierTasks {
+    handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
 
 /// Driver lifecycle evidence, not a claim about every OS Bluetooth object.
 /// Subscribe before serving/dialling; a lost event makes the evidence invalid.
@@ -234,43 +261,46 @@ impl NativeSessions {
     }
 }
 
-async fn wait_for_native_cleanup(
-    sessions: &Mutex<NativeSessions>,
-    timeout: Duration,
-) -> Result<usize, String> {
-    tokio::time::timeout(timeout, async {
-        loop {
-            {
-                let state = sessions.lock().expect("diagnostic native sessions mutex");
-                if let Some(error) = &state.failure {
-                    return Err(error.clone());
+impl NativeSessions {
+    async fn wait_for_native_cleanup(
+        sessions: &Mutex<NativeSessions>,
+        timeout: Duration,
+    ) -> Result<usize, String> {
+        tokio::time::timeout(timeout, async {
+            loop {
+                {
+                    let state = sessions.lock().expect("diagnostic native sessions mutex");
+                    if let Some(error) = &state.failure {
+                        return Err(error.clone());
+                    }
+                    if state.observed > 0 && state.active.is_empty() {
+                        return Ok(state.observed);
+                    }
                 }
-                if state.observed > 0 && state.active.is_empty() {
-                    return Ok(state.observed);
-                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .map_err(|_| {
-        let state = sessions.lock().expect("diagnostic native sessions mutex");
-        format!(
-            "native session cleanup timed out before shutdown: observed={} active={:?}",
-            state.observed, state.active
-        )
-    })?
+        })
+        .await
+        .map_err(|_| {
+            let state = sessions.lock().expect("diagnostic native sessions mutex");
+            format!(
+                "native session cleanup timed out before shutdown: observed={} active={:?}",
+                state.observed, state.active
+            )
+        })?
+    }
 }
 
-async fn wait_for_cleanup(
-    transport: &BleGattTransport,
-    carriers: &CarrierTasks,
-    timeout: Duration,
-) -> Result<usize, String> {
-    tokio::time::timeout(timeout, async {
+impl CarrierTasks {
+    async fn wait_for_cleanup(
+        &self,
+        transport: &BleGattTransport,
+        timeout: Duration,
+    ) -> Result<usize, String> {
+        tokio::time::timeout(timeout, async {
         loop {
             let finished = {
-                let mut handles = carriers.lock().expect("diagnostic carriers mutex");
+                let mut handles = self.handles.lock().expect("diagnostic carriers mutex");
                 if transport.linked_peers().is_empty() && handles.iter().all(|h| h.is_finished()) {
                     Some(std::mem::take(&mut *handles))
                 } else {
@@ -289,172 +319,182 @@ async fn wait_for_cleanup(
     }).await.map_err(|_| format!(
         "last-user cleanup timed out before shutdown: address_queues={:?} incoming_carriers_pending={}",
         transport.linked_peers(),
-        carriers.lock().expect("diagnostic carriers mutex").iter().filter(|h| !h.is_finished()).count(),
+        self.handles.lock().expect("diagnostic carriers mutex").iter().filter(|h| !h.is_finished()).count(),
     ))?
+    }
 }
 
-// Shared production finalization seam: carrier cleanup may yield while the
-// independent native observer continues to update its evidence.
-async fn finalize_cleanup<F, Fut, C>(
-    sessions: &Mutex<NativeSessions>,
-    timeout: Duration,
-    mut cleanup: F,
-    carriers_clean: C,
-) -> Result<(usize, usize), String>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<usize, String>>,
-    C: Fn() -> bool,
-{
-    tokio::time::timeout(timeout, async {
-        let mut joined = cleanup().await?;
-        loop {
-            wait_for_native_cleanup(sessions, timeout).await?;
-            // Late QUIC close traffic may have produced another carrier
-            // while the native disconnect was in flight. Joining it can yield
-            // and invalidate the native checkpoint: never reuse that snapshot.
-            joined += cleanup().await?;
-            {
-                let state = sessions.lock().expect("diagnostic native sessions mutex");
-                if let Some(error) = &state.failure {
-                    return Err(error.clone());
+impl NativeSessions {
+    // Shared production finalization seam: carrier cleanup may yield while the
+    // independent native observer continues to update its evidence.
+    async fn finalize_cleanup<F, Fut, C>(
+        sessions: &Mutex<NativeSessions>,
+        timeout: Duration,
+        mut cleanup: F,
+        carriers_clean: C,
+    ) -> Result<(usize, usize), String>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<usize, String>>,
+        C: Fn() -> bool,
+    {
+        tokio::time::timeout(timeout, async {
+            let mut joined = cleanup().await?;
+            loop {
+                NativeSessions::wait_for_native_cleanup(sessions, timeout).await?;
+                // Late QUIC close traffic may have produced another carrier
+                // while the native disconnect was in flight. Joining it can yield
+                // and invalidate the native checkpoint: never reuse that snapshot.
+                joined += cleanup().await?;
+                {
+                    let state = sessions.lock().expect("diagnostic native sessions mutex");
+                    if let Some(error) = &state.failure {
+                        return Err(error.clone());
+                    }
+                    if state.observed > 0 && state.active.is_empty() && carriers_clean() {
+                        return Ok((joined, state.observed));
+                    }
                 }
-                if state.observed > 0 && state.active.is_empty() && carriers_clean() {
-                    return Ok((joined, state.observed));
-                }
+                // Retry both checkpoints, bounded by one overall deadline.
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            // Retry both checkpoints, bounded by one overall deadline.
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .map_err(|_| "final native/carrier cleanup checkpoint timed out before shutdown".to_string())?
+        })
+        .await
+        .map_err(|_| {
+            "final native/carrier cleanup checkpoint timed out before shutdown".to_string()
+        })?
+    }
 }
 
 /// Bounded run, including shutdown on failure. A PASS requires last-user cleanup
 /// without force-close; emergency close_links is only used after failure.
 pub async fn run(adapter: Adapter, options: Options) -> Result<(), String> {
-    run_inner(
-        adapter,
-        options,
-        #[cfg(test)]
-        false,
-    )
-    .await
+    options
+        .run_inner(
+            adapter,
+            #[cfg(test)]
+            false,
+        )
+        .await
 }
 
-async fn run_inner(
-    adapter: Adapter,
-    options: Options,
-    #[cfg(test)] acquire_before_survivor: bool,
-) -> Result<(), String> {
-    let id = options.key.public();
-    if id == options.peer {
-        return Err("local and remote keys must differ".into());
-    }
-    let caps = adapter.capabilities().await;
-    mark(format!("START local={id} peer={} establishment=core initiate={} expect_incoming={} ip=disabled relay=disabled central={} peripheral={}", options.peer, options.initiate, options.expect_incoming, caps.central, caps.peripheral));
-    if !caps.central || !caps.peripheral {
-        return Err("diagnostic requires both individual roles (not proof of concurrency)".into());
-    }
-    let config = config(id);
-    let mut native_events = adapter.driver().events();
-    let peer_link = PeerLink::with_driver(adapter.driver(), PeerLinkConfig::new(config.clone()));
-    let base_dial = dial_with(peer_link.clone());
-    let attempts = Arc::new(AtomicUsize::new(0));
-    let count = attempts.clone();
-    let dialer: Dialer = Arc::new(move |peer| {
-        let base = base_dial.clone();
-        let n = count.fetch_add(1, Ordering::SeqCst) + 1;
-        Box::pin(async move {
-            mark(format!("ACQUIRE request={n} advertised_address={}", peer.0));
-            let result = base(peer.clone()).await;
-            match &result {
-                Ok(_) => mark(format!("ACQUIRED request={n} address={}", peer.0)),
-                Err(e) => mark(format!("FAILED request={n} address={} error={e}", peer.0)),
+impl Options {
+    async fn run_inner(
+        self,
+        adapter: Adapter,
+        #[cfg(test)] acquire_before_survivor: bool,
+    ) -> Result<(), String> {
+        let id = self.key.public();
+        if id == self.peer {
+            return Err("local and remote keys must differ".into());
+        }
+        let caps = adapter.capabilities().await;
+        mark(format!("START local={id} peer={} establishment=core initiate={} expect_incoming={} ip=disabled relay=disabled central={} peripheral={}", self.peer, self.initiate, self.expect_incoming, caps.central, caps.peripheral));
+        if !caps.central || !caps.peripheral {
+            return Err(
+                "diagnostic requires both individual roles (not proof of concurrency)".into(),
+            );
+        }
+        let config = Options::config(id);
+        let mut native_events = adapter.driver().events();
+        let peer_link =
+            PeerLink::with_driver(adapter.driver(), PeerLinkConfig::new(config.clone()));
+        let base_dial = dial_with(peer_link.clone());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let count = attempts.clone();
+        let dialer: Dialer = Arc::new(move |peer| {
+            let base = base_dial.clone();
+            let n = count.fetch_add(1, Ordering::SeqCst) + 1;
+            Box::pin(async move {
+                mark(format!("ACQUIRE request={n} advertised_address={}", peer.0));
+                let result = base(peer.clone()).await;
+                match &result {
+                    Ok(_) => mark(format!("ACQUIRED request={n} address={}", peer.0)),
+                    Err(e) => mark(format!("FAILED request={n} address={} error={e}", peer.0)),
+                }
+                result
+            })
+        });
+        let transport = BleGattTransport::builder()
+            .dialer(dialer.clone())
+            .link_idle_timeout(Duration::from_secs(2))
+            .build();
+        let mut incoming = peer_link
+            .incoming()
+            .map_err(|e| format!("incoming requests: {e}"))?;
+        peer_link
+            .set_advertising(true)
+            .await
+            .map_err(|e| format!("advertising: {e}"))?;
+        let native_sessions = Arc::new(Mutex::new(NativeSessions::default()));
+        let watched_sessions = native_sessions.clone();
+        let native_watch = tokio::spawn(async move {
+            while let Some(event) = native_events.next().await {
+                watched_sessions
+                    .lock()
+                    .expect("diagnostic native sessions mutex")
+                    .observe(event);
             }
-            result
-        })
-    });
-    let transport = BleGattTransport::builder()
-        .dialer(dialer.clone())
-        .link_idle_timeout(Duration::from_secs(2))
-        .build();
-    let mut incoming = peer_link
-        .incoming()
-        .map_err(|e| format!("incoming requests: {e}"))?;
-    peer_link
-        .set_advertising(true)
-        .await
-        .map_err(|e| format!("advertising: {e}"))?;
-    let native_sessions = Arc::new(Mutex::new(NativeSessions::default()));
-    let watched_sessions = native_sessions.clone();
-    let native_watch = tokio::spawn(async move {
-        while let Some(event) = native_events.next().await {
             watched_sessions
                 .lock()
                 .expect("diagnostic native sessions mutex")
-                .observe(event);
-        }
-        watched_sessions
-            .lock()
-            .expect("diagnostic native sessions mutex")
-            .failure = Some("native lifecycle event stream ended before cleanup".into());
-    });
-    let attach_to = transport.clone();
-    let carriers: CarrierTasks = Arc::new(Mutex::new(Vec::new()));
-    let incoming_carriers = carriers.clone();
-    let attach = tokio::spawn(async move {
-        let mut n = 0;
-        while let Some(request) = incoming.next().await {
-            let channel = match request.accept().await {
-                Ok(channel) => channel,
-                Err(error) => {
-                    mark(format!("INCOMING failed error={error}"));
-                    continue;
-                }
-            };
-            n += 1;
-            mark(format!(
-                "ATTACH incoming={n} source_address={} source_is_not_dial_mapping=true",
-                channel.peer().0
-            ));
-            incoming_carriers
-                .lock()
-                .expect("diagnostic carriers mutex")
-                .push(attach_to.attach(channel));
-        }
-    });
-    let endpoint = match Endpoint::builder(presets::Minimal)
-        .secret_key(options.key.clone())
-        .relay_mode(RelayMode::Disabled)
-        .clear_ip_transports()
-        .add_custom_transport(Arc::new(transport.clone()))
-        .address_lookup(transport.address_lookup())
-        .hooks(transport.hooks())
-        .bind()
-        .await
-    {
-        Ok(endpoint) => endpoint,
-        Err(e) => {
-            attach.abort();
-            native_watch.abort();
-            let _ = adapter.close().await;
-            return Err(format!("bind: {e}"));
-        }
-    };
-    let received = Arc::new(AtomicUsize::new(0));
-    let echo = Echo {
-        peer: options.peer,
-        received: received.clone(),
-        failure: Arc::new(Mutex::new(None)),
-    };
-    let router = Router::builder(endpoint.clone())
-        .accept(ALPN, echo.clone())
-        .spawn();
-    mark(format!("READY local={id} service={}", config.service.0));
-    let result = tokio::time::timeout(options.timeout, async {
-        if options.initiate {
+                .failure = Some("native lifecycle event stream ended before cleanup".into());
+        });
+        let attach_to = transport.clone();
+        let carriers = CarrierTasks::default();
+        let incoming_carriers = carriers.clone();
+        let attach = tokio::spawn(async move {
+            let mut n = 0;
+            while let Some(request) = incoming.next().await {
+                let channel = match request.accept().await {
+                    Ok(channel) => channel,
+                    Err(error) => {
+                        mark(format!("INCOMING failed error={error}"));
+                        continue;
+                    }
+                };
+                n += 1;
+                mark(format!(
+                    "ATTACH incoming={n} source_address={} source_is_not_dial_mapping=true",
+                    channel.peer().0
+                ));
+                incoming_carriers
+                    .handles
+                    .lock()
+                    .expect("diagnostic carriers mutex")
+                    .push(attach_to.attach(channel));
+            }
+        });
+        let endpoint = match Endpoint::builder(presets::Minimal)
+            .secret_key(self.key.clone())
+            .relay_mode(RelayMode::Disabled)
+            .clear_ip_transports()
+            .add_custom_transport(Arc::new(transport.clone()))
+            .address_lookup(transport.address_lookup())
+            .hooks(transport.hooks())
+            .bind()
+            .await
+        {
+            Ok(endpoint) => endpoint,
+            Err(e) => {
+                attach.abort();
+                native_watch.abort();
+                let _ = adapter.close().await;
+                return Err(format!("bind: {e}"));
+            }
+        };
+        let received = Arc::new(AtomicUsize::new(0));
+        let echo = Echo {
+            peer: self.peer,
+            received: received.clone(),
+            failure: Arc::new(Mutex::new(None)),
+        };
+        let router = Router::builder(endpoint.clone())
+            .accept(ALPN, echo.clone())
+            .spawn();
+        mark(format!("READY local={id} service={}", config.service.0));
+        let result = tokio::time::timeout(self.timeout, async {
+        if self.initiate {
             let mut scan = peer_link.discover().await.map_err(|e| format!("discovery: {e}"))?;
             let address = loop {
                 let (_core_endpoint, peer) = scan
@@ -465,25 +505,25 @@ async fn run_inner(
                 mark(format!(
                     "DISCOVERY advertised_address={} hint_match={}",
                     peer.address.0,
-                    peer.manufacturer_data.get(&COMPANY) == Some(&hint(options.peer))
+                    peer.manufacturer_data.get(&COMPANY) == Some(&Options::hint(self.peer))
                 ));
-                if peer.manufacturer_data.get(&COMPANY) == Some(&hint(options.peer)) {
+                if peer.manufacturer_data.get(&COMPANY) == Some(&Options::hint(self.peer)) {
                     break peer.address;
                 }
             };
             drop(scan);
-            transport.set_peer_address(options.peer, address.clone());
+            transport.set_peer_address(self.peer, address.clone());
             mark(format!(
                 "MAP authenticated_target={} advertised_address={}",
-                options.peer, address.0
+                self.peer, address.0
             ));
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|e| e.to_string())?;
-            tokio::time::sleep(scheduled_delay(options.start_at, now)).await;
+            tokio::time::sleep(Options::scheduled_delay(self.start_at, now)).await;
             mark("CONNECT application_attempt=1");
             let first = endpoint
-                .connect(options.peer, ALPN)
+                .connect(self.peer, ALPN)
                 .await
                 .map_err(|e| format!("connect 1: {e}"))?;
             mark(format!(
@@ -492,13 +532,13 @@ async fn run_inner(
                 first.stable_id(),
                 first.paths()
             ));
-            probe(&first, id, 1).await?;
+            Echo::probe(&first, id, 1).await?;
             let before = attempts.load(Ordering::SeqCst);
             let second = endpoint
-                .connect(options.peer, ALPN)
+                .connect(self.peer, ALPN)
                 .await
                 .map_err(|e| format!("connect 2: {e}"))?;
-            probe(&second, id, 2).await?;
+            Echo::probe(&second, id, 2).await?;
             if attempts.load(Ordering::SeqCst) != before {
                 return Err(
                     "second QUIC connection unexpectedly dialled a new BLE carrier".into(),
@@ -523,7 +563,7 @@ async fn run_inner(
                 let extra = dialer(address.clone()).await.map_err(|e| e.to_string())?;
                 drop(extra);
             }
-            probe(&second, id, 3).await?;
+            Echo::probe(&second, id, 3).await?;
             let after = attempts.load(Ordering::SeqCst);
             if after != before {
                 return Err(format!(
@@ -534,19 +574,19 @@ async fn run_inner(
             second.close(0u32.into(), b"diagnostic done");
             drop(second);
         }
-        if options.expect_incoming {
+        if self.expect_incoming {
             while !echo.complete() {
                 echo.check()?;
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
         echo.check()?;
-        let (joined, observed) = finalize_cleanup(
+        let (joined, observed) = NativeSessions::finalize_cleanup(
             &native_sessions,
             Duration::from_secs(20),
-            || wait_for_cleanup(&transport, &carriers, Duration::from_secs(20)),
+            || carriers.wait_for_cleanup(&transport, Duration::from_secs(20)),
             || {
-                let handles = carriers.lock().expect("diagnostic carriers mutex");
+                let handles = carriers.handles.lock().expect("diagnostic carriers mutex");
                 handles.is_empty() && transport.linked_peers().is_empty()
             },
         ).await?;
@@ -561,27 +601,29 @@ async fn run_inner(
     })
     .await
     .unwrap_or_else(|_| Err("diagnostic timed out (inspect earliest missing native event)".into()));
-    if result.is_err() {
-        transport.close_links(&options.peer);
+        if result.is_err() {
+            transport.close_links(&self.peer);
+        }
+        let _ = router.shutdown().await;
+        native_watch.abort();
+        let _ = native_watch.await;
+        endpoint.close().await;
+        attach.abort();
+        let _ = attach.await;
+        let _ = peer_link.close().await;
+        let closed = adapter
+            .close()
+            .await
+            .map_err(|e| format!("adapter shutdown: {e}"));
+        // Only failure/late-arrival tasks can remain; this is teardown, not PASS evidence.
+        let remaining =
+            std::mem::take(&mut *carriers.handles.lock().expect("diagnostic carriers mutex"));
+        for handle in remaining {
+            handle.abort();
+            let _ = handle.await;
+        }
+        result.and(closed)
     }
-    let _ = router.shutdown().await;
-    native_watch.abort();
-    let _ = native_watch.await;
-    endpoint.close().await;
-    attach.abort();
-    let _ = attach.await;
-    let _ = peer_link.close().await;
-    let closed = adapter
-        .close()
-        .await
-        .map_err(|e| format!("adapter shutdown: {e}"));
-    // Only failure/late-arrival tasks can remain; this is teardown, not PASS evidence.
-    let remaining = std::mem::take(&mut *carriers.lock().expect("diagnostic carriers mutex"));
-    for handle in remaining {
-        handle.abort();
-        let _ = handle.await;
-    }
-    result.and(closed)
 }
 
 #[cfg(test)]
@@ -603,7 +645,7 @@ mod tests {
             ..Default::default()
         });
         let calls = AtomicUsize::new(0);
-        let finalization = finalize_cleanup(
+        let finalization = NativeSessions::finalize_cleanup(
             &state,
             Duration::from_secs(1),
             || {
@@ -659,7 +701,7 @@ mod tests {
             ..Default::default()
         });
         let calls = AtomicUsize::new(0);
-        let result = finalize_cleanup(
+        let result = NativeSessions::finalize_cleanup(
             &state,
             Duration::from_secs(1),
             || {
@@ -708,7 +750,7 @@ mod tests {
             observed: 2,
             ..Default::default()
         });
-        let result = finalize_cleanup(
+        let result = NativeSessions::finalize_cleanup(
             &state,
             Duration::from_secs(1),
             || async {
@@ -724,20 +766,23 @@ mod tests {
     #[test]
     fn scheduled_start_preserves_subsecond_deadline() {
         let now = Duration::from_millis(100_900);
-        assert_eq!(scheduled_delay(101, now), Duration::from_millis(100));
         assert_eq!(
-            scheduled_delay(101, Duration::from_millis(100_100)),
+            Options::scheduled_delay(101, now),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            Options::scheduled_delay(101, Duration::from_millis(100_100)),
             Duration::from_millis(900)
         );
-        assert_eq!(scheduled_delay(100, now), Duration::ZERO);
-        assert_eq!(scheduled_delay(0, now), Duration::ZERO);
+        assert_eq!(Options::scheduled_delay(100, now), Duration::ZERO);
+        assert_eq!(Options::scheduled_delay(0, now), Duration::ZERO);
     }
 
     #[tokio::test]
     async fn native_cleanup_waits_for_each_role_and_session_and_rejects_lag() {
         let state = Arc::new(Mutex::new(NativeSessions::default()));
         assert!(
-            wait_for_native_cleanup(&state, Duration::from_millis(5))
+            NativeSessions::wait_for_native_cleanup(&state, Duration::from_millis(5))
                 .await
                 .is_err(),
             "an empty observer with no lifecycle evidence is not teardown proof"
@@ -761,7 +806,8 @@ mod tests {
             local_role: Role::Central,
             session: Some(1),
         });
-        let result = wait_for_native_cleanup(&state, Duration::from_millis(10)).await;
+        let result =
+            NativeSessions::wait_for_native_cleanup(&state, Duration::from_millis(10)).await;
         assert!(
             result.is_err(),
             "the peripheral session still exists: {result:?}"
@@ -772,16 +818,18 @@ mod tests {
             local_role: Role::Peripheral,
             session: Some(1),
         });
-        assert!(wait_for_native_cleanup(&state, Duration::from_millis(10))
-            .await
-            .is_err());
+        assert!(
+            NativeSessions::wait_for_native_cleanup(&state, Duration::from_millis(10))
+                .await
+                .is_err()
+        );
         state.lock().unwrap().observe(GattEvent::Disconnected {
             peer,
             local_role: Role::Peripheral,
             session: Some(2),
         });
         assert_eq!(
-            wait_for_native_cleanup(&state, Duration::from_millis(100))
+            NativeSessions::wait_for_native_cleanup(&state, Duration::from_millis(100))
                 .await
                 .unwrap(),
             2
@@ -790,9 +838,11 @@ mod tests {
             .lock()
             .unwrap()
             .observe(GattEvent::Lagged { dropped: 1 });
-        assert!(wait_for_native_cleanup(&state, Duration::from_millis(100))
-            .await
-            .is_err());
+        assert!(
+            NativeSessions::wait_for_native_cleanup(&state, Duration::from_millis(100))
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -854,7 +904,7 @@ mod tests {
         let aa = Adapter::new(make("redial-a")).await;
         let ba = Adapter::new(make("redial-b")).await;
         let (ar, _br) = tokio::join!(
-            run_inner(aa, opts(a.clone(), b.public(), true), true),
+            opts(a.clone(), b.public(), true).run_inner(aa, true),
             run(ba, opts(b, a.public(), false)),
         );
         assert!(
@@ -890,7 +940,7 @@ mod tests {
         let ba = Adapter::new(make("ack-b")).await;
         let a = SecretKey::generate();
         let b = SecretKey::generate();
-        let config = config(b.public());
+        let config = Options::config(b.public());
         let bt = BleGattTransport::builder().build();
         let bp = PeerLink::with_driver(ba.driver(), PeerLinkConfig::new(config.clone()));
         let ap = PeerLink::with_driver(aa.driver(), PeerLinkConfig::new(config));
@@ -984,8 +1034,8 @@ mod tests {
                 let echo = echo.clone();
                 async move { echo.accept(server).await }
             });
-            probe(&client, echo.peer, 1).await.unwrap();
-            probe(&client, echo.peer, 1).await.unwrap();
+            Echo::probe(&client, echo.peer, 1).await.unwrap();
+            Echo::probe(&client, echo.peer, 1).await.unwrap();
             assert!(handler.await.unwrap().is_err());
             assert!(!echo.complete());
             assert!(echo
@@ -1022,9 +1072,13 @@ mod tests {
     async fn empty_address_map_does_not_hide_live_incoming_carrier() {
         let transport = BleGattTransport::builder().build();
         let task = tokio::spawn(std::future::pending());
-        let carriers = Arc::new(Mutex::new(vec![task]));
-        let result = wait_for_cleanup(&transport, &carriers, Duration::from_millis(100)).await;
-        carriers.lock().unwrap()[0].abort();
+        let carriers = CarrierTasks {
+            handles: Arc::new(Mutex::new(vec![task])),
+        };
+        let result = carriers
+            .wait_for_cleanup(&transport, Duration::from_millis(100))
+            .await;
+        carriers.handles.lock().unwrap()[0].abort();
         assert!(
             result.is_err(),
             "empty address queues must not mask a live carrier: {result:?}"
@@ -1047,18 +1101,22 @@ mod tests {
     async fn cleanup_joins_finished_carriers_and_rejects_cancelled_task() {
         let transport = BleGattTransport::builder().build();
         let done = tokio::spawn(async {});
-        let carriers = Arc::new(Mutex::new(vec![done]));
+        let carriers = CarrierTasks {
+            handles: Arc::new(Mutex::new(vec![done])),
+        };
         assert_eq!(
-            wait_for_cleanup(&transport, &carriers, Duration::from_secs(1))
+            carriers
+                .wait_for_cleanup(&transport, Duration::from_secs(1))
                 .await
                 .unwrap(),
             1
         );
-        assert!(carriers.lock().unwrap().is_empty());
+        assert!(carriers.handles.lock().unwrap().is_empty());
         let cancelled = tokio::spawn(std::future::pending());
         cancelled.abort();
-        carriers.lock().unwrap().push(cancelled);
-        let error = wait_for_cleanup(&transport, &carriers, Duration::from_secs(1))
+        carriers.handles.lock().unwrap().push(cancelled);
+        let error = carriers
+            .wait_for_cleanup(&transport, Duration::from_secs(1))
             .await
             .unwrap_err();
         assert!(error.contains("incoming carrier task failed"), "{error}");

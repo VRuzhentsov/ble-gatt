@@ -151,24 +151,26 @@ pub(super) enum Push {
 /// `u32` BE length prefix + `serde_json`. Test-only, non-perf-sensitive
 /// protocol — see docs/adr/0004 for why this was chosen over hand-rolled
 /// binary framing.
-pub(super) async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, env: &Envelope) -> Result<()> {
-    let bytes = serde_json::to_vec(env).map_err(|e| BleError::Transport(e.to_string()))?;
-    w.write_u32(bytes.len() as u32)
-        .await
-        .map_err(|e| BleError::Transport(e.to_string()))?;
-    w.write_all(&bytes)
-        .await
-        .map_err(|e| BleError::Transport(e.to_string()))
-}
+impl Envelope {
+    pub(super) async fn write_frame<W: AsyncWrite + Unpin>(&self, w: &mut W) -> Result<()> {
+        let bytes = serde_json::to_vec(self).map_err(|e| BleError::Transport(e.to_string()))?;
+        w.write_u32(bytes.len() as u32)
+            .await
+            .map_err(|e| BleError::Transport(e.to_string()))?;
+        w.write_all(&bytes)
+            .await
+            .map_err(|e| BleError::Transport(e.to_string()))
+    }
 
-pub(super) async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Envelope> {
-    let len = r
-        .read_u32()
-        .await
-        .map_err(|e| BleError::Transport(e.to_string()))?;
-    let mut buf = vec![0u8; len as usize];
-    r.read_exact(&mut buf)
-        .await
-        .map_err(|e| BleError::Transport(e.to_string()))?;
-    serde_json::from_slice(&buf).map_err(|e| BleError::Transport(e.to_string()))
+    pub(super) async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Envelope> {
+        let len = r
+            .read_u32()
+            .await
+            .map_err(|e| BleError::Transport(e.to_string()))?;
+        let mut buf = vec![0u8; len as usize];
+        r.read_exact(&mut buf)
+            .await
+            .map_err(|e| BleError::Transport(e.to_string()))?;
+        serde_json::from_slice(&buf).map_err(|e| BleError::Transport(e.to_string()))
+    }
 }

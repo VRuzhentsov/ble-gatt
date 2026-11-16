@@ -49,7 +49,7 @@ impl Connection {
     ) -> Self {
         let (state_tx, _) = watch::channel(ConnectionState::Connected);
         let cancel = CancellationToken::new();
-        let watcher = tokio::spawn(watch_for_end(
+        let watcher = tokio::spawn(Self::watch_for_end(
             events,
             inner.peer(),
             inner.session(),
@@ -137,7 +137,7 @@ impl Connection {
     pub async fn disconnect(&mut self) -> Result<()> {
         let result = self.conn_mut().disconnect().await;
         self.open = false;
-        end(&self.state_tx, &self.cancel);
+        Self::end(&self.state_tx, &self.cancel);
         result
     }
 
@@ -164,7 +164,7 @@ impl Connection {
 impl Drop for Connection {
     fn drop(&mut self) {
         self.watcher.abort();
-        end(&self.state_tx, &self.cancel);
+        Self::end(&self.state_tx, &self.cancel);
         // No driver disconnects on its own drop; on Android the
         // `BluetoothGatt` stays open and the next connect to the peer is
         // refused as already open. `Drop` cannot await, so a task does it,
@@ -187,53 +187,55 @@ impl Drop for Connection {
     }
 }
 
-fn end(state_tx: &watch::Sender<ConnectionState>, cancel: &CancellationToken) {
-    state_tx.send_if_modified(|state| {
-        let changed = state.is_connected();
-        *state = ConnectionState::Disconnected;
-        changed
-    });
-    cancel.cancel();
-}
-
-/// Whether `event` ends the connection to `peer` this device dialled.
-/// Events from another connection to the same peer (a different `session`)
-/// do not; where either side has no session, the address decides.
-fn ends_connection(event: &GattEvent, peer: &PeerAddress, session: Option<u64>) -> bool {
-    match event {
-        GattEvent::Disconnected {
-            peer: event_peer,
-            local_role: Role::Central,
-            session: event_session,
-        } => {
-            event_peer == peer
-                && match (session, event_session) {
-                    (Some(ours), Some(theirs)) => ours == *theirs,
-                    _ => true,
-                }
-        }
-        GattEvent::RadioChanged { status } => *status != RadioStatus::On,
-        // A discarded lifecycle transition may have ended this connection.
-        GattEvent::Lagged { .. } => true,
-        _ => false,
+impl Connection {
+    fn end(state_tx: &watch::Sender<ConnectionState>, cancel: &CancellationToken) {
+        state_tx.send_if_modified(|state| {
+            let changed = state.is_connected();
+            *state = ConnectionState::Disconnected;
+            changed
+        });
+        cancel.cancel();
     }
-}
 
-async fn watch_for_end(
-    mut events: BoxStream<GattEvent>,
-    peer: PeerAddress,
-    session: Option<u64>,
-    state_tx: watch::Sender<ConnectionState>,
-    cancel: CancellationToken,
-) {
-    while let Some(event) = events.next().await {
-        if ends_connection(&event, &peer, session) {
-            end(&state_tx, &cancel);
-            return;
+    /// Whether `event` ends the connection to `peer` this device dialled.
+    /// Events from another connection to the same peer (a different `session`)
+    /// do not; where either side has no session, the address decides.
+    fn ends_connection(event: &GattEvent, peer: &PeerAddress, session: Option<u64>) -> bool {
+        match event {
+            GattEvent::Disconnected {
+                peer: event_peer,
+                local_role: Role::Central,
+                session: event_session,
+            } => {
+                event_peer == peer
+                    && match (session, event_session) {
+                        (Some(ours), Some(theirs)) => ours == *theirs,
+                        _ => true,
+                    }
+            }
+            GattEvent::RadioChanged { status } => *status != RadioStatus::On,
+            // A discarded lifecycle transition may have ended this connection.
+            GattEvent::Lagged { .. } => true,
+            _ => false,
         }
     }
-    // Without a lifecycle source, connection state can no longer be verified.
-    end(&state_tx, &cancel);
+
+    async fn watch_for_end(
+        mut events: BoxStream<GattEvent>,
+        peer: PeerAddress,
+        session: Option<u64>,
+        state_tx: watch::Sender<ConnectionState>,
+        cancel: CancellationToken,
+    ) {
+        while let Some(event) = events.next().await {
+            if Self::ends_connection(&event, &peer, session) {
+                Self::end(&state_tx, &cancel);
+                return;
+            }
+        }
+        // Without a lifecycle source, connection state can no longer be verified.
+        Self::end(&state_tx, &cancel);
+    }
 }
 
 #[cfg(test)]
@@ -251,28 +253,28 @@ mod tests {
     #[test]
     fn only_this_connections_disconnect_ends_it() {
         let peer = PeerAddress("AA".into());
-        assert!(ends_connection(
+        assert!(Connection::ends_connection(
             &disconnected("AA", Role::Central, Some(1)),
             &peer,
             Some(1)
         ));
-        assert!(ends_connection(
+        assert!(Connection::ends_connection(
             &disconnected("AA", Role::Central, None),
             &peer,
             Some(1)
         ));
-        assert!(!ends_connection(
+        assert!(!Connection::ends_connection(
             &disconnected("AA", Role::Central, Some(2)),
             &peer,
             Some(1)
         ));
-        assert!(!ends_connection(
+        assert!(!Connection::ends_connection(
             &disconnected("BB", Role::Central, Some(1)),
             &peer,
             Some(1)
         ));
         // The same peer connected to our GATT server is a different link.
-        assert!(!ends_connection(
+        assert!(!Connection::ends_connection(
             &disconnected("AA", Role::Peripheral, Some(1)),
             &peer,
             Some(1)
@@ -283,7 +285,7 @@ mod tests {
     async fn lifecycle_stream_end_publishes_disconnected() {
         let (state, _) = watch::channel(ConnectionState::Connected);
         let cancelled = CancellationToken::new();
-        watch_for_end(
+        Connection::watch_for_end(
             Box::pin(tokio_stream::empty()),
             PeerAddress("closed-source".into()),
             Some(1),
@@ -307,7 +309,7 @@ mod tests {
         let on = GattEvent::RadioChanged {
             status: RadioStatus::On,
         };
-        assert!(ends_connection(&off, &peer, None));
-        assert!(!ends_connection(&on, &peer, None));
+        assert!(Connection::ends_connection(&off, &peer, None));
+        assert!(!Connection::ends_connection(&on, &peer, None));
     }
 }

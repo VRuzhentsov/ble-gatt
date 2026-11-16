@@ -126,7 +126,7 @@ impl PeerLink {
             cancellation,
             reply,
         })?;
-        let result = receiver.await.map_err(|_| closed())?;
+        let result = receiver.await.map_err(|_| PeerLink::closed_error())?;
         if result.is_ok() {
             guard.0.take();
         }
@@ -144,22 +144,22 @@ impl PeerLink {
     pub async fn set_advertising(&self, enabled: bool) -> Result<()> {
         let (reply, receiver) = oneshot::channel();
         self.submit(Command::Advertising(enabled, reply))?;
-        receiver.await.map_err(|_| closed())?
+        receiver.await.map_err(|_| PeerLink::closed_error())?
     }
     pub async fn disconnect(&self, endpoint: EndpointId) -> Result<()> {
         let (reply, receiver) = oneshot::channel();
         self.submit(Command::Disconnect(endpoint, reply))?;
-        receiver.await.map_err(|_| closed())?
+        receiver.await.map_err(|_| PeerLink::closed_error())?
     }
     pub async fn close(&self) -> Result<()> {
         let (reply, receiver) = oneshot::channel();
         self.submit(Command::Close(reply))?;
-        receiver.await.map_err(|_| closed())?
+        receiver.await.map_err(|_| PeerLink::closed_error())?
     }
     pub async fn discover(&self) -> Result<BoxStream<Result<(EndpointId, DiscoveredPeer)>>> {
         let (reply, receiver) = oneshot::channel();
         self.submit(Command::Discover(reply))?;
-        receiver.await.map_err(|_| closed())?
+        receiver.await.map_err(|_| PeerLink::closed_error())?
     }
     fn submit(&self, command: Command) -> Result<()> {
         self.commands
@@ -168,7 +168,7 @@ impl PeerLink {
                 mpsc::error::TrySendError::Full(_) => {
                     BleError::GattBusy("worker queue full".into())
                 }
-                mpsc::error::TrySendError::Closed(_) => closed(),
+                mpsc::error::TrySendError::Closed(_) => PeerLink::closed_error(),
             })
     }
 }
@@ -210,13 +210,16 @@ impl ConnectionRequest {
         self.commands
             .send(Command::Accept(self.generation, reply))
             .await
-            .map_err(|_| closed())?;
-        let result = receiver.await.map_err(|_| closed())?.map_err(|error| {
-            self.outcome
-                .lock()
-                .unwrap()
-                .map_or(error, BleError::Attempt)
-        });
+            .map_err(|_| PeerLink::closed_error())?;
+        let result = receiver
+            .await
+            .map_err(|_| PeerLink::closed_error())?
+            .map_err(|error| {
+                self.outcome
+                    .lock()
+                    .unwrap()
+                    .map_or(error, BleError::Attempt)
+            });
         if result.is_ok() {
             self.cancellation.0.take();
         }
@@ -227,8 +230,8 @@ impl ConnectionRequest {
         self.commands
             .send(Command::Reject(self.generation, reply))
             .await
-            .map_err(|_| closed())?;
-        receiver.await.map_err(|_| closed())?
+            .map_err(|_| PeerLink::closed_error())?;
+        receiver.await.map_err(|_| PeerLink::closed_error())?
     }
 }
 
@@ -290,7 +293,7 @@ impl PeerChannel {
     }
     pub async fn send(&self, payload: Vec<u8>) -> Result<()> {
         if self.state.ended.is_cancelled() {
-            return Err(closed());
+            return Err(PeerLink::closed_error());
         }
         if payload.len() > self.state.maximum {
             return Err(BleError::Protocol(
@@ -308,7 +311,7 @@ impl PeerChannel {
                 Some(reply),
             ))
             .map_err(|_| BleError::GattBusy("channel queue full or closed".into()))?;
-        receiver.await.map_err(|_| closed())?
+        receiver.await.map_err(|_| PeerLink::closed_error())?
     }
     pub async fn recv(&self) -> Option<Result<Vec<u8>>> {
         // Hold the receive lock across flag checks and wakeups too: clones
@@ -332,14 +335,14 @@ impl PeerChannel {
     }
     pub async fn request_connection_priority(&self, priority: ConnectionPriority) -> Result<()> {
         if self.state.ended.is_cancelled() {
-            return Err(closed());
+            return Err(PeerLink::closed_error());
         }
         let (reply, receiver) = oneshot::channel();
         self.state
             .transport
             .try_send(TransportCommand::Priority(priority, reply))
             .map_err(|_| BleError::GattBusy("priority queue full or closed".into()))?;
-        receiver.await.map_err(|_| closed())?
+        receiver.await.map_err(|_| PeerLink::closed_error())?
     }
     pub async fn disconnect(&self) -> Result<()> {
         let (reply, receiver) = oneshot::channel();
@@ -347,8 +350,8 @@ impl PeerChannel {
             .commands
             .send(Command::DisconnectGeneration(self.state.generation, reply))
             .await
-            .map_err(|_| closed())?;
-        receiver.await.map_err(|_| closed())?
+            .map_err(|_| PeerLink::closed_error())?;
+        receiver.await.map_err(|_| PeerLink::closed_error())?
     }
     pub async fn release(self) -> Result<()> {
         let generation = self.state.generation;
@@ -374,18 +377,20 @@ impl PeerChannel {
             commands
                 .send(Command::Retire(generation, reply))
                 .await
-                .map_err(|_| closed())?;
-            receiver.await.map_err(|_| closed())?
+                .map_err(|_| PeerLink::closed_error())?;
+            receiver.await.map_err(|_| PeerLink::closed_error())?
         } else {
             Ok(())
         }
     }
 }
-pub(super) fn closed() -> BleError {
-    BleError::NotConnected("managed peer".into())
-}
-pub(super) fn failed(reason: &str) -> BleError {
-    BleError::Protocol(reason.into())
+impl PeerLink {
+    pub(super) fn closed_error() -> BleError {
+        BleError::NotConnected("managed peer".into())
+    }
+    pub(super) fn protocol_error(reason: &str) -> BleError {
+        BleError::Protocol(reason.into())
+    }
 }
 
 #[cfg(test)]
@@ -449,10 +454,13 @@ pub(super) mod tests {
         );
         let mut incoming = managed.incoming().unwrap();
         managed.set_advertising(true).await.unwrap();
-        let mut raw =
-            crate::datagram::connect_driver(raw_driver, &PeerAddress("managed".into()), &config)
-                .await
-                .unwrap();
+        let mut raw = crate::datagram::DatagramChannel::connect_driver(
+            raw_driver,
+            &PeerAddress("managed".into()),
+            &config,
+        )
+        .await
+        .unwrap();
         let _ = raw
             .send(
                 Record::Request {
@@ -499,9 +507,13 @@ pub(super) mod tests {
         );
         let mut incoming = managed.incoming().unwrap();
         managed.set_advertising(true).await.unwrap();
-        let mut raw = crate::datagram::connect_driver(raw, &PeerAddress("managed".into()), &config)
-            .await
-            .unwrap();
+        let mut raw = crate::datagram::DatagramChannel::connect_driver(
+            raw,
+            &PeerAddress("managed".into()),
+            &config,
+        )
+        .await
+        .unwrap();
         raw.send(
             Record::Request {
                 sender: EndpointId([1; 16]),
@@ -558,9 +570,13 @@ pub(super) mod tests {
         );
         let mut incoming = managed.incoming().unwrap();
         managed.set_advertising(true).await.unwrap();
-        let mut raw = crate::datagram::connect_driver(raw, &PeerAddress("managed".into()), &config)
-            .await
-            .unwrap();
+        let mut raw = crate::datagram::DatagramChannel::connect_driver(
+            raw,
+            &PeerAddress("managed".into()),
+            &config,
+        )
+        .await
+        .unwrap();
         raw.send(
             Record::Request {
                 sender: EndpointId([1; 16]),

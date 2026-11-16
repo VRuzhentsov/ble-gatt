@@ -193,7 +193,7 @@ fn windows_server_callbacks_reject_replaced_generations() {
         "async fn handle_write(",
         "pub(super) async fn notify_client(",
     );
-    assert!(write.contains("inner.server_generation.lock().unwrap()"));
+    assert!(write.contains("self.server_generation.lock().unwrap()"));
     assert!(write.contains("*current != generation"));
     let note = body(
         source,
@@ -223,7 +223,7 @@ fn metadata_updates_preserve_hidden_visibility() {
     assert!(update.contains("if desired_visibility"));
     assert!(!update.contains("provider.AdvertisementStatus()"));
     let start = include_str!("../src/drivers/windows/peripheral.rs");
-    assert!(start.contains("advertising_start::confirm"));
+    assert!(start.contains("advertising_start::PendingStart::confirm"));
     let kotlin = include_str!(
         "../../tauri-plugin-ble-gatt/android/src/main/kotlin/dev/blegatt/BleGattBridge.kt"
     );

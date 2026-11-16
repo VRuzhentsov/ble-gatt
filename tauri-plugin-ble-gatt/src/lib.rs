@@ -88,7 +88,7 @@ impl Builder {
             .setup(move |app, api| {
                 let driver = match self.driver {
                     Some(driver) => driver,
-                    None => default_driver().ok_or(Error::NoDriver)?,
+                    None => Self::default_driver().ok_or(Error::NoDriver)?,
                 };
                 app.manage(BleGatt::new(app, api, driver.clone())?);
                 app.manage(PluginState::new(driver));
@@ -216,33 +216,36 @@ impl<R: Runtime, T: Manager<R>> BleGattExt<R> for T {
 
 /// Linux, Android and Windows are the implemented drivers (see the README's
 /// platform matrix). Elsewhere the application must inject one.
-#[cfg(target_os = "linux")]
-fn default_driver() -> Option<Arc<dyn Driver>> {
-    Some(Arc::new(LazyDriver::new(|| async {
-        let driver = ble_gatt::drivers::linux::LinuxDriver::new().await?;
-        Ok(Arc::new(driver) as Arc<dyn Driver>)
-    })))
-}
+impl Builder {
+    #[cfg(target_os = "linux")]
+    fn default_driver() -> Option<Arc<dyn Driver>> {
+        Some(Arc::new(LazyDriver::new(|| async {
+            let driver = ble_gatt::drivers::linux::LinuxDriver::new().await?;
+            Ok(Arc::new(driver) as Arc<dyn Driver>)
+        })))
+    }
 
-#[cfg(target_os = "android")]
-fn default_driver() -> Option<Arc<dyn Driver>> {
-    Some(Arc::new(LazyDriver::new(|| async {
-        let (vm, context) =
-            android_context::get().map_err(ble_gatt::BleError::AdapterUnavailable)?;
-        let driver = ble_gatt::drivers::android::AndroidDriver::with_context(vm, context).await?;
-        Ok(Arc::new(driver) as Arc<dyn Driver>)
-    })))
-}
+    #[cfg(target_os = "android")]
+    fn default_driver() -> Option<Arc<dyn Driver>> {
+        Some(Arc::new(LazyDriver::new(|| async {
+            let (vm, context) =
+                android_context::get().map_err(ble_gatt::BleError::AdapterUnavailable)?;
+            let driver =
+                ble_gatt::drivers::android::AndroidDriver::with_context(vm, context).await?;
+            Ok(Arc::new(driver) as Arc<dyn Driver>)
+        })))
+    }
 
-#[cfg(target_os = "windows")]
-fn default_driver() -> Option<Arc<dyn Driver>> {
-    Some(Arc::new(LazyDriver::new(|| async {
-        let driver = ble_gatt::drivers::windows::WindowsDriver::new().await?;
-        Ok(Arc::new(driver) as Arc<dyn Driver>)
-    })))
-}
+    #[cfg(target_os = "windows")]
+    fn default_driver() -> Option<Arc<dyn Driver>> {
+        Some(Arc::new(LazyDriver::new(|| async {
+            let driver = ble_gatt::drivers::windows::WindowsDriver::new().await?;
+            Ok(Arc::new(driver) as Arc<dyn Driver>)
+        })))
+    }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
-fn default_driver() -> Option<Arc<dyn Driver>> {
-    None
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
+    fn default_driver() -> Option<Arc<dyn Driver>> {
+        None
+    }
 }

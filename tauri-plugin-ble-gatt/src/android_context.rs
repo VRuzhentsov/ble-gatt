@@ -29,14 +29,20 @@ static LOCK: Mutex<()> = Mutex::new(());
 /// on any thread; a failure before plugin registration is not cached.
 /// This does not read or modify the runtime's ndk-context global.
 pub fn get() -> Result<(JavaVM, GlobalRef), String> {
-    let ctx = APPLICATION.get().ok_or_else(|| {
-        "Android Application context is not initialized; register the ble-gatt plugin first"
-            .to_string()
-    })?;
-    // JavaVM is a non-owning JVM handle. The process JVM outlives this copy.
-    let vm = unsafe { JavaVM::from_raw(ctx.vm.get_java_vm_pointer()) }
-        .map_err(|err| format!("JavaVM handle unavailable: {err}"))?;
-    Ok((vm, ctx.application.clone()))
+    Context::get()
+}
+
+impl Context {
+    fn get() -> Result<(JavaVM, GlobalRef), String> {
+        let ctx = APPLICATION.get().ok_or_else(|| {
+            "Android Application context is not initialized; register the ble-gatt plugin first"
+                .to_string()
+        })?;
+        // JavaVM is a non-owning JVM handle. The process JVM outlives this copy.
+        let vm = unsafe { JavaVM::from_raw(ctx.vm.get_java_vm_pointer()) }
+            .map_err(|err| format!("JavaVM handle unavailable: {err}"))?;
+        Ok((vm, ctx.application.clone()))
+    }
 }
 
 /// Legacy opt-in: installs this Application into `ndk-context` once.
@@ -49,33 +55,39 @@ pub fn get() -> Result<(JavaVM, GlobalRef), String> {
 /// cannot discover or safely take over an independently owned global.
 /// The plugin's default driver does not call this legacy function.
 pub fn ensure() -> Result<(), String> {
-    let (vm, application) = get()?;
-    static NDK_CONTEXT: OnceLock<()> = OnceLock::new();
-    NDK_CONTEXT.get_or_init(|| unsafe {
-        ndk_context::initialize_android_context(
-            vm.get_java_vm_pointer().cast(),
-            application.as_obj().as_raw().cast(),
-        );
-    });
-    Ok(())
+    Context::ensure()
 }
 
-fn initialize(env: &mut JNIEnv<'_>, context: JObject<'_>) -> Result<(), String> {
-    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if APPLICATION.get().is_some() {
-        return Ok(());
+impl Context {
+    fn ensure() -> Result<(), String> {
+        let (vm, application) = get()?;
+        static NDK_CONTEXT: OnceLock<()> = OnceLock::new();
+        NDK_CONTEXT.get_or_init(|| unsafe {
+            ndk_context::initialize_android_context(
+                vm.get_java_vm_pointer().cast(),
+                application.as_obj().as_raw().cast(),
+            );
+        });
+        Ok(())
     }
-    if context.is_null() {
-        return Err("Android Application context is null".into());
+
+    fn initialize(env: &mut JNIEnv<'_>, context: JObject<'_>) -> Result<(), String> {
+        let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if APPLICATION.get().is_some() {
+            return Ok(());
+        }
+        if context.is_null() {
+            return Err("Android Application context is null".into());
+        }
+        let vm = env
+            .get_java_vm()
+            .map_err(|err| format!("JNI JavaVM unavailable: {err}"))?;
+        let application = env
+            .new_global_ref(context)
+            .map_err(|err| format!("retaining Android Application context failed: {err}"))?;
+        let _ = APPLICATION.set(Context { vm, application });
+        Ok(())
     }
-    let vm = env
-        .get_java_vm()
-        .map_err(|err| format!("JNI JavaVM unavailable: {err}"))?;
-    let application = env
-        .new_global_ref(context)
-        .map_err(|err| format!("retaining Android Application context failed: {err}"))?;
-    let _ = APPLICATION.set(Context { vm, application });
-    Ok(())
 }
 
 /// Called synchronously by the app-owned Kotlin plugin's constructor.
@@ -86,7 +98,7 @@ pub extern "system" fn Java_dev_blegatt_BleGattPlugin_initializeContext(
     _plugin: JObject<'_>,
     context: JObject<'_>,
 ) {
-    if let Err(err) = initialize(&mut env, context) {
+    if let Err(err) = Context::initialize(&mut env, context) {
         // Preserve an existing JVM exception (e.g. an allocation failure).
         if !env.exception_check().unwrap_or(true) {
             let _ = env.throw_new("java/lang/IllegalStateException", err);

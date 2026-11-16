@@ -31,7 +31,7 @@ impl Peripheral {
     pub async fn serve(&self, service: GattServiceSpec) -> Result<ServerHandle> {
         let events = self.driver.lifecycle_events();
         self.driver.advertise(service.clone()).await?;
-        let recovery = spawn_recovery(self.driver.clone(), service, events);
+        let recovery = ServerHandle::spawn_recovery(self.driver.clone(), service, events);
         Ok(ServerHandle {
             driver: Some(self.driver.clone()),
             recovery: Some(recovery),
@@ -120,33 +120,35 @@ impl Drop for ServerHandle {
 /// covers — cheap and idempotent-enough (the same operation a consumer like
 /// Fini was already calling by hand before the generation-race fix), and
 /// simpler than tracking whether a matching `Off` came first.
-fn spawn_recovery(
-    driver: Arc<dyn Driver>,
-    service: GattServiceSpec,
-    mut events: crate::hal::BoxStream<GattEvent>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        while let Some(event) = events.next().await {
-            if let GattEvent::RadioChanged {
-                status: RadioStatus::On,
-            } = event
-            {
-                // With the latest `update_advertisement`'s data, so an update
-                // survives a power cycle; nothing once it was stopped.
-                let Some(spec) = driver
-                    .served_service()
-                    .filter(|served| served.same_service(&service))
-                else {
-                    continue;
-                };
-                log::info!(
-                    "serve: radio recovered, re-registering service {}",
-                    service.uuid.0
-                );
-                if let Err(err) = driver.advertise(spec).await {
-                    log::warn!("serve: failed to re-register after radio recovery: {err}");
+impl ServerHandle {
+    fn spawn_recovery(
+        driver: Arc<dyn Driver>,
+        service: GattServiceSpec,
+        mut events: crate::hal::BoxStream<GattEvent>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            while let Some(event) = events.next().await {
+                if let GattEvent::RadioChanged {
+                    status: RadioStatus::On,
+                } = event
+                {
+                    // With the latest `update_advertisement`'s data, so an update
+                    // survives a power cycle; nothing once it was stopped.
+                    let Some(spec) = driver
+                        .served_service()
+                        .filter(|served| served.same_service(&service))
+                    else {
+                        continue;
+                    };
+                    log::info!(
+                        "serve: radio recovered, re-registering service {}",
+                        service.uuid.0
+                    );
+                    if let Err(err) = driver.advertise(spec).await {
+                        log::warn!("serve: failed to re-register after radio recovery: {err}");
+                    }
                 }
             }
-        }
-    })
+        })
+    }
 }

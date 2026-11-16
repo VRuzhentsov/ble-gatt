@@ -91,7 +91,7 @@ impl MockNetwork {
     /// rather than separately maintained. See docs/adr/0004.
     #[cfg(feature = "mock-broker")]
     pub async fn serve(listener: tokio::net::TcpListener) -> Result<()> {
-        broker::serve(listener).await
+        local::LocalRadio::serve_broker(listener).await
     }
 
     /// Fault-injection and inspection methods below require a `Local`

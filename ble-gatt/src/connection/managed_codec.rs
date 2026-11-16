@@ -38,24 +38,33 @@ pub(super) enum Record {
     },
 }
 
-pub(super) fn invalid() -> BleError {
-    BleError::Protocol("invalid managed record".into())
+/// The managed profile header and the endpoint it advertises.
+pub(super) struct ManagedMetadata {
+    pub endpoint: EndpointId,
 }
 
-pub(super) fn metadata(endpoint: EndpointId) -> Vec<u8> {
-    let mut bytes = vec![b'B', b'G', VERSION, CAPABILITY];
-    bytes.extend_from_slice(&endpoint.0);
-    bytes
-}
-
-pub(super) fn endpoint(bytes: &[u8]) -> Result<EndpointId> {
-    if bytes.len() != 20 || bytes[..4] != [b'B', b'G', VERSION, CAPABILITY] {
-        return Err(BleError::Protocol("unsupported managed profile".into()));
+impl ManagedMetadata {
+    pub(super) fn encode(&self) -> Vec<u8> {
+        let mut bytes = vec![b'B', b'G', VERSION, CAPABILITY];
+        bytes.extend_from_slice(&self.endpoint.0);
+        bytes
     }
-    Ok(EndpointId(bytes[4..20].try_into().map_err(|_| invalid())?))
+
+    pub(super) fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != 20 || bytes[..4] != [b'B', b'G', VERSION, CAPABILITY] {
+            return Err(BleError::Protocol("unsupported managed profile".into()));
+        }
+        Ok(Self {
+            endpoint: EndpointId(bytes[4..20].try_into().map_err(|_| Record::invalid())?),
+        })
+    }
 }
 
 impl Record {
+    pub(super) fn invalid() -> BleError {
+        BleError::Protocol("invalid managed record".into())
+    }
+
     pub(super) fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         match self {
@@ -108,23 +117,25 @@ impl Record {
             Ok(u64::from_be_bytes(
                 bytes
                     .get(offset..offset + 8)
-                    .ok_or_else(invalid)?
+                    .ok_or_else(Self::invalid)?
                     .try_into()
-                    .map_err(|_| invalid())?,
+                    .map_err(|_| Self::invalid())?,
             ))
         };
         match bytes.first() {
             Some(1) if bytes.len() == 47 && bytes[1..3] == [VERSION, CAPABILITY] => {
                 Ok(Self::Request {
-                    sender: EndpointId(bytes[3..19].try_into().map_err(|_| invalid())?),
-                    target: EndpointId(bytes[19..35].try_into().map_err(|_| invalid())?),
+                    sender: EndpointId(bytes[3..19].try_into().map_err(|_| Self::invalid())?),
+                    target: EndpointId(bytes[19..35].try_into().map_err(|_| Self::invalid())?),
                     attempt: read_attempt(35)?,
-                    nonce: i32::from_be_bytes(bytes[43..47].try_into().map_err(|_| invalid())?),
+                    nonce: i32::from_be_bytes(
+                        bytes[43..47].try_into().map_err(|_| Self::invalid())?,
+                    ),
                 })
             }
             Some(2) if bytes.len() == 41 => Ok(Self::Response {
-                sender: EndpointId(bytes[1..17].try_into().map_err(|_| invalid())?),
-                target: EndpointId(bytes[17..33].try_into().map_err(|_| invalid())?),
+                sender: EndpointId(bytes[1..17].try_into().map_err(|_| Self::invalid())?),
+                target: EndpointId(bytes[17..33].try_into().map_err(|_| Self::invalid())?),
                 attempt: read_attempt(33)?,
             }),
             Some(3) if bytes.len() == 10 && bytes[9] <= 2 => Ok(Self::Decision {
@@ -146,7 +157,7 @@ impl Record {
             Some(7) if bytes.len() == 9 => Ok(Self::Pong {
                 attempt: read_attempt(1)?,
             }),
-            _ => Err(invalid()),
+            _ => Err(Self::invalid()),
         }
     }
 }
