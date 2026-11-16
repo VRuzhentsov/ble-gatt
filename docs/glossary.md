@@ -32,6 +32,14 @@ and pull request text. The technical terms below define meaning, not sentence st
 These are local writing rules, not verified ASD-STE100 dictionary compliance or
 certification. Do not copy the copyrighted ASD dictionary into this repository.
 
+## Code design terms
+
+### Object-oriented programming (OOP)
+
+Code organized around objects that own state and behavior. A class defines
+such objects. Rust uses structs or enums with `impl` blocks for this purpose.
+See [the code rule](architecture.md#object-oriented-code).
+
 ## Bluetooth basics
 
 ### BLE (Bluetooth Low Energy)

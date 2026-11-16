@@ -23,6 +23,12 @@ This repo is a Cargo workspace with three crates:
   custom transport over core `PeerChannel` messages. It translates packets and
   addresses and accounts for authenticated QUIC users of a shared carrier.
 
+## Code style
+
+Use [object-oriented code](docs/architecture.md#object-oriented-code) as the
+default. Before code changes or review, load the
+[code-style skill](.agents/skills/ble-gatt-code-style/SKILL.md).
+
 ## Managed communication: working-tree implementation
 
 [ADR-0012](docs/adr/0012-discovery-like-nearby.md) now has a core implementation:

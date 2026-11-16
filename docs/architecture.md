@@ -21,6 +21,28 @@ The core works without iroh or Tauri. A Tauri app can obtain a shared core
 need not cross frontend IPC. Android still needs a compatible native bridge and
 Application context, even in a non-Tauri host.
 
+## Object-oriented code
+
+Use object-oriented programming (OOP) as the default for new and changed code.
+In Rust, use structs or enums with `impl` methods and associated functions.
+Put behavior on the type that owns its state, rules or protocol.
+
+- Put state access on the owning object. A helper that takes `inner` or a
+  context object belongs on that object or its existing service.
+- Put protocol parsing, validation and conversion on the protocol type or its
+  codec. A pure operation still has an owner.
+- Reuse existing types and traits. Give a new type a real responsibility,
+  rather than making one wrapper type for each function.
+- Keep language and framework entry points as thin calls to owning objects.
+  Keep a generic free helper only when no domain type owns the operation;
+  explain that exception in review.
+- Check this rule in each code review. Keep current interfaces and wire bytes
+  until a separate implementation change updates them.
+
+Load [the code-style skill](../.agents/skills/ble-gatt-code-style/SKILL.md)
+before writing or reviewing code. This is a design rule, not a claim that all
+existing free functions have been moved.
+
 ## Ownership map
 
 Boxes group responsibilities; arrows show selected caller/provider dependencies,
