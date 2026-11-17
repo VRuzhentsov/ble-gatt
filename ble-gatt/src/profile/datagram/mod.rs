@@ -1252,10 +1252,18 @@ impl DatagramConfig {
         log::info!("serve: updating the advertisement for {}", self.service.0);
         let spec = self.service_spec();
         let driver = adapter.driver();
-        driver.update_advertisement(spec.clone()).await?;
-        // Keep the GATT advertisement consistent with the radio advertisement for scanners that read it (ADR-0012).
-        let advertisement_value =
-            crate::profile::advertisement::GattAdvertisement::of(&spec).encode();
+        Self::update_spec(driver.as_ref(), spec).await
+    }
+
+    pub(crate) async fn update_spec(driver: &dyn Driver, spec: GattServiceSpec) -> Result<()> {
+        let advertisement_value = spec
+            .characteristics
+            .iter()
+            .find(|value| value.uuid == crate::advertisement::GATT_ADVERTISEMENT_CHARACTERISTIC)
+            .expect("datagram metadata characteristic")
+            .initial_value
+            .clone();
+        driver.update_advertisement(spec).await?;
         driver
             .set_characteristic_value(
                 crate::profile::advertisement::GATT_ADVERTISEMENT_CHARACTERISTIC,
@@ -1270,6 +1278,15 @@ impl DatagramConfig {
     pub(crate) async fn serve_driver(
         &self,
         driver: Arc<dyn Driver>,
+    ) -> Result<BoxStream<DatagramChannel>> {
+        self.serve_spec(driver, self.service_spec(), true).await
+    }
+
+    pub(crate) async fn serve_spec(
+        &self,
+        driver: Arc<dyn Driver>,
+        spec: GattServiceSpec,
+        recover_radio: bool,
     ) -> Result<BoxStream<DatagramChannel>> {
         self.validate()?;
         // Subscribe *before* advertising. `events()` is a broadcast subscription,
@@ -1291,7 +1308,7 @@ impl DatagramConfig {
             Payload,
         }
         log::info!("serve: advertising service {}", self.service.0);
-        if let Err(err) = driver.advertise(self.service_spec()).await {
+        if let Err(err) = driver.advertise(spec).await {
             log::warn!("serve: advertise failed for {}: {err}", self.service.0);
             return Err(err);
         }
@@ -1747,7 +1764,7 @@ impl DatagramConfig {
                     GattEvent::RadioChanged {
                         status: RadioStatus::On,
                     } => {
-                        if accept_closed {
+                        if accept_closed || !recover_radio {
                             continue;
                         }
                         // With the latest `update_advertisement`'s data, not the

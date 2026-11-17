@@ -164,8 +164,12 @@ The refactor replaces the existing worker's tracking/ranking contract. It does
 not add a second manager. The unused crate-private `link_state` implementation
 is retired; historical ADR-0005 remains unchanged.
 
-Managed discovery completes missing metadata through bounded GATT reads. Raw
-scan completion remains opt-in. Neither path implements Nearby's exact wire protocol.
+Managed discovery completes missing metadata through bounded GATT reads and
+reuses the existing metadata tracker for continuous refresh. Owned sessions do
+not open parallel probes; their readable-only refresh remains an acceptance gap.
+Managed advertisement construction, update, visibility, and radio recovery belong
+to the existing metadata owner and Worker lane. Raw scan completion and raw
+server recovery remain independent. Neither path implements Nearby's exact wire protocol.
 The datagram server still admits one inbound peer; `MaxLinks` does not establish
 Cluster/M-to-N or universal crossed-attempt support.
 
@@ -178,7 +182,10 @@ does not create a receive gap.
 Drivers publish bounded lifecycle events separately from characteristic writes.
 Native/mock drivers, the broker and wrappers preserve this separation through
 `Driver::lifecycle_events()`. The third-party default filters the legacy stream;
-it cannot isolate loss. Critical lag remains terminal, unlike known payload gaps.
+it cannot isolate loss. Critical lag remains terminal for an affected raw channel,
+unlike known payload gaps. The managed advertisement owner treats its lifecycle
+lag as unknown native state, not confirmed radio loss. It guards updates and show
+until hide and a full hidden retry succeed. This guard does not stop a surviving channel.
 See [event-stream limits](interface.md#driver-event-streams-and-receive-loss).
 
 Core handles separate scoped release from generation-wide disconnect. The iroh

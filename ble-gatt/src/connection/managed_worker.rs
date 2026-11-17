@@ -26,7 +26,14 @@ const MAX_PENDING_OPERATIONS: usize = 64;
 type Teardown = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>;
 enum Operation {
     Cleaned(PeerAddress, u64, Result<()>),
-    Advertising(Result<Option<BoxStream<DatagramChannel>>>, Reply<()>),
+    Advertising(
+        Result<Option<BoxStream<DatagramChannel>>>,
+        Reply<()>,
+        bool,
+        u64,
+    ),
+    Metadata(Result<()>, Reply<()>, u64),
+    Recovered(Result<()>, u64),
     Discovery(
         Result<BoxStream<Result<DiscoveredPeer>>>,
         Reply<BoxStream<Result<(EndpointId, DiscoveredPeer)>>>,
@@ -49,6 +56,7 @@ pub(super) enum Command {
         reply: Reply<ConnectionRequest>,
     },
     Advertising(bool, Reply<()>),
+    UpdateAdvertisement(crate::advertisement::GattAdvertisement, Reply<()>),
     Discover(Reply<BoxStream<Result<(EndpointId, DiscoveredPeer)>>>),
     Accept(u64, Reply<PeerChannel>),
     Reject(u64, Reply<()>),
@@ -176,24 +184,114 @@ impl Worker {
         };
         let mut served: Option<BoxStream<DatagramChannel>> = None;
         let mut scan: Option<DiscoveryScan> = None;
-        let mut probed = std::collections::HashSet::new();
+        let mut tracked_metadata = HashMap::<PeerAddress, crate::advertisement::TrackedPeer>::new();
+        let mut scan_exhausted = false;
         let mut scan_generation = 0u64;
         let mut advertising_pending = false;
+        let mut metadata_uncertain = false;
+        let mut metadata_fenced = false;
+        let mut native_present = false;
+        let mut desired_visible = false;
+        let mut recovery_needed = false;
+        let mut radio_available = true;
+        let mut loss_revision = 0u64;
+        let mut lifecycle: BoxStream<crate::GattEvent> =
+            Box::pin(driver.lifecycle_events().filter(|event| {
+                matches!(
+                    event,
+                    crate::GattEvent::RadioChanged { .. } | crate::GattEvent::Lagged { .. }
+                )
+            }));
         let mut discovery_pending = false;
         let mut close_reply = None;
         let mut tick = tokio::time::interval(Duration::from_millis(50));
         loop {
+            if recovery_needed
+                && radio_available
+                && desired_visible
+                && !metadata_uncertain
+                && !advertising_pending
+                && self.operation_capacity()
+            {
+                recovery_needed = false;
+                match (ManagedMetadata {
+                    endpoint: self.endpoint,
+                })
+                .service_spec(&self.config.datagram)
+                {
+                    Ok(spec) => {
+                        advertising_pending = true;
+                        let driver = driver.clone();
+                        let shutdown = self.shutdown.clone();
+                        let revision = loss_revision;
+                        self.operations.spawn(async move {
+                            let result = tokio::select! {
+                                biased;
+                                _ = shutdown.cancelled() => Err(AttemptError::Cancelled.into()),
+                                result = tokio::time::timeout(IO_BOUND, driver.advertise(spec)) => result.unwrap_or(Err(AttemptError::TimedOut.into())),
+                            };
+                            Operation::Recovered(result, revision)
+                        });
+                    }
+                    Err(_) => {
+                        metadata_uncertain = true;
+                        metadata_fenced = false;
+                    }
+                }
+            }
             let scan_output = scan.as_ref().map(|(_, output)| output.clone());
             tokio::select! {
                 _ = self.shutdown.cancelled() => break,
+                event = lifecycle.next() => {
+                    match event {
+                        Some(crate::GattEvent::RadioChanged { status: crate::RadioStatus::On }) => { radio_available = true; }
+                        Some(crate::GattEvent::RadioChanged { .. }) => {
+                            radio_available = false;
+                            native_present = false;
+                            loss_revision = loss_revision.wrapping_add(1);
+                            recovery_needed = served.is_some() || advertising_pending;
+                        }
+                        Some(crate::GattEvent::Lagged { .. }) => {
+                            // Missed events do not confirm radio loss or native absence.
+                            loss_revision = loss_revision.wrapping_add(1);
+                            if served.is_some() || advertising_pending {
+                                metadata_uncertain = true;
+                                metadata_fenced = false;
+                            }
+                        }
+                        _ => lifecycle = Box::pin(tokio_stream::pending()),
+                    }
+                }
                 completed = self.operations.join_next(), if !self.operations.is_empty() => {
                     if let Some(Ok(operation)) = completed {
                         match operation {
                             Operation::Cleaned(peer, generation, result) => self.cleaned(peer, generation, result),
-                            Operation::Advertising(result, reply) => {
+                            Operation::Advertising(mut result, reply, enabled, revision) => {
+                                if revision != loss_revision { result = Err(AttemptError::PeerLost.into()); }
                                 advertising_pending = false;
+                                if result.is_err() { metadata_uncertain = true; metadata_fenced = false; }
+                                else {
+                                    if enabled { native_present = true; recovery_needed = false; }
+                                    else {
+                                        // Successful hide confirms a retained server and invalidates late callbacks.
+                                        native_present = true;
+                                        if metadata_uncertain { metadata_fenced = true; }
+                                    }
+                                }
                                 let result = result.map(|stream| { if let Some(stream) = stream { served = Some(stream); } });
                                 let _ = reply.send(result);
+                            }
+                            Operation::Metadata(mut result, reply, revision) => {
+                                if revision != loss_revision { result = Err(AttemptError::PeerLost.into()); }
+                                advertising_pending = false;
+                                metadata_uncertain = result.is_err();
+                                metadata_fenced = false;
+                                let _ = reply.send(result);
+                            }
+                            Operation::Recovered(result, revision) => {
+                                advertising_pending = false;
+                                if result.is_ok() && revision == loss_revision { native_present = true; }
+                                else { metadata_uncertain = true; metadata_fenced = false; }
                             }
                             Operation::Discovery(result, reply) => {
                                 discovery_pending = false;
@@ -206,7 +304,10 @@ impl Worker {
                             }
                             Operation::Probe(generation, peer, output, result) => {
                                 if self.probing.get(&peer) == Some(&generation) { self.probing.remove(&peer); }
-                                if generation == scan_generation { let _ = output.try_send(result); }
+                                if generation == scan_generation {
+                                    let changed = tracked_metadata.get_mut(&peer).is_none_or(|entry| entry.managed_result(result.as_ref().ok().map(|(_, peer)| peer)));
+                                    if changed { let _ = output.try_send(result); }
+                                }
                             }
                             Operation::Retired(targets, result) => {
                                 self.retired(targets, result);
@@ -216,6 +317,22 @@ impl Worker {
                 }
                 _ = tick.tick() => {
                     let now = tokio::time::Instant::now();
+                    if let Some((_, output)) = &scan {
+                        let output = output.clone();
+                        let due: Vec<_> = tracked_metadata.iter().filter(|(_, entry)| entry.managed_due(now, !scan_exhausted)).map(|(address, entry)| (address.clone(), entry.radio_peer())).collect();
+                        for (address, peer) in due {
+                            let entry = tracked_metadata.get_mut(&address).expect("tracked peer");
+                            match self.probe_metadata(driver.clone(), peer, output.clone(), scan_generation) {
+                                Ok(()) => entry.managed_scheduled(),
+                                Err(error) => {
+                                    let initial = entry.managed_initial();
+                                    entry.managed_deferred();
+                                    if initial { let _ = output.try_send(Err(error)); }
+                                }
+                            }
+                        }
+                        if scan_exhausted && !tracked_metadata.values().any(|entry| entry.managed_initial()) && !self.probing.values().any(|generation| *generation == scan_generation) { scan = None; }
+                    }
                     let expired: Vec<_> = self.attempts.iter().filter(|(_, a)| a.released.is_cancelled() || (a.channel.is_none() && (a.cancellation.is_cancelled() || now >= a.deadline)) || (a.channel.is_some() && now.duration_since(a.last_received) >= ESTABLISHMENT_BOUND)).map(|(generation, _)| *generation).collect();
                     for generation in expired {
                         let attempt = &self.attempts[&generation];
@@ -243,30 +360,8 @@ impl Worker {
                                             let Some(endpoint) = attempt.endpoint else { continue; };
                                             peer.service_data.insert(service, ManagedMetadata { endpoint }.encode());
                                         } else {
-                                            // One bounded read per address per discovery. Never replace an owned session.
-                                            if probed.len() >= 64 || self.acquired.contains_key(&peer.address) || self.probing.contains_key(&peer.address) || self.address_retiring(&peer.address) || !probed.insert(peer.address.clone()) { continue; }
-                                            let output = scan_output.as_ref().expect("active scan").clone();
-                                            if !self.operation_capacity() || self.link_count() >= self.config.max_links.0 { let _ = output.try_send(Err(AttemptError::QueueFull.into())); continue; }
-                                            let cleanup_generation = self.generation();
-                                            let cleanup = self.reserve_cleanup(peer.address.clone(), cleanup_generation);
-                                            let driver = Arc::new(ManagedDriver { inner: driver.clone(), service, endpoint: Arc::new(Mutex::new(None)), cleanup, validate_metadata: false });
-                                            let shutdown = self.shutdown.clone();
-                                            let generation = scan_generation;
-                                            let address = peer.address.clone();
-                                            self.probing.insert(address.clone(), generation);
-                                            self.operations.spawn(async move {
-                                                let read = tokio::select! {
-                                                    _ = shutdown.cancelled() => Err(AttemptError::Cancelled.into()),
-                                                    _ = output.closed() => Err(AttemptError::Cancelled.into()),
-                                                    result = tokio::time::timeout(IO_BOUND, crate::advertisement::GattAdvertisement::read_managed(driver.as_ref(), &peer.address)) => result.unwrap_or(Err(AttemptError::TimedOut.into())),
-                                                };
-                                                let result = read.and_then(|metadata| {
-                                                    let peer = metadata.merge_into(service, peer);
-                                                    peer.service_data.get(&service).ok_or_else(|| PeerLink::protocol_error("missing managed profile"))
-                                                        .and_then(|bytes| ManagedMetadata::decode(bytes)).map(|metadata| (metadata.endpoint, peer))
-                                                });
-                                                Operation::Probe(generation, address, output, result)
-                                            });
+                                            if let Some(entry) = tracked_metadata.get_mut(&peer.address) { entry.update_radio(peer); }
+                                            else if tracked_metadata.len() < 64 { tracked_metadata.insert(peer.address.clone(), crate::advertisement::TrackedPeer::managed(peer)); }
                                             continue;
                                         }
                                     }
@@ -277,7 +372,10 @@ impl Worker {
                             };
                             if let Some((_, output)) = &scan { if output.try_send(result).is_err() { scan = None; } }
                         }
-                        None => scan = None,
+                        None => {
+                            scan_exhausted = true;
+                            if let Some((stream, _)) = &mut scan { *stream = Box::pin(tokio_stream::pending()); }
+                        },
                     }
                 }
                 item = async { match &mut served { Some(stream) => stream.next().await, None => std::future::pending().await } } => {
@@ -287,26 +385,63 @@ impl Worker {
                     let Some(command) = command else { break; };
                     match command {
                         #[cfg(test)] Command::SetNonce(value, reply) => { self.next_nonce = Some(value); let _ = reply.send(Ok(())); }
-                        Command::Advertising(enabled, reply) => {
-                            if advertising_pending || !self.operation_capacity() {
+                        Command::UpdateAdvertisement(advertisement, reply) => {
+                            if advertising_pending || (metadata_uncertain && !metadata_fenced) || !self.operation_capacity() {
                                 let _ = reply.send(Err(BleError::GattBusy("managed native operation pending".into())));
                                 continue;
                             }
+                            let mut config = self.config.datagram.clone();
+                            config.advertised_manufacturer_data = advertisement.manufacturer_data;
+                            config.advertised_service_data = advertisement.service_data;
+                            config.advertised_local_name = advertisement.local_name;
+                            let spec = match (ManagedMetadata { endpoint: self.endpoint }).service_spec(&config) {
+                                Ok(spec) => spec,
+                                Err(error) => { let _ = reply.send(Err(error)); continue; }
+                            };
+                            self.config.datagram = config;
+                            if !native_present { let _ = reply.send(Ok(())); continue; }
+                            advertising_pending = true;
+                            let driver = driver.clone();
+                            let shutdown = self.shutdown.clone();
+                            let revision = loss_revision;
+                            self.operations.spawn(async move {
+                                let result = tokio::select! {
+                                    biased;
+                                    _ = shutdown.cancelled() => Err(AttemptError::Cancelled.into()),
+                                    result = tokio::time::timeout(IO_BOUND, datagram::DatagramConfig::update_spec(driver.as_ref(), spec)) => result.unwrap_or(Err(AttemptError::TimedOut.into())),
+                                };
+                                Operation::Metadata(result, reply, revision)
+                            });
+                        }
+                        Command::Advertising(enabled, reply) => {
+                            if advertising_pending || (enabled && metadata_uncertain) || !self.operation_capacity() {
+                                let _ = reply.send(Err(BleError::GattBusy("managed native operation pending".into())));
+                                continue;
+                            }
+                            if !native_present && !enabled && !metadata_uncertain { desired_visible = false; let _ = reply.send(Ok(())); continue; }
                             advertising_pending = true;
                             let startup = served.is_none() && enabled;
-                            let mut config = self.config.datagram.clone();
-                            config.advertised_service_data.insert(config.service, ManagedMetadata { endpoint: self.endpoint }.encode());
+                            let restore = !native_present && enabled;
+                            let revision = loss_revision;
+                            let config = self.config.datagram.clone();
+                            let spec = match (ManagedMetadata { endpoint: self.endpoint }).service_spec(&config) {
+                                Ok(spec) => spec,
+                                Err(error) => { advertising_pending = false; let _ = reply.send(Err(error)); continue; }
+                            };
+                            desired_visible = enabled;
                             let driver = driver.clone();
                             let shutdown = self.shutdown.clone();
                             self.operations.spawn(async move {
                                 let result = tokio::select! {
+                                    biased;
                                     _ = shutdown.cancelled() => Err(AttemptError::Cancelled.into()),
                                     result = tokio::time::timeout(IO_BOUND, async {
-                                        if startup { config.serve_driver(driver.clone()).await.map(Some) }
+                                        if startup { config.serve_spec(driver.clone(), spec, false).await.map(Some) }
+                                        else if restore { driver.advertise(spec).await.map(|()| None) }
                                         else { driver.set_advertising_enabled(enabled).await.map(|()| None) }
                                     }) => result.unwrap_or(Err(AttemptError::TimedOut.into())),
                                 };
-                                Operation::Advertising(result, reply)
+                                Operation::Advertising(result, reply, enabled, revision)
                             });
                         }
                         Command::Request { peer, cancellation, reply } => self.request(driver.clone(), peer, cancellation, reply),
@@ -335,7 +470,8 @@ impl Worker {
                             } else {
                                 scan = None;
                                 scan_generation += 1;
-                                probed.clear();
+                                tracked_metadata.clear();
+                                scan_exhausted = false;
                                 discovery_pending = true;
                                 let driver = driver.clone();
                                 let service = self.config.datagram.service;
@@ -378,7 +514,9 @@ impl Worker {
                         }
                         self.retired(targets, result);
                     }
-                    Ok(Operation::Advertising(_, reply)) => {
+                    Ok(
+                        Operation::Advertising(_, reply, _, _) | Operation::Metadata(_, reply, _),
+                    ) => {
                         let _ = reply.send(Err(AttemptError::Cancelled.into()));
                     }
                     Ok(Operation::Discovery(_, reply)) => {
@@ -415,6 +553,54 @@ impl Worker {
         if let Some(reply) = close_reply {
             let _ = reply.send(stopped.and(teardown));
         }
+    }
+    fn probe_metadata(
+        &mut self,
+        driver: Arc<dyn Driver>,
+        peer: DiscoveredPeer,
+        output: DiscoveryOutput,
+        generation: u64,
+    ) -> Result<()> {
+        if self.acquired.contains_key(&peer.address)
+            || self.probing.contains_key(&peer.address)
+            || self.address_retiring(&peer.address)
+            || self
+                .attempts
+                .values()
+                .any(|attempt| attempt.peer == peer.address)
+        {
+            return Err(BleError::AdapterBusy("peer address is reserved".into()));
+        }
+        if self.link_count() >= self.config.max_links.0
+            || self.operations.len() + self.attempts.len() + self.retiring.len() + 2
+                > MAX_PENDING_OPERATIONS
+        {
+            return Err(AttemptError::QueueFull.into());
+        }
+        let cleanup_generation = self.generation();
+        let cleanup = self.reserve_cleanup(peer.address.clone(), cleanup_generation);
+        let service = self.config.datagram.service;
+        let driver = Arc::new(ManagedDriver {
+            inner: driver,
+            service,
+            endpoint: Arc::new(Mutex::new(None)),
+            cleanup,
+            validate_metadata: false,
+        });
+        let shutdown = self.shutdown.clone();
+        let address = peer.address.clone();
+        self.probing.insert(address.clone(), generation);
+        self.operations.spawn(async move {
+            let read = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => Err(AttemptError::Cancelled.into()),
+                _ = output.closed() => Err(AttemptError::Cancelled.into()),
+                result = tokio::time::timeout(IO_BOUND, crate::advertisement::GattAdvertisement::read_managed(driver.as_ref(), &peer.address)) => result.unwrap_or(Err(AttemptError::TimedOut.into())),
+            };
+            let result = read.and_then(|metadata| ManagedMetadata::complete_peer(metadata, service, peer));
+            Operation::Probe(generation, address, output, result)
+        });
+        Ok(())
     }
     fn address_retiring(&self, peer: &PeerAddress) -> bool {
         self.retiring.keys().any(|(address, _)| address == peer)

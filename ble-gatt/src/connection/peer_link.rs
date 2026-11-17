@@ -153,6 +153,29 @@ impl PeerLink {
         self.submit(Command::Advertising(enabled, reply))?;
         receiver.await.map_err(|_| PeerLink::closed_error())?
     }
+    /// Replace application advertisement fields without replacing the server or channels.
+    /// The configured service-data key is reserved for this owner's endpoint metadata.
+    /// Oversized readable metadata and reserved-key injection fail before native work.
+    ///
+    /// Admission retains validated desired metadata even if this waiter is cancelled.
+    /// Updates before startup or while the native server is absent stage that metadata.
+    /// A live update preserves visibility and completes both native and readable writes.
+    /// Native and readable updates are separate operations, not an atomic transaction.
+    /// Platform limits can reject optional native fields; success does not guarantee their broadcast.
+    ///
+    /// An error after admission does not restore the previous metadata. Native errors,
+    /// timeouts and intervening radio loss guard show and further native updates.
+    /// A successful `set_advertising(false)` must fence late callbacks first.
+    /// Then retry the complete desired advertisement while hidden before explicitly showing it.
+    /// A failed or unsupported hide does not establish that fence.
+    pub async fn update_advertisement(
+        &self,
+        advertisement: crate::advertisement::GattAdvertisement,
+    ) -> Result<()> {
+        let (reply, receiver) = oneshot::channel();
+        self.submit(Command::UpdateAdvertisement(advertisement, reply))?;
+        receiver.await.map_err(|_| PeerLink::closed_error())?
+    }
     pub async fn disconnect(&self, endpoint: EndpointId) -> Result<()> {
         let (reply, receiver) = oneshot::channel();
         self.submit(Command::Disconnect(endpoint, reply))?;

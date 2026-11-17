@@ -72,10 +72,57 @@ Consume incoming requests with `tokio_stream::StreamExt::next`. Accept a winning
 incoming request independently when a crossed outgoing request fails. Never
 report the incoming winner as success for the losing outgoing attempt.
 
-Managed discovery completes missing profile metadata through GATT. It reuses
-known metadata for an owned attempt rather than opening a replacement session.
-Each discovery allows one bounded probe per address, up to 64 addresses.
-A fresh discovery resets that probe set. Raw scans do not inherit completion.
+Managed discovery completes missing profile metadata through GATT. It tracks up
+to 64 addresses and retains the five-second read deadline and existing native
+ownership reservations. Changed radio fields schedule another read. A continuous
+scan also uses the existing ten-second metadata refresh schedule. Three consecutive
+read failures stop refresh for that address. Refused initial probes report typed
+`QueueFull` for capacity or `AdapterBusy` for an address reservation. Finite scans
+then finish their admitted initial reads and close. Active scans defer refused
+work until the next refresh without consuming the read-failure budget.
+Raw scans and their opt-in completion behavior remain unchanged.
+
+An owned attempt supplies its known endpoint without another native connection.
+Its native fields can change, but readable-only fields are not refreshed over
+that owned session. In particular, an inbound peripheral session has no remote
+characteristic-read port. A fresh scan during that session does not remove this
+limit. Do not treat local update success as complete discovery refresh.
+
+### Managed advertisement updates
+
+`update_advertisement(GattAdvertisement).await` changes only manufacturer data,
+application service data, and local name. It preserves the service, message
+settings, endpoint, server reader, channel generations, and existing scoped uses.
+The configured service UUID is reserved in the caller's service-data map.
+Reserved-key injection and any omitted readable field fail before native work.
+
+The complete readable value retains the managed header and full local name.
+The native projection excludes that reserved header and name. Small caller
+manufacturer and nonreserved service data remain subject to native platform limits.
+This is managed field placement, not a change to BG bytes, UUIDs, or the raw codec.
+Success does not guarantee that every optional native field was broadcast.
+
+Admission retains the latest validated desired fields even if the caller aborts
+or native work fails. Before startup, or while a lost server remains hidden,
+updates stage those fields without starting a server. A live update completes
+native replacement and then the readable write. The two effects are not atomic.
+
+Startup, updates, visibility, and managed recovery share the bounded Worker lane.
+Conflicts return `GattBusy`; the command queue and operation/reference caps remain
+64, with a five-second native-operation deadline. An error after admission does
+not imply rollback. After failure or timeout, show and ordinary retries are guarded.
+First complete `set_advertising(false)` to invalidate late native callbacks.
+Then retry the complete desired advertisement while hidden before explicitly showing it.
+A failed or unsupported hide does not establish that fence. Lifecycle `Lagged`
+means unknown state, not confirmed radio loss or native absence. For a started
+owner, it guards updates and show through the same hide and hidden-retry sequence.
+This reconciliation needs no new radio On event and does not restart the server.
+
+Managed radio recovery uses the latest desired metadata and the existing server
+reader. Hidden or guarded owners do not advertise on radio On. Hidden restoration
+after actual native server loss waits for explicit show. If an uncertain lost
+server cannot complete a hide, these ports cannot certify hidden reconciliation;
+close and re-create the owner rather than assuming a successful fence.
 
 ### Messages and closure
 

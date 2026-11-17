@@ -41,16 +41,28 @@ simultaneous-role or crossed-attempt support.
 Its BLE tracker retrieves full metadata through GATT and caches successful reads.[2]
 Windows can use an alternate-UUID advertisement to trigger retrieval.[3]
 
-**Implementation.** Managed serving inserts version/capability and endpoint bytes
-into `DatagramConfig::advertised_service_data`. Initial readable GATT metadata
-contains the same service data. Managed discovery uses radio data when present;
-otherwise, it performs a bounded GATT read. It reuses known metadata for owned
-attempts rather than opening a replacement session.
+**Implementation.** `ManagedMetadata` constructs complete readable metadata with
+the unchanged version/capability and endpoint header. It rejects caller use of
+the reserved service-data key and any field omitted by the readable encoder.
+The native projection excludes the managed header and local name. Small caller
+manufacturer and nonreserved service data remain subject to platform limits.
+This changes managed field placement, not the selected bytes or raw behavior.
 
-Each discovery permits one five-second probe per address, up to 64 addresses.
-A fresh discovery resets the probe set. This is not Nearby's header/hash cache
-protocol. Raw scanning remains raw; `advertisement::complete` is an opt-in helper
-with separate timer-refresh and bounded retry behavior.
+Managed discovery uses valid radio profile data when present; otherwise, it reads
+GATT metadata through the existing bounded probe owner. Up to 64 tracked addresses
+use five-second read deadlines. Changed radio fields schedule another read; an
+active scan also uses the existing ten-second metadata refresh schedule. Three
+consecutive read failures stop that address's refresh. Refused initial probes report
+`QueueFull` for capacity or `AdapterBusy` for an address reservation. Finite scans
+finish admitted initial reads and close. Active scans defer refused work until
+refresh without consuming the read-failure budget.
+
+Owned attempts supply known endpoint data without opening a replacement session.
+Readable-only fields are not refreshed over those sessions. An inbound peripheral
+session has no remote characteristic-read port. This remains a consumer acceptance
+gap, not proof of continuous complete metadata refresh for connected peers.
+This is not Nearby's header/hash cache protocol. Raw scanning and its opt-in
+`advertisement::complete` behavior remain unchanged.
 
 A metadata read is not accepted message communication. Release only resources
 owned by the read. Acquired-resource Drop cleanup is asynchronous and needs a
@@ -88,6 +100,15 @@ advertise / discover -> discovered peer -> request
   Link `disconnect(endpoint).await` ends current communication for that endpoint.
 - `set_advertising(false).await` changes visibility, not server ownership.
   `close().await` ends communication and stops serving.
+- `update_advertisement(GattAdvertisement).await` retains validated desired fields
+  on admission. Native replacement and readable-value writes remain separate effects.
+  Startup, update, visibility, and managed recovery share the bounded Worker lane.
+  Failures guard show until a successful hide and full hidden retry complete.
+  Lifecycle `Lagged` means unknown native state, not confirmed radio loss.
+  A started owner guards updates and show until the same reconciliation completes.
+  It needs no new radio On event or server restart.
+  Hidden or guarded owners do not advertise on radio On. Recovery reuses the
+  server reader and latest desired metadata; ordinary updates retain generations.
 
 There is no public tracking, ranking, retry-budget or initiation-policy mode.
 A terminal request does not restart automatically. Finishing a message does not

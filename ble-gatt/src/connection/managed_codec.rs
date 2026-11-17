@@ -12,6 +12,52 @@ pub(super) struct ManagedMetadata {
 }
 
 impl ManagedMetadata {
+    pub(super) fn complete_peer(
+        advertisement: crate::advertisement::GattAdvertisement,
+        service: crate::ServiceUuid,
+        mut peer: crate::DiscoveredPeer,
+    ) -> Result<(EndpointId, crate::DiscoveredPeer)> {
+        let bytes = advertisement
+            .service_data
+            .get(&service)
+            .ok_or_else(|| BleError::Protocol("missing managed profile".into()))?;
+        let endpoint = Self::decode(bytes)?.endpoint;
+        // The readable managed value is complete; removed fields must not survive in a radio cache.
+        peer.manufacturer_data = advertisement.manufacturer_data;
+        peer.service_data = advertisement.service_data;
+        peer.name = advertisement.local_name;
+        Ok((endpoint, peer))
+    }
+    pub(super) fn service_spec(
+        &self,
+        config: &crate::datagram::DatagramConfig,
+    ) -> Result<crate::GattServiceSpec> {
+        use crate::advertisement::{GattAdvertisement, GATT_ADVERTISEMENT_CHARACTERISTIC};
+        if config.advertised_service_data.contains_key(&config.service) {
+            return Err(BleError::Protocol(
+                "managed service data is reserved".into(),
+            ));
+        }
+        let mut spec = config.service_spec();
+        let mut complete = GattAdvertisement::of(&spec);
+        complete.service_data.insert(config.service, self.encode());
+        let bytes = complete.encode();
+        if GattAdvertisement::decode(&bytes)? != complete {
+            return Err(BleError::Protocol(
+                "managed advertisement exceeds readable limits".into(),
+            ));
+        }
+        spec.characteristics
+            .iter_mut()
+            .find(|value| value.uuid == GATT_ADVERTISEMENT_CHARACTERISTIC)
+            .expect("datagram metadata characteristic")
+            .initial_value = bytes;
+        // Keep the managed header and name readable, not in legacy native packets.
+        spec.local_name = None;
+        spec.validate()?;
+        Ok(spec)
+    }
+
     pub(super) fn encode(&self) -> Vec<u8> {
         let mut bytes = vec![b'B', b'G', VERSION, CAPABILITY];
         bytes.extend_from_slice(&self.endpoint.0);

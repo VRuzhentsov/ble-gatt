@@ -426,7 +426,7 @@ impl AdvertisementScan {
     }
 }
 
-struct TrackedPeer {
+pub(crate) struct TrackedPeer {
     peer: DiscoveredPeer,
     next_read_at: Instant,
     last_advertisement: Option<GattAdvertisement>,
@@ -435,6 +435,60 @@ struct TrackedPeer {
 }
 
 impl TrackedPeer {
+    pub(crate) fn managed(peer: DiscoveredPeer) -> Self {
+        Self {
+            peer,
+            next_read_at: Instant::now(),
+            last_advertisement: None,
+            consecutive_failures: 0,
+            has_been_reported: false,
+        }
+    }
+    pub(crate) fn update_radio(&mut self, peer: DiscoveredPeer) {
+        if self.peer.manufacturer_data != peer.manufacturer_data
+            || self.peer.service_data != peer.service_data
+            || self.peer.name != peer.name
+        {
+            self.next_read_at = Instant::now();
+        }
+        self.peer = peer;
+    }
+    pub(crate) fn managed_due(&self, now: Instant, scan_active: bool) -> bool {
+        self.consecutive_failures < GattAdvertisementPolicy::default().max_failures
+            && (!self.has_been_reported || scan_active)
+            && self.next_read_at <= now
+    }
+    pub(crate) fn managed_initial(&self) -> bool {
+        !self.has_been_reported
+    }
+    pub(crate) fn radio_peer(&self) -> DiscoveredPeer {
+        self.peer.clone()
+    }
+    pub(crate) fn managed_scheduled(&mut self) {
+        self.next_read_at = Instant::now() + GattAdvertisementPolicy::default().refresh;
+    }
+    pub(crate) fn managed_deferred(&mut self) {
+        // Report admission failure once. An active scan can try again at refresh.
+        self.has_been_reported = true;
+        self.managed_scheduled();
+    }
+    pub(crate) fn managed_result(&mut self, peer: Option<&DiscoveredPeer>) -> bool {
+        self.has_been_reported = true;
+        self.managed_scheduled();
+        let Some(peer) = peer else {
+            self.consecutive_failures += 1;
+            return true;
+        };
+        self.consecutive_failures = 0;
+        let metadata = GattAdvertisement {
+            manufacturer_data: peer.manufacturer_data.clone(),
+            service_data: peer.service_data.clone(),
+            local_name: peer.name.clone(),
+        };
+        let changed = self.last_advertisement.as_ref() != Some(&metadata);
+        self.last_advertisement = Some(metadata);
+        changed
+    }
     fn record_read(
         &mut self,
         service: ServiceUuid,
