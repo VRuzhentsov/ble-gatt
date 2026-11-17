@@ -56,14 +56,6 @@ use crate::hal::{BoxStream, GattConnection, DEFAULT_ATT_MTU};
 /// instead. btleplug's value.
 const GATT_CACHE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The opened parts of one link.
-pub(super) struct OpenedLink {
-    device: BluetoothLEDevice,
-    gatt_session: GattSession,
-    services: Vec<GattDeviceService>,
-    characteristics: HashMap<Uuid, GattCharacteristic>,
-}
-
 /// Own each acquired object before another await can cancel construction.
 #[derive(Default)]
 struct AcquiringLink {
@@ -85,6 +77,14 @@ impl Drop for AcquiringLink {
             let _ = device.Close();
         }
     }
+}
+
+/// The opened parts of one link.
+pub(super) struct OpenedLink {
+    device: BluetoothLEDevice,
+    gatt_session: GattSession,
+    services: Vec<GattDeviceService>,
+    characteristics: HashMap<Uuid, GattCharacteristic>,
 }
 
 /// Open the device, hold the link with a `GattSession`, and discover every
@@ -415,12 +415,6 @@ impl WindowsGattConnection {
     }
 }
 
-impl Drop for WindowsGattConnection {
-    fn drop(&mut self) {
-        self.release();
-    }
-}
-
 /// Select Notify, then Indicate, then `None`, based on the characteristic
 /// properties (btleplug's `to_descriptor_value`).
 impl WindowsGattConnection {
@@ -437,6 +431,12 @@ impl WindowsGattConnection {
         } else {
             GattClientCharacteristicConfigurationDescriptorValue::None
         }
+    }
+}
+
+impl Drop for WindowsGattConnection {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 

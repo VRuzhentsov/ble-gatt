@@ -66,6 +66,13 @@ impl PeerLink {
     pub fn new(config: PeerLinkConfig) -> Arc<Self> {
         Self::spawn(None, config)
     }
+    pub(super) fn closed_error() -> BleError {
+        BleError::NotConnected("managed peer".into())
+    }
+    pub(super) fn protocol_error(reason: &str) -> BleError {
+        BleError::Protocol(reason.into())
+    }
+
     pub fn with_driver(driver: Arc<dyn Driver>, config: PeerLinkConfig) -> Arc<Self> {
         Self::spawn(Some(driver), config)
     }
@@ -384,15 +391,6 @@ impl PeerChannel {
         }
     }
 }
-impl PeerLink {
-    pub(super) fn closed_error() -> BleError {
-        BleError::NotConnected("managed peer".into())
-    }
-    pub(super) fn protocol_error(reason: &str) -> BleError {
-        BleError::Protocol(reason.into())
-    }
-}
-
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;

@@ -16,11 +16,6 @@ use std::sync::{Mutex, OnceLock};
 use jni::objects::{GlobalRef, JObject};
 use jni::{JNIEnv, JavaVM};
 
-struct Context {
-    vm: JavaVM,
-    application: GlobalRef,
-}
-
 // Owns the JNI reference for the remainder of the process.
 static APPLICATION: OnceLock<Context> = OnceLock::new();
 static LOCK: Mutex<()> = Mutex::new(());
@@ -30,19 +25,6 @@ static LOCK: Mutex<()> = Mutex::new(());
 /// This does not read or modify the runtime's ndk-context global.
 pub fn get() -> Result<(JavaVM, GlobalRef), String> {
     Context::get()
-}
-
-impl Context {
-    fn get() -> Result<(JavaVM, GlobalRef), String> {
-        let ctx = APPLICATION.get().ok_or_else(|| {
-            "Android Application context is not initialized; register the ble-gatt plugin first"
-                .to_string()
-        })?;
-        // JavaVM is a non-owning JVM handle. The process JVM outlives this copy.
-        let vm = unsafe { JavaVM::from_raw(ctx.vm.get_java_vm_pointer()) }
-            .map_err(|err| format!("JavaVM handle unavailable: {err}"))?;
-        Ok((vm, ctx.application.clone()))
-    }
 }
 
 /// Legacy opt-in: installs this Application into `ndk-context` once.
@@ -58,7 +40,23 @@ pub fn ensure() -> Result<(), String> {
     Context::ensure()
 }
 
+struct Context {
+    vm: JavaVM,
+    application: GlobalRef,
+}
+
 impl Context {
+    fn get() -> Result<(JavaVM, GlobalRef), String> {
+        let ctx = APPLICATION.get().ok_or_else(|| {
+            "Android Application context is not initialized; register the ble-gatt plugin first"
+                .to_string()
+        })?;
+        // JavaVM is a non-owning JVM handle. The process JVM outlives this copy.
+        let vm = unsafe { JavaVM::from_raw(ctx.vm.get_java_vm_pointer()) }
+            .map_err(|err| format!("JavaVM handle unavailable: {err}"))?;
+        Ok((vm, ctx.application.clone()))
+    }
+
     fn ensure() -> Result<(), String> {
         let (vm, application) = get()?;
         static NDK_CONTEXT: OnceLock<()> = OnceLock::new();

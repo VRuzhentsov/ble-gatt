@@ -174,63 +174,6 @@ struct ScanState {
 mod advertisement_outcome;
 use advertisement_outcome::PendingAdvertisement;
 
-struct Inner {
-    vm: JavaVM,
-    context: GlobalRef,
-    bridge: OnceLock<GlobalRef>,
-    connections: StdMutex<HashMap<String, ConnectionState>>,
-    /// Sender and terminal error for the active scan, under **one** lock.
-    ///
-    /// They cannot be separate mutexes: `scan()` and `onScanFailed` would
-    /// acquire them in opposite orders. And the lock is deliberately held
-    /// across the `startScan` JNI call, which is what makes the exclusivity
-    /// check atomic — see `scan()`.
-    scan: StdMutex<ScanState>,
-    /// Named `server_events_tx` historically, but now carries both roles'
-    /// lifecycle events — including central-side link loss. See
-    /// `Driver::events`.
-    server_events_tx: EventBus,
-    /// Negotiated ATT MTU per peer address, populated from
-    /// `onMtuChanged`. Shared rather than held per-`AndroidGattConnection`
-    /// because the JNI callback arrives on a Binder thread with only the
-    /// address to key on.
-    att_mtus: StdMutex<HashMap<String, u16>>,
-    /// When this side's GATT client to each address last disconnected; see
-    /// `REDIAL_GAP`.
-    client_disconnected_at: StdMutex<HashMap<String, std::time::Instant>>,
-    /// Resolved by `onAdvertiseResult`. Android decides asynchronously
-    /// whether an advertisement actually started, so `advertise()` must wait
-    /// for it rather than reporting success the moment the JNI call returns.
-    advertise_tx: StdMutex<Option<PendingAdvertisement<GattServiceSpec>>>,
-    /// Outstanding server notifications, keyed by request id. Android
-    /// reports the real send status on `onNotificationSent`, so `notify`
-    /// must wait for it rather than trusting the initiating call.
-    notify_waiters: StdMutex<HashMap<u64, oneshot::Sender<bool>>>,
-    next_notify_id: AtomicU64,
-    /// Request ids for reads and writes, so a completion can be matched to
-    /// the operation that issued it rather than to whatever now occupies the
-    /// slot.
-    next_op_id: AtomicU64,
-    /// Session id per central attached to our GATT server, assigned when it
-    /// subscribes. Gives server-side peers the same identity outbound
-    /// connections have, so a stale caller cannot disconnect the session
-    /// that replaced the one it meant.
-    server_sessions: StdMutex<HashMap<String, u64>>,
-    /// Which advertise attempt is current. A guard for an abandoned attempt
-    /// must not tear down the advertisement that replaced it.
-    advertise_generation: AtomicU64,
-    /// Serialises starting an advertisement against cleaning up an abandoned
-    /// one. Reading the generation and then acting on it are two steps, so
-    /// without this a retry could increment, install its sender and start
-    /// its server in between — and the abandoned attempt's cleanup would
-    /// then take the retry's sender and stop the retry's advertisement.
-    advertise_lock: tokio::sync::Mutex<()>,
-    /// The spec the live server and advertisement were started from, so
-    /// `update_advertisement` can tell whether a spec is for the served
-    /// service. `None` until an advertise succeeds.
-    served_service: StdMutex<Option<GattServiceSpec>>,
-}
-
 /// A spec's advertisement data as `startAdvertising` and
 /// `updateAdvertising` take it.
 struct AdvertisementArgs<'local> {
@@ -315,102 +258,6 @@ impl<'local> AdvertisementArgs<'local> {
     }
 }
 
-impl Inner {
-    fn env(&self) -> Result<JNIEnv<'_>> {
-        self.vm
-            .attach_current_thread_as_daemon()
-            .map_err(|err| BleError::Gatt(format!("JNI attach failed: {err}")))
-    }
-
-    /// Drop a failed connect attempt's slot, and the whole entry if nothing
-    /// else is using it, so a retry is not rejected as already in progress.
-    fn clear_pending_connect(&self, address: &str) {
-        let mut connections = self.connections.lock().unwrap();
-        if let Some(state) = connections.get_mut(address) {
-            state.connected_tx = None;
-            // Also clear `live`: a callback that landed while the attempt was
-            // being abandoned would otherwise leave the address marked open
-            // with no Rust handle owning it, and every later connect refused
-            // as "already open".
-            state.live = false;
-            if state.disconnected_tx.is_none() && state.notify_tx.is_empty() {
-                connections.remove(address);
-            }
-        }
-    }
-
-    fn bridge(&self) -> Result<&GlobalRef> {
-        self.bridge
-            .get()
-            .ok_or_else(|| BleError::Gatt("BleGattBridge not initialized".to_string()))
-    }
-
-    /// Callers own the `JNIEnv` (via `self.env()`) and pass it in explicitly
-    /// — rather than this method re-attaching internally — so call sites
-    /// can scope `env` (and its borrowed JNI locals) to end *before* any
-    /// subsequent `.await`. `JNIEnv` is `!Send`; holding one across an
-    /// await point would make every `Driver`/`GattConnection` future
-    /// non-`Send`, which the trait's `Send` supertrait bound forbids.
-    fn call_void(&self, env: &mut JNIEnv, method: &str, sig: &str, args: &[JValue]) -> Result<()> {
-        let bridge = self.bridge()?;
-        let result = env.call_method(bridge.as_obj(), method, sig, args);
-        match result {
-            Ok(_) => Ok(()),
-            Err(err) => Err(BleError::jni_error(env, method, err)),
-        }
-    }
-
-    fn call_bool(&self, env: &mut JNIEnv, method: &str, sig: &str) -> Result<bool> {
-        let bridge = self.bridge()?;
-        let result = env
-            .call_method(bridge.as_obj(), method, sig, &[])
-            .and_then(|v| v.z());
-        match result {
-            Ok(value) => Ok(value),
-            Err(err) => Err(BleError::jni_error(env, method, err)),
-        }
-    }
-
-    fn call_int(&self, env: &mut JNIEnv, method: &str, sig: &str) -> Result<i32> {
-        self.call_int_with(env, method, sig, &[])
-    }
-
-    fn call_int_with(
-        &self,
-        env: &mut JNIEnv,
-        method: &str,
-        sig: &str,
-        args: &[JValue],
-    ) -> Result<i32> {
-        let bridge = self.bridge()?;
-        let result = env
-            .call_method(bridge.as_obj(), method, sig, args)
-            .and_then(|v| v.i());
-        match result {
-            Ok(value) => Ok(value),
-            Err(err) => Err(BleError::jni_error(env, method, err)),
-        }
-    }
-}
-
-/// Turn a failed JNI call into a `BleError`, **describing and clearing any
-/// pending Java exception first**.
-///
-/// This is not just for nicer messages. `attach_current_thread_as_daemon`
-/// leaves the Tokio worker attached to the JVM, so an uncleared exception
-/// stays pending on that worker and makes every later JNI call scheduled
-/// there fail too — long after the original cause (a missing runtime
-/// Bluetooth permission, say) has been fixed.
-impl BleError {
-    fn jni_error(env: &mut JNIEnv, method: &str, err: jni::errors::Error) -> BleError {
-        let detail = BleError::describe_pending_exception(env);
-        BleError::Gatt(format!(
-            "{method} failed: {err}{}",
-            detail.map(|d| format!(" ({d})")).unwrap_or_default()
-        ))
-    }
-}
-
 pub struct AndroidDriver {
     inner: Arc<Inner>,
 }
@@ -447,9 +294,6 @@ impl AndroidDriver {
         }
         Ok(peers)
     }
-}
-
-impl AndroidDriver {
     pub async fn new() -> Result<Self> {
         let ctx = ndk_context::android_context();
         let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }.map_err(|err| {
@@ -578,6 +422,54 @@ impl AndroidDriver {
         }
 
         Ok(Self { inner })
+    }
+}
+
+/// `FindClass` — used implicitly by `JNIEnv::new_object` when given a class
+/// name string — only searches the bootstrap classloader when called from a
+/// thread the JVM did not create itself, which is exactly this thread
+/// (attached via `attach_current_thread_as_daemon`, not JVM-spawned). The
+/// bootstrap classloader can only find core Android framework classes,
+/// never app-defined ones — confirmed directly, not assumed: an earlier
+/// build of this file failed with `ClassNotFoundException: Didn't find
+/// class "dev.blegatt.BleGattBridge"` at exactly this call site. The
+/// standard fix is to resolve the class through the app's own classloader,
+/// `Context.getClassLoader()`. Not the classloader of the context's class:
+/// the context is the Application, and an app without its own subclass has
+/// a plain `android.app.Application`, a framework class.
+impl AndroidDriver {
+    fn load_app_class<'a>(
+        env: &mut JNIEnv<'a>,
+        context: &JObject,
+        binary_name: &str,
+    ) -> Result<JClass<'a>> {
+        let class_loader = env
+            .call_method(context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+            .and_then(|v| v.l())
+            .map_err(|err| BleError::Gatt(format!("getClassLoader failed: {err}")))?;
+        let name = env
+            .new_string(binary_name)
+            .map_err(|err| BleError::Gatt(err.to_string()))?;
+        let class_obj = env
+            .call_method(
+                &class_loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&name)],
+            )
+            .and_then(|v| v.l())
+            .map_err(|err| BleError::Gatt(format!("loadClass({binary_name}) failed: {err}")))?;
+        Ok(JClass::from(class_obj))
+    }
+}
+
+// Referenced only to keep the `CALLBACK_CLASS` constant documented and
+// grep-discoverable alongside `BRIDGE_CLASS`; the JVM resolves the actual
+// symbol by the exported function names below, not this constant.
+#[allow(dead_code)]
+impl AndroidDriver {
+    fn _callback_class_name() -> &'static str {
+        CALLBACK_CLASS
     }
 }
 
@@ -1739,22 +1631,21 @@ impl GattConnection for AndroidGattConnection {
     }
 }
 
-// ---------------------------------------------------------------------
-// Native callbacks — implemented here, declared as `external fun` in
-// Native.kt. Every signature must match Native.kt exactly: Kotlin
-// compiles those top-level functions as static methods on `NativeKt`,
-// giving the fixed JNI symbol name `Java_dev_blegatt_NativeKt_<name>`.
-// ---------------------------------------------------------------------
-
-/// # Safety contract
-/// See the module doc comment: `native_handle` must be a live `Arc<Inner>`
-/// pointer. Never called by Rust directly — only by the JVM, from whatever
-/// thread owns the Android Bluetooth callback (usually a Binder thread).
-impl Inner {
-    unsafe fn from_handle(native_handle: jlong) -> Arc<Self> {
-        let ptr = native_handle as *const Inner;
-        Arc::increment_strong_count(ptr);
-        Arc::from_raw(ptr)
+/// Turn a failed JNI call into a `BleError`, **describing and clearing any
+/// pending Java exception first**.
+///
+/// This is not just for nicer messages. `attach_current_thread_as_daemon`
+/// leaves the Tokio worker attached to the JVM, so an uncleared exception
+/// stays pending on that worker and makes every later JNI call scheduled
+/// there fail too — long after the original cause (a missing runtime
+/// Bluetooth permission, say) has been fixed.
+impl BleError {
+    fn jni_error(env: &mut JNIEnv, method: &str, err: jni::errors::Error) -> BleError {
+        let detail = BleError::describe_pending_exception(env);
+        BleError::Gatt(format!(
+            "{method} failed: {err}{}",
+            detail.map(|d| format!(" ({d})")).unwrap_or_default()
+        ))
     }
 }
 
@@ -1779,44 +1670,6 @@ impl BleError {
             .ok()?;
         let message = JString::from(message);
         Some(JniCodec::read_jstring(env, &message))
-    }
-}
-
-/// `FindClass` — used implicitly by `JNIEnv::new_object` when given a class
-/// name string — only searches the bootstrap classloader when called from a
-/// thread the JVM did not create itself, which is exactly this thread
-/// (attached via `attach_current_thread_as_daemon`, not JVM-spawned). The
-/// bootstrap classloader can only find core Android framework classes,
-/// never app-defined ones — confirmed directly, not assumed: an earlier
-/// build of this file failed with `ClassNotFoundException: Didn't find
-/// class "dev.blegatt.BleGattBridge"` at exactly this call site. The
-/// standard fix is to resolve the class through the app's own classloader,
-/// `Context.getClassLoader()`. Not the classloader of the context's class:
-/// the context is the Application, and an app without its own subclass has
-/// a plain `android.app.Application`, a framework class.
-impl AndroidDriver {
-    fn load_app_class<'a>(
-        env: &mut JNIEnv<'a>,
-        context: &JObject,
-        binary_name: &str,
-    ) -> Result<JClass<'a>> {
-        let class_loader = env
-            .call_method(context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
-            .and_then(|v| v.l())
-            .map_err(|err| BleError::Gatt(format!("getClassLoader failed: {err}")))?;
-        let name = env
-            .new_string(binary_name)
-            .map_err(|err| BleError::Gatt(err.to_string()))?;
-        let class_obj = env
-            .call_method(
-                &class_loader,
-                "loadClass",
-                "(Ljava/lang/String;)Ljava/lang/Class;",
-                &[JValue::Object(&name)],
-            )
-            .and_then(|v| v.l())
-            .map_err(|err| BleError::Gatt(format!("loadClass({binary_name}) failed: {err}")))?;
-        Ok(JClass::from(class_obj))
     }
 }
 
@@ -1855,37 +1708,140 @@ impl JniCodec {
     }
 }
 
-#[no_mangle]
-#[allow(clippy::too_many_arguments)]
-pub extern "system" fn Java_dev_blegatt_NativeKt_onPeerDiscovered<'local>(
-    env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    native_handle: jlong,
-    generation: jlong,
-    advertised_service_uuids: JObjectArray<'local>,
-    address: JString<'local>,
-    name: JString<'local>,
-    rssi: jint,
-    manufacturer_ids: JIntArray<'local>,
-    manufacturer_values: JObjectArray<'local>,
-    service_data_uuids: JObjectArray<'local>,
-    service_data_values: JObjectArray<'local>,
-) {
-    unsafe { Inner::from_handle(native_handle) }.peer_discovered(
-        env,
-        generation,
-        advertised_service_uuids,
-        address,
-        name,
-        rssi,
-        manufacturer_ids,
-        manufacturer_values,
-        service_data_uuids,
-        service_data_values,
-    );
+struct Inner {
+    vm: JavaVM,
+    context: GlobalRef,
+    bridge: OnceLock<GlobalRef>,
+    connections: StdMutex<HashMap<String, ConnectionState>>,
+    /// Sender and terminal error for the active scan, under **one** lock.
+    ///
+    /// They cannot be separate mutexes: `scan()` and `onScanFailed` would
+    /// acquire them in opposite orders. And the lock is deliberately held
+    /// across the `startScan` JNI call, which is what makes the exclusivity
+    /// check atomic — see `scan()`.
+    scan: StdMutex<ScanState>,
+    /// Named `server_events_tx` historically, but now carries both roles'
+    /// lifecycle events — including central-side link loss. See
+    /// `Driver::events`.
+    server_events_tx: EventBus,
+    /// Negotiated ATT MTU per peer address, populated from
+    /// `onMtuChanged`. Shared rather than held per-`AndroidGattConnection`
+    /// because the JNI callback arrives on a Binder thread with only the
+    /// address to key on.
+    att_mtus: StdMutex<HashMap<String, u16>>,
+    /// When this side's GATT client to each address last disconnected; see
+    /// `REDIAL_GAP`.
+    client_disconnected_at: StdMutex<HashMap<String, std::time::Instant>>,
+    /// Resolved by `onAdvertiseResult`. Android decides asynchronously
+    /// whether an advertisement actually started, so `advertise()` must wait
+    /// for it rather than reporting success the moment the JNI call returns.
+    advertise_tx: StdMutex<Option<PendingAdvertisement<GattServiceSpec>>>,
+    /// Outstanding server notifications, keyed by request id. Android
+    /// reports the real send status on `onNotificationSent`, so `notify`
+    /// must wait for it rather than trusting the initiating call.
+    notify_waiters: StdMutex<HashMap<u64, oneshot::Sender<bool>>>,
+    next_notify_id: AtomicU64,
+    /// Request ids for reads and writes, so a completion can be matched to
+    /// the operation that issued it rather than to whatever now occupies the
+    /// slot.
+    next_op_id: AtomicU64,
+    /// Session id per central attached to our GATT server, assigned when it
+    /// subscribes. Gives server-side peers the same identity outbound
+    /// connections have, so a stale caller cannot disconnect the session
+    /// that replaced the one it meant.
+    server_sessions: StdMutex<HashMap<String, u64>>,
+    /// Which advertise attempt is current. A guard for an abandoned attempt
+    /// must not tear down the advertisement that replaced it.
+    advertise_generation: AtomicU64,
+    /// Serialises starting an advertisement against cleaning up an abandoned
+    /// one. Reading the generation and then acting on it are two steps, so
+    /// without this a retry could increment, install its sender and start
+    /// its server in between — and the abandoned attempt's cleanup would
+    /// then take the retry's sender and stop the retry's advertisement.
+    advertise_lock: tokio::sync::Mutex<()>,
+    /// The spec the live server and advertisement were started from, so
+    /// `update_advertisement` can tell whether a spec is for the served
+    /// service. `None` until an advertise succeeds.
+    served_service: StdMutex<Option<GattServiceSpec>>,
 }
 
 impl Inner {
+    fn env(&self) -> Result<JNIEnv<'_>> {
+        self.vm
+            .attach_current_thread_as_daemon()
+            .map_err(|err| BleError::Gatt(format!("JNI attach failed: {err}")))
+    }
+
+    /// Drop a failed connect attempt's slot, and the whole entry if nothing
+    /// else is using it, so a retry is not rejected as already in progress.
+    fn clear_pending_connect(&self, address: &str) {
+        let mut connections = self.connections.lock().unwrap();
+        if let Some(state) = connections.get_mut(address) {
+            state.connected_tx = None;
+            // Also clear `live`: a callback that landed while the attempt was
+            // being abandoned would otherwise leave the address marked open
+            // with no Rust handle owning it, and every later connect refused
+            // as "already open".
+            state.live = false;
+            if state.disconnected_tx.is_none() && state.notify_tx.is_empty() {
+                connections.remove(address);
+            }
+        }
+    }
+
+    fn bridge(&self) -> Result<&GlobalRef> {
+        self.bridge
+            .get()
+            .ok_or_else(|| BleError::Gatt("BleGattBridge not initialized".to_string()))
+    }
+
+    /// Callers own the `JNIEnv` (via `self.env()`) and pass it in explicitly
+    /// — rather than this method re-attaching internally — so call sites
+    /// can scope `env` (and its borrowed JNI locals) to end *before* any
+    /// subsequent `.await`. `JNIEnv` is `!Send`; holding one across an
+    /// await point would make every `Driver`/`GattConnection` future
+    /// non-`Send`, which the trait's `Send` supertrait bound forbids.
+    fn call_void(&self, env: &mut JNIEnv, method: &str, sig: &str, args: &[JValue]) -> Result<()> {
+        let bridge = self.bridge()?;
+        let result = env.call_method(bridge.as_obj(), method, sig, args);
+        match result {
+            Ok(_) => Ok(()),
+            Err(err) => Err(BleError::jni_error(env, method, err)),
+        }
+    }
+
+    fn call_bool(&self, env: &mut JNIEnv, method: &str, sig: &str) -> Result<bool> {
+        let bridge = self.bridge()?;
+        let result = env
+            .call_method(bridge.as_obj(), method, sig, &[])
+            .and_then(|v| v.z());
+        match result {
+            Ok(value) => Ok(value),
+            Err(err) => Err(BleError::jni_error(env, method, err)),
+        }
+    }
+
+    fn call_int(&self, env: &mut JNIEnv, method: &str, sig: &str) -> Result<i32> {
+        self.call_int_with(env, method, sig, &[])
+    }
+
+    fn call_int_with(
+        &self,
+        env: &mut JNIEnv,
+        method: &str,
+        sig: &str,
+        args: &[JValue],
+    ) -> Result<i32> {
+        let bridge = self.bridge()?;
+        let result = env
+            .call_method(bridge.as_obj(), method, sig, args)
+            .and_then(|v| v.i());
+        match result {
+            Ok(value) => Ok(value),
+            Err(err) => Err(BleError::jni_error(env, method, err)),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn peer_discovered<'local>(
         self: Arc<Self>,
@@ -1987,20 +1943,6 @@ impl Inner {
             }
         }
     }
-}
-
-#[no_mangle]
-pub extern "system" fn Java_dev_blegatt_NativeKt_onAdvertiseResult<'local>(
-    _env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    native_handle: jlong,
-    success: jboolean,
-    error_code: jint,
-) {
-    unsafe { Inner::from_handle(native_handle) }.advertise_result(_env, success, error_code);
-}
-
-impl Inner {
     fn advertise_result<'local>(
         self: Arc<Self>,
         _env: JNIEnv<'local>,
@@ -2027,20 +1969,6 @@ impl Inner {
             log::warn!("jni onAdvertiseResult: no pending advertise request to complete");
         }
     }
-}
-
-#[no_mangle]
-pub extern "system" fn Java_dev_blegatt_NativeKt_onScanFailed<'local>(
-    _env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    native_handle: jlong,
-    generation: jlong,
-    error_code: jint,
-) {
-    unsafe { Inner::from_handle(native_handle) }.scan_failed(_env, generation, error_code);
-}
-
-impl Inner {
     fn scan_failed<'local>(
         self: Arc<Self>,
         _env: JNIEnv<'local>,
@@ -2072,20 +2000,6 @@ impl Inner {
         // error as its final item.
         scan.tx.take();
     }
-}
-
-#[no_mangle]
-pub extern "system" fn Java_dev_blegatt_NativeKt_onMtuChanged<'local>(
-    env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    native_handle: jlong,
-    address: JString<'local>,
-    mtu: jint,
-) {
-    unsafe { Inner::from_handle(native_handle) }.mtu_changed(env, address, mtu);
-}
-
-impl Inner {
     fn mtu_changed<'local>(
         self: Arc<Self>,
         mut env: JNIEnv<'local>,
@@ -2097,20 +2011,6 @@ impl Inner {
         log::info!("jni onMtuChanged: {address} negotiated ATT MTU {mtu}");
         inner.att_mtus.lock().unwrap().insert(address, mtu as u16);
     }
-}
-
-#[no_mangle]
-pub extern "system" fn Java_dev_blegatt_NativeKt_onConnected<'local>(
-    env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    native_handle: jlong,
-    address: JString<'local>,
-    from_server: jboolean,
-) {
-    unsafe { Inner::from_handle(native_handle) }.connected(env, address, from_server);
-}
-
-impl Inner {
     fn connected<'local>(
         self: Arc<Self>,
         mut env: JNIEnv<'local>,
@@ -2157,20 +2057,6 @@ impl Inner {
             });
         }
     }
-}
-
-#[no_mangle]
-pub extern "system" fn Java_dev_blegatt_NativeKt_onDisconnected<'local>(
-    env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    native_handle: jlong,
-    address: JString<'local>,
-    from_server: jboolean,
-) {
-    unsafe { Inner::from_handle(native_handle) }.disconnected(env, address, from_server);
-}
-
-impl Inner {
     fn disconnected<'local>(
         self: Arc<Self>,
         mut env: JNIEnv<'local>,
@@ -2251,25 +2137,6 @@ impl Inner {
             session: disconnected_session,
         });
     }
-}
-
-/// The local adapter's state changed. `status` is `"on"` / `"off"` /
-/// `"unsupported"`. Android does not fire a GATT disconnect callback for an
-/// adapter toggle, so the Kotlin receiver has already called
-/// `onDisconnected` for each address it held — this sweeps any straggler
-/// `connections` entry defensively and emits `GattEvent::RadioChanged` so a
-/// consumer (`PeerLink`) learns the radio's usability changed.
-#[no_mangle]
-pub extern "system" fn Java_dev_blegatt_NativeKt_onRadioState<'local>(
-    env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    native_handle: jlong,
-    status: JString<'local>,
-) {
-    unsafe { Inner::from_handle(native_handle) }.radio_state_changed(env, status);
-}
-
-impl Inner {
     fn radio_state_changed<'local>(
         self: Arc<Self>,
         mut env: JNIEnv<'local>,
@@ -2312,30 +2179,6 @@ impl Inner {
             status: radio_status,
         });
     }
-}
-
-#[no_mangle]
-pub extern "system" fn Java_dev_blegatt_NativeKt_onCharacteristicRead<'local>(
-    env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    native_handle: jlong,
-    request_id: jlong,
-    address: JString<'local>,
-    _characteristic_uuid: JString<'local>,
-    value: JByteArray<'local>,
-    success: jboolean,
-) {
-    unsafe { Inner::from_handle(native_handle) }.characteristic_read(
-        env,
-        request_id,
-        address,
-        _characteristic_uuid,
-        value,
-        success,
-    );
-}
-
-impl Inner {
     fn characteristic_read<'local>(
         self: Arc<Self>,
         mut env: JNIEnv<'local>,
@@ -2367,28 +2210,6 @@ impl Inner {
             }
         }
     }
-}
-
-#[no_mangle]
-pub extern "system" fn Java_dev_blegatt_NativeKt_onCharacteristicWriteResult<'local>(
-    env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    native_handle: jlong,
-    request_id: jlong,
-    address: JString<'local>,
-    _characteristic_uuid: JString<'local>,
-    success: jboolean,
-) {
-    unsafe { Inner::from_handle(native_handle) }.characteristic_written(
-        env,
-        request_id,
-        address,
-        _characteristic_uuid,
-        success,
-    );
-}
-
-impl Inner {
     fn characteristic_written<'local>(
         self: Arc<Self>,
         mut env: JNIEnv<'local>,
@@ -2418,26 +2239,6 @@ impl Inner {
             }
         }
     }
-}
-
-#[no_mangle]
-pub extern "system" fn Java_dev_blegatt_NativeKt_onCharacteristicChanged<'local>(
-    env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    native_handle: jlong,
-    address: JString<'local>,
-    characteristic_uuid: JString<'local>,
-    value: JByteArray<'local>,
-) {
-    unsafe { Inner::from_handle(native_handle) }.characteristic_changed(
-        env,
-        address,
-        characteristic_uuid,
-        value,
-    );
-}
-
-impl Inner {
     fn characteristic_changed<'local>(
         self: Arc<Self>,
         mut env: JNIEnv<'local>,
@@ -2483,28 +2284,6 @@ impl Inner {
             log::debug!("jni onCharacteristicChanged: no connection state for {address}");
         }
     }
-}
-
-#[no_mangle]
-pub extern "system" fn Java_dev_blegatt_NativeKt_onServerCharacteristicWritten<'local>(
-    env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    native_handle: jlong,
-    address: JString<'local>,
-    characteristic_uuid: JString<'local>,
-    value: JByteArray<'local>,
-    session: jlong,
-) {
-    unsafe { Inner::from_handle(native_handle) }.server_characteristic_written(
-        env,
-        address,
-        characteristic_uuid,
-        value,
-        session,
-    );
-}
-
-impl Inner {
     fn server_characteristic_written<'local>(
         self: Arc<Self>,
         mut env: JNIEnv<'local>,
@@ -2553,28 +2332,6 @@ impl Inner {
                 value: bytes,
             });
     }
-}
-
-#[no_mangle]
-pub extern "system" fn Java_dev_blegatt_NativeKt_onSubscribed<'local>(
-    env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    native_handle: jlong,
-    request_id: jlong,
-    address: JString<'local>,
-    characteristic_uuid: JString<'local>,
-    success: jboolean,
-) {
-    unsafe { Inner::from_handle(native_handle) }.subscribed(
-        env,
-        request_id,
-        address,
-        characteristic_uuid,
-        success,
-    );
-}
-
-impl Inner {
     fn subscribed<'local>(
         self: Arc<Self>,
         mut env: JNIEnv<'local>,
@@ -2610,37 +2367,6 @@ impl Inner {
             }
         }
     }
-}
-
-// Referenced only to keep the `CALLBACK_CLASS` constant documented and
-// grep-discoverable alongside `BRIDGE_CLASS`; the JVM resolves the actual
-// symbol by the exported function names above, not this constant.
-#[allow(dead_code)]
-impl AndroidDriver {
-    fn _callback_class_name() -> &'static str {
-        CALLBACK_CLASS
-    }
-}
-
-/// A central enabled notifications on one of our server characteristics.
-///
-/// This is the peripheral-role equivalent of "connected", and deliberately
-/// later than the physical connection: it is the first moment the notify
-/// path back to that peer exists, so a server that greets on this event
-/// cannot lose the greeting. It also attributes the peer to *this* service,
-/// which a bare connection does not.
-#[no_mangle]
-pub extern "system" fn Java_dev_blegatt_NativeKt_onServerSubscribed<'local>(
-    env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    native_handle: jlong,
-    address: JString<'local>,
-    session: jlong,
-) {
-    unsafe { Inner::from_handle(native_handle) }.server_subscribed(env, address, session);
-}
-
-impl Inner {
     fn server_subscribed<'local>(
         self: Arc<Self>,
         mut env: JNIEnv<'local>,
@@ -2664,6 +2390,35 @@ impl Inner {
             local_role: Role::Peripheral,
             session: Some(session),
         });
+    }
+
+    fn notification_sent<'local>(
+        self: Arc<Self>,
+        _env: JNIEnv<'local>,
+        request_id: jlong,
+        success: jboolean,
+    ) {
+        let inner = self;
+        let waiter = inner
+            .notify_waiters
+            .lock()
+            .unwrap()
+            .remove(&(request_id as u64));
+        if let Some(tx) = waiter {
+            let _ = tx.send(success != 0);
+        }
+    }
+}
+
+/// # Safety contract
+/// See the module doc comment: `native_handle` must be a live `Arc<Inner>`
+/// pointer. Never called by Rust directly — only by the JVM, from whatever
+/// thread owns the Android Bluetooth callback (usually a Binder thread).
+impl Inner {
+    unsafe fn from_handle(native_handle: jlong) -> Arc<Self> {
+        let ptr = native_handle as *const Inner;
+        Arc::increment_strong_count(ptr);
+        Arc::from_raw(ptr)
     }
 }
 
@@ -2907,6 +2662,226 @@ impl Drop for ConnectGuard {
     }
 }
 
+// ---------------------------------------------------------------------
+// Native callbacks — implemented here, declared as `external fun` in
+// Native.kt. Every signature must match Native.kt exactly: Kotlin
+// compiles those top-level functions as static methods on `NativeKt`,
+// giving the fixed JNI symbol name `Java_dev_blegatt_NativeKt_<name>`.
+// ---------------------------------------------------------------------
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_dev_blegatt_NativeKt_onPeerDiscovered<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    native_handle: jlong,
+    generation: jlong,
+    advertised_service_uuids: JObjectArray<'local>,
+    address: JString<'local>,
+    name: JString<'local>,
+    rssi: jint,
+    manufacturer_ids: JIntArray<'local>,
+    manufacturer_values: JObjectArray<'local>,
+    service_data_uuids: JObjectArray<'local>,
+    service_data_values: JObjectArray<'local>,
+) {
+    unsafe { Inner::from_handle(native_handle) }.peer_discovered(
+        env,
+        generation,
+        advertised_service_uuids,
+        address,
+        name,
+        rssi,
+        manufacturer_ids,
+        manufacturer_values,
+        service_data_uuids,
+        service_data_values,
+    );
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_blegatt_NativeKt_onAdvertiseResult<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    native_handle: jlong,
+    success: jboolean,
+    error_code: jint,
+) {
+    unsafe { Inner::from_handle(native_handle) }.advertise_result(_env, success, error_code);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_blegatt_NativeKt_onScanFailed<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    native_handle: jlong,
+    generation: jlong,
+    error_code: jint,
+) {
+    unsafe { Inner::from_handle(native_handle) }.scan_failed(_env, generation, error_code);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_blegatt_NativeKt_onMtuChanged<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    native_handle: jlong,
+    address: JString<'local>,
+    mtu: jint,
+) {
+    unsafe { Inner::from_handle(native_handle) }.mtu_changed(env, address, mtu);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_blegatt_NativeKt_onConnected<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    native_handle: jlong,
+    address: JString<'local>,
+    from_server: jboolean,
+) {
+    unsafe { Inner::from_handle(native_handle) }.connected(env, address, from_server);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_blegatt_NativeKt_onDisconnected<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    native_handle: jlong,
+    address: JString<'local>,
+    from_server: jboolean,
+) {
+    unsafe { Inner::from_handle(native_handle) }.disconnected(env, address, from_server);
+}
+
+/// The local adapter's state changed. `status` is `"on"` / `"off"` /
+/// `"unsupported"`. Android does not fire a GATT disconnect callback for an
+/// adapter toggle, so the Kotlin receiver has already called
+/// `onDisconnected` for each address it held — this sweeps any straggler
+/// `connections` entry defensively and emits `GattEvent::RadioChanged` so a
+/// consumer (`PeerLink`) learns the radio's usability changed.
+#[no_mangle]
+pub extern "system" fn Java_dev_blegatt_NativeKt_onRadioState<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    native_handle: jlong,
+    status: JString<'local>,
+) {
+    unsafe { Inner::from_handle(native_handle) }.radio_state_changed(env, status);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_blegatt_NativeKt_onCharacteristicRead<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    native_handle: jlong,
+    request_id: jlong,
+    address: JString<'local>,
+    _characteristic_uuid: JString<'local>,
+    value: JByteArray<'local>,
+    success: jboolean,
+) {
+    unsafe { Inner::from_handle(native_handle) }.characteristic_read(
+        env,
+        request_id,
+        address,
+        _characteristic_uuid,
+        value,
+        success,
+    );
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_blegatt_NativeKt_onCharacteristicWriteResult<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    native_handle: jlong,
+    request_id: jlong,
+    address: JString<'local>,
+    _characteristic_uuid: JString<'local>,
+    success: jboolean,
+) {
+    unsafe { Inner::from_handle(native_handle) }.characteristic_written(
+        env,
+        request_id,
+        address,
+        _characteristic_uuid,
+        success,
+    );
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_blegatt_NativeKt_onCharacteristicChanged<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    native_handle: jlong,
+    address: JString<'local>,
+    characteristic_uuid: JString<'local>,
+    value: JByteArray<'local>,
+) {
+    unsafe { Inner::from_handle(native_handle) }.characteristic_changed(
+        env,
+        address,
+        characteristic_uuid,
+        value,
+    );
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_blegatt_NativeKt_onServerCharacteristicWritten<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    native_handle: jlong,
+    address: JString<'local>,
+    characteristic_uuid: JString<'local>,
+    value: JByteArray<'local>,
+    session: jlong,
+) {
+    unsafe { Inner::from_handle(native_handle) }.server_characteristic_written(
+        env,
+        address,
+        characteristic_uuid,
+        value,
+        session,
+    );
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_blegatt_NativeKt_onSubscribed<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    native_handle: jlong,
+    request_id: jlong,
+    address: JString<'local>,
+    characteristic_uuid: JString<'local>,
+    success: jboolean,
+) {
+    unsafe { Inner::from_handle(native_handle) }.subscribed(
+        env,
+        request_id,
+        address,
+        characteristic_uuid,
+        success,
+    );
+}
+
+/// A central enabled notifications on one of our server characteristics.
+///
+/// This is the peripheral-role equivalent of "connected", and deliberately
+/// later than the physical connection: it is the first moment the notify
+/// path back to that peer exists, so a server that greets on this event
+/// cannot lose the greeting. It also attributes the peer to *this* service,
+/// which a bare connection does not.
+#[no_mangle]
+pub extern "system" fn Java_dev_blegatt_NativeKt_onServerSubscribed<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    native_handle: jlong,
+    address: JString<'local>,
+    session: jlong,
+) {
+    unsafe { Inner::from_handle(native_handle) }.server_subscribed(env, address, session);
+}
+
 /// Completion of a queued server notification.
 #[no_mangle]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onNotifySent<'local>(
@@ -2917,23 +2892,4 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onNotifySent<'local>(
     success: jboolean,
 ) {
     unsafe { Inner::from_handle(native_handle) }.notification_sent(_env, request_id, success);
-}
-
-impl Inner {
-    fn notification_sent<'local>(
-        self: Arc<Self>,
-        _env: JNIEnv<'local>,
-        request_id: jlong,
-        success: jboolean,
-    ) {
-        let inner = self;
-        let waiter = inner
-            .notify_waiters
-            .lock()
-            .unwrap()
-            .remove(&(request_id as u64));
-        if let Some(tx) = waiter {
-            let _ = tx.send(success != 0);
-        }
-    }
 }

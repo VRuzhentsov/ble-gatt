@@ -45,25 +45,6 @@ const ATT_WRITE_NOT_PERMITTED: u8 = 0x03;
 /// ATT error "Invalid Offset": a long read past the end of the value.
 const ATT_INVALID_OFFSET: u8 = 0x07;
 
-/// A central attached to the local GATT server.
-pub(super) struct ServerPeer {
-    pub(super) session: u64,
-    /// Held so its `SessionStatusChanged` registration stays alive.
-    gatt_session: GattSession,
-    status_token: i64,
-    /// Set by `disconnect_peer`. WinRT has no call that drops a central
-    /// from a GATT server, so an excluded central stays connected until it
-    /// leaves; meanwhile it gets no notifications and its writes are
-    /// refused (ADR-0011 D6).
-    pub(super) excluded: bool,
-}
-
-/// One inbound request, queued so a single task answers them in order.
-enum ServerRequest {
-    Write(CharacteristicUuid, GattWriteRequestedEventArgs),
-    Read(CharacteristicUuid, GattReadRequestedEventArgs),
-}
-
 /// `(characteristic, ReadRequested, WriteRequested, SubscribedClientsChanged)` tokens.
 type Tokens = (
     GattLocalCharacteristic,
@@ -72,67 +53,33 @@ type Tokens = (
     Option<i64>,
 );
 
-/// The live GATT server.
-pub(super) struct Server {
-    inner: Weak<Inner>,
-    generation: u64,
-    pub(super) provider: GattServiceProvider,
-    pub(super) desired_visibility: bool,
-    characteristics: HashMap<CharacteristicUuid, GattLocalCharacteristic>,
-    /// What reads return, per readable characteristic.
-    values: Arc<StdMutex<HashMap<CharacteristicUuid, Vec<u8>>>>,
-    tokens: Vec<Tokens>,
-    /// Answers reads and writes in arrival order.
-    request_task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        if let Some(inner) = self.inner.upgrade() {
-            let mut current = inner.server_generation.lock().unwrap();
-            if *current == self.generation {
-                *current = inner.next_id();
-                inner.forget_server_peers();
-            }
+/// Select the provider advertisement's service data: the local name or the
+/// caller's data under the served UUID.
+/// `validate` rejects specifications that supply both.
+/// Windows omits data that cannot fit with a 128-bit UUID
+/// (`StartedWithoutAllAdvertisementData`). The GATT advertisement carries it instead.
+impl GattServiceSpec {
+    pub(super) fn provider_service_data(&self) -> Option<Vec<u8>> {
+        match &self.local_name {
+            Some(name) => Some(
+                truncate_name(name, NAME_SERVICE_DATA_MAX_LEN)
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            None => self.service_data.get(&self.uuid).cloned(),
         }
-        if let Some(task) = self.request_task.take() {
-            task.abort();
-        }
-        for (characteristic, read, write, subscribed) in &self.tokens {
-            if let Some(token) = read {
-                let _ = characteristic.RemoveReadRequested(*token);
-            }
-            if let Some(token) = write {
-                let _ = characteristic.RemoveWriteRequested(*token);
-            }
-            if let Some(token) = subscribed {
-                let _ = characteristic.RemoveSubscribedClientsChanged(*token);
-            }
-        }
-        let _ = self.provider.StopAdvertising();
     }
 }
 
-impl Server {
-    pub(super) fn shut_down(self) {
-        drop(self);
-    }
-
-    /// `Driver::set_characteristic_value`.
-    pub(super) fn set_value(
-        &self,
-        characteristic: CharacteristicUuid,
-        value: Vec<u8>,
-    ) -> Result<()> {
-        let mut values = self.values.lock().unwrap();
-        let stored_value = values.get_mut(&characteristic).ok_or_else(|| {
-            BleError::Gatt(format!(
-                "characteristic {} is not served as readable",
-                characteristic.0
-            ))
-        })?;
-        *stored_value = value;
-        Ok(())
+impl BleError {
+    fn server_error(context: &str, error: BluetoothError) -> BleError {
+        if error == BluetoothError::RadioNotAvailable || error == BluetoothError::DisabledByUser {
+            BleError::AdapterUnavailable(format!("{context}: the Bluetooth radio is off"))
+        } else if error == BluetoothError::NotSupported {
+            BleError::PeripheralUnsupported
+        } else {
+            BleError::Gatt(format!("{context}: Bluetooth error {}", error.0))
+        }
     }
 }
 
@@ -285,39 +232,6 @@ impl Inner {
             })
             .collect())
     }
-}
-
-/// Select the provider advertisement's service data: the local name or the
-/// caller's data under the served UUID.
-/// `validate` rejects specifications that supply both.
-/// Windows omits data that cannot fit with a 128-bit UUID
-/// (`StartedWithoutAllAdvertisementData`). The GATT advertisement carries it instead.
-impl GattServiceSpec {
-    pub(super) fn provider_service_data(&self) -> Option<Vec<u8>> {
-        match &self.local_name {
-            Some(name) => Some(
-                truncate_name(name, NAME_SERVICE_DATA_MAX_LEN)
-                    .as_bytes()
-                    .to_vec(),
-            ),
-            None => self.service_data.get(&self.uuid).cloned(),
-        }
-    }
-}
-
-impl BleError {
-    fn server_error(context: &str, error: BluetoothError) -> BleError {
-        if error == BluetoothError::RadioNotAvailable || error == BluetoothError::DisabledByUser {
-            BleError::AdapterUnavailable(format!("{context}: the Bluetooth radio is off"))
-        } else if error == BluetoothError::NotSupported {
-            BleError::PeripheralUnsupported
-        } else {
-            BleError::Gatt(format!("{context}: Bluetooth error {}", error.0))
-        }
-    }
-}
-
-impl Inner {
     pub(super) async fn start_server(self: &Arc<Self>, spec: &GattServiceSpec) -> Result<Server> {
         if !spec.manufacturer_data.is_empty()
             || spec.service_data.keys().any(|uuid| *uuid != spec.uuid)
@@ -486,9 +400,123 @@ impl Inner {
         Server::start_provider_advertising(&provider, spec).await?;
         Ok(server)
     }
+    async fn handle_write(
+        self: &Arc<Self>,
+        generation: u64,
+        characteristic: CharacteristicUuid,
+        args: &GattWriteRequestedEventArgs,
+    ) -> windows::core::Result<()> {
+        let deferral = args.GetDeferral()?;
+        let outcome = async {
+            let session = args.Session()?;
+            let request = args.GetRequestAsync()?.await?;
+            let with_response = request.Option()? == GattWriteOption::WriteWithResponse;
+            let address = WindowsCodec::session_address(&session)?;
+            if self.is_excluded(&address) {
+                if with_response {
+                    request.RespondWithProtocolError(ATT_WRITE_NOT_PERMITTED)?;
+                }
+                return Ok(());
+            }
+            let Some((address, _)) = self.note_server_peer(&session, generation) else {
+                if with_response {
+                    request.RespondWithProtocolError(ATT_WRITE_NOT_PERMITTED)?;
+                }
+                return Ok(());
+            };
+            // Serialize event publication with server replacement. No native await occurs under this lock.
+            let current = self.server_generation.lock().unwrap();
+            if *current != generation || self.is_excluded(&address) {
+                if with_response {
+                    request.RespondWithProtocolError(ATT_WRITE_NOT_PERMITTED)?;
+                }
+                return Ok(());
+            }
+            let value = WindowsCodec::from_buffer(&request.Value()?)?;
+            if with_response {
+                request.Respond()?;
+            }
+            log::debug!(
+                "server: {} bytes from {address} on {}",
+                value.len(),
+                characteristic.0
+            );
+            let _ = self.events_tx.send(GattEvent::CharacteristicWritten {
+                peer: PeerAddress(address),
+                characteristic,
+                value,
+            });
+            Ok(())
+        }
+        .await;
+        deferral.Complete()?;
+        outcome
+    }
+}
+
+/// The live GATT server.
+pub(super) struct Server {
+    inner: Weak<Inner>,
+    generation: u64,
+    pub(super) provider: GattServiceProvider,
+    pub(super) desired_visibility: bool,
+    characteristics: HashMap<CharacteristicUuid, GattLocalCharacteristic>,
+    /// What reads return, per readable characteristic.
+    values: Arc<StdMutex<HashMap<CharacteristicUuid, Vec<u8>>>>,
+    tokens: Vec<Tokens>,
+    /// Answers reads and writes in arrival order.
+    request_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.upgrade() {
+            let mut current = inner.server_generation.lock().unwrap();
+            if *current == self.generation {
+                *current = inner.next_id();
+                inner.forget_server_peers();
+            }
+        }
+        if let Some(task) = self.request_task.take() {
+            task.abort();
+        }
+        for (characteristic, read, write, subscribed) in &self.tokens {
+            if let Some(token) = read {
+                let _ = characteristic.RemoveReadRequested(*token);
+            }
+            if let Some(token) = write {
+                let _ = characteristic.RemoveWriteRequested(*token);
+            }
+            if let Some(token) = subscribed {
+                let _ = characteristic.RemoveSubscribedClientsChanged(*token);
+            }
+        }
+        let _ = self.provider.StopAdvertising();
+    }
 }
 
 impl Server {
+    pub(super) fn shut_down(self) {
+        drop(self);
+    }
+
+    /// `Driver::set_characteristic_value`.
+    pub(super) fn set_value(
+        &self,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
+    ) -> Result<()> {
+        let mut values = self.values.lock().unwrap();
+        let stored_value = values.get_mut(&characteristic).ok_or_else(|| {
+            BleError::Gatt(format!(
+                "characteristic {} is not served as readable",
+                characteristic.0
+            ))
+        })?;
+        *stored_value = value;
+        Ok(())
+    }
+
     pub(super) async fn start_provider_advertising(
         provider: &GattServiceProvider,
         spec: &GattServiceSpec,
@@ -536,6 +564,12 @@ impl Server {
         }
         Ok(())
     }
+}
+
+/// One inbound request, queued so a single task answers them in order.
+enum ServerRequest {
+    Write(CharacteristicUuid, GattWriteRequestedEventArgs),
+    Read(CharacteristicUuid, GattReadRequestedEventArgs),
 }
 
 /// Answers inbound reads and writes in the order they arrived; writes are
@@ -595,59 +629,17 @@ impl ServerRequest {
     }
 }
 
-impl Inner {
-    async fn handle_write(
-        self: &Arc<Self>,
-        generation: u64,
-        characteristic: CharacteristicUuid,
-        args: &GattWriteRequestedEventArgs,
-    ) -> windows::core::Result<()> {
-        let deferral = args.GetDeferral()?;
-        let outcome = async {
-            let session = args.Session()?;
-            let request = args.GetRequestAsync()?.await?;
-            let with_response = request.Option()? == GattWriteOption::WriteWithResponse;
-            let address = WindowsCodec::session_address(&session)?;
-            if self.is_excluded(&address) {
-                if with_response {
-                    request.RespondWithProtocolError(ATT_WRITE_NOT_PERMITTED)?;
-                }
-                return Ok(());
-            }
-            let Some((address, _)) = self.note_server_peer(&session, generation) else {
-                if with_response {
-                    request.RespondWithProtocolError(ATT_WRITE_NOT_PERMITTED)?;
-                }
-                return Ok(());
-            };
-            // Serialize event publication with server replacement. No native await occurs under this lock.
-            let current = self.server_generation.lock().unwrap();
-            if *current != generation || self.is_excluded(&address) {
-                if with_response {
-                    request.RespondWithProtocolError(ATT_WRITE_NOT_PERMITTED)?;
-                }
-                return Ok(());
-            }
-            let value = WindowsCodec::from_buffer(&request.Value()?)?;
-            if with_response {
-                request.Respond()?;
-            }
-            log::debug!(
-                "server: {} bytes from {address} on {}",
-                value.len(),
-                characteristic.0
-            );
-            let _ = self.events_tx.send(GattEvent::CharacteristicWritten {
-                peer: PeerAddress(address),
-                characteristic,
-                value,
-            });
-            Ok(())
-        }
-        .await;
-        deferral.Complete()?;
-        outcome
-    }
+/// A central attached to the local GATT server.
+pub(super) struct ServerPeer {
+    pub(super) session: u64,
+    /// Held so its `SessionStatusChanged` registration stays alive.
+    gatt_session: GattSession,
+    status_token: i64,
+    /// Set by `disconnect_peer`. WinRT has no call that drops a central
+    /// from a GATT server, so an excluded central stays connected until it
+    /// leaves; meanwhile it gets no notifications and its writes are
+    /// refused (ADR-0011 D6).
+    pub(super) excluded: bool,
 }
 
 impl ServerPeer {

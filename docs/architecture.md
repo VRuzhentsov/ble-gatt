@@ -36,8 +36,16 @@ Put behavior on the type that owns its state, rules or protocol.
 - Keep language and framework entry points as thin calls to owning objects.
   Keep a generic free helper only when no domain type owns the operation;
   explain that exception in review.
-- Check this rule in each code review. Keep current interfaces and wire bytes
-  until a separate implementation change updates them.
+- Place a type near its inherent implementation. Group related methods, such
+  as encode/decode pairs, and consolidate compatible `impl` blocks.
+- Keep trait implementations separate. Group compatibility functions and foreign
+  entry points apart from implementations. Preserve attributes, visibility and
+  conditional compilation. Explain separate inherent blocks with different bounds
+  or conditions in review.
+- Use existing interfaces. Add traits for concrete shared contracts or interchangeable
+  implementations, rather than for every internal object.
+- Check ownership and source organization in each code review. Keep current
+  interfaces and wire bytes until a separate implementation change updates them.
 
 Load [the code-style skill](../.agents/skills/ble-gatt-code-style/SKILL.md)
 before writing or reviewing code.

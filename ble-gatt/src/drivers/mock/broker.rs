@@ -21,19 +21,6 @@ use super::local::LocalRadio;
 use super::wire::{Envelope, Frame, Push, Request, Response};
 use crate::drivers::event_bus::EventBus;
 
-struct ConnHandle {
-    outbox: mpsc::Sender<Envelope>,
-    /// Addresses this connection has `RegisterAddress`'d — swept on
-    /// disconnect so a killed process doesn't leave the survivor's
-    /// `events()` stream waiting forever for a `Disconnected` that will
-    /// never come.
-    owned_addresses: Mutex<HashSet<PeerAddress>>,
-    /// Event/notify forwarder tasks spawned for this connection — aborted on
-    /// disconnect rather than left to notice a failed send on their own
-    /// next wakeup, which could otherwise be an arbitrarily long time away.
-    forwarders: Mutex<Vec<JoinHandle<()>>>,
-}
-
 impl LocalRadio {
     pub(super) async fn serve_broker(listener: TcpListener) -> Result<()> {
         let radio = Arc::new(LocalRadio::default());
@@ -45,6 +32,19 @@ impl LocalRadio {
             tokio::spawn(ConnHandle::run(socket, radio.clone()));
         }
     }
+}
+
+struct ConnHandle {
+    outbox: mpsc::Sender<Envelope>,
+    /// Addresses this connection has `RegisterAddress`'d — swept on
+    /// disconnect so a killed process doesn't leave the survivor's
+    /// `events()` stream waiting forever for a `Disconnected` that will
+    /// never come.
+    owned_addresses: Mutex<HashSet<PeerAddress>>,
+    /// Event/notify forwarder tasks spawned for this connection — aborted on
+    /// disconnect rather than left to notice a failed send on their own
+    /// next wakeup, which could otherwise be an arbitrarily long time away.
+    forwarders: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl ConnHandle {

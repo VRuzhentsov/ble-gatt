@@ -6,6 +6,28 @@ pub(super) const VERSION: u8 = 1;
 pub(super) const CAPABILITY: u8 = 1;
 pub(super) const DATA_HEADER: usize = 9;
 
+/// The managed profile header and the endpoint it advertises.
+pub(super) struct ManagedMetadata {
+    pub endpoint: EndpointId,
+}
+
+impl ManagedMetadata {
+    pub(super) fn encode(&self) -> Vec<u8> {
+        let mut bytes = vec![b'B', b'G', VERSION, CAPABILITY];
+        bytes.extend_from_slice(&self.endpoint.0);
+        bytes
+    }
+
+    pub(super) fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != 20 || bytes[..4] != [b'B', b'G', VERSION, CAPABILITY] {
+            return Err(BleError::Protocol("unsupported managed profile".into()));
+        }
+        Ok(Self {
+            endpoint: EndpointId(bytes[4..20].try_into().map_err(|_| Record::invalid())?),
+        })
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Record {
     Request {
@@ -36,28 +58,6 @@ pub(super) enum Record {
     Pong {
         attempt: u64,
     },
-}
-
-/// The managed profile header and the endpoint it advertises.
-pub(super) struct ManagedMetadata {
-    pub endpoint: EndpointId,
-}
-
-impl ManagedMetadata {
-    pub(super) fn encode(&self) -> Vec<u8> {
-        let mut bytes = vec![b'B', b'G', VERSION, CAPABILITY];
-        bytes.extend_from_slice(&self.endpoint.0);
-        bytes
-    }
-
-    pub(super) fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() != 20 || bytes[..4] != [b'B', b'G', VERSION, CAPABILITY] {
-            return Err(BleError::Protocol("unsupported managed profile".into()));
-        }
-        Ok(Self {
-            endpoint: EndpointId(bytes[4..20].try_into().map_err(|_| Record::invalid())?),
-        })
-    }
 }
 
 impl Record {

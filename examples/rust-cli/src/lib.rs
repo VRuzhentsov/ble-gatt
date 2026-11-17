@@ -26,6 +26,11 @@ pub async fn central(
     GattDemo { adapter, wait }.central(value).await
 }
 
+/// Serve one write and echo it. Keep serving until that central disconnects.
+pub async fn peripheral(adapter: &Adapter, wait: Duration) -> Result<Vec<u8>> {
+    GattDemo { adapter, wait }.peripheral().await
+}
+
 /// The adapter and operation deadline shared by the raw GATT demonstration.
 struct GattDemo<'a> {
     adapter: &'a Adapter,
@@ -75,14 +80,6 @@ impl GattDemo<'_> {
         disconnected?;
         exchange?
     }
-}
-
-/// Serve one write and echo it. Keep serving until that central disconnects.
-pub async fn peripheral(adapter: &Adapter, wait: Duration) -> Result<Vec<u8>> {
-    GattDemo { adapter, wait }.peripheral().await
-}
-
-impl GattDemo<'_> {
     async fn peripheral(self) -> Result<Vec<u8>> {
         let Self { adapter, wait } = self;
         let peripheral = adapter.peripheral();

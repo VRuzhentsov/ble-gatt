@@ -121,55 +121,14 @@ pub fn dial_with(link: Arc<PeerLink>) -> Dialer {
     BleGattTransport::make_dialer(link)
 }
 
-impl BleGattTransport {
-    fn make_dialer(link: Arc<PeerLink>) -> Dialer {
-        Arc::new(move |peer: PeerAddress| {
-            let link = link.clone();
-            Box::pin(async move {
-                let channel = match link.channel(&peer) {
-                    Some(channel) => channel,
-                    None => link.request(&peer).await?.accept().await?,
-                };
-                if let Err(err) = channel
-                    .request_connection_priority(ConnectionPriority::High)
-                    .await
-                {
-                    log::debug!(
-                        "link to {}: high connection priority not applied: {err}",
-                        peer.0
-                    );
-                }
-                Ok(channel)
-            })
-        })
-    }
-}
-
 /// The iroh address of a Bluetooth peer.
 pub fn custom_addr(peer: &PeerAddress) -> CustomAddr {
     BleGattTransport::encode_address(peer)
 }
 
-impl BleGattTransport {
-    fn encode_address(peer: &PeerAddress) -> CustomAddr {
-        CustomAddr::from_parts(TRANSPORT_ID, peer.0.as_bytes())
-    }
-}
-
 /// The Bluetooth peer an iroh address names, if it is one of this transport's.
 pub fn peer_address(addr: &CustomAddr) -> Option<PeerAddress> {
     BleGattTransport::decode_address(addr)
-}
-
-impl BleGattTransport {
-    fn decode_address(addr: &CustomAddr) -> Option<PeerAddress> {
-        if addr.id() != TRANSPORT_ID {
-            return None;
-        }
-        String::from_utf8(addr.data().to_vec())
-            .ok()
-            .map(PeerAddress)
-    }
 }
 
 /// Routing heuristic for the first datagram on a new channel: QUIC Initials
@@ -180,12 +139,6 @@ impl BleGattTransport {
 /// byte never has the top bit set (UTF-8 JSON, for one, cannot start so).
 pub fn is_quic_initial(packet: &[u8]) -> bool {
     BleGattTransport::has_initial_header(packet)
-}
-
-impl BleGattTransport {
-    fn has_initial_header(packet: &[u8]) -> bool {
-        packet.first().is_some_and(|byte| byte & 0x80 != 0)
-    }
 }
 
 /// Builder for [`BleGattTransport`].
@@ -265,59 +218,6 @@ impl BleGattTransportBuilder {
     }
 }
 
-/// iroh custom transport over `ble-gatt` datagram channels. Cheap to clone;
-/// clones share one transport.
-#[derive(Clone)]
-pub struct BleGattTransport {
-    inner: Arc<Inner>,
-}
-
-struct Inner {
-    /// One outbound queue per peer with a channel (open or being dialled).
-    links: Mutex<HashMap<PeerAddress, mpsc::Sender<Outgoing>>>,
-    /// One packet receiver per attached core channel. Core owns native attempts.
-    carriers: Mutex<HashMap<PeerAddress, PacketCarrier>>,
-    /// Explicit application users authorize acquisition generations. Old QUIC
-    /// traffic cannot reset a terminal generation; it has no hook invocation.
-    acquisition: Mutex<HashMap<PeerAddress, Acquisition>>,
-    /// When a link to each address last dropped a packet for a full queue;
-    /// see `close_sent`.
-    dropped: Mutex<HashMap<PeerAddress, Instant>>,
-    /// Where each known endpoint can be reached, for address lookup.
-    peers: Mutex<HashMap<EndpointId, PeerAddress>>,
-    /// Addresses `set_peer_address` replaced or `forget_peer` removed, and
-    /// not set again since, with the endpoint they were set for: never
-    /// dialled; see `Sender::send`.
-    retired: Mutex<HashMap<PeerAddress, EndpointId>>,
-    /// A close signal per running link, replaced ones included; see
-    /// [`BleGattTransport::close_link`].
-    closers: Mutex<HashMap<PeerAddress, Vec<Arc<Notify>>>>,
-    #[cfg(test)]
-    published: Mutex<Option<Box<dyn FnOnce() + Send>>>,
-    #[cfg(test)]
-    retiring: Mutex<Option<(oneshot::Sender<()>, Arc<Notify>)>>,
-    #[cfg(test)]
-    terminating: Mutex<Option<(oneshot::Sender<()>, Arc<Notify>)>>,
-
-    /// Historical key/address associations plus separate current-path users,
-    /// in either role (ADR-0008 D1). History survives path closure for close
-    /// barriers and ended-packet suppression; it alone cannot defeat idle.
-    learned: Mutex<HashMap<PeerAddress, Learned>>,
-    /// A signal per running link, fired when the last iroh connection on its
-    /// address ends (ADR-0008 D3).
-    releasers: Mutex<HashMap<PeerAddress, Vec<Arc<Notify>>>>,
-    next_connection: AtomicU64,
-    inbound_tx: mpsc::Sender<Inbound>,
-    /// Taken by the one endpoint that binds this transport.
-    inbound_rx: Mutex<Option<mpsc::Receiver<Inbound>>>,
-    /// Incoming source addresses are not necessarily connectable addresses.
-    incoming_addresses: Mutex<HashSet<PeerAddress>>,
-    dialer: Option<Dialer>,
-    local: n0_watcher::Watchable<Vec<CustomAddr>>,
-    link_idle_timeout: Duration,
-    link_release_delay: Duration,
-}
-
 /// Packet-task ownership, separate from the core's native generation.
 struct PacketCarrier {
     queue: mpsc::Sender<Outgoing>,
@@ -331,16 +231,6 @@ struct PacketCarrier {
 struct Acquisition {
     generation: u64,
     terminal: bool,
-}
-
-impl Inner {
-    fn authorize_acquisition(&self, peer: &PeerAddress) -> u64 {
-        let mut acquisitions = self.acquisition.lock().expect("poisoned");
-        let acquisition = acquisitions.entry(peer.clone()).or_default();
-        acquisition.generation += 1;
-        acquisition.terminal = false;
-        acquisition.generation
-    }
 }
 
 /// One address's owner, as iroh's connections over it showed.
@@ -358,16 +248,53 @@ struct Learned {
     ended: HashSet<u64>,
 }
 
-impl fmt::Debug for BleGattTransport {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BleGattTransport")
-            .field("links", &self.inner.links.lock().expect("poisoned").len())
-            .field("dialer", &self.inner.dialer.is_some())
-            .finish()
-    }
+/// iroh custom transport over `ble-gatt` datagram channels. Cheap to clone;
+/// clones share one transport.
+#[derive(Clone)]
+pub struct BleGattTransport {
+    inner: Arc<Inner>,
 }
 
 impl BleGattTransport {
+    fn encode_address(peer: &PeerAddress) -> CustomAddr {
+        CustomAddr::from_parts(TRANSPORT_ID, peer.0.as_bytes())
+    }
+
+    fn decode_address(addr: &CustomAddr) -> Option<PeerAddress> {
+        if addr.id() != TRANSPORT_ID {
+            return None;
+        }
+        String::from_utf8(addr.data().to_vec())
+            .ok()
+            .map(PeerAddress)
+    }
+
+    fn has_initial_header(packet: &[u8]) -> bool {
+        packet.first().is_some_and(|byte| byte & 0x80 != 0)
+    }
+
+    fn make_dialer(link: Arc<PeerLink>) -> Dialer {
+        Arc::new(move |peer: PeerAddress| {
+            let link = link.clone();
+            Box::pin(async move {
+                let channel = match link.channel(&peer) {
+                    Some(channel) => channel,
+                    None => link.request(&peer).await?.accept().await?,
+                };
+                if let Err(err) = channel
+                    .request_connection_priority(ConnectionPriority::High)
+                    .await
+                {
+                    log::debug!(
+                        "link to {}: high connection priority not applied: {err}",
+                        peer.0
+                    );
+                }
+                Ok(channel)
+            })
+        })
+    }
+
     pub fn builder() -> BleGattTransportBuilder {
         BleGattTransportBuilder::default()
     }
@@ -553,6 +480,87 @@ impl BleGattTransport {
         BleGattAddressLookup {
             inner: self.inner.clone(),
         }
+    }
+}
+
+impl fmt::Debug for BleGattTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BleGattTransport")
+            .field("links", &self.inner.links.lock().expect("poisoned").len())
+            .field("dialer", &self.inner.dialer.is_some())
+            .finish()
+    }
+}
+
+impl CustomTransport for BleGattTransport {
+    fn bind(&self) -> io::Result<Box<dyn CustomEndpoint>> {
+        let inbound = self
+            .inner
+            .inbound_rx
+            .lock()
+            .expect("poisoned")
+            .take()
+            .ok_or_else(|| io::Error::other("this transport is already bound to an endpoint"))?;
+        Ok(Box::new(Endpoint {
+            inner: self.inner.clone(),
+            inbound,
+        }))
+    }
+}
+
+struct Inner {
+    /// One outbound queue per peer with a channel (open or being dialled).
+    links: Mutex<HashMap<PeerAddress, mpsc::Sender<Outgoing>>>,
+    /// One packet receiver per attached core channel. Core owns native attempts.
+    carriers: Mutex<HashMap<PeerAddress, PacketCarrier>>,
+    /// Explicit application users authorize acquisition generations. Old QUIC
+    /// traffic cannot reset a terminal generation; it has no hook invocation.
+    acquisition: Mutex<HashMap<PeerAddress, Acquisition>>,
+    /// When a link to each address last dropped a packet for a full queue;
+    /// see `close_sent`.
+    dropped: Mutex<HashMap<PeerAddress, Instant>>,
+    /// Where each known endpoint can be reached, for address lookup.
+    peers: Mutex<HashMap<EndpointId, PeerAddress>>,
+    /// Addresses `set_peer_address` replaced or `forget_peer` removed, and
+    /// not set again since, with the endpoint they were set for: never
+    /// dialled; see `Sender::send`.
+    retired: Mutex<HashMap<PeerAddress, EndpointId>>,
+    /// A close signal per running link, replaced ones included; see
+    /// [`BleGattTransport::close_link`].
+    closers: Mutex<HashMap<PeerAddress, Vec<Arc<Notify>>>>,
+    #[cfg(test)]
+    published: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    retiring: Mutex<Option<(oneshot::Sender<()>, Arc<Notify>)>>,
+    #[cfg(test)]
+    terminating: Mutex<Option<(oneshot::Sender<()>, Arc<Notify>)>>,
+
+    /// Historical key/address associations plus separate current-path users,
+    /// in either role (ADR-0008 D1). History survives path closure for close
+    /// barriers and ended-packet suppression; it alone cannot defeat idle.
+    learned: Mutex<HashMap<PeerAddress, Learned>>,
+    /// A signal per running link, fired when the last iroh connection on its
+    /// address ends (ADR-0008 D3).
+    releasers: Mutex<HashMap<PeerAddress, Vec<Arc<Notify>>>>,
+    next_connection: AtomicU64,
+    inbound_tx: mpsc::Sender<Inbound>,
+    /// Taken by the one endpoint that binds this transport.
+    inbound_rx: Mutex<Option<mpsc::Receiver<Inbound>>>,
+    /// Incoming source addresses are not necessarily connectable addresses.
+    incoming_addresses: Mutex<HashSet<PeerAddress>>,
+    dialer: Option<Dialer>,
+    local: n0_watcher::Watchable<Vec<CustomAddr>>,
+    link_idle_timeout: Duration,
+    link_release_delay: Duration,
+}
+
+impl Inner {
+    fn authorize_acquisition(&self, peer: &PeerAddress) -> u64 {
+        let mut acquisitions = self.acquisition.lock().expect("poisoned");
+        let acquisition = acquisitions.entry(peer.clone()).or_default();
+        acquisition.generation += 1;
+        acquisition.terminal = false;
+        acquisition.generation
     }
 }
 
@@ -941,155 +949,6 @@ impl Inner {
     }
 }
 
-/// Endpoint hooks from [`BleGattTransport::hooks`].
-#[derive(Clone)]
-pub struct BleGattHooks {
-    inner: Arc<Inner>,
-}
-
-impl fmt::Debug for BleGattHooks {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("ble_gatt_iroh::BleGattHooks")
-    }
-}
-
-impl EndpointHooks for BleGattHooks {
-    async fn before_connect<'a>(
-        &'a self,
-        remote: &'a iroh::EndpointAddr,
-        _alpn: &'a [u8],
-    ) -> BeforeConnectOutcome {
-        // This callback represents a new application connect, never a QUIC
-        // retransmission. Authorize its generation without inspecting packets.
-        let _links = self.inner.links.lock().expect("poisoned");
-        let mut addresses: HashSet<_> = self.inner.addresses_of(&remote.id).into_iter().collect();
-        // Caller destinations authorize this application action, but are not
-        // authenticated key/address associations. Only after_handshake learns
-        // those. Sender still rejects retired and unknown incoming addresses.
-        addresses.extend(remote.addrs.iter().filter_map(|addr| match addr {
-            TransportAddr::Custom(addr) => peer_address(addr),
-            _ => None,
-        }));
-        for peer in addresses {
-            // Sharing a healthy carrier does not change its authorization:
-            // a later terminal close must suppress every existing QUIC user.
-            let terminal = self
-                .inner
-                .acquisition
-                .lock()
-                .expect("poisoned")
-                .get(&peer)
-                .is_some_and(|acquisition| acquisition.terminal);
-            // Core publishes closure before waking the packet task. A new
-            // application connect in that interval must not inherit the old
-            // generation just because its queue is not closed yet. Healthy
-            // shared carriers still keep all existing users in one generation.
-            let core_closed = self
-                .inner
-                .carriers
-                .lock()
-                .expect("poisoned")
-                .get(&peer)
-                .is_some_and(|carrier| carrier.channel.close_reason().is_some());
-            if terminal || core_closed {
-                self.inner.authorize_acquisition(&peer);
-            }
-        }
-        BeforeConnectOutcome::Accept
-    }
-
-    async fn after_handshake<'a>(&'a self, conn: &'a Connection) -> AfterHandshakeOutcome {
-        let endpoint = conn.remote_id();
-        let connection = self.inner.next_connection.fetch_add(1, Ordering::Relaxed);
-        // Neither keeps the connection alive; see `EndpointHooks`.
-        // Subscribe before snapshotting. Every event (including Closed and
-        // Lagged) triggers a fresh snapshot, so queued older Opened events
-        // cannot resurrect ownership after that path has already closed.
-        let mut events = conn.path_events();
-        self.inner.reconcile_paths(
-            endpoint,
-            connection,
-            conn.paths().iter().map(|path| path.remote_addr().clone()),
-        );
-        let weak = conn.weak_handle();
-        let closed = weak.closed();
-        let inner = self.inner.clone();
-        tokio::spawn(async move {
-            tokio::pin!(closed);
-            loop {
-                tokio::select! {
-                    _ = &mut closed => break,
-                    event = events.next() => match event {
-                        Some(_) => {
-                            if let Some(conn) = weak.upgrade() {
-                                // A closing connection retains its carrier
-                                // until the existing close-frame barrier.
-                                if conn.close_reason().is_none() {
-                                    inner.reconcile_paths(endpoint, connection,
-                                        conn.paths().iter().map(|path| path.remote_addr().clone()));
-                                }
-                            }
-                        }
-                        None => break,
-                    },
-                }
-            }
-            inner.connection_closing(connection);
-            // `closed` fires when the close starts: at `close()`, before its
-            // CONNECTION_CLOSE is even sent, or when the peer's arrives.
-            let reason = weak.upgrade().and_then(|conn| conn.close_reason());
-            let closing = Instant::now();
-            match reason {
-                // Closed by the peer, reset, or silent: this side is draining
-                // and sends nothing more (RFC 9000 §10.2.2), so ending the
-                // link now loses nothing. Waiting out the drain instead kept
-                // a phone's link up 13s on hardware, and the old link made
-                // BlueZ abort every dial to the phone meanwhile.
-                Some(
-                    ConnectionError::ConnectionClosed(_)
-                    | ConnectionError::ApplicationClosed(_)
-                    | ConnectionError::Reset
-                    | ConnectionError::TimedOut,
-                ) => {
-                    log::debug!(
-                        "connection {connection} to {}: closed by the peer ({reason:?}), its links can go",
-                        endpoint.fmt_short()
-                    );
-                }
-                // Closed by this side. Cutting the link at once lost the
-                // peer's copy of the CONNECTION_CLOSE on hardware, so the link
-                // goes once that packet has been sent, without the closing
-                // period after it: like `iroh-ble-transport`, which tears its
-                // link down as soon as a connection closes.
-                _ => {
-                    log::debug!(
-                        "connection {connection} to {}: closing ({reason:?}), waiting for its CONNECTION_CLOSE to go out",
-                        endpoint.fmt_short()
-                    );
-                    let sent = inner.close_sent(&weak, connection, closing).await;
-                    log::debug!(
-                        "connection {connection} to {}: {} after {:?}",
-                        endpoint.fmt_short(),
-                        if sent {
-                            "CONNECTION_CLOSE sent"
-                        } else {
-                            "drained"
-                        },
-                        closing.elapsed()
-                    );
-                }
-            }
-            inner.forget_connection(connection);
-            // Still known until drained, so its late packets dial nothing.
-            while weak.upgrade().is_some() {
-                tokio::time::sleep(DRAINED_CHECK_INTERVAL).await;
-            }
-            inner.connection_drained(connection);
-        });
-        AfterHandshakeOutcome::accept()
-    }
-}
-
 /// Waits until connection `connection`, closed by this side, has sent its
 /// CONNECTION_CLOSE; false if it drained first. noq counts the frame when it
 /// builds the packet and hands the packet to the transport under the same
@@ -1244,19 +1103,152 @@ impl Inner {
     }
 }
 
-impl CustomTransport for BleGattTransport {
-    fn bind(&self) -> io::Result<Box<dyn CustomEndpoint>> {
-        let inbound = self
-            .inner
-            .inbound_rx
-            .lock()
-            .expect("poisoned")
-            .take()
-            .ok_or_else(|| io::Error::other("this transport is already bound to an endpoint"))?;
-        Ok(Box::new(Endpoint {
-            inner: self.inner.clone(),
-            inbound,
-        }))
+/// Endpoint hooks from [`BleGattTransport::hooks`].
+#[derive(Clone)]
+pub struct BleGattHooks {
+    inner: Arc<Inner>,
+}
+
+impl fmt::Debug for BleGattHooks {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ble_gatt_iroh::BleGattHooks")
+    }
+}
+
+impl EndpointHooks for BleGattHooks {
+    async fn before_connect<'a>(
+        &'a self,
+        remote: &'a iroh::EndpointAddr,
+        _alpn: &'a [u8],
+    ) -> BeforeConnectOutcome {
+        // This callback represents a new application connect, never a QUIC
+        // retransmission. Authorize its generation without inspecting packets.
+        let _links = self.inner.links.lock().expect("poisoned");
+        let mut addresses: HashSet<_> = self.inner.addresses_of(&remote.id).into_iter().collect();
+        // Caller destinations authorize this application action, but are not
+        // authenticated key/address associations. Only after_handshake learns
+        // those. Sender still rejects retired and unknown incoming addresses.
+        addresses.extend(remote.addrs.iter().filter_map(|addr| match addr {
+            TransportAddr::Custom(addr) => peer_address(addr),
+            _ => None,
+        }));
+        for peer in addresses {
+            // Sharing a healthy carrier does not change its authorization:
+            // a later terminal close must suppress every existing QUIC user.
+            let terminal = self
+                .inner
+                .acquisition
+                .lock()
+                .expect("poisoned")
+                .get(&peer)
+                .is_some_and(|acquisition| acquisition.terminal);
+            // Core publishes closure before waking the packet task. A new
+            // application connect in that interval must not inherit the old
+            // generation just because its queue is not closed yet. Healthy
+            // shared carriers still keep all existing users in one generation.
+            let core_closed = self
+                .inner
+                .carriers
+                .lock()
+                .expect("poisoned")
+                .get(&peer)
+                .is_some_and(|carrier| carrier.channel.close_reason().is_some());
+            if terminal || core_closed {
+                self.inner.authorize_acquisition(&peer);
+            }
+        }
+        BeforeConnectOutcome::Accept
+    }
+
+    async fn after_handshake<'a>(&'a self, conn: &'a Connection) -> AfterHandshakeOutcome {
+        let endpoint = conn.remote_id();
+        let connection = self.inner.next_connection.fetch_add(1, Ordering::Relaxed);
+        // Neither keeps the connection alive; see `EndpointHooks`.
+        // Subscribe before snapshotting. Every event (including Closed and
+        // Lagged) triggers a fresh snapshot, so queued older Opened events
+        // cannot resurrect ownership after that path has already closed.
+        let mut events = conn.path_events();
+        self.inner.reconcile_paths(
+            endpoint,
+            connection,
+            conn.paths().iter().map(|path| path.remote_addr().clone()),
+        );
+        let weak = conn.weak_handle();
+        let closed = weak.closed();
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            tokio::pin!(closed);
+            loop {
+                tokio::select! {
+                    _ = &mut closed => break,
+                    event = events.next() => match event {
+                        Some(_) => {
+                            if let Some(conn) = weak.upgrade() {
+                                // A closing connection retains its carrier
+                                // until the existing close-frame barrier.
+                                if conn.close_reason().is_none() {
+                                    inner.reconcile_paths(endpoint, connection,
+                                        conn.paths().iter().map(|path| path.remote_addr().clone()));
+                                }
+                            }
+                        }
+                        None => break,
+                    },
+                }
+            }
+            inner.connection_closing(connection);
+            // `closed` fires when the close starts: at `close()`, before its
+            // CONNECTION_CLOSE is even sent, or when the peer's arrives.
+            let reason = weak.upgrade().and_then(|conn| conn.close_reason());
+            let closing = Instant::now();
+            match reason {
+                // Closed by the peer, reset, or silent: this side is draining
+                // and sends nothing more (RFC 9000 §10.2.2), so ending the
+                // link now loses nothing. Waiting out the drain instead kept
+                // a phone's link up 13s on hardware, and the old link made
+                // BlueZ abort every dial to the phone meanwhile.
+                Some(
+                    ConnectionError::ConnectionClosed(_)
+                    | ConnectionError::ApplicationClosed(_)
+                    | ConnectionError::Reset
+                    | ConnectionError::TimedOut,
+                ) => {
+                    log::debug!(
+                        "connection {connection} to {}: closed by the peer ({reason:?}), its links can go",
+                        endpoint.fmt_short()
+                    );
+                }
+                // Closed by this side. Cutting the link at once lost the
+                // peer's copy of the CONNECTION_CLOSE on hardware, so the link
+                // goes once that packet has been sent, without the closing
+                // period after it: like `iroh-ble-transport`, which tears its
+                // link down as soon as a connection closes.
+                _ => {
+                    log::debug!(
+                        "connection {connection} to {}: closing ({reason:?}), waiting for its CONNECTION_CLOSE to go out",
+                        endpoint.fmt_short()
+                    );
+                    let sent = inner.close_sent(&weak, connection, closing).await;
+                    log::debug!(
+                        "connection {connection} to {}: {} after {:?}",
+                        endpoint.fmt_short(),
+                        if sent {
+                            "CONNECTION_CLOSE sent"
+                        } else {
+                            "drained"
+                        },
+                        closing.elapsed()
+                    );
+                }
+            }
+            inner.forget_connection(connection);
+            // Still known until drained, so its late packets dial nothing.
+            while weak.upgrade().is_some() {
+                tokio::time::sleep(DRAINED_CHECK_INTERVAL).await;
+            }
+            inner.connection_drained(connection);
+        });
+        AfterHandshakeOutcome::accept()
     }
 }
 

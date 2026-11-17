@@ -15,12 +15,6 @@ use crate::entities::models::{
 };
 
 #[derive(Serialize, Deserialize)]
-pub(super) struct Envelope {
-    pub(super) correlation_id: u64,
-    pub(super) frame: Frame,
-}
-
-#[derive(Serialize, Deserialize)]
 pub(super) enum Frame {
     Req(Request),
     Resp(Response),
@@ -146,6 +140,12 @@ pub(super) enum Push {
         subscription_id: u64,
         item: std::result::Result<Vec<u8>, BleError>,
     },
+}
+
+#[derive(Serialize, Deserialize)]
+pub(super) struct Envelope {
+    pub(super) correlation_id: u64,
+    pub(super) frame: Frame,
 }
 
 /// `u32` BE length prefix + `serde_json`. Test-only, non-perf-sensitive

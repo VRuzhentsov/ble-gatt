@@ -159,35 +159,6 @@ impl Connection {
             .as_deref_mut()
             .expect("only Drop takes the connection")
     }
-}
-
-impl Drop for Connection {
-    fn drop(&mut self) {
-        self.watcher.abort();
-        Self::end(&self.state_tx, &self.cancel);
-        // No driver disconnects on its own drop; on Android the
-        // `BluetoothGatt` stays open and the next connect to the peer is
-        // refused as already open. `Drop` cannot await, so a task does it,
-        // as `DatagramChannel`'s `Drop` does.
-        let Some(mut inner) = self.inner.take().filter(|_| self.open) else {
-            return;
-        };
-        if self.managed_cleanup {
-            drop(inner);
-            return;
-        }
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        runtime.spawn(async move {
-            if let Err(err) = inner.disconnect().await {
-                log::warn!("drop: could not disconnect {}: {err}", inner.peer().0);
-            }
-        });
-    }
-}
-
-impl Connection {
     fn end(state_tx: &watch::Sender<ConnectionState>, cancel: &CancellationToken) {
         state_tx.send_if_modified(|state| {
             let changed = state.is_connected();
@@ -235,6 +206,32 @@ impl Connection {
         }
         // Without a lifecycle source, connection state can no longer be verified.
         Self::end(&state_tx, &cancel);
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.watcher.abort();
+        Self::end(&self.state_tx, &self.cancel);
+        // No driver disconnects on its own drop; on Android the
+        // `BluetoothGatt` stays open and the next connect to the peer is
+        // refused as already open. `Drop` cannot await, so a task does it,
+        // as `DatagramChannel`'s `Drop` does.
+        let Some(mut inner) = self.inner.take().filter(|_| self.open) else {
+            return;
+        };
+        if self.managed_cleanup {
+            drop(inner);
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
+            if let Err(err) = inner.disconnect().await {
+                log::warn!("drop: could not disconnect {}: {err}", inner.peer().0);
+            }
+        });
     }
 }
 

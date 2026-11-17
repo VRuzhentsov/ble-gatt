@@ -119,136 +119,6 @@ pub const DEFAULT_ACCEPT_QUEUE_DEPTH: usize = 8;
 /// Let receive and lifecycle tasks run even when native sends complete immediately.
 const FRAGMENT_SEND_BATCH: usize = 8;
 
-#[derive(Debug, Clone)]
-pub struct DatagramConfig {
-    pub service: ServiceUuid,
-    pub characteristic: CharacteristicUuid,
-    pub max_message_len: usize,
-    pub reassembly_timeout: Duration,
-    pub max_concurrent_reassemblies: usize,
-    /// Defaults to `WithResponse`: ATT write
-    /// requests are acknowledged. `WithoutResponse` trades that for
-    /// throughput and will silently drop under load — opt in only where the
-    /// layer above tolerates loss.
-    pub write_type: WriteType,
-    /// How many *completed* messages may sit unread before the reassembler
-    /// stops accepting more. The reassembly limits bound only partial
-    /// messages, so without this a slow or stalled consumer is a memory
-    /// exhaustion vector.
-    pub inbound_queue_depth: usize,
-    /// Maximum raw fragments buffered per peer. A full queue drops arriving
-    /// fragments and reports `ReceiveGap` without delaying lifecycle handling.
-    /// Complete-message bounds alone do not bound pending fragments.
-    pub fragment_queue_depth: usize,
-    /// Accepted-but-not-yet-taken peripheral channels buffered by [`serve`]
-    /// before further centrals are refused. Each queued channel pins a
-    /// driver `Arc`, its reassembly buffers and a live task, so an
-    /// unbounded queue lets a peer that connects and disconnects in a loop
-    /// grow the process without limit while the caller is slow to accept.
-    pub accept_queue_depth: usize,
-    /// Merged into [`service_spec`](Self::service_spec)'s `GattServiceSpec.manufacturer_data`.
-    /// Empty by default — [`serve`] otherwise has no way to carry anything
-    /// beyond the bare service UUID in its advertisement, since it builds
-    /// the spec internally from this config. A caller that needs the
-    /// advertised payload to change between `serve` calls (e.g. a
-    /// discoverability flag toggled on and off) re-advertises by ending the
-    /// current `serve` stream and calling it again with an updated config.
-    pub advertised_manufacturer_data: BTreeMap<u16, Vec<u8>>,
-    /// Service data included in the initial radio and readable advertisements.
-    /// Empty by default.
-    pub advertised_service_data: BTreeMap<ServiceUuid, Vec<u8>>,
-    /// Becomes [`service_spec`](Self::service_spec)'s
-    /// `GattServiceSpec.local_name`: a short name scanners read from the
-    /// scan response without connecting. `None` by default.
-    pub advertised_local_name: Option<String>,
-}
-
-impl DatagramConfig {
-    pub fn new(service: ServiceUuid, characteristic: CharacteristicUuid) -> Self {
-        Self {
-            service,
-            characteristic,
-            max_message_len: DEFAULT_MAX_MESSAGE_LEN,
-            reassembly_timeout: DEFAULT_REASSEMBLY_TIMEOUT,
-            max_concurrent_reassemblies: DEFAULT_MAX_CONCURRENT_REASSEMBLIES,
-            write_type: WriteType::WithResponse,
-            inbound_queue_depth: DEFAULT_INBOUND_QUEUE_DEPTH,
-            fragment_queue_depth: DEFAULT_FRAGMENT_QUEUE_DEPTH,
-            accept_queue_depth: DEFAULT_ACCEPT_QUEUE_DEPTH,
-            advertised_manufacturer_data: BTreeMap::new(),
-            advertised_service_data: BTreeMap::new(),
-            advertised_local_name: None,
-        }
-    }
-
-    /// `mpsc::channel(0)` panics, and `inbound_queue_depth` is a public
-    /// field with no non-zero invariant — validate rather than letting a
-    /// caller's zero crash `connect`, or worse, panic `serve`'s detached
-    /// background task where nothing observes it.
-    fn validate(&self) -> Result<()> {
-        if self.inbound_queue_depth == 0 {
-            return Err(BleError::Gatt(
-                "inbound_queue_depth must be at least 1".to_string(),
-            ));
-        }
-        if self.fragment_queue_depth == 0 {
-            return Err(BleError::Gatt(
-                "fragment_queue_depth must be at least 1".to_string(),
-            ));
-        }
-        if self.accept_queue_depth == 0 {
-            return Err(BleError::Gatt(
-                "accept_queue_depth must be at least 1".to_string(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn limits(&self) -> ReassemblyLimits {
-        ReassemblyLimits {
-            max_message_len: self.max_message_len,
-            reassembly_timeout: self.reassembly_timeout,
-            max_concurrent_reassemblies: self.max_concurrent_reassemblies,
-        }
-    }
-
-    /// The GATT service this tier expects on the wire. Both roles must agree,
-    /// so both derive it from here rather than hand-rolling a spec.
-    ///
-    /// Include a readable GATT advertisement characteristic for scanners that receive no advertisement data over the radio
-    /// (`profile::advertisement`, ADR-0012).
-    pub fn service_spec(&self) -> GattServiceSpec {
-        let mut spec = GattServiceSpec::new(
-            self.service,
-            vec![GattCharacteristicSpec {
-                uuid: self.characteristic,
-                readable: true,
-                writable: true,
-                notifiable: true,
-                initial_value: Vec::new(),
-            }],
-        );
-        spec.manufacturer_data = self.advertised_manufacturer_data.clone();
-        spec.service_data = self.advertised_service_data.clone();
-        spec.local_name = self.advertised_local_name.clone();
-        let gatt_advertisement = crate::profile::advertisement::characteristic_spec(&spec);
-        spec.characteristics.push(gatt_advertisement);
-        spec
-    }
-}
-
-/// The configured ceiling, lowered to whatever the fragment budget can
-/// actually carry. Without this the two limits disagree: a peripheral
-/// budgets 14-byte fragments against the spec-minimum MTU, capping a
-/// message at ~896 KiB, while `max_message_len` defaults to 1 MiB — so
-/// messages in the gap passed the size check and then failed inside
-/// `split()` one call later.
-impl DatagramChannel {
-    fn message_limit(configured: usize, fragment_budget: usize) -> usize {
-        configured.min(fragment_budget.saturating_mul(MAX_FRAGMENTS))
-    }
-}
-
 /// How a channel pushes bytes at its peer — the only thing that differs
 /// between the two roles once fragmentation is factored out.
 enum Sink {
@@ -413,6 +283,18 @@ impl Drop for DatagramChannel {
                 }
             });
         }
+    }
+}
+
+/// The configured ceiling, lowered to whatever the fragment budget can
+/// actually carry. Without this the two limits disagree: a peripheral
+/// budgets 14-byte fragments against the spec-minimum MTU, capping a
+/// message at ~896 KiB, while `max_message_len` defaults to 1 MiB — so
+/// messages in the gap passed the size check and then failed inside
+/// `split()` one call later.
+impl DatagramChannel {
+    fn message_limit(configured: usize, fragment_budget: usize) -> usize {
+        configured.min(fragment_budget.saturating_mul(MAX_FRAGMENTS))
     }
 }
 
@@ -600,372 +482,6 @@ impl DatagramChannel {
             }
         }
     }
-}
-
-/// Sends on a [`DatagramChannel`] without holding it, from
-/// [`DatagramChannel::sender`].
-#[derive(Clone)]
-pub struct DatagramSender {
-    peer: PeerAddress,
-    characteristic: CharacteristicUuid,
-    sink: Arc<Mutex<Sink>>,
-    session: Option<u64>,
-    next_msg_id: Arc<AtomicU32>,
-    max_message_len: usize,
-    fragment_budget: usize,
-}
-
-impl DatagramSender {
-    pub async fn send(&self, payload: Vec<u8>) -> Result<()> {
-        if payload.len() > self.max_message_len {
-            log::warn!(
-                "send: refusing {} bytes to {} — over the {}-byte channel limit",
-                payload.len(),
-                self.peer.0,
-                self.max_message_len
-            );
-            return Err(BleError::Gatt(format!(
-                "message of {} bytes exceeds the {}-byte limit for this channel",
-                payload.len(),
-                self.max_message_len
-            )));
-        }
-        let msg_id = self.next_msg_id.fetch_add(1, Ordering::Relaxed);
-
-        let fragments = split(msg_id, &payload, self.fragment_budget)?;
-        log::debug!(
-            "send: {} bytes to {} as msg_id={msg_id} in {} fragment(s)",
-            payload.len(),
-            self.peer.0,
-            fragments.len()
-        );
-        let characteristic = self.characteristic;
-        let mut sink = self.sink.lock().await;
-        for (index, fragment) in fragments.into_iter().enumerate() {
-            if index > 0 && index % FRAGMENT_SEND_BATCH == 0 {
-                tokio::task::yield_now().await;
-            }
-            log::trace!(
-                "send: msg_id={msg_id} fragment {index} ({} bytes) to {}",
-                fragment.len(),
-                self.peer.0
-            );
-            match &mut *sink {
-                Sink::Connection {
-                    connection,
-                    write_type,
-                } => {
-                    let Some(connection) = connection.as_mut() else {
-                        log::warn!(
-                            "send: refusing msg_id={msg_id} — channel to {} is already closed",
-                            self.peer.0
-                        );
-                        return Err(BleError::NotConnected(self.peer.0.clone()));
-                    };
-                    if let Err(err) = connection
-                        .write_with_type(characteristic, fragment, *write_type)
-                        .await
-                    {
-                        log::warn!(
-                            "send: write of msg_id={msg_id} fragment {index} to {} failed: {err}",
-                            self.peer.0
-                        );
-                        return Err(err);
-                    }
-                }
-                Sink::Notify { driver, active } => {
-                    if !active.load(Ordering::SeqCst) {
-                        log::warn!(
-                            "send: refusing msg_id={msg_id} — channel to {} is no longer active",
-                            self.peer.0
-                        );
-                        return Err(BleError::NotConnected(self.peer.0.clone()));
-                    }
-                    // Addressed, not broadcast. Refusing a second central is
-                    // asynchronous — it subscribes, `serve` sees it, then
-                    // disconnects it — and a broadcast in that window would
-                    // hand it this peer's fragments. Addressing closes the
-                    // window entirely rather than narrowing it.
-                    // Named by the session this channel serves: a stale
-                    // channel must not route its fragments through the
-                    // subscription that replaced its peer, where they would
-                    // be reassembled as current data.
-                    if let Err(err) = driver
-                        .notify_peer(&self.peer, self.session, characteristic, fragment)
-                        .await
-                    {
-                        log::warn!(
-                            "send: notify of msg_id={msg_id} fragment {index} to {} failed: {err}",
-                            self.peer.0
-                        );
-                        return Err(err);
-                    }
-                }
-            }
-        }
-        log::trace!("send: msg_id={msg_id} fully written to {}", self.peer.0);
-        drop(sink);
-        // Short ready sends must not bypass fairness between fragment batches.
-        tokio::task::yield_now().await;
-        Ok(())
-    }
-}
-
-/// A served peer's fragment sender, channel-liveness flag, and overflow
-/// signal, as held by `serve` while that peer occupies the single slot.
-/// A served channel was dropped. `keep_peer` when it was closed first, so
-/// the central keeps its connection.
-struct Released {
-    peer: PeerAddress,
-    generation: u64,
-    keep_peer: bool,
-}
-
-struct ServedPeer {
-    /// The driver's own session id for this peer's connection, so a
-    /// lifecycle event from a previous one can be recognised and ignored.
-    driver_session: Option<u64>,
-    fragments: mpsc::Sender<Vec<u8>>,
-    active: Arc<AtomicBool>,
-    overflow: Arc<OverflowSignal>,
-    /// Distinguishes successive channels for the same address, so a release
-    /// from a superseded channel cannot evict its replacement.
-    generation: u64,
-    ended: tokio_util::sync::CancellationToken,
-}
-
-impl Drop for ServedPeer {
-    fn drop(&mut self) {
-        self.active.store(false, Ordering::SeqCst);
-        self.ended.cancel();
-    }
-}
-
-/// Free the single-central slot for a peer whose channel the caller dropped,
-/// and, unless the caller closed it first, drop the peer so it is not left
-/// subscribed to a server that is no longer reading from it.
-impl Released {
-    async fn release_peer(
-        self,
-        inbound: &mut HashMap<PeerAddress, ServedPeer>,
-        driver: &dyn Driver,
-    ) -> Option<(PeerAddress, Option<u64>)> {
-        let Released {
-            peer,
-            generation,
-            keep_peer,
-        } = self;
-        let peer = &peer;
-        // Only if this release belongs to the channel currently holding the
-        // slot. A late release from a superseded generation must not evict the
-        // peer that replaced it.
-        if inbound.get(peer).map(|served| served.generation) != Some(generation) {
-            return None;
-        }
-        if let Some(served) = inbound.remove(peer) {
-            served.active.store(false, Ordering::SeqCst);
-            if keep_peer {
-                log::info!(
-                    "release: central {} session={:?}, kept connected",
-                    peer.0,
-                    served.driver_session
-                );
-                return Some((peer.clone(), served.driver_session));
-            }
-            // Named by the driver session this channel was serving. Releasing a
-            // channel from a superseded `serve` generation would otherwise
-            // disconnect whatever now holds the address — the peer's own
-            // replacement session, established by the server that replaced us.
-            log::info!(
-                "release: central {} session={:?}",
-                peer.0,
-                served.driver_session
-            );
-            if let Err(err) = driver.disconnect_peer(peer, served.driver_session).await {
-                log::warn!("release: could not disconnect central {}: {err}", peer.0);
-            }
-        }
-        None
-    }
-}
-
-/// Exclude a central this server has refused.
-///
-/// Every refusal path must go through this. Refusing to allocate state does
-/// not stop the peer receiving traffic: it is still subscribed, and
-/// `Driver::notify` is a broadcast that cannot be addressed to one peer on
-/// BlueZ. Disconnecting is the only portable exclusion.
-impl ServedPeer {
-    async fn refuse(driver: &dyn Driver, peer: &PeerAddress, session: Option<u64>) {
-        log::info!(
-            "refuse: disconnecting central {} session={session:?}",
-            peer.0
-        );
-        if let Err(err) = driver.disconnect_peer(peer, session).await {
-            log::warn!(
-                "refuse: could not disconnect central {}: {err} \
-             — it may still receive broadcast notifications",
-                peer.0
-            );
-        }
-    }
-}
-
-/// Feed inbound fragments through a reassembler and forward whole messages.
-/// Shared by both roles — the only difference is where fragments come from.
-///
-/// Takes sole ownership of `out`. That is deliberate: the returned handle's
-/// `abort()` is then sufficient to close the consumer's `recv()`, because
-/// aborting drops the only sender. An earlier version handed a clone to the
-/// link-loss watcher as well, so dropping the watcher's copy closed nothing
-/// and `recv()` hung forever on a dead link.
-impl Reassembler {
-    fn spawn<S>(
-        mut fragments: S,
-        limits: ReassemblyLimits,
-        out: mpsc::Sender<Result<Vec<u8>>>,
-        overflow: Arc<OverflowSignal>,
-        peer: PeerAddress,
-        ended: tokio_util::sync::CancellationToken,
-    ) -> tokio::task::JoinHandle<()>
-    where
-        S: tokio_stream::Stream<Item = Result<Vec<u8>>> + Send + Unpin + 'static,
-    {
-        let ended = ended.drop_guard();
-        tokio::spawn(async move {
-            let _ended = ended;
-            let mut reassembler = Reassembler::new(limits);
-            // `Reassembler::expire` only runs from inside `accept`, so a peer
-            // that sends half a message and then goes quiet would otherwise pin
-            // its partial sets for the life of the link — `reassembly_timeout`
-            // would silently never fire. Ticking here is what makes the
-            // configured timeout real on an idle connection.
-            let tick = (limits.reassembly_timeout / 4).max(Duration::from_secs(1));
-            loop {
-                tokio::select! {
-                    incoming = fragments.next() => {
-                        let Some(raw) = incoming else {
-                            // Fragment source ended: the link is gone. Dropping
-                            // `out` here is what makes `recv()` return `None`.
-                            return;
-                        };
-                        // A gap reported by the driver — payloads the peer was
-                        // told were delivered but that never reached us. Surface
-                        // it rather than letting the affected message expire
-                        // unexplained, and discard partial sets, since any of
-                        // them may be missing the fragment that was lost.
-                        let raw = match raw {
-                            Ok(raw) => raw,
-                            Err(BleError::ReceiveGap(_)) => {
-                                log::warn!(
-                                    "reassembly: driver reported dropped notifications from {}; \
-                                     discarding partial messages",
-                                    peer.0
-                                );
-                                overflow.raise();
-                                reassembler = Reassembler::new(limits);
-                                continue;
-                            }
-                            Err(error) => {
-                                log::warn!("reassembly: notification source for {} failed: {error}", peer.0);
-                                // Never wait for application capacity to publish termination.
-                                let _ = out.try_send(Err(error));
-                                return;
-                            }
-                        };
-                        let Some((header, payload)) = FragmentHeader::parse(&raw) else {
-                            // Too short to be ours — a foreign write to our
-                            // characteristic, not a reason to kill the channel.
-                            log::trace!(
-                                "reassembly: ignoring {}-byte write from {} — too short for a \
-                                 fragment header",
-                                raw.len(),
-                                peer.0
-                            );
-                            continue;
-                        };
-                        match reassembler.accept(header, payload, Instant::now()) {
-                            Accept::Complete(message) => {
-                                log::trace!(
-                                    "reassembly: msg_id={} complete from {} ({} bytes)",
-                                    header.msg_id,
-                                    peer.0,
-                                    message.len()
-                                );
-                                // Awaiting bounds complete-message storage. The
-                                // separate fragment queue reports overflow without
-                                // blocking lifecycle handling.
-                                if out.send(Ok(message)).await.is_err() {
-                                    return; // receiver dropped; stop reassembling
-                                }
-                            }
-                            Accept::Pending => {}
-                            Accept::Rejected(reason) => {
-                                // Dropped by policy (bounds breach or malformed).
-                                // The channel stays usable: one bad message must
-                                // not deny service for the rest of the session.
-                                log::warn!(
-                                    "reassembly: dropped fragment {} of msg_id={} from {}: {reason:?}",
-                                    header.index,
-                                    header.msg_id,
-                                    peer.0
-                                );
-                            }
-                        }
-                    }
-                    _ = tokio::time::sleep(tick) => {
-                        reassembler.expire(Instant::now());
-                    }
-                }
-            }
-        })
-    }
-}
-
-/// Holds a freshly established connection until datagram setup succeeds.
-///
-/// Its `Drop` is the only thing that covers a *cancelled* setup: an async fn
-/// whose future is dropped runs none of its remaining code, so error
-/// handling alone cannot close the connection. Disconnecting needs to await,
-/// which `Drop` cannot, so it hands the connection to a detached task —
-/// short-lived and self-terminating, unlike the address it would otherwise
-/// strand.
-struct PendingConnection {
-    connection: Option<Box<dyn GattConnection>>,
-    peer: PeerAddress,
-    managed_cleanup: bool,
-}
-
-impl Drop for PendingConnection {
-    fn drop(&mut self) {
-        let Some(mut connection) = self.connection.take() else {
-            return; // setup succeeded; ownership moved on
-        };
-        if self.managed_cleanup {
-            drop(connection);
-            return;
-        }
-        let peer = self.peer.clone();
-        tokio::spawn(async move {
-            log::info!("connect: tearing down {} after abandoned setup", peer.0);
-            if let Err(err) = connection.disconnect().await {
-                log::warn!(
-                    "connect: could not disconnect {} after abandoned setup: {err}",
-                    peer.0
-                );
-            }
-        });
-    }
-}
-
-/// Central role: connect to `peer` and bring up a channel over `config`'s
-/// service.
-pub async fn connect(
-    adapter: &Adapter,
-    peer: &PeerAddress,
-    config: &DatagramConfig,
-) -> Result<DatagramChannel> {
-    DatagramChannel::connect_driver(adapter.driver(), peer, config).await
 }
 
 /// [`connect`] over a driver directly, for `PeerLink`, which holds one.
@@ -1178,6 +694,372 @@ impl DatagramChannel {
     }
 }
 
+/// Sends on a [`DatagramChannel`] without holding it, from
+/// [`DatagramChannel::sender`].
+#[derive(Clone)]
+pub struct DatagramSender {
+    peer: PeerAddress,
+    characteristic: CharacteristicUuid,
+    sink: Arc<Mutex<Sink>>,
+    session: Option<u64>,
+    next_msg_id: Arc<AtomicU32>,
+    max_message_len: usize,
+    fragment_budget: usize,
+}
+
+impl DatagramSender {
+    pub async fn send(&self, payload: Vec<u8>) -> Result<()> {
+        if payload.len() > self.max_message_len {
+            log::warn!(
+                "send: refusing {} bytes to {} — over the {}-byte channel limit",
+                payload.len(),
+                self.peer.0,
+                self.max_message_len
+            );
+            return Err(BleError::Gatt(format!(
+                "message of {} bytes exceeds the {}-byte limit for this channel",
+                payload.len(),
+                self.max_message_len
+            )));
+        }
+        let msg_id = self.next_msg_id.fetch_add(1, Ordering::Relaxed);
+
+        let fragments = split(msg_id, &payload, self.fragment_budget)?;
+        log::debug!(
+            "send: {} bytes to {} as msg_id={msg_id} in {} fragment(s)",
+            payload.len(),
+            self.peer.0,
+            fragments.len()
+        );
+        let characteristic = self.characteristic;
+        let mut sink = self.sink.lock().await;
+        for (index, fragment) in fragments.into_iter().enumerate() {
+            if index > 0 && index % FRAGMENT_SEND_BATCH == 0 {
+                tokio::task::yield_now().await;
+            }
+            log::trace!(
+                "send: msg_id={msg_id} fragment {index} ({} bytes) to {}",
+                fragment.len(),
+                self.peer.0
+            );
+            match &mut *sink {
+                Sink::Connection {
+                    connection,
+                    write_type,
+                } => {
+                    let Some(connection) = connection.as_mut() else {
+                        log::warn!(
+                            "send: refusing msg_id={msg_id} — channel to {} is already closed",
+                            self.peer.0
+                        );
+                        return Err(BleError::NotConnected(self.peer.0.clone()));
+                    };
+                    if let Err(err) = connection
+                        .write_with_type(characteristic, fragment, *write_type)
+                        .await
+                    {
+                        log::warn!(
+                            "send: write of msg_id={msg_id} fragment {index} to {} failed: {err}",
+                            self.peer.0
+                        );
+                        return Err(err);
+                    }
+                }
+                Sink::Notify { driver, active } => {
+                    if !active.load(Ordering::SeqCst) {
+                        log::warn!(
+                            "send: refusing msg_id={msg_id} — channel to {} is no longer active",
+                            self.peer.0
+                        );
+                        return Err(BleError::NotConnected(self.peer.0.clone()));
+                    }
+                    // Addressed, not broadcast. Refusing a second central is
+                    // asynchronous — it subscribes, `serve` sees it, then
+                    // disconnects it — and a broadcast in that window would
+                    // hand it this peer's fragments. Addressing closes the
+                    // window entirely rather than narrowing it.
+                    // Named by the session this channel serves: a stale
+                    // channel must not route its fragments through the
+                    // subscription that replaced its peer, where they would
+                    // be reassembled as current data.
+                    if let Err(err) = driver
+                        .notify_peer(&self.peer, self.session, characteristic, fragment)
+                        .await
+                    {
+                        log::warn!(
+                            "send: notify of msg_id={msg_id} fragment {index} to {} failed: {err}",
+                            self.peer.0
+                        );
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        log::trace!("send: msg_id={msg_id} fully written to {}", self.peer.0);
+        drop(sink);
+        // Short ready sends must not bypass fairness between fragment batches.
+        tokio::task::yield_now().await;
+        Ok(())
+    }
+}
+
+struct ServedPeer {
+    /// The driver's own session id for this peer's connection, so a
+    /// lifecycle event from a previous one can be recognised and ignored.
+    driver_session: Option<u64>,
+    fragments: mpsc::Sender<Vec<u8>>,
+    active: Arc<AtomicBool>,
+    overflow: Arc<OverflowSignal>,
+    /// Distinguishes successive channels for the same address, so a release
+    /// from a superseded channel cannot evict its replacement.
+    generation: u64,
+    ended: tokio_util::sync::CancellationToken,
+}
+
+impl Drop for ServedPeer {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::SeqCst);
+        self.ended.cancel();
+    }
+}
+
+/// Exclude a central this server has refused.
+///
+/// Every refusal path must go through this. Refusing to allocate state does
+/// not stop the peer receiving traffic: it is still subscribed, and
+/// `Driver::notify` is a broadcast that cannot be addressed to one peer on
+/// BlueZ. Disconnecting is the only portable exclusion.
+impl ServedPeer {
+    async fn refuse(driver: &dyn Driver, peer: &PeerAddress, session: Option<u64>) {
+        log::info!(
+            "refuse: disconnecting central {} session={session:?}",
+            peer.0
+        );
+        if let Err(err) = driver.disconnect_peer(peer, session).await {
+            log::warn!(
+                "refuse: could not disconnect central {}: {err} \
+             — it may still receive broadcast notifications",
+                peer.0
+            );
+        }
+    }
+}
+
+/// A served peer's fragment sender, channel-liveness flag, and overflow
+/// signal, as held by `serve` while that peer occupies the single slot.
+/// A served channel was dropped. `keep_peer` when it was closed first, so
+/// the central keeps its connection.
+struct Released {
+    peer: PeerAddress,
+    generation: u64,
+    keep_peer: bool,
+}
+
+/// Free the single-central slot for a peer whose channel the caller dropped,
+/// and, unless the caller closed it first, drop the peer so it is not left
+/// subscribed to a server that is no longer reading from it.
+impl Released {
+    async fn release_peer(
+        self,
+        inbound: &mut HashMap<PeerAddress, ServedPeer>,
+        driver: &dyn Driver,
+    ) -> Option<(PeerAddress, Option<u64>)> {
+        let Released {
+            peer,
+            generation,
+            keep_peer,
+        } = self;
+        let peer = &peer;
+        // Only if this release belongs to the channel currently holding the
+        // slot. A late release from a superseded generation must not evict the
+        // peer that replaced it.
+        if inbound.get(peer).map(|served| served.generation) != Some(generation) {
+            return None;
+        }
+        if let Some(served) = inbound.remove(peer) {
+            served.active.store(false, Ordering::SeqCst);
+            if keep_peer {
+                log::info!(
+                    "release: central {} session={:?}, kept connected",
+                    peer.0,
+                    served.driver_session
+                );
+                return Some((peer.clone(), served.driver_session));
+            }
+            // Named by the driver session this channel was serving. Releasing a
+            // channel from a superseded `serve` generation would otherwise
+            // disconnect whatever now holds the address — the peer's own
+            // replacement session, established by the server that replaced us.
+            log::info!(
+                "release: central {} session={:?}",
+                peer.0,
+                served.driver_session
+            );
+            if let Err(err) = driver.disconnect_peer(peer, served.driver_session).await {
+                log::warn!("release: could not disconnect central {}: {err}", peer.0);
+            }
+        }
+        None
+    }
+}
+
+/// Feed inbound fragments through a reassembler and forward whole messages.
+/// Shared by both roles — the only difference is where fragments come from.
+///
+/// Takes sole ownership of `out`. That is deliberate: the returned handle's
+/// `abort()` is then sufficient to close the consumer's `recv()`, because
+/// aborting drops the only sender. An earlier version handed a clone to the
+/// link-loss watcher as well, so dropping the watcher's copy closed nothing
+/// and `recv()` hung forever on a dead link.
+impl Reassembler {
+    fn spawn<S>(
+        mut fragments: S,
+        limits: ReassemblyLimits,
+        out: mpsc::Sender<Result<Vec<u8>>>,
+        overflow: Arc<OverflowSignal>,
+        peer: PeerAddress,
+        ended: tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        S: tokio_stream::Stream<Item = Result<Vec<u8>>> + Send + Unpin + 'static,
+    {
+        let ended = ended.drop_guard();
+        tokio::spawn(async move {
+            let _ended = ended;
+            let mut reassembler = Reassembler::new(limits);
+            // `Reassembler::expire` only runs from inside `accept`, so a peer
+            // that sends half a message and then goes quiet would otherwise pin
+            // its partial sets for the life of the link — `reassembly_timeout`
+            // would silently never fire. Ticking here is what makes the
+            // configured timeout real on an idle connection.
+            let tick = (limits.reassembly_timeout / 4).max(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    incoming = fragments.next() => {
+                        let Some(raw) = incoming else {
+                            // Fragment source ended: the link is gone. Dropping
+                            // `out` here is what makes `recv()` return `None`.
+                            return;
+                        };
+                        // A gap reported by the driver — payloads the peer was
+                        // told were delivered but that never reached us. Surface
+                        // it rather than letting the affected message expire
+                        // unexplained, and discard partial sets, since any of
+                        // them may be missing the fragment that was lost.
+                        let raw = match raw {
+                            Ok(raw) => raw,
+                            Err(BleError::ReceiveGap(_)) => {
+                                log::warn!(
+                                    "reassembly: driver reported dropped notifications from {}; \
+                                     discarding partial messages",
+                                    peer.0
+                                );
+                                overflow.raise();
+                                reassembler = Reassembler::new(limits);
+                                continue;
+                            }
+                            Err(error) => {
+                                log::warn!("reassembly: notification source for {} failed: {error}", peer.0);
+                                // Never wait for application capacity to publish termination.
+                                let _ = out.try_send(Err(error));
+                                return;
+                            }
+                        };
+                        let Some((header, payload)) = FragmentHeader::parse(&raw) else {
+                            // Too short to be ours — a foreign write to our
+                            // characteristic, not a reason to kill the channel.
+                            log::trace!(
+                                "reassembly: ignoring {}-byte write from {} — too short for a \
+                                 fragment header",
+                                raw.len(),
+                                peer.0
+                            );
+                            continue;
+                        };
+                        match reassembler.accept(header, payload, Instant::now()) {
+                            Accept::Complete(message) => {
+                                log::trace!(
+                                    "reassembly: msg_id={} complete from {} ({} bytes)",
+                                    header.msg_id,
+                                    peer.0,
+                                    message.len()
+                                );
+                                // Awaiting bounds complete-message storage. The
+                                // separate fragment queue reports overflow without
+                                // blocking lifecycle handling.
+                                if out.send(Ok(message)).await.is_err() {
+                                    return; // receiver dropped; stop reassembling
+                                }
+                            }
+                            Accept::Pending => {}
+                            Accept::Rejected(reason) => {
+                                // Dropped by policy (bounds breach or malformed).
+                                // The channel stays usable: one bad message must
+                                // not deny service for the rest of the session.
+                                log::warn!(
+                                    "reassembly: dropped fragment {} of msg_id={} from {}: {reason:?}",
+                                    header.index,
+                                    header.msg_id,
+                                    peer.0
+                                );
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(tick) => {
+                        reassembler.expire(Instant::now());
+                    }
+                }
+            }
+        })
+    }
+}
+
+/// Holds a freshly established connection until datagram setup succeeds.
+///
+/// Its `Drop` is the only thing that covers a *cancelled* setup: an async fn
+/// whose future is dropped runs none of its remaining code, so error
+/// handling alone cannot close the connection. Disconnecting needs to await,
+/// which `Drop` cannot, so it hands the connection to a detached task —
+/// short-lived and self-terminating, unlike the address it would otherwise
+/// strand.
+struct PendingConnection {
+    connection: Option<Box<dyn GattConnection>>,
+    peer: PeerAddress,
+    managed_cleanup: bool,
+}
+
+impl Drop for PendingConnection {
+    fn drop(&mut self) {
+        let Some(mut connection) = self.connection.take() else {
+            return; // setup succeeded; ownership moved on
+        };
+        if self.managed_cleanup {
+            drop(connection);
+            return;
+        }
+        let peer = self.peer.clone();
+        tokio::spawn(async move {
+            log::info!("connect: tearing down {} after abandoned setup", peer.0);
+            if let Err(err) = connection.disconnect().await {
+                log::warn!(
+                    "connect: could not disconnect {} after abandoned setup: {err}",
+                    peer.0
+                );
+            }
+        });
+    }
+}
+
+/// Central role: connect to `peer` and bring up a channel over `config`'s
+/// service.
+pub async fn connect(
+    adapter: &Adapter,
+    peer: &PeerAddress,
+    config: &DatagramConfig,
+) -> Result<DatagramChannel> {
+    DatagramChannel::connect_driver(adapter.driver(), peer, config).await
+}
+
 /// Peripheral role: advertise `config`'s service and serve **one** central
 /// at a time.
 ///
@@ -1221,25 +1103,6 @@ pub async fn update_advertisement(adapter: &Adapter, config: &DatagramConfig) ->
     config.update_advertisement(adapter).await
 }
 
-impl DatagramConfig {
-    async fn update_advertisement(&self, adapter: &Adapter) -> Result<()> {
-        self.validate()?;
-        log::info!("serve: updating the advertisement for {}", self.service.0);
-        let spec = self.service_spec();
-        let driver = adapter.driver();
-        driver.update_advertisement(spec.clone()).await?;
-        // Keep the GATT advertisement consistent with the radio advertisement for scanners that read it (ADR-0012).
-        let advertisement_value =
-            crate::profile::advertisement::GattAdvertisement::of(&spec).encode();
-        driver
-            .set_characteristic_value(
-                crate::profile::advertisement::GATT_ADVERTISEMENT_CHARACTERISTIC,
-                advertisement_value,
-            )
-            .await
-    }
-}
-
 /// Stop a running [`serve`]: its advertisement and its GATT server, which
 /// drops the centrals connected to it. Waits until the platform did.
 ///
@@ -1264,6 +1127,141 @@ impl Adapter {
             Err(err) => log::warn!("serve: stopping failed: {err}"),
         }
         stopped
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DatagramConfig {
+    pub service: ServiceUuid,
+    pub characteristic: CharacteristicUuid,
+    pub max_message_len: usize,
+    pub reassembly_timeout: Duration,
+    pub max_concurrent_reassemblies: usize,
+    /// Defaults to `WithResponse`: ATT write
+    /// requests are acknowledged. `WithoutResponse` trades that for
+    /// throughput and will silently drop under load — opt in only where the
+    /// layer above tolerates loss.
+    pub write_type: WriteType,
+    /// How many *completed* messages may sit unread before the reassembler
+    /// stops accepting more. The reassembly limits bound only partial
+    /// messages, so without this a slow or stalled consumer is a memory
+    /// exhaustion vector.
+    pub inbound_queue_depth: usize,
+    /// Maximum raw fragments buffered per peer. A full queue drops arriving
+    /// fragments and reports `ReceiveGap` without delaying lifecycle handling.
+    /// Complete-message bounds alone do not bound pending fragments.
+    pub fragment_queue_depth: usize,
+    /// Accepted-but-not-yet-taken peripheral channels buffered by [`serve`]
+    /// before further centrals are refused. Each queued channel pins a
+    /// driver `Arc`, its reassembly buffers and a live task, so an
+    /// unbounded queue lets a peer that connects and disconnects in a loop
+    /// grow the process without limit while the caller is slow to accept.
+    pub accept_queue_depth: usize,
+    /// Merged into [`service_spec`](Self::service_spec)'s `GattServiceSpec.manufacturer_data`.
+    /// Empty by default — [`serve`] otherwise has no way to carry anything
+    /// beyond the bare service UUID in its advertisement, since it builds
+    /// the spec internally from this config. A caller that needs the
+    /// advertised payload to change between `serve` calls (e.g. a
+    /// discoverability flag toggled on and off) re-advertises by ending the
+    /// current `serve` stream and calling it again with an updated config.
+    pub advertised_manufacturer_data: BTreeMap<u16, Vec<u8>>,
+    /// Service data included in the initial radio and readable advertisements.
+    /// Empty by default.
+    pub advertised_service_data: BTreeMap<ServiceUuid, Vec<u8>>,
+    /// Becomes [`service_spec`](Self::service_spec)'s
+    /// `GattServiceSpec.local_name`: a short name scanners read from the
+    /// scan response without connecting. `None` by default.
+    pub advertised_local_name: Option<String>,
+}
+
+impl DatagramConfig {
+    pub fn new(service: ServiceUuid, characteristic: CharacteristicUuid) -> Self {
+        Self {
+            service,
+            characteristic,
+            max_message_len: DEFAULT_MAX_MESSAGE_LEN,
+            reassembly_timeout: DEFAULT_REASSEMBLY_TIMEOUT,
+            max_concurrent_reassemblies: DEFAULT_MAX_CONCURRENT_REASSEMBLIES,
+            write_type: WriteType::WithResponse,
+            inbound_queue_depth: DEFAULT_INBOUND_QUEUE_DEPTH,
+            fragment_queue_depth: DEFAULT_FRAGMENT_QUEUE_DEPTH,
+            accept_queue_depth: DEFAULT_ACCEPT_QUEUE_DEPTH,
+            advertised_manufacturer_data: BTreeMap::new(),
+            advertised_service_data: BTreeMap::new(),
+            advertised_local_name: None,
+        }
+    }
+
+    /// `mpsc::channel(0)` panics, and `inbound_queue_depth` is a public
+    /// field with no non-zero invariant — validate rather than letting a
+    /// caller's zero crash `connect`, or worse, panic `serve`'s detached
+    /// background task where nothing observes it.
+    fn validate(&self) -> Result<()> {
+        if self.inbound_queue_depth == 0 {
+            return Err(BleError::Gatt(
+                "inbound_queue_depth must be at least 1".to_string(),
+            ));
+        }
+        if self.fragment_queue_depth == 0 {
+            return Err(BleError::Gatt(
+                "fragment_queue_depth must be at least 1".to_string(),
+            ));
+        }
+        if self.accept_queue_depth == 0 {
+            return Err(BleError::Gatt(
+                "accept_queue_depth must be at least 1".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn limits(&self) -> ReassemblyLimits {
+        ReassemblyLimits {
+            max_message_len: self.max_message_len,
+            reassembly_timeout: self.reassembly_timeout,
+            max_concurrent_reassemblies: self.max_concurrent_reassemblies,
+        }
+    }
+
+    /// The GATT service this tier expects on the wire. Both roles must agree,
+    /// so both derive it from here rather than hand-rolling a spec.
+    ///
+    /// Include a readable GATT advertisement characteristic for scanners that receive no advertisement data over the radio
+    /// (`profile::advertisement`, ADR-0012).
+    pub fn service_spec(&self) -> GattServiceSpec {
+        let mut spec = GattServiceSpec::new(
+            self.service,
+            vec![GattCharacteristicSpec {
+                uuid: self.characteristic,
+                readable: true,
+                writable: true,
+                notifiable: true,
+                initial_value: Vec::new(),
+            }],
+        );
+        spec.manufacturer_data = self.advertised_manufacturer_data.clone();
+        spec.service_data = self.advertised_service_data.clone();
+        spec.local_name = self.advertised_local_name.clone();
+        let gatt_advertisement = crate::profile::advertisement::characteristic_spec(&spec);
+        spec.characteristics.push(gatt_advertisement);
+        spec
+    }
+
+    async fn update_advertisement(&self, adapter: &Adapter) -> Result<()> {
+        self.validate()?;
+        log::info!("serve: updating the advertisement for {}", self.service.0);
+        let spec = self.service_spec();
+        let driver = adapter.driver();
+        driver.update_advertisement(spec.clone()).await?;
+        // Keep the GATT advertisement consistent with the radio advertisement for scanners that read it (ADR-0012).
+        let advertisement_value =
+            crate::profile::advertisement::GattAdvertisement::of(&spec).encode();
+        driver
+            .set_characteristic_value(
+                crate::profile::advertisement::GATT_ADVERTISEMENT_CHARACTERISTIC,
+                advertisement_value,
+            )
+            .await
     }
 }
 

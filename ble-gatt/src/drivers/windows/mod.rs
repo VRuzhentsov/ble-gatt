@@ -167,6 +167,15 @@ impl WindowsDriver {
         );
         Ok(Self { inner, radio_token })
     }
+    async fn default_adapter() -> Result<BluetoothAdapter> {
+        let op = BluetoothAdapter::GetDefaultAsync().map_err(|err| {
+            BleError::AdapterUnavailable(format!("BluetoothAdapter::GetDefaultAsync: {err}"))
+        })?;
+        // WinRT returns a null adapter, which `windows` reports as an error,
+        // when the computer has no Bluetooth adapter.
+        op.await
+            .map_err(|err| BleError::AdapterUnavailable(format!("no Bluetooth adapter: {err}")))
+    }
 }
 
 impl Drop for WindowsDriver {
@@ -177,18 +186,6 @@ impl Drop for WindowsDriver {
         if let Some(server) = self.inner.server.lock().unwrap().take() {
             server.shut_down();
         }
-    }
-}
-
-impl WindowsDriver {
-    async fn default_adapter() -> Result<BluetoothAdapter> {
-        let op = BluetoothAdapter::GetDefaultAsync().map_err(|err| {
-            BleError::AdapterUnavailable(format!("BluetoothAdapter::GetDefaultAsync: {err}"))
-        })?;
-        // WinRT returns a null adapter, which `windows` reports as an error,
-        // when the computer has no Bluetooth adapter.
-        op.await
-            .map_err(|err| BleError::AdapterUnavailable(format!("no Bluetooth adapter: {err}")))
     }
 }
 

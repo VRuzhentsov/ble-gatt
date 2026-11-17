@@ -22,88 +22,28 @@ use tokio_stream::StreamExt;
 const ALPN: &[u8] = b"ble-gatt/example/either-peer/1";
 const COMPANY: u16 = 0xffff;
 
-impl Options {
-    fn scheduled_delay(start_at: u64, now: Duration) -> Duration {
-        // Keep the fractional part: truncating `now` schedules each peer at
-        // start_at plus its own discovery-time fraction, up to one second apart.
-        Duration::from_secs(start_at).saturating_sub(now)
-    }
-}
-
 pub fn mark(line: impl std::fmt::Display) {
     Options::mark(line)
-}
-
-impl Options {
-    fn mark(line: impl std::fmt::Display) {
-        log::info!("EITHERPEER: {line}");
-    }
 }
 
 pub fn payload(sender: EndpointId, round: u8) -> Vec<u8> {
     Echo::payload(sender, round)
 }
 
-impl Echo {
-    fn payload(sender: EndpointId, round: u8) -> Vec<u8> {
-        let mut bytes: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
-        bytes[..32].copy_from_slice(sender.as_bytes());
-        bytes[32] = round;
-        bytes
-    }
-}
-
-// Five bytes fit alongside flags + 128-bit service UUID in legacy advertising.
-// A discovery hint only: TLS authenticates the full out-of-band peer key.
-impl Options {
-    fn hint(id: EndpointId) -> Vec<u8> {
-        let mut bytes = vec![1];
-        bytes.extend_from_slice(&id.as_bytes()[..4]);
-        bytes
-    }
-
-    fn config(id: EndpointId) -> DatagramConfig {
-        let mut config = DatagramConfig::new(
-            ServiceUuid(uuid::Uuid::from_u128(
-                0xb1e6a110_f101_4000_8000_00805f9b34fb,
-            )),
-            CharacteristicUuid(uuid::Uuid::from_u128(
-                0xb1e6a111_f101_4000_8000_00805f9b34fb,
-            )),
-        );
-        config
-            .advertised_manufacturer_data
-            .insert(COMPANY, Options::hint(id));
-        config
-    }
-}
-
-pub struct Options {
-    pub key: SecretKey,
-    pub peer: EndpointId,
-    pub initiate: bool,
-    pub expect_incoming: bool,
-    /// Optional common wall-clock start in Unix seconds, after discovery.
-    pub start_at: u64,
-    pub timeout: Duration,
-}
-
 pub fn mode(side: &str, mode: &str) -> Result<(bool, bool), String> {
     Options::mode(side, mode)
 }
 
-impl Options {
-    fn mode(side: &str, mode: &str) -> Result<(bool, bool), String> {
-        if !matches!(side, "phone" | "linux") {
-            return Err("side must be phone or linux".into());
-        }
-        match mode {
-            "both" => Ok((true, true)),
-            "phone-initiate" => Ok((side == "phone", side != "phone")),
-            "linux-initiate" => Ok((side == "linux", side != "linux")),
-            _ => Err("mode must be phone-initiate, linux-initiate or both".into()),
-        }
-    }
+/// Bounded run, including shutdown on failure. A PASS requires last-user cleanup
+/// without force-close; emergency close_links is only used after failure.
+pub async fn run(adapter: Adapter, options: Options) -> Result<(), String> {
+    options
+        .run_inner(
+            adapter,
+            #[cfg(test)]
+            false,
+        )
+        .await
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +53,13 @@ struct Echo {
     failure: Arc<Mutex<Option<String>>>,
 }
 impl Echo {
+    fn payload(sender: EndpointId, round: u8) -> Vec<u8> {
+        let mut bytes: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        bytes[..32].copy_from_slice(sender.as_bytes());
+        bytes[32] = round;
+        bytes
+    }
+
     fn acknowledged(
         &self,
         round: u8,
@@ -152,7 +99,25 @@ impl Echo {
             None => Ok(()),
         }
     }
+    async fn probe(connection: &Connection, local: EndpointId, round: u8) -> Result<(), String> {
+        let bytes = payload(local, round);
+        let (mut send, mut recv) = connection.open_bi().await.map_err(|e| e.to_string())?;
+        send.write_all(&bytes).await.map_err(|e| e.to_string())?;
+        send.finish().map_err(|e| e.to_string())?;
+        let echoed = recv.read_to_end(4096).await.map_err(|e| e.to_string())?;
+        if echoed != bytes {
+            return Err("synthetic payload mismatch".into());
+        }
+        mark(format!(
+            "PAYLOAD matched peer={} handle={} round={round} bytes={}",
+            connection.remote_id(),
+            connection.stable_id(),
+            bytes.len()
+        ));
+        Ok(())
+    }
 }
+
 impl ProtocolHandler for Echo {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         if connection.remote_id() != self.peer {
@@ -194,29 +159,42 @@ impl ProtocolHandler for Echo {
     }
 }
 
-impl Echo {
-    async fn probe(connection: &Connection, local: EndpointId, round: u8) -> Result<(), String> {
-        let bytes = payload(local, round);
-        let (mut send, mut recv) = connection.open_bi().await.map_err(|e| e.to_string())?;
-        send.write_all(&bytes).await.map_err(|e| e.to_string())?;
-        send.finish().map_err(|e| e.to_string())?;
-        let echoed = recv.read_to_end(4096).await.map_err(|e| e.to_string())?;
-        if echoed != bytes {
-            return Err("synthetic payload mismatch".into());
-        }
-        mark(format!(
-            "PAYLOAD matched peer={} handle={} round={round} bytes={}",
-            connection.remote_id(),
-            connection.stable_id(),
-            bytes.len()
-        ));
-        Ok(())
-    }
-}
-
 #[derive(Clone, Default)]
 struct CarrierTasks {
     handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
+
+impl CarrierTasks {
+    async fn wait_for_cleanup(
+        &self,
+        transport: &BleGattTransport,
+        timeout: Duration,
+    ) -> Result<usize, String> {
+        tokio::time::timeout(timeout, async {
+        loop {
+            let finished = {
+                let mut handles = self.handles.lock().expect("diagnostic carriers mutex");
+                if transport.linked_peers().is_empty() && handles.iter().all(|h| h.is_finished()) {
+                    Some(std::mem::take(&mut *handles))
+                } else {
+                    None
+                }
+            };
+            if let Some(handles) = finished {
+                let count = handles.len();
+                for handle in handles {
+                    handle.await.map_err(|e| format!("incoming carrier task failed: {e}"))?;
+                }
+                return Ok(count);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }).await.map_err(|_| format!(
+        "last-user cleanup timed out before shutdown: address_queues={:?} incoming_carriers_pending={}",
+        transport.linked_peers(),
+        self.handles.lock().expect("diagnostic carriers mutex").iter().filter(|h| !h.is_finished()).count(),
+    ))?
+    }
 }
 
 /// Driver lifecycle evidence, not a claim about every OS Bluetooth object.
@@ -259,9 +237,6 @@ impl NativeSessions {
             _ => {}
         }
     }
-}
-
-impl NativeSessions {
     async fn wait_for_native_cleanup(
         sessions: &Mutex<NativeSessions>,
         timeout: Duration,
@@ -289,42 +264,6 @@ impl NativeSessions {
             )
         })?
     }
-}
-
-impl CarrierTasks {
-    async fn wait_for_cleanup(
-        &self,
-        transport: &BleGattTransport,
-        timeout: Duration,
-    ) -> Result<usize, String> {
-        tokio::time::timeout(timeout, async {
-        loop {
-            let finished = {
-                let mut handles = self.handles.lock().expect("diagnostic carriers mutex");
-                if transport.linked_peers().is_empty() && handles.iter().all(|h| h.is_finished()) {
-                    Some(std::mem::take(&mut *handles))
-                } else {
-                    None
-                }
-            };
-            if let Some(handles) = finished {
-                let count = handles.len();
-                for handle in handles {
-                    handle.await.map_err(|e| format!("incoming carrier task failed: {e}"))?;
-                }
-                return Ok(count);
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    }).await.map_err(|_| format!(
-        "last-user cleanup timed out before shutdown: address_queues={:?} incoming_carriers_pending={}",
-        transport.linked_peers(),
-        self.handles.lock().expect("diagnostic carriers mutex").iter().filter(|h| !h.is_finished()).count(),
-    ))?
-    }
-}
-
-impl NativeSessions {
     // Shared production finalization seam: carrier cleanup may yield while the
     // independent native observer continues to update its evidence.
     async fn finalize_cleanup<F, Fut, C>(
@@ -366,19 +305,62 @@ impl NativeSessions {
     }
 }
 
-/// Bounded run, including shutdown on failure. A PASS requires last-user cleanup
-/// without force-close; emergency close_links is only used after failure.
-pub async fn run(adapter: Adapter, options: Options) -> Result<(), String> {
-    options
-        .run_inner(
-            adapter,
-            #[cfg(test)]
-            false,
-        )
-        .await
+pub struct Options {
+    pub key: SecretKey,
+    pub peer: EndpointId,
+    pub initiate: bool,
+    pub expect_incoming: bool,
+    /// Optional common wall-clock start in Unix seconds, after discovery.
+    pub start_at: u64,
+    pub timeout: Duration,
 }
 
 impl Options {
+    fn scheduled_delay(start_at: u64, now: Duration) -> Duration {
+        // Keep the fractional part: truncating `now` schedules each peer at
+        // start_at plus its own discovery-time fraction, up to one second apart.
+        Duration::from_secs(start_at).saturating_sub(now)
+    }
+
+    fn mark(line: impl std::fmt::Display) {
+        log::info!("EITHERPEER: {line}");
+    }
+
+    // Five bytes fit alongside flags + 128-bit service UUID in legacy advertising.
+    // A discovery hint only: TLS authenticates the full out-of-band peer key.
+    fn hint(id: EndpointId) -> Vec<u8> {
+        let mut bytes = vec![1];
+        bytes.extend_from_slice(&id.as_bytes()[..4]);
+        bytes
+    }
+
+    fn config(id: EndpointId) -> DatagramConfig {
+        let mut config = DatagramConfig::new(
+            ServiceUuid(uuid::Uuid::from_u128(
+                0xb1e6a110_f101_4000_8000_00805f9b34fb,
+            )),
+            CharacteristicUuid(uuid::Uuid::from_u128(
+                0xb1e6a111_f101_4000_8000_00805f9b34fb,
+            )),
+        );
+        config
+            .advertised_manufacturer_data
+            .insert(COMPANY, Options::hint(id));
+        config
+    }
+
+    fn mode(side: &str, mode: &str) -> Result<(bool, bool), String> {
+        if !matches!(side, "phone" | "linux") {
+            return Err("side must be phone or linux".into());
+        }
+        match mode {
+            "both" => Ok((true, true)),
+            "phone-initiate" => Ok((side == "phone", side != "phone")),
+            "linux-initiate" => Ok((side == "linux", side != "linux")),
+            _ => Err("mode must be phone-initiate, linux-initiate or both".into()),
+        }
+    }
+
     async fn run_inner(
         self,
         adapter: Adapter,

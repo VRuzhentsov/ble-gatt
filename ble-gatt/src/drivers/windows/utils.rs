@@ -25,12 +25,6 @@ pub(super) const AD_SERVICE_DATA_128: u8 = 0x21;
 /// The Bluetooth Base UUID, `00000000-0000-1000-8000-00805F9B34FB`.
 const BLUETOOTH_BASE_UUID: u128 = 0x0000_0000_0000_1000_8000_0080_5F9B_34FB;
 
-impl BleError {
-    pub(super) fn windows_error(context: &str, err: windows::core::Error) -> BleError {
-        BleError::Gatt(format!("{context}: {err}"))
-    }
-}
-
 /// Encodes and decodes WinRT GATT values and Bluetooth advertisement fields.
 pub(super) struct WindowsCodec;
 
@@ -144,6 +138,10 @@ impl WindowsCodec {
 }
 
 impl BleError {
+    pub(super) fn windows_error(context: &str, err: windows::core::Error) -> BleError {
+        BleError::Gatt(format!("{context}: {err}"))
+    }
+
     pub(super) fn communication_error(
         context: &str,
         status: GattCommunicationStatus,

@@ -86,29 +86,6 @@ impl ServerHandle {
     }
 }
 
-impl Drop for ServerHandle {
-    fn drop(&mut self) {
-        if let Some(recovery) = self.recovery.take() {
-            recovery.abort();
-        }
-        let Some(driver) = self.driver.take() else {
-            return;
-        };
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => {
-                runtime.spawn(async move {
-                    if let Err(err) = driver.stop_advertising().await {
-                        log::warn!("stopping a dropped GATT server failed: {err}");
-                    }
-                });
-            }
-            Err(_) => {
-                log::warn!("GATT server handle dropped outside a Tokio runtime; it keeps running")
-            }
-        }
-    }
-}
-
 /// Re-registers `service` whenever the radio reports `On` after this
 /// subscription started — the driver's way of saying it just regained a
 /// usable adapter (powered back on, or on Linux, `bluetoothd` itself
@@ -150,5 +127,28 @@ impl ServerHandle {
                 }
             }
         })
+    }
+}
+
+impl Drop for ServerHandle {
+    fn drop(&mut self) {
+        if let Some(recovery) = self.recovery.take() {
+            recovery.abort();
+        }
+        let Some(driver) = self.driver.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    if let Err(err) = driver.stop_advertising().await {
+                        log::warn!("stopping a dropped GATT server failed: {err}");
+                    }
+                });
+            }
+            Err(_) => {
+                log::warn!("GATT server handle dropped outside a Tokio runtime; it keeps running")
+            }
+        }
     }
 }

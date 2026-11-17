@@ -476,6 +476,54 @@ impl Drop for ScanGuard {
     }
 }
 
+/// The BlueZ advertisement for `service`, shared by `advertise` and
+/// `update_advertisement`.
+impl GattServiceSpec {
+    fn bluez_advertisement(&self) -> Advertisement {
+        Advertisement {
+            service_uuids: [self.uuid.0].into_iter().collect(),
+            discoverable: Some(true),
+            manufacturer_data: self.manufacturer_data.clone(),
+            service_data: self
+                .service_data
+                .iter()
+                .map(|(uuid, value)| (uuid.0, value.clone()))
+                .collect(),
+            // BlueZ sends LocalName in the scan response. Truncated here so a
+            // long name is cut on a character boundary, not by BlueZ.
+            local_name: self
+                .local_name
+                .as_deref()
+                .map(|name| truncate_name(name, LOCAL_NAME_MAX_LEN).to_string()),
+            ..Default::default()
+        }
+    }
+}
+
+/// One dial/teardown lock per peer address (see `LinuxDriver::dial_lock`).
+///
+/// The race the lock closes is per address: `Device` resolves by address, so
+/// only operations on the *same* address can drop each other's link. A
+/// single driver-wide lock also made every other peer wait behind a slow
+/// dial: on hardware, a 20s Connect to a stale address held a live link's
+/// write for those 20s, and the QUIC handshake on that link timed out.
+///
+/// Entries no one holds or waits on are dropped on the next `lock`, so
+/// rotating private addresses do not grow the map without bound.
+#[derive(Clone, Default)]
+struct DialLocks(Arc<StdMutex<HashMap<PeerAddress, Arc<AsyncMutex<()>>>>>);
+
+impl DialLocks {
+    async fn lock(&self, peer: &PeerAddress) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.0.lock().unwrap();
+            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+            locks.entry(peer.clone()).or_default().clone()
+        };
+        lock.lock_owned().await
+    }
+}
+
 pub struct LinuxDriver {
     // Held only to keep the D-Bus session connection alive for the
     // lifetime of the driver; `Adapter` clones its own `Arc` into the
@@ -588,134 +636,6 @@ pub struct LinuxDriver {
     discovery: Arc<DiscoveryBus>,
     /// Services `sweep_leftover_links` already ran for.
     swept: StdMutex<HashSet<ServiceUuid>>,
-}
-
-impl LinuxDriver {
-    async fn release_advertisement(
-        &self,
-        handle: &mut Option<bluer::adv::AdvertisementHandle>,
-    ) -> Result<()> {
-        let released = self
-            .advertisement_release
-            .release(
-                handle,
-                || self.adapter.supported_advertising_instances(),
-                ADVERTISING_INSTANCE_WAIT,
-                ADVERTISING_INSTANCE_CHECK_INTERVAL,
-            )
-            .await
-            .map_err(|err| BleError::Gatt(err.to_string()))?;
-        Self::check_advertisement_release(released)
-    }
-
-    async fn wait_advertisement_release(&self) -> Result<()> {
-        let released = self
-            .advertisement_release
-            .wait(
-                || self.adapter.supported_advertising_instances(),
-                ADVERTISING_INSTANCE_WAIT,
-                ADVERTISING_INSTANCE_CHECK_INTERVAL,
-            )
-            .await
-            .map_err(|err| BleError::Gatt(err.to_string()))?;
-        Self::check_advertisement_release(released)
-    }
-
-    fn check_advertisement_release(released: bool) -> Result<()> {
-        if !released {
-            return Err(BleError::Gatt(
-                "advertisement unregister was not confirmed before the deadline".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// A generation number never handed out before; see `generation_counter`.
-    fn next_generation(&self) -> u64 {
-        self.generation_counter.fetch_add(1, Ordering::SeqCst) + 1
-    }
-
-    /// Announces every served central as gone, then forgets it and its notify
-    /// sessions. For when the registration serving them ends (stop, or a
-    /// replacement `advertise`), whose disconnect watchers are aborted.
-    ///
-    /// Announcing first matters: silently clearing left `datagram::serve`
-    /// holding those peers with their channels live, so the next server
-    /// refused the real central as an interloper. And forgetting matters: a
-    /// stale `served_peers` entry makes `watch_notify_sessions` skip the
-    /// peer's next subscription, so it is never given a session or a
-    /// disconnect watcher again.
-    async fn release_served_peers(&self, why: &str) {
-        let mut writers = self.notify_writers.lock().await;
-        let served: Vec<PeerAddress> = self
-            .served_peers
-            .lock()
-            .unwrap()
-            .drain()
-            .map(|(peer, _)| peer)
-            .collect();
-        self.announce_released(served, why);
-        writers.clear();
-    }
-
-    fn announce_released(&self, served: Vec<PeerAddress>, why: &str) {
-        for peer in served {
-            log::info!("advertise: releasing served central {} on {why}", peer.0);
-            let _ = self.events_tx.send(GattEvent::Disconnected {
-                peer,
-                local_role: Role::Peripheral,
-                session: None,
-            });
-        }
-    }
-}
-
-/// The BlueZ advertisement for `service`, shared by `advertise` and
-/// `update_advertisement`.
-impl GattServiceSpec {
-    fn bluez_advertisement(&self) -> Advertisement {
-        Advertisement {
-            service_uuids: [self.uuid.0].into_iter().collect(),
-            discoverable: Some(true),
-            manufacturer_data: self.manufacturer_data.clone(),
-            service_data: self
-                .service_data
-                .iter()
-                .map(|(uuid, value)| (uuid.0, value.clone()))
-                .collect(),
-            // BlueZ sends LocalName in the scan response. Truncated here so a
-            // long name is cut on a character boundary, not by BlueZ.
-            local_name: self
-                .local_name
-                .as_deref()
-                .map(|name| truncate_name(name, LOCAL_NAME_MAX_LEN).to_string()),
-            ..Default::default()
-        }
-    }
-}
-
-/// One dial/teardown lock per peer address (see `LinuxDriver::dial_lock`).
-///
-/// The race the lock closes is per address: `Device` resolves by address, so
-/// only operations on the *same* address can drop each other's link. A
-/// single driver-wide lock also made every other peer wait behind a slow
-/// dial: on hardware, a 20s Connect to a stale address held a live link's
-/// write for those 20s, and the QUIC handshake on that link timed out.
-///
-/// Entries no one holds or waits on are dropped on the next `lock`, so
-/// rotating private addresses do not grow the map without bound.
-#[derive(Clone, Default)]
-struct DialLocks(Arc<StdMutex<HashMap<PeerAddress, Arc<AsyncMutex<()>>>>>);
-
-impl DialLocks {
-    async fn lock(&self, peer: &PeerAddress) -> tokio::sync::OwnedMutexGuard<()> {
-        let lock = {
-            let mut locks = self.0.lock().unwrap();
-            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
-            locks.entry(peer.clone()).or_default().clone()
-        };
-        lock.lock_owned().await
-    }
 }
 
 /// Reports bluetoothd itself leaving and rejoining the bus — a crash or a
@@ -941,47 +861,85 @@ impl LinuxDriver {
     }
 }
 
-/// Track notify sessions for one characteristic.
-///
-/// Each `Notify` event is a central acquiring a notification channel, and —
-/// unlike `StartNotify` — it carries the subscriber's address. That makes
-/// this both the peripheral-role arrival signal and the notify path itself:
-/// service-attributed (an unrelated device connected to the same adapter
-/// never appears here), notification-ready by construction, and identified
-/// without inference.
-/// Report the loss of an outbound connection, but only while this watcher
-/// still owns the dial it was armed for.
-///
-/// A peer that drops and reconnects quickly leaves the old watcher holding a
-/// queued `Connected(false)`. Emitting that unconditionally would announce a
-/// disconnect for the *replacement* link — whose datagram watcher would then
-/// tear down a channel that is working — and would clear a `dialed` entry
-/// that now belongs to the new connection.
-impl LinuxGattConnection {
-    fn report_loss(
-        events_tx: &EventBus,
-        dialed: &Arc<StdMutex<HashMap<PeerAddress, u64>>>,
-        peer: &PeerAddress,
-        generation: u64,
-    ) {
-        let mut dialed = dialed.lock().unwrap();
-        if dialed.get(peer) != Some(&generation) {
-            return;
-        }
-        // Stop suppressing inbound reports for this address: a later connection
-        // from it may genuinely be an inbound one.
-        dialed.remove(peer);
-        drop(dialed);
-        log::info!("link lost: {} session={generation} (central role)", peer.0);
-        let _ = events_tx.send(GattEvent::Disconnected {
-            peer: peer.clone(),
-            local_role: Role::Central,
-            session: Some(generation),
-        });
-    }
-}
-
 impl LinuxDriver {
+    async fn release_advertisement(
+        &self,
+        handle: &mut Option<bluer::adv::AdvertisementHandle>,
+    ) -> Result<()> {
+        let released = self
+            .advertisement_release
+            .release(
+                handle,
+                || self.adapter.supported_advertising_instances(),
+                ADVERTISING_INSTANCE_WAIT,
+                ADVERTISING_INSTANCE_CHECK_INTERVAL,
+            )
+            .await
+            .map_err(|err| BleError::Gatt(err.to_string()))?;
+        Self::check_advertisement_release(released)
+    }
+
+    async fn wait_advertisement_release(&self) -> Result<()> {
+        let released = self
+            .advertisement_release
+            .wait(
+                || self.adapter.supported_advertising_instances(),
+                ADVERTISING_INSTANCE_WAIT,
+                ADVERTISING_INSTANCE_CHECK_INTERVAL,
+            )
+            .await
+            .map_err(|err| BleError::Gatt(err.to_string()))?;
+        Self::check_advertisement_release(released)
+    }
+
+    fn check_advertisement_release(released: bool) -> Result<()> {
+        if !released {
+            return Err(BleError::Gatt(
+                "advertisement unregister was not confirmed before the deadline".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// A generation number never handed out before; see `generation_counter`.
+    fn next_generation(&self) -> u64 {
+        self.generation_counter.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Announces every served central as gone, then forgets it and its notify
+    /// sessions. For when the registration serving them ends (stop, or a
+    /// replacement `advertise`), whose disconnect watchers are aborted.
+    ///
+    /// Announcing first matters: silently clearing left `datagram::serve`
+    /// holding those peers with their channels live, so the next server
+    /// refused the real central as an interloper. And forgetting matters: a
+    /// stale `served_peers` entry makes `watch_notify_sessions` skip the
+    /// peer's next subscription, so it is never given a session or a
+    /// disconnect watcher again.
+    async fn release_served_peers(&self, why: &str) {
+        let mut writers = self.notify_writers.lock().await;
+        let served: Vec<PeerAddress> = self
+            .served_peers
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(peer, _)| peer)
+            .collect();
+        self.announce_released(served, why);
+        writers.clear();
+    }
+
+    fn announce_released(&self, served: Vec<PeerAddress>, why: &str) {
+        for peer in served {
+            log::info!("advertise: releasing served central {} on {why}", peer.0);
+            let _ = self.events_tx.send(GattEvent::Disconnected {
+                peer,
+                local_role: Role::Peripheral,
+                session: None,
+            });
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn watch_notifications(
         mut control: CharacteristicControl,
@@ -2615,6 +2573,46 @@ struct LinuxGattConnection {
     att_mtu: AtomicU16,
 }
 
+/// Track notify sessions for one characteristic.
+///
+/// Each `Notify` event is a central acquiring a notification channel, and —
+/// unlike `StartNotify` — it carries the subscriber's address. That makes
+/// this both the peripheral-role arrival signal and the notify path itself:
+/// service-attributed (an unrelated device connected to the same adapter
+/// never appears here), notification-ready by construction, and identified
+/// without inference.
+/// Report the loss of an outbound connection, but only while this watcher
+/// still owns the dial it was armed for.
+///
+/// A peer that drops and reconnects quickly leaves the old watcher holding a
+/// queued `Connected(false)`. Emitting that unconditionally would announce a
+/// disconnect for the *replacement* link — whose datagram watcher would then
+/// tear down a channel that is working — and would clear a `dialed` entry
+/// that now belongs to the new connection.
+impl LinuxGattConnection {
+    fn report_loss(
+        events_tx: &EventBus,
+        dialed: &Arc<StdMutex<HashMap<PeerAddress, u64>>>,
+        peer: &PeerAddress,
+        generation: u64,
+    ) {
+        let mut dialed = dialed.lock().unwrap();
+        if dialed.get(peer) != Some(&generation) {
+            return;
+        }
+        // Stop suppressing inbound reports for this address: a later connection
+        // from it may genuinely be an inbound one.
+        dialed.remove(peer);
+        drop(dialed);
+        log::info!("link lost: {} session={generation} (central role)", peer.0);
+        let _ = events_tx.send(GattEvent::Disconnected {
+            peer: peer.clone(),
+            local_role: Role::Central,
+            session: Some(generation),
+        });
+    }
+}
+
 impl LinuxGattConnection {
     async fn find_characteristic(
         &self,
@@ -2645,9 +2643,6 @@ impl LinuxGattConnection {
             characteristic.0
         )))
     }
-}
-
-impl LinuxGattConnection {
     /// Refuse to act when a newer dial to this peer has superseded us,
     /// matching the Android and mock drivers.
     fn ensure_current(&self) -> Result<()> {

@@ -68,6 +68,41 @@ const AD_MAX_DATA_LEN: usize = 254;
 /// The Bluetooth Base UUID, `00000000-0000-1000-8000-00805F9B34FB`.
 const BLUETOOTH_BASE_UUID: u128 = 0x0000_0000_0000_1000_8000_0080_5F9B_34FB;
 
+/// The characteristic a peripheral adds to its service to serve `spec`'s
+/// advertisement data: readable only.
+pub fn characteristic_spec(spec: &GattServiceSpec) -> GattCharacteristicSpec {
+    GattAdvertisement::characteristic_spec(spec)
+}
+
+/// Whether a scanner should read `peer`'s GATT advertisement: its radio
+/// advertisement carried no manufacturer and no service data.
+pub fn needs_gatt_advertisement(peer: &DiscoveredPeer) -> bool {
+    peer.needs_gatt_advertisement()
+}
+
+/// Connect to `peer`, read its GATT advertisement and disconnect.
+pub async fn read(driver: &dyn Driver, peer: &PeerAddress) -> Result<GattAdvertisement> {
+    GattAdvertisement::read_owned(driver, peer, false).await
+}
+
+/// `scan` (a scan for `service` on `driver`), with the GATT advertisement
+/// of every peer that [needs one](needs_gatt_advertisement) read and merged
+/// in. Peers whose radio advertisement carries the data pass through without a read.
+/// A peer that needs a read is reported after its first read and when later reads find changed data.
+/// On failure, a peer not yet reported is reported with its radio advertisement data.
+///
+/// Reads run one at a time, so a crowd of peers cannot exhaust the
+/// platform's connection slots. A scan error ends the stream as it ends a
+/// scan.
+pub fn complete(
+    driver: Arc<dyn Driver>,
+    service: ServiceUuid,
+    scan: BoxStream<Result<DiscoveredPeer>>,
+    policy: GattAdvertisementPolicy,
+) -> BoxStream<Result<DiscoveredPeer>> {
+    policy.complete(driver, service, scan)
+}
+
 /// The advertisement data a GATT advertisement carries: the same fields as
 /// `GattServiceSpec`'s advertisement data and `DiscoveredPeer`'s.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -187,9 +222,6 @@ impl GattAdvertisement {
             .or_else(|| advertised_name(service, &peer.service_data, peer.name.take()));
         peer
     }
-}
-
-impl GattAdvertisement {
     fn service_data_entry(kind: u8, data: &[u8]) -> Option<(ServiceUuid, Vec<u8>)> {
         let expand_short_uuid =
             |value: u32| Uuid::from_u128(BLUETOOTH_BASE_UUID | ((value as u128) << 96));
@@ -209,15 +241,6 @@ impl GattAdvertisement {
         };
         Some((ServiceUuid(uuid), rest.to_vec()))
     }
-}
-
-/// The characteristic a peripheral adds to its service to serve `spec`'s
-/// advertisement data: readable only.
-pub fn characteristic_spec(spec: &GattServiceSpec) -> GattCharacteristicSpec {
-    GattAdvertisement::characteristic_spec(spec)
-}
-
-impl GattAdvertisement {
     pub(crate) fn characteristic_spec(spec: &GattServiceSpec) -> GattCharacteristicSpec {
         GattCharacteristicSpec {
             uuid: GATT_ADVERTISEMENT_CHARACTERISTIC,
@@ -227,26 +250,6 @@ impl GattAdvertisement {
             initial_value: GattAdvertisement::of(spec).encode(),
         }
     }
-}
-
-/// Whether a scanner should read `peer`'s GATT advertisement: its radio
-/// advertisement carried no manufacturer and no service data.
-pub fn needs_gatt_advertisement(peer: &DiscoveredPeer) -> bool {
-    peer.needs_gatt_advertisement()
-}
-
-impl DiscoveredPeer {
-    pub(crate) fn needs_gatt_advertisement(&self) -> bool {
-        self.manufacturer_data.is_empty() && self.service_data.is_empty()
-    }
-}
-
-/// Connect to `peer`, read its GATT advertisement and disconnect.
-pub async fn read(driver: &dyn Driver, peer: &PeerAddress) -> Result<GattAdvertisement> {
-    GattAdvertisement::read_owned(driver, peer, false).await
-}
-
-impl GattAdvertisement {
     pub(crate) async fn read_managed(
         driver: &dyn Driver,
         peer: &PeerAddress,
@@ -278,6 +281,12 @@ impl GattAdvertisement {
     }
 }
 
+impl DiscoveredPeer {
+    pub(crate) fn needs_gatt_advertisement(&self) -> bool {
+        self.manufacturer_data.is_empty() && self.service_data.is_empty()
+    }
+}
+
 /// How [`complete`] reads GATT advertisements.
 #[derive(Debug, Clone, Copy)]
 pub struct GattAdvertisementPolicy {
@@ -305,32 +314,6 @@ impl Default for GattAdvertisementPolicy {
             max_peers: 64,
         }
     }
-}
-
-struct TrackedPeer {
-    peer: DiscoveredPeer,
-    next_read_at: Instant,
-    last_advertisement: Option<GattAdvertisement>,
-    consecutive_failures: u32,
-    has_been_reported: bool,
-}
-
-/// `scan` (a scan for `service` on `driver`), with the GATT advertisement
-/// of every peer that [needs one](needs_gatt_advertisement) read and merged
-/// in. Peers whose radio advertisement carries the data pass through without a read.
-/// A peer that needs a read is reported after its first read and when later reads find changed data.
-/// On failure, a peer not yet reported is reported with its radio advertisement data.
-///
-/// Reads run one at a time, so a crowd of peers cannot exhaust the
-/// platform's connection slots. A scan error ends the stream as it ends a
-/// scan.
-pub fn complete(
-    driver: Arc<dyn Driver>,
-    service: ServiceUuid,
-    scan: BoxStream<Result<DiscoveredPeer>>,
-    policy: GattAdvertisementPolicy,
-) -> BoxStream<Result<DiscoveredPeer>> {
-    policy.complete(driver, service, scan)
 }
 
 impl GattAdvertisementPolicy {
@@ -441,6 +424,14 @@ impl AdvertisementScan {
         }
         None
     }
+}
+
+struct TrackedPeer {
+    peer: DiscoveredPeer,
+    next_read_at: Instant,
+    last_advertisement: Option<GattAdvertisement>,
+    consecutive_failures: u32,
+    has_been_reported: bool,
 }
 
 impl TrackedPeer {
