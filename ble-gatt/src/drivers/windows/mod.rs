@@ -402,17 +402,13 @@ impl Driver for WindowsDriver {
             }
             server.provider.clone()
         };
-        if enabled {
-            Server::start_provider_advertising(&provider, &service).await
-        } else {
-            provider
-                .StopAdvertising()
-                .map_err(|err| BleError::windows_error("StopAdvertising", err))?;
+        Server::set_provider_advertising(&provider, &service, enabled).await?;
+        if !enabled {
             if let Some(server) = self.inner.server.lock().unwrap().as_mut() {
                 server.desired_visibility = false;
             }
-            Ok(())
         }
+        Ok(())
     }
 
     async fn stop_advertising(&self) -> Result<()> {

@@ -28,7 +28,7 @@ use windows::Devices::Bluetooth::GenericAttributeProfile::{
     GattSessionStatusChangedEventArgs, GattSubscribedClient, GattWriteOption,
     GattWriteRequestedEventArgs,
 };
-use windows::Foundation::TypedEventHandler;
+use windows::Foundation::{Deferral, TypedEventHandler};
 
 use super::utils::WindowsCodec;
 use super::{Inner, ADVERTISE_START_TIMEOUT, STATUS_POLL_INTERVAL};
@@ -333,7 +333,9 @@ impl Inner {
                 let handler = TypedEventHandler::new(
                     move |_: Ref<GattLocalCharacteristic>,
                           args: Ref<GattReadRequestedEventArgs>| {
-                        let _ = requests_tx.send(ServerRequest::Read(uuid, args.ok()?.clone()));
+                        let args = args.ok()?;
+                        let deferral = RequestDeferral(args.GetDeferral()?);
+                        let _ = requests_tx.send(ServerRequest::Read(uuid, args.clone(), deferral));
                         Ok(())
                     },
                 );
@@ -352,7 +354,10 @@ impl Inner {
                           args: Ref<GattWriteRequestedEventArgs>| {
                         // Queued in arrival order and handled on one task, so
                         // the fragments of a datagram stay in order.
-                        let _ = requests_tx.send(ServerRequest::Write(uuid, args.ok()?.clone()));
+                        let args = args.ok()?;
+                        let deferral = RequestDeferral(args.GetDeferral()?);
+                        let _ =
+                            requests_tx.send(ServerRequest::Write(uuid, args.clone(), deferral));
                         Ok(())
                     },
                 );
@@ -406,51 +411,45 @@ impl Inner {
         characteristic: CharacteristicUuid,
         args: &GattWriteRequestedEventArgs,
     ) -> windows::core::Result<()> {
-        let deferral = args.GetDeferral()?;
-        let outcome = async {
-            let session = args.Session()?;
-            let request = args.GetRequestAsync()?.await?;
-            let with_response = request.Option()? == GattWriteOption::WriteWithResponse;
-            let address = WindowsCodec::session_address(&session)?;
-            if self.is_excluded(&address) {
-                if with_response {
-                    request.RespondWithProtocolError(ATT_WRITE_NOT_PERMITTED)?;
-                }
-                return Ok(());
-            }
-            let Some((address, _)) = self.note_server_peer(&session, generation) else {
-                if with_response {
-                    request.RespondWithProtocolError(ATT_WRITE_NOT_PERMITTED)?;
-                }
-                return Ok(());
-            };
-            // Serialize event publication with server replacement. No native await occurs under this lock.
-            let current = self.server_generation.lock().unwrap();
-            if *current != generation || self.is_excluded(&address) {
-                if with_response {
-                    request.RespondWithProtocolError(ATT_WRITE_NOT_PERMITTED)?;
-                }
-                return Ok(());
-            }
-            let value = WindowsCodec::from_buffer(&request.Value()?)?;
+        let session = args.Session()?;
+        let request = args.GetRequestAsync()?.await?;
+        let with_response = request.Option()? == GattWriteOption::WriteWithResponse;
+        let address = WindowsCodec::session_address(&session)?;
+        if self.is_excluded(&address) {
             if with_response {
-                request.Respond()?;
+                request.RespondWithProtocolError(ATT_WRITE_NOT_PERMITTED)?;
             }
-            log::debug!(
-                "server: {} bytes from {address} on {}",
-                value.len(),
-                characteristic.0
-            );
-            let _ = self.events_tx.send(GattEvent::CharacteristicWritten {
-                peer: PeerAddress(address),
-                characteristic,
-                value,
-            });
-            Ok(())
+            return Ok(());
         }
-        .await;
-        deferral.Complete()?;
-        outcome
+        let Some((address, _)) = self.note_server_peer(&session, generation) else {
+            if with_response {
+                request.RespondWithProtocolError(ATT_WRITE_NOT_PERMITTED)?;
+            }
+            return Ok(());
+        };
+        // Serialize event publication with server replacement. No native await occurs under this lock.
+        let current = self.server_generation.lock().unwrap();
+        if *current != generation || self.is_excluded(&address) {
+            if with_response {
+                request.RespondWithProtocolError(ATT_WRITE_NOT_PERMITTED)?;
+            }
+            return Ok(());
+        }
+        let value = WindowsCodec::from_buffer(&request.Value()?)?;
+        if with_response {
+            request.Respond()?;
+        }
+        log::debug!(
+            "server: {} bytes from {address} on {}",
+            value.len(),
+            characteristic.0
+        );
+        let _ = self.events_tx.send(GattEvent::CharacteristicWritten {
+            peer: PeerAddress(address),
+            characteristic,
+            value,
+        });
+        Ok(())
     }
 }
 
@@ -517,6 +516,38 @@ impl Server {
         Ok(())
     }
 
+    /// `Driver::set_advertising_enabled` on the provider, idempotent like the
+    /// Linux driver. WinRT refuses `StartAdvertising` on a started provider
+    /// and `StopAdvertising` on one that is not advertising, both with
+    /// `E_ILLEGAL_METHOD_CALL` (0x8000000E). Google Nearby's Windows GATT
+    /// server checks `AdvertisementStatus` before each call the same way.
+    pub(super) async fn set_provider_advertising(
+        provider: &GattServiceProvider,
+        spec: &GattServiceSpec,
+        enabled: bool,
+    ) -> Result<()> {
+        let status = provider
+            .AdvertisementStatus()
+            .map_err(|err| BleError::windows_error("AdvertisementStatus", err))?;
+        let started = status == GattServiceProviderAdvertisementStatus::Started
+            || status == GattServiceProviderAdvertisementStatus::StartedWithoutAllAdvertisementData;
+        let stopped = status == GattServiceProviderAdvertisementStatus::Created
+            || status == GattServiceProviderAdvertisementStatus::Stopped;
+        if enabled {
+            if started {
+                return Ok(());
+            }
+            Self::start_provider_advertising(provider, spec).await
+        } else {
+            if !stopped {
+                provider
+                    .StopAdvertising()
+                    .map_err(|err| BleError::windows_error("StopAdvertising", err))?;
+            }
+            Ok(())
+        }
+    }
+
     pub(super) async fn start_provider_advertising(
         provider: &GattServiceProvider,
         spec: &GattServiceSpec,
@@ -568,8 +599,33 @@ impl Server {
 
 /// One inbound request, queued so a single task answers them in order.
 enum ServerRequest {
-    Write(CharacteristicUuid, GattWriteRequestedEventArgs),
-    Read(CharacteristicUuid, GattReadRequestedEventArgs),
+    Write(
+        CharacteristicUuid,
+        GattWriteRequestedEventArgs,
+        RequestDeferral,
+    ),
+    Read(
+        CharacteristicUuid,
+        GattReadRequestedEventArgs,
+        RequestDeferral,
+    ),
+}
+
+/// The deferral of a queued request. WinRT accepts `GetDeferral` only while
+/// the `ReadRequested` or `WriteRequested` handler runs; afterwards it fails
+/// with `E_ILLEGAL_METHOD_CALL` (0x8000000E) and the request is gone. The
+/// handler therefore takes it, and dropping the request completes it: after
+/// the answer, or unanswered when the queue is dropped with the server.
+/// Microsoft's `BluetoothLE` sample and Google Nearby's Windows GATT server
+/// take the deferral first thing in the handler the same way.
+struct RequestDeferral(Deferral);
+
+impl Drop for RequestDeferral {
+    fn drop(&mut self) {
+        if let Err(err) = self.0.Complete() {
+            log::warn!("server: completing a request deferral failed: {err}");
+        }
+    }
 }
 
 /// Answers inbound reads and writes in the order they arrived; writes are
@@ -583,16 +639,20 @@ impl ServerRequest {
     ) {
         while let Some(request) = requests.recv().await {
             let Some(inner) = inner.upgrade() else { return };
-            let (characteristic, outcome) = match &request {
-                ServerRequest::Write(characteristic, args) => (
-                    *characteristic,
-                    inner.handle_write(generation, *characteristic, args).await,
+            let (characteristic, outcome, deferral) = match request {
+                ServerRequest::Write(characteristic, args, deferral) => (
+                    characteristic,
+                    inner.handle_write(generation, characteristic, &args).await,
+                    deferral,
                 ),
-                ServerRequest::Read(characteristic, args) => (
-                    *characteristic,
-                    Self::handle_read(&values, *characteristic, args).await,
+                ServerRequest::Read(characteristic, args, deferral) => (
+                    characteristic,
+                    Self::handle_read(&values, characteristic, &args).await,
+                    deferral,
                 ),
             };
+            // Completes the deferral now that the request is answered.
+            drop(deferral);
             if let Err(err) = outcome {
                 log::warn!("server: request on {} failed: {err}", characteristic.0);
             }
@@ -608,24 +668,18 @@ impl ServerRequest {
         characteristic: CharacteristicUuid,
         args: &GattReadRequestedEventArgs,
     ) -> windows::core::Result<()> {
-        let deferral = args.GetDeferral()?;
-        let outcome = async {
-            let request = args.GetRequestAsync()?.await?;
-            let offset = request.Offset()? as usize;
-            let value = values
-                .lock()
-                .unwrap()
-                .get(&characteristic)
-                .cloned()
-                .unwrap_or_default();
-            if offset > value.len() {
-                return request.RespondWithProtocolError(ATT_INVALID_OFFSET);
-            }
-            request.RespondWithValue(&WindowsCodec::encode_buffer(&value[offset..])?)
+        let request = args.GetRequestAsync()?.await?;
+        let offset = request.Offset()? as usize;
+        let value = values
+            .lock()
+            .unwrap()
+            .get(&characteristic)
+            .cloned()
+            .unwrap_or_default();
+        if offset > value.len() {
+            return request.RespondWithProtocolError(ATT_INVALID_OFFSET);
         }
-        .await;
-        deferral.Complete()?;
-        outcome
+        request.RespondWithValue(&WindowsCodec::encode_buffer(&value[offset..])?)
     }
 }
 

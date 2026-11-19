@@ -190,6 +190,13 @@ Windows has no call that disconnects a central from a GATT server, so the
 Windows driver stops notifying it and refuses its writes until it leaves by
 itself (ADR-0011, native events and cleanup limits).
 
+### Request deferral
+A Windows promise to answer an inbound GATT read or write later, after the
+event handler has returned. The handler must take it (`GetDeferral`) before
+it returns; the answer is final only once the deferral is completed. The
+Windows driver takes it in the handler and completes it after its request
+task has answered.
+
 ## This library's concepts
 
 ### Fast advertisement
