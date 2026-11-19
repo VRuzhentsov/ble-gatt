@@ -1620,6 +1620,37 @@ mod tests {
         )
     }
 
+    /// Connects `client` to `server` over IP and accepts it, failing instead
+    /// of hanging when the handshake does not finish. The server binds the
+    /// unspecified address, which Windows refuses as a destination
+    /// (WSAEADDRNOTAVAIL), so this dials the same port on loopback.
+    async fn connect_on_ip(
+        client: &iroh::Endpoint,
+        server: &iroh::Endpoint,
+        alpn: &[u8],
+    ) -> (iroh::endpoint::Connection, iroh::endpoint::Connection) {
+        let address = iroh::EndpointAddr::from_parts(
+            server.id(),
+            server.bound_sockets().into_iter().map(|mut socket| {
+                if socket.ip().is_unspecified() {
+                    socket.set_ip(match socket {
+                        std::net::SocketAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+                        std::net::SocketAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+                    });
+                }
+                TransportAddr::Ip(socket)
+            }),
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (outgoing, accepted) = tokio::join!(client.connect(address, alpn), async {
+                server.accept().await.unwrap().await.unwrap()
+            });
+            (outgoing.unwrap(), accepted)
+        })
+        .await
+        .expect("IP connect and accept must finish")
+    }
+
     #[test]
     fn an_address_round_trips_through_its_custom_form() {
         let peer = PeerAddress("AA:BB:CC:DD:EE:FF".to_string());
@@ -2527,18 +2558,7 @@ mod tests {
             .await
             .unwrap();
         let client = iroh::Endpoint::bind(presets::Minimal).await.unwrap();
-        let address = iroh::EndpointAddr::from_parts(
-            server.id(),
-            server
-                .bound_sockets()
-                .iter()
-                .copied()
-                .map(TransportAddr::Ip),
-        );
-        let (connection, accepted) = tokio::join!(client.connect(address, ALPN), async {
-            server.accept().await.unwrap().await.unwrap()
-        });
-        let connection = connection.unwrap();
+        let (connection, accepted) = connect_on_ip(&client, &server, ALPN).await;
         let transport = BleGattTransport::builder().build();
         let peer = PeerAddress("failed-barrier".into());
         transport
@@ -2594,23 +2614,9 @@ mod tests {
             .await
             .unwrap();
         let client = iroh::Endpoint::bind(presets::Minimal).await.unwrap();
-        let address = iroh::EndpointAddr::from_parts(
-            server.id(),
-            server
-                .bound_sockets()
-                .iter()
-                .copied()
-                .map(TransportAddr::Ip),
-        );
-        let (connection, accepted) = tokio::join!(client.connect(address.clone(), ALPN), async {
-            server.accept().await.unwrap().await.unwrap()
-        },);
-        let connection = connection.unwrap();
+        let (connection, accepted) = connect_on_ip(&client, &server, ALPN).await;
         let surviving_connection = if survivor {
-            let (other, incoming) = tokio::join!(client.connect(address, ALPN), async {
-                server.accept().await.unwrap().await.unwrap()
-            },);
-            let other = other.unwrap();
+            let (other, incoming) = connect_on_ip(&client, &server, ALPN).await;
             assert_ne!(connection.stable_id(), other.stable_id());
             Some((other, incoming))
         } else {
