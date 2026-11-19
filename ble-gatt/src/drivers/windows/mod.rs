@@ -392,17 +392,18 @@ impl Driver for WindowsDriver {
             .unwrap()
             .clone()
             .ok_or_else(|| BleError::Gatt("advertising visibility: nothing is served".into()))?;
-        let provider = {
+        let (provider, was_visible) = {
             let mut server = self.inner.server.lock().unwrap();
             let server = server
                 .as_mut()
                 .ok_or_else(|| BleError::Gatt("advertising visibility: no GATT server".into()))?;
+            let was_visible = server.desired_visibility;
             if enabled {
                 server.desired_visibility = true;
             }
-            server.provider.clone()
+            (server.provider.clone(), was_visible)
         };
-        Server::set_provider_advertising(&provider, &service, enabled).await?;
+        Server::set_provider_advertising(&provider, &service, enabled, was_visible).await?;
         if !enabled {
             if let Some(server) = self.inner.server.lock().unwrap().as_mut() {
                 server.desired_visibility = false;

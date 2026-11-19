@@ -45,6 +45,9 @@ const ATT_WRITE_NOT_PERMITTED: u8 = 0x03;
 /// ATT error "Invalid Offset": a long read past the end of the value.
 const ATT_INVALID_OFFSET: u8 = 0x07;
 
+/// `E_ILLEGAL_METHOD_CALL` (0x8000000E): "A method was called at an unexpected time."
+const E_ILLEGAL_METHOD_CALL: windows::core::HRESULT = windows::core::HRESULT(0x8000000E_u32 as i32);
+
 /// `(characteristic, ReadRequested, WriteRequested, SubscribedClientsChanged)` tokens.
 type Tokens = (
     GattLocalCharacteristic,
@@ -517,34 +520,43 @@ impl Server {
     }
 
     /// `Driver::set_advertising_enabled` on the provider, idempotent like the
-    /// Linux driver. WinRT refuses `StartAdvertising` on a started provider
-    /// and `StopAdvertising` on one that is not advertising, both with
-    /// `E_ILLEGAL_METHOD_CALL` (0x8000000E). Google Nearby's Windows GATT
-    /// server checks `AdvertisementStatus` before each call the same way.
+    /// Linux driver. `was_visible` is `desired_visibility` before this call.
+    /// WinRT refuses `StartAdvertising` on a started provider and
+    /// `StopAdvertising` on one that is not advertising, both with
+    /// `E_ILLEGAL_METHOD_CALL`. `AdvertisementStatus` can still read started
+    /// just after `StopAdvertising`, so the driver's own visibility decides,
+    /// and the status only shows an advertisement that WinRT aborted.
+    /// Google Nearby's Windows GATT server checks its own `is_advertising_`
+    /// flag first and `AdvertisementStatus` second the same way.
     pub(super) async fn set_provider_advertising(
         provider: &GattServiceProvider,
         spec: &GattServiceSpec,
         enabled: bool,
+        was_visible: bool,
     ) -> Result<()> {
-        let status = provider
-            .AdvertisementStatus()
-            .map_err(|err| BleError::windows_error("AdvertisementStatus", err))?;
-        let started = status == GattServiceProviderAdvertisementStatus::Started
-            || status == GattServiceProviderAdvertisementStatus::StartedWithoutAllAdvertisementData;
-        let stopped = status == GattServiceProviderAdvertisementStatus::Created
-            || status == GattServiceProviderAdvertisementStatus::Stopped;
         if enabled {
-            if started {
+            let status = provider
+                .AdvertisementStatus()
+                .map_err(|err| BleError::windows_error("AdvertisementStatus", err))?;
+            let started = status == GattServiceProviderAdvertisementStatus::Started
+                || status
+                    == GattServiceProviderAdvertisementStatus::StartedWithoutAllAdvertisementData;
+            if was_visible && started {
                 return Ok(());
             }
-            Self::start_provider_advertising(provider, spec).await
-        } else {
-            if !stopped {
-                provider
-                    .StopAdvertising()
-                    .map_err(|err| BleError::windows_error("StopAdvertising", err))?;
+            return Self::start_provider_advertising(provider, spec).await;
+        }
+        if !was_visible {
+            return Ok(());
+        }
+        match provider.StopAdvertising() {
+            // The provider is not advertising, which is what hiding asks for:
+            // for example, a start that did not confirm was already stopped.
+            Err(err) if err.code() == E_ILLEGAL_METHOD_CALL => {
+                log::info!("advertise: hide: the provider was not advertising");
+                Ok(())
             }
-            Ok(())
+            result => result.map_err(|err| BleError::windows_error("StopAdvertising", err)),
         }
     }
 
