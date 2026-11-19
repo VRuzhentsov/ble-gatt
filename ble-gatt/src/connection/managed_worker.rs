@@ -595,7 +595,10 @@ impl Worker {
                 biased;
                 _ = shutdown.cancelled() => Err(AttemptError::Cancelled.into()),
                 _ = output.closed() => Err(AttemptError::Cancelled.into()),
-                result = tokio::time::timeout(IO_BOUND, crate::advertisement::GattAdvertisement::read_managed(driver.as_ref(), &peer.address)) => result.unwrap_or(Err(AttemptError::TimedOut.into())),
+                // One read includes the first connection to the peer; bound it like an unmanaged
+                // GATT advertisement read. Windows took 3-5 s and more for a first connection to a
+                // phone, and a read cut at `IO_BOUND` started over after the next scan.
+                result = tokio::time::timeout(crate::advertisement::GattAdvertisementPolicy::default().timeout, crate::advertisement::GattAdvertisement::read_managed(driver.as_ref(), &peer.address)) => result.unwrap_or(Err(AttemptError::TimedOut.into())),
             };
             let result = read.and_then(|metadata| ManagedMetadata::complete_peer(metadata, service, peer));
             Operation::Probe(generation, address, output, result)

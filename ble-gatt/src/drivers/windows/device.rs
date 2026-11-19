@@ -8,7 +8,9 @@
 //!
 //! - Uncached GATT discovery falls back to the Windows cache after
 //!   [`GATT_CACHE_TIMEOUT`], because some Windows Bluetooth drivers never
-//!   answer an uncached request (btleplug issue #325).
+//!   answer an uncached request (btleplug issue #325). Unlike btleplug, only
+//!   the services are discovered uncached; their characteristics come from
+//!   the cache that this discovery refreshed.
 //! - Link loss is `BluetoothLEDevice.ConnectionStatusChanged` to
 //!   `Disconnected`.
 //! - `subscribe` writes Notify or Indicate to the CCCD, whichever the
@@ -199,7 +201,26 @@ impl OpenedLink {
     /// Every characteristic of `service`, or none when Windows cannot list
     /// them. btleplug also skips such a service instead of failing the
     /// connection.
+    ///
+    /// `service` comes from an uncached service discovery on this link, so
+    /// the Windows cache holds its characteristics already: read them from
+    /// there, and from the peer only when the cache has none. An uncached
+    /// request for each service took 60-90 ms on a fast link and up to 1.6 s
+    /// on a link that had just come up, in every connection.
     async fn discover_characteristics(service: &GattDeviceService) -> Vec<GattCharacteristic> {
+        if let Ok(result) =
+            Self::characteristics_with_cache_mode(service, BluetoothCacheMode::Cached).await
+        {
+            if result.Status() == Ok(GattCommunicationStatus::Success) {
+                let cached: Vec<GattCharacteristic> = result
+                    .Characteristics()
+                    .map(|list| list.into_iter().collect())
+                    .unwrap_or_default();
+                if !cached.is_empty() {
+                    return cached;
+                }
+            }
+        }
         let uncached = tokio::time::timeout(
             GATT_CACHE_TIMEOUT,
             Self::characteristics_with_cache_mode(service, BluetoothCacheMode::Uncached),
