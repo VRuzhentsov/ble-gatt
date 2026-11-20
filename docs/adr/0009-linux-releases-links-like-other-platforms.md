@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. Implemented in `drivers/linux.rs` and `tauri-plugin-ble-gatt`.
+Accepted. Implemented in `drivers/linux/mod.rs` and `tauri-plugin-ble-gatt`.
 
 ## Context
 

@@ -25,6 +25,8 @@ shared contracts.
 
 ## Source layout
 
+- Give every platform driver the same layout: `drivers/<platform>/mod.rs`,
+  with that driver's submodules as files next to it.
 - Place a type near its inherent implementation. Group related methods, such
   as encode/decode pairs, and consolidate compatible `impl` blocks instead of
   leaving one block at each former function location.

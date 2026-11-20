@@ -23,7 +23,7 @@ bluer = { version = "0.17", features = ["bluetoothd"] }
 # Same versions `bluer` already depends on (no new crates): discovery runs on
 # a D-Bus connection of our own, because `bluer` neither exposes
 # `StopDiscovery` nor reports its result. See `DiscoveryBus` in
-# `drivers/linux.rs`.
+# `drivers/linux/mod.rs`.
 dbus = "0.9"
 dbus-tokio = "0.7"
 futures = "0.3"
@@ -57,7 +57,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 env_logger = "0.11"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-# A fake `org.bluez` adapter for the discovery tests in `drivers/linux.rs`.
+# A fake `org.bluez` adapter for the discovery tests in `drivers/linux/mod.rs`.
 # Same version `bluer` already depends on.
 dbus-crossroads = "0.5"
 

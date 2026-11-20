@@ -196,7 +196,6 @@ const SCAN_REPORTED_CAPACITY: usize = 1024;
 /// which a consumer like Fini drops a device it has not heard.
 const SCAN_REPORT_REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
 
-#[path = "advertisement_outcome.rs"]
 mod advertisement_outcome;
 use advertisement_outcome::PendingAdvertisement;
 

@@ -35,7 +35,7 @@ fn body<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
 #[test]
 fn native_visibility_keeps_server_ownership() {
     for source in [
-        include_str!("../src/drivers/linux.rs"),
+        include_str!("../src/drivers/linux/mod.rs"),
         include_str!("../src/drivers/windows/mod.rs"),
     ] {
         let toggle = body(
@@ -53,7 +53,7 @@ fn native_visibility_keeps_server_ownership() {
 
 #[test]
 fn android_visibility_jni_and_abi_are_coherent() {
-    let rust = include_str!("../src/drivers/android.rs");
+    let rust = include_str!("../src/drivers/android/mod.rs");
     let kotlin = include_str!(
         "../../tauri-plugin-ble-gatt/android/src/main/kotlin/dev/blegatt/BleGattBridge.kt"
     );
@@ -207,7 +207,7 @@ fn windows_server_callbacks_reject_replaced_generations() {
 
 #[test]
 fn metadata_updates_preserve_hidden_visibility() {
-    let linux = include_str!("../src/drivers/linux.rs");
+    let linux = include_str!("../src/drivers/linux/mod.rs");
     let update = body(
         linux,
         "async fn update_advertisement(",

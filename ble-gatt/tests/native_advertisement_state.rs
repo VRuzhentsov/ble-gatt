@@ -1,7 +1,7 @@
 //! Executes the same release/start ownership helpers as native drivers, without a radio.
-#[path = "../src/drivers/advertisement_outcome.rs"]
+#[path = "../src/drivers/android/advertisement_outcome.rs"]
 mod advertisement_outcome;
-#[path = "../src/drivers/advertisement_release.rs"]
+#[path = "../src/drivers/linux/advertisement_release.rs"]
 mod advertisement_release;
 
 #[tokio::test]

@@ -128,8 +128,8 @@ ble-gatt/src/
 ├── profile/      Use Cases: the datagram profile (fragmentation, reassembly)
 ├── power/        Use Cases: power-profile advice
 └── drivers/      Frameworks & Drivers: one Driver per platform
-    ├── linux.rs    BlueZ via bluer — central + peripheral       (M1)
-    ├── android.rs  JNI driver with explicit context support    (M1)
+    ├── linux/      BlueZ via bluer — central + peripheral       (M1)
+    ├── android/    JNI driver with explicit context support    (M1)
     ├── windows/    WinRT via the windows crate — central + peripheral (M2)
     └── mock/       in-process, radio-free — CI-safe protocol tests;
                     optionally a cross-process broker behind the
@@ -184,7 +184,7 @@ Read the doc next to each before changing it:
 | `ble-gatt/src/connection/peer_link.rs` | request/accept and scoped channel API | `docs/interface.md`, ADR-0012 |
 | `ble-gatt/src/connection/managed_worker.rs` | attempt state, arbitration and native channel ownership | ADR-0012 |
 | `ble-gatt/src/connection/managed_codec.rs` | managed metadata and record bytes | ADR-0012 |
-| `ble-gatt/src/drivers/linux.rs` — `LinuxConnectGuard` / `pending_cleanup` | abandoned-connect cleanup and native ownership | code comments, ADR-0009 |
+| `ble-gatt/src/drivers/linux/mod.rs` — `LinuxConnectGuard` / `pending_cleanup` | abandoned-connect cleanup and native ownership | code comments, ADR-0009 |
 | `ble-gatt/src/profile/datagram/mod.rs` | complete messages, serving and channel limits | ADR-0003, ADR-0012 |
 
 The unused crate-private `link_state` implementation is retired. ADR-0005 remains

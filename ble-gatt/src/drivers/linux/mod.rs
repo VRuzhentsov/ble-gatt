@@ -15,7 +15,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-#[path = "advertisement_release.rs"]
 mod advertisement_release;
 
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};

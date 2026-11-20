@@ -8,7 +8,7 @@ use crate::{
 };
 use std::{sync::Arc, time::Duration};
 use tokio_stream::StreamExt;
-#[path = "../drivers/advertisement_outcome.rs"]
+#[path = "../drivers/android/advertisement_outcome.rs"]
 mod advertisement_outcome;
 
 fn config() -> DatagramConfig {
