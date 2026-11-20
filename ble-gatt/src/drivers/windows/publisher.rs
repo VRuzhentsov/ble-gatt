@@ -38,9 +38,10 @@ impl FastPublisher {
     /// Start a publisher for `spec`'s fast advertisement. `None` when the
     /// spec has none, or Windows refused it (logged): scanners then read the
     /// GATT advertisement, as before.
-    pub(super) async fn start(spec: &GattServiceSpec) -> Option<FastPublisher> {
+    /// `paused`: created but not sent yet, because a scan runs.
+    pub(super) async fn start(spec: &GattServiceSpec, paused: bool) -> Option<FastPublisher> {
         let record = spec.fast_advertisement.clone()?;
-        match Self::try_start(&record).await {
+        match Self::try_start(&record, paused).await {
             Ok(publisher) => Some(publisher),
             Err(err) => {
                 log::warn!("advertise: fast advertisement publisher not started: {err}");
@@ -49,7 +50,7 @@ impl FastPublisher {
         }
     }
 
-    async fn try_start(record: &FastAdvertisement) -> Result<FastPublisher> {
+    async fn try_start(record: &FastAdvertisement, paused: bool) -> Result<FastPublisher> {
         let publisher = BluetoothLEAdvertisementPublisher::new()
             .map_err(|err| BleError::windows_error("AdvertisementPublisher", err))?;
         {
@@ -106,17 +107,41 @@ impl FastPublisher {
             status_token,
             record: record.clone(),
         };
-        started
-            .publisher
-            .Start()
-            .map_err(|err| BleError::windows_error("Publisher::Start", err))?;
+        if !paused {
+            started
+                .publisher
+                .Start()
+                .map_err(|err| BleError::windows_error("Publisher::Start", err))?;
+        }
         log::info!(
-            "advertise: fast advertisement published ({} bytes under {:#06x}, {})",
+            "advertise: fast advertisement published ({} bytes under {:#06x}, {}{})",
             record.data.len(),
             record.company_id,
-            if extended { "extended" } else { "legacy" }
+            if extended { "extended" } else { "legacy" },
+            if paused {
+                ", paused while scanning"
+            } else {
+                ""
+            }
         );
         Ok(started)
+    }
+
+    /// Stop sending while this computer scans, and send again after: the
+    /// radio shares its time between the scan and every advertisement, and
+    /// with the publisher running the PC heard phones later (ADR-0011 §3).
+    pub(super) fn set_paused(&self, paused: bool) {
+        let result = if paused {
+            self.publisher.Stop()
+        } else {
+            self.publisher.Start()
+        };
+        match result {
+            Ok(()) => log::debug!("advertise: fast advertisement publisher paused={paused}"),
+            Err(err) => {
+                log::warn!("advertise: fast advertisement publisher paused={paused} failed: {err}")
+            }
+        }
     }
 }
 

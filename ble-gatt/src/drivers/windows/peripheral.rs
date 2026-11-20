@@ -200,9 +200,24 @@ impl Inner {
             .as_mut()
             .and_then(|server| server.publisher.take());
         drop(old);
-        let started = FastPublisher::start(spec).await;
+        let scanning = self.scan.lock().unwrap().active;
+        let started = FastPublisher::start(spec, scanning).await;
         if let Some(server) = self.server.lock().unwrap().as_mut() {
             server.publisher = started;
+        }
+    }
+
+    /// Pause the fast advertisement publisher while this computer scans
+    /// (`FastPublisher::set_paused`), and send again when the scan ends.
+    pub(super) fn pause_publisher(&self, paused: bool) {
+        if let Some(publisher) = self
+            .server
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|server| server.publisher.as_ref())
+        {
+            publisher.set_paused(paused);
         }
     }
 
@@ -438,7 +453,8 @@ impl Inner {
             requests_rx,
         )));
         Server::start_provider_advertising(&provider, spec).await?;
-        server.publisher = FastPublisher::start(spec).await;
+        let scanning = self.scan.lock().unwrap().active;
+        server.publisher = FastPublisher::start(spec, scanning).await;
         Ok(server)
     }
     async fn handle_write(

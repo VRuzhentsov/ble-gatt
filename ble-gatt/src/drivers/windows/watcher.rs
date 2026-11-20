@@ -299,9 +299,16 @@ impl Drop for ScanStream {
         let _ = self.watcher.RemoveStopped(self.stopped_token);
         let _ = self.watcher.Stop();
         let _ = self.watcher.RemoveReceived(self.received_token);
-        let mut scan = self.inner.scan.lock().unwrap();
-        if scan.generation == self.generation {
-            scan.active = false;
+        let ended = {
+            let mut scan = self.inner.scan.lock().unwrap();
+            let ended = scan.generation == self.generation;
+            if ended {
+                scan.active = false;
+            }
+            ended
+        };
+        if ended {
+            self.inner.pause_publisher(false);
         }
         log::info!("scan: stopped generation={}", self.generation);
     }

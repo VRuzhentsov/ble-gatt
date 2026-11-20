@@ -230,6 +230,7 @@ impl Driver for WindowsDriver {
             scan.generation += 1;
             scan.generation
         };
+        self.inner.pause_publisher(true);
         match watcher::ScanStream::start(&self.inner, service, generation) {
             Ok(stream) => {
                 log::info!(
@@ -239,9 +240,16 @@ impl Driver for WindowsDriver {
                 Ok(Box::pin(stream))
             }
             Err(err) => {
-                let mut scan = self.inner.scan.lock().unwrap();
-                if scan.generation == generation {
-                    scan.active = false;
+                let ended = {
+                    let mut scan = self.inner.scan.lock().unwrap();
+                    let ended = scan.generation == generation;
+                    if ended {
+                        scan.active = false;
+                    }
+                    ended
+                };
+                if ended {
+                    self.inner.pause_publisher(false);
                 }
                 Err(err)
             }

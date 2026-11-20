@@ -105,7 +105,19 @@ advertisement. Like Nearby, it would use an extended advertisement with
 `IsAnonymous = false` only when the record does not fit a legacy one and
 `BluetoothAdapter.IsExtendedAdvertisingSupported`; the record always fits, and
 legacy scanners cannot see extended-only advertisements. The publisher follows
-show, hide and advertisement updates, and stops with the server.
+show, hide and advertisement updates, and stops with the server. It pauses while
+this computer scans and sends again when the scan ends: with it running the PC
+heard the phone later. Measured on the test pair (20, 20 and 10 PC-to-phone
+discovery runs; time until the PC lists the phone's row from radio data):
+
+| Windows build | median | worst | phone lists PC, median / worst |
+|---|---|---|---|
+| no publisher | 0.85 s | 6.5 s | 1.2 s / 5.0 s |
+| publisher always on | 2.25 s | 9.5 s | 1.05 s / 2.5 s |
+| publisher paused while scanning | 0.65 s | 2.9 s | 1.1 s / 2.9 s |
+
+So a phone gets the record while the PC is not scanning (it then reads the PC once
+per hash, not in every scan window), and the PC's own scan keeps the radio.
 
 Evidence on the test PC (Windows 11 build 26200) and the Android test phone:
 
