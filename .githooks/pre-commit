@@ -1,15 +1,5 @@
 #!/bin/sh
-# Checks the staged Rust code: rustfmt on the staged .rs files, and clippy
-# warnings on the staged lines only. The logic is in `xtask/src/main.rs`.
-# Turn it on once per clone with `cargo xtask setup-hooks`.
-
-if [ -z "$(git diff --cached --name-only --diff-filter=ACMR -- '*.rs')" ]; then
-  exit 0
-fi
-if ! command -v cargo >/dev/null 2>&1; then
-  echo "pre-commit: cargo is not on PATH, so the Rust checks cannot run." >&2
-  echo "pre-commit: install the Rust toolchain (rustup, with the clippy and rustfmt components)," >&2
-  echo "pre-commit: or skip the checks one time with \"git commit --no-verify\"." >&2
-  exit 1
-fi
-exec cargo xtask pre-commit
+# Runs rustfmt and clippy when .rs files are staged. Turn on: git config core.hooksPath .githooks
+git diff --cached --quiet --diff-filter=ACMR -- '*.rs' && exit 0
+command -v cargo >/dev/null || { echo "pre-commit: cargo is not on PATH. Install Rust (with clippy and rustfmt), or skip once with git commit --no-verify." >&2; exit 1; }
+cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features -- -D warnings

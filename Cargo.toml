@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["ble-gatt", "ble-gatt-iroh", "tauri-plugin-ble-gatt", "xtask"]
+members = ["ble-gatt", "ble-gatt-iroh", "tauri-plugin-ble-gatt"]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,7 +17,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
 uuid = { version = "1", features = ["v4"] }
 
-# Each crate takes these with `[lints] workspace = true`. The pre-commit hook
-# (`cargo xtask pre-commit`) stops a commit on clippy warnings on its lines.
+# Each crate takes these with `[lints] workspace = true`. CI and the
+# pre-commit hook run clippy with `-D warnings`.
 [workspace.lints.clippy]
 all = "warn"

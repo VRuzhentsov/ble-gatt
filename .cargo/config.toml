@@ -1,3 +1,0 @@
-[alias]
-# Repository tasks, see `xtask/src/main.rs`.
-xtask = "run --quiet --package xtask --"
