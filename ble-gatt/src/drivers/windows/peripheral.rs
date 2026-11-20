@@ -57,10 +57,13 @@ type Tokens = (
 );
 
 /// Select the provider advertisement's service data: the local name or the
-/// caller's data under the served UUID.
+/// caller's data under the served UUID (for `PeerLink`, the 9-byte
+/// advertisement header, ADR-0012 §2).
 /// `validate` rejects specifications that supply both.
 /// Windows omits data that cannot fit with a 128-bit UUID
 /// (`StartedWithoutAllAdvertisementData`). The GATT advertisement carries it instead.
+/// The fast advertisement is not placed: the provider has no manufacturer
+/// data, and ADR-0011 D3 keeps a separate publisher out.
 impl GattServiceSpec {
     pub(super) fn provider_service_data(&self) -> Option<Vec<u8>> {
         match &self.local_name {
@@ -591,7 +594,10 @@ impl Server {
             return Ok(true);
         }
         if status == GattServiceProviderAdvertisementStatus::StartedWithoutAllAdvertisementData {
-            log::info!("advertise: started; service data does not fit. The GATT advertisement carries it");
+            log::info!(
+                "advertise: started without the service data ({} bytes: the advertisement header or the name); scanners read the GATT advertisement",
+                spec.provider_service_data().map_or(0, |data| data.len())
+            );
             return Ok(true);
         }
         Ok(false)

@@ -18,9 +18,9 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use windows::core::Ref;
 use windows::Devices::Bluetooth::Advertisement::{
-    BluetoothLEAdvertisementReceivedEventArgs, BluetoothLEAdvertisementType,
-    BluetoothLEAdvertisementWatcher, BluetoothLEAdvertisementWatcherStoppedEventArgs,
-    BluetoothLEScanningMode,
+    BluetoothLEAdvertisementReceivedEventArgs, BluetoothLEAdvertisementScanParameters,
+    BluetoothLEAdvertisementType, BluetoothLEAdvertisementWatcher,
+    BluetoothLEAdvertisementWatcherStoppedEventArgs, BluetoothLEScanningMode,
 };
 use windows::Devices::Bluetooth::BluetoothError;
 use windows::Foundation::TypedEventHandler;
@@ -58,6 +58,46 @@ pub(super) struct ScanStream {
     generation: u64,
 }
 
+/// Logs the first scan's scan-parameter outcome at info level, later ones at
+/// debug: it does not change while the process runs.
+static SCAN_PARAMETERS_REPORTED: std::sync::Once = std::sync::Once::new();
+
+impl ScanStream {
+    /// Ask for the low-latency scan window and interval
+    /// (`BluetoothLEAdvertisementScanParameters.LowLatency`, Windows 11
+    /// 24H2, build 26100, and later). Managed scans run only while
+    /// `discover()` is wanted, so the radio time is short. Where the class
+    /// or `IBluetoothLEAdvertisementWatcher3` is missing (`E_NOINTERFACE`,
+    /// class not registered) the call fails and the watcher keeps the
+    /// system's parameters: that failure is the feature check.
+    fn apply_low_latency(watcher: &BluetoothLEAdvertisementWatcher) {
+        let outcome = BluetoothLEAdvertisementScanParameters::LowLatency()
+            .and_then(|parameters| watcher.SetScanParameters(&parameters));
+        let mut first = false;
+        SCAN_PARAMETERS_REPORTED.call_once(|| first = true);
+        let level = if first {
+            log::Level::Info
+        } else {
+            log::Level::Debug
+        };
+        match outcome {
+            Ok(()) => log::log!(level, "scan parameters: LowLatency applied"),
+            Err(err) => log::log!(level, "scan parameters: not available ({err})"),
+        }
+    }
+
+    /// Whether one advertisement event is for `service`: its UUID list
+    /// names it, or it carries service data under it (a scan response or an
+    /// extended advertisement may hold only that).
+    fn matches_service(
+        service: ServiceUuid,
+        advertised_uuids: &[ServiceUuid],
+        service_data: &BTreeMap<ServiceUuid, Vec<u8>>,
+    ) -> bool {
+        advertised_uuids.contains(&service) || service_data.contains_key(&service)
+    }
+}
+
 /// Start a watcher for `service`. The caller has already claimed the scan
 /// slot under `generation`.
 impl ScanStream {
@@ -73,6 +113,7 @@ impl ScanStream {
             .map_err(|err| BleError::windows_error("SetScanningMode", err))?;
         // Windows 10 2004 and later; harmless to skip where it is missing.
         let _ = watcher.SetAllowExtendedAdvertisements(true);
+        Self::apply_low_latency(&watcher);
 
         let (tx, rx) = mpsc::channel(DISCOVERY_QUEUE_DEPTH);
         let tx = Arc::new(StdMutex::new(Some(tx)));
@@ -94,7 +135,9 @@ impl ScanStream {
                     .into_iter()
                     .map(|guid| ServiceUuid(WindowsCodec::from_guid(guid)))
                     .collect();
-                let matches_service = advertised_uuids.contains(&service);
+                let service_data = WindowsCodec::service_data_of(advertisement.DataSections()?);
+                let matches_service =
+                    Self::matches_service(service, &advertised_uuids, &service_data);
                 let is_scan_response =
                     args.AdvertisementType() == Ok(BluetoothLEAdvertisementType::ScanResponse);
 
@@ -120,9 +163,7 @@ impl ScanStream {
                         .manufacturer_data
                         .insert(data.CompanyId()?, WindowsCodec::from_buffer(&data.Data()?)?);
                 }
-                entry
-                    .service_data
-                    .extend(WindowsCodec::service_data_of(advertisement.DataSections()?));
+                entry.service_data.extend(service_data);
                 let name = advertisement.LocalName()?.to_string();
                 if !name.is_empty() {
                     entry.local_name = Some(name);
@@ -251,5 +292,23 @@ impl Drop for ScanStream {
             scan.active = false;
         }
         log::info!("scan: stopped generation={}", self.generation);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_result_matches_by_uuid_list_or_by_service_data() {
+        let service = ServiceUuid(uuid::Uuid::from_u128(0xB1E6));
+        let other = ServiceUuid(uuid::Uuid::from_u128(7));
+        let none = BTreeMap::new();
+        assert!(ScanStream::matches_service(service, &[service], &none));
+        assert!(!ScanStream::matches_service(service, &[other], &none));
+        let data: BTreeMap<_, _> = [(service, vec![0xF8; 9])].into();
+        assert!(ScanStream::matches_service(service, &[], &data));
+        let foreign: BTreeMap<_, _> = [(other, vec![1])].into();
+        assert!(!ScanStream::matches_service(service, &[], &foreign));
     }
 }
