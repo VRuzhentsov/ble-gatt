@@ -85,7 +85,8 @@ Managed discovery reads the radio records first (ADR-0012 §2):
   cache, for a fresh sighting (one with a signal strength). Otherwise one read.
   The peer is read again only when its hash changes.
 - **No record** (a Windows or Linux peer, an old build): a read after a 300 ms
-  grace for the scan response, then the ten-second refresh.
+  grace for the scan response. Later sightings of that address report the value
+  read, and it is read again after 30 s or when its radio fields change.
 
 A completion read has a 6 s deadline; header and no-record reads keep 10 s.
 

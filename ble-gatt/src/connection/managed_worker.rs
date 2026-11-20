@@ -149,6 +149,8 @@ pub(super) struct Worker {
     /// not connectable) to the connectable address of the same endpoint.
     endpoint_addresses: HashMap<EndpointId, PeerAddress>,
     address_endpoints: HashMap<PeerAddress, EndpointId>,
+    /// The value the last read at each address found (its cache key).
+    address_keys: HashMap<PeerAddress, MetadataKey>,
     /// The newest record key each such publisher advertised.
     published: HashMap<EndpointId, MetadataKey>,
     acquired: HashMap<PeerAddress, u64>,
@@ -186,6 +188,7 @@ impl Worker {
             metadata_cache: MetadataCache::default(),
             endpoint_addresses: HashMap::new(),
             address_endpoints: HashMap::new(),
+            address_keys: HashMap::new(),
             published: HashMap::new(),
             acquired: HashMap::new(),
             cleanup_failure: None,
@@ -722,14 +725,31 @@ impl Worker {
                     }
                     return None;
                 }
+                // A read of this address found its endpoint before: report that
+                // value on every fresh sighting, and read again only when the radio
+                // fields change or after `KNOWN_PEER_REFRESH`. Reading a phone's or a
+                // PC's metadata every 10 s held a link to it half of the time, and
+                // the other side's reads crossed those links (ADR-0012 §2).
+                let known = self
+                    .address_keys
+                    .get(&radio.address)
+                    .copied()
+                    .filter(|key| self.metadata_cache.hit(*key, now).is_some());
                 if let Some(entry) = tracked.get_mut(&radio.address) {
                     if entry.is_unnamed() {
-                        entry.update_radio(radio);
+                        entry.update_radio(radio.clone());
                     }
                 } else if tracked.len() < crate::advertisement::METADATA_CACHE_CAPACITY {
-                    tracked.insert(radio.address.clone(), TrackedPeer::managed(radio));
+                    let entry = match known {
+                        Some(_) => TrackedPeer::known(radio.clone()),
+                        None => TrackedPeer::managed(radio.clone()),
+                    };
+                    tracked.insert(radio.address.clone(), entry);
                 }
-                None
+                let key = known?;
+                let (endpoint, fields) = self.metadata_cache.fresh_hit(key, &radio, now)?;
+                let endpoint = *endpoint;
+                Some(Ok((endpoint, Self::cached_peer(fields, radio))))
             }
         }
     }
@@ -745,18 +765,21 @@ impl Worker {
         self.published.insert(endpoint, key);
     }
 
-    /// Remember that a read at `address` found `endpoint`.
-    fn remember_address(&mut self, endpoint: EndpointId, address: &PeerAddress) {
+    /// Remember that a read at `address` found `endpoint` and the value `key`.
+    fn remember_address(&mut self, endpoint: EndpointId, address: &PeerAddress, key: MetadataKey) {
         if self.endpoint_addresses.len() >= crate::advertisement::METADATA_CACHE_CAPACITY
             && !self.endpoint_addresses.contains_key(&endpoint)
         {
             self.endpoint_addresses.clear();
             self.address_endpoints.clear();
+            self.address_keys.clear();
         }
         if let Some(old) = self.endpoint_addresses.insert(endpoint, address.clone()) {
             self.address_endpoints.remove(&old);
+            self.address_keys.remove(&old);
         }
         self.address_endpoints.insert(address.clone(), endpoint);
+        self.address_keys.insert(address.clone(), key);
     }
 
     /// The radio fields of `peer` as a readable value.
@@ -801,12 +824,12 @@ impl Worker {
         });
         match &result {
             Ok((endpoint, peer, hash)) => {
-                self.remember_address(*endpoint, address);
                 let value = (*endpoint, Self::fields(peer));
                 let read = MetadataKey {
                     tag: endpoint.tag(),
                     hash: *hash,
                 };
+                self.remember_address(*endpoint, address, read);
                 if let Some(key) = key.filter(|key| *key != read) {
                     // The radio named an older value: remember the newer one
                     // under that name too, so it is not read again.
@@ -831,6 +854,11 @@ impl Worker {
         };
         let retry_at = key.map(|key| self.metadata_cache.retry_at(key, now));
         let report = entry.managed_result(result.as_ref().ok().map(|(_, peer, _)| peer), retry_at);
+        if result.is_ok() && entry.is_unnamed() {
+            // Its endpoint is known now: sightings report this value, and the
+            // next read waits `KNOWN_PEER_REFRESH`.
+            entry.known_refresh();
+        }
         report.then(|| result.map(|(endpoint, peer, _)| (endpoint, peer)))
     }
 

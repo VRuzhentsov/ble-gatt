@@ -117,7 +117,12 @@ automatically.
   Otherwise one read; later reads only when the hash changes.
 - *No record* (a Windows or Linux peer, an old peer, a foreign version): a read
   after a 300 ms grace for the scan response (Windows reports it apart from the
-  advertisement), then the ten-second refresh, as before.
+  advertisement). Once a read found the endpoint at that address, each fresh
+  sighting reports that value, and the next read waits 30 s
+  (`KNOWN_PEER_REFRESH`) or a change of the radio fields. A phone read a PC
+  without a record every 10 s, holding a link to it about half of the time, and
+  the PC's read of the phone's name crossed those links and stalled (18.1 s and
+  28.4 s on hardware).
 
 Reads use the existing bounded probe owner and its 10 s deadline (6 s for a
 completion read). The cache of

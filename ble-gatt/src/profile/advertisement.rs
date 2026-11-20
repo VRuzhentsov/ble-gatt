@@ -434,6 +434,15 @@ impl AdvertisementScan {
 /// by no more than that.
 pub(crate) const SCAN_RESPONSE_GRACE: Duration = Duration::from_millis(300);
 
+/// How often a managed scanner reads a peer without a radio record again once
+/// a read found its endpoint at that address (a Windows PC while it scans, a
+/// Linux peer). Meanwhile each sighting reports the last value, and a change of
+/// its radio fields reads at once. Every 10 s held a link to the peer half of
+/// the time (Android keeps an idle link 4 s), and the peer's own reads crossed
+/// those links and stalled (ADR-0012 §2). A Windows peer's publisher names a
+/// new value at once when the PC stops scanning.
+pub(crate) const KNOWN_PEER_REFRESH: Duration = Duration::from_secs(30);
+
 /// Deadline of one completion read. Shorter than a header read's 10 s: its
 /// peer is listed already, and a read that stalls on a link the peer dropped
 /// (Windows to Android, while the phone also reads the PC) is better retried
@@ -610,6 +619,19 @@ impl TrackedPeer {
             ReadKind::Unnamed,
             Instant::now() + SCAN_RESPONSE_GRACE,
         )
+    }
+    /// A peer without a radio record whose address a read already matched to
+    /// an endpoint: reported from that read, read again after
+    /// [`KNOWN_PEER_REFRESH`] or when its radio fields change.
+    pub(crate) fn known(peer: DiscoveredPeer) -> Self {
+        let mut tracked = Self::new(peer, ReadKind::Unnamed, Instant::now() + KNOWN_PEER_REFRESH);
+        tracked.has_been_reported = true;
+        tracked
+    }
+    /// After a read of a peer without a radio record: the next one waits
+    /// [`KNOWN_PEER_REFRESH`], not the 10 s refresh.
+    pub(crate) fn known_refresh(&mut self) {
+        self.next_read_at = Instant::now() + KNOWN_PEER_REFRESH;
     }
     /// A peer whose advertisement header names `key`: read at `read_at`.
     pub(crate) fn header(peer: DiscoveredPeer, key: MetadataKey, read_at: Instant) -> Self {

@@ -1015,8 +1015,12 @@ async fn managed_metadata_continuous_read_refreshes_without_new_native_fields() 
         .update_advertisement(GattAdvertisement::default())
         .await
         .unwrap();
-    // Existing raw refresh scheduling is ten seconds; each managed read still has a five-second deadline.
-    let changed = tokio::time::timeout(Duration::from_secs(11), discovery.next()).await;
+    // Once a read found the endpoint, the refresh is `KNOWN_PEER_REFRESH` (30 s), not 10 s.
+    let changed = tokio::time::timeout(
+        crate::advertisement::KNOWN_PEER_REFRESH + Duration::from_secs(2),
+        discovery.next(),
+    )
+    .await;
     drop(discovery);
     reader.close().await.unwrap();
     advertiser.close().await.unwrap();
@@ -2655,12 +2659,13 @@ async fn a_header_is_read_once_per_hash_across_scans() {
 }
 
 #[tokio::test]
-async fn a_peer_without_a_record_is_read_after_the_grace_on_every_scan() {
+async fn a_peer_without_a_record_is_read_once_then_reported_from_that_read() {
     let network = MockNetwork::new();
     let address = PeerAddress("unnamed-peer".into());
     network.set_radio_capacity(&address, crate::drivers::mock::RadioCapacity::None);
     let advertiser = advertiser_with(&network, "unnamed-peer", fast_config(Some("Linux")));
     advertiser.set_advertising(true).await.unwrap();
+    network.set_rssi(&address, Some(-50));
     let (_, control, reader) =
         BlockingVisibility::metadata_with(network, "unnamed-reader", fast_config(None));
     for scan in 1..=2 {
@@ -2670,11 +2675,23 @@ async fn a_peer_without_a_record_is_read_after_the_grace_on_every_scan() {
             .await
             .unwrap()
             .unwrap();
-        assert!(started.elapsed() >= crate::advertisement::SCAN_RESPONSE_GRACE);
+        if scan == 1 {
+            assert!(started.elapsed() >= crate::advertisement::SCAN_RESPONSE_GRACE);
+        } else {
+            assert!(
+                started.elapsed() < crate::advertisement::SCAN_RESPONSE_GRACE,
+                "the address is known: reported from the last read"
+            );
+        }
         assert_eq!(endpoint, advertiser.endpoint_id());
         assert_eq!(peer.name.as_deref(), Some("Linux"));
         assert_eq!(peer.manufacturer_data[&FINI_COMPANY], FINI_RECORD.to_vec());
-        assert_eq!(connects(&control), scan, "no record, no cache key");
+        assert_eq!(
+            connects(&control),
+            1,
+            "one read; the next waits KNOWN_PEER_REFRESH"
+        );
+        drop(discovery);
     }
     reader.close().await.unwrap();
     advertiser.close().await.unwrap();
