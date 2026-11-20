@@ -60,7 +60,7 @@ lock. The Rust diagnostic requires this process's service marker.
 
 Use package `dev.blegatt.example.debug` and activity
 `dev.blegatt.example.MainActivity`. Verify the packaged ABI, manifest and bridge
-bytecode, including bridge ABI 7. Source parity alone is insufficient. Diagnostic properties
+bytecode, including bridge ABI 8. Source parity alone is insufficient. Diagnostic properties
 are read only by debug builds. Do not run the interactive/datagram buttons at
 the same time as the iroh runner.
 
@@ -177,6 +177,22 @@ Require fresh evidence, independent of historical diagnostic passes, for:
    GATT must remain unaffected.
 8. iroh multi-user/path accounting with core-owned establishment, then native
    visibility, cancellation and physical checks on each required platform pair.
+
+9. Discovery from radio records (ADR-0012 §2), on real radios:
+   - Windows scanning an Android Fini peer lists it with no GATT connection
+     before the hand-off (`DISCOVERY ... after_ms=` in the iroh diagnostic,
+     `after_ms=` in `hw_peer`); the name follows from one completion read.
+   - Android scanning Windows: the first scan window reads once, later
+     windows do not; an Add Device change on Windows reaches the phone in
+     under 2 s (a new header hash).
+   - Captures (nRF Connect, btmon): Android's scan response holds an `0xFF`
+     structure with company `FFFF` and data starting `FC`; Windows' advertisement
+     holds a `0x21` structure starting `F8`, unless Windows logs
+     `started without the service data` (then record that evidence).
+   - Windows 11 24H2 logs `scan parameters: LowLatency applied`; older builds log
+     `not available`.
+   - Linux: btmon shows an advertising interval of about 250 ms (Balanced), and
+     scanners still read a Linux peer with Fini's data.
 
 Review metadata partial failure and WinRT watcher overflow/cache behavior.
 Source ownership guards and ABI checks do not prove native cancellation,

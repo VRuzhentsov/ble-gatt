@@ -72,15 +72,42 @@ Consume incoming requests with `tokio_stream::StreamExt::next`. Accept a winning
 incoming request independently when a crossed outgoing request fails. Never
 report the incoming winner as success for the losing outgoing attempt.
 
-Managed discovery completes missing profile metadata through GATT. It tracks up
-to 64 addresses and retains the five-second read deadline and existing native
-ownership reservations. Changed radio fields schedule another read. A continuous
-scan also uses the existing ten-second metadata refresh schedule. Three consecutive
-read failures stop refresh for that address. Refused initial probes report typed
-`QueueFull` for capacity or `AdapterBusy` for an address reservation. Finite scans
-then finish their admitted initial reads and close. Active scans defer refused
-work until the next refresh without consuming the read-failure budget.
-Raw scans and their opt-in completion behavior remain unchanged.
+Managed discovery reads the radio records first (ADR-0012 §2):
+
+- A **fast advertisement** lists the peer at once, with the manufacturer data
+  under `fast_advertisement_company` restored as the caller set it. When the
+  radio lacks a field (an Android peer's name), one completion read per endpoint
+  and hash follows, and the peer is reported again with it. The completion read
+  never delays the first report, waits while a dial or read holds the address,
+  and a `request` to that address cancels it: that request gets `AdapterBusy`
+  once, and a retry gets the address. Its failures are not reported.
+- An **advertisement header** whose value was read before is answered from the
+  cache, for a fresh sighting (one with a signal strength). Otherwise one read.
+  The peer is read again only when its hash changes.
+- **No record** (a Linux peer, an old build): a read after a 1 s grace for the
+  scan response, then the ten-second refresh.
+
+The cache lives as long as the `PeerLink`: 64 values, 5 min unseen at most,
+across scans and address rotation. A failed read waits 1 s, doubling to 5 min;
+only the first failure of a peer not yet reported is reported. Reads keep the
+10 s deadline and the native ownership reservations. Refused initial probes
+report typed `QueueFull` for capacity or `AdapterBusy` for an address
+reservation. Finite scans finish their admitted initial and completion reads
+and close. Raw scans and their opt-in completion behavior remain unchanged.
+
+Fast advertisement and advertising rate are set on `DatagramConfig`:
+
+```rust
+let mut config = ble_gatt::datagram::DatagramConfig::new(service, characteristic);
+config.advertised_manufacturer_data.insert(0xFFFF, vec![flags, 1, 2, 3, 4]);
+// Both sides: the record travels as 0xFFFF manufacturer data. At most 6 bytes of
+// the caller's entry fit in it; a longer entry means no fast advertisement.
+config.fast_advertisement_company = Some(0xFFFF);
+// Android: AdvertiseSettings mode; BlueZ: 100/250/1000 ms; Windows: ignored.
+config.advertising_mode = ble_gatt::AdvertisingMode::Balanced;
+```
+
+`PowerProfile::advertising_mode` suggests a mode per power profile.
 
 An owned attempt supplies its known endpoint without another native connection.
 Its native fields can change, but readable-only fields are not refreshed over
@@ -97,8 +124,11 @@ The configured service UUID is reserved in the caller's service-data map.
 Reserved-key injection and any omitted readable field fail before native work.
 
 The complete readable value retains the managed header and full local name.
-The native projection excludes that reserved header and name. Small caller
-manufacturer and nonreserved service data remain subject to native platform limits.
+The native projection excludes that reserved header and name; it carries the
+advertisement header (hash and endpoint tag) under the reserved key instead,
+and the fast advertisement when a company is configured. An update changes the
+hash, so scanners read the new value once. Small caller manufacturer and
+nonreserved service data remain subject to native platform limits.
 This is managed field placement, not a change to BG bytes, UUIDs, or the raw codec.
 Success does not guarantee that every optional native field was broadcast.
 

@@ -75,8 +75,27 @@ independent manufacturer-data publisher to repair profile discovery.
 `StartedWithoutAllAdvertisementData`. This is not a universal prohibition on
 service data or a fixed payload limit for every Windows configuration.[1]
 
-Advertise the fields the chosen API can supply. Shared profile discovery, not
+Advertise the fields the chosen API can supply. For `PeerLink` that is the
+9-byte advertisement header (ADR-0012 §2, §5) as `ServiceData`: within the room
+Windows gives service data next to a 128-bit UUID. Scanners then read the readable
+value once per header hash instead of on a timer. Where Windows starts without it
+(`StartedWithoutAllAdvertisementData`, logged with its size), scanners read as
+before. The fast advertisement is not placed: the provider has no manufacturer
+data, and the rule above keeps a publisher out. Phase 2 (ADR-0012) spikes
+Windows 26100's extended provider advertisement first; a Nearby-style publisher
+is reconsidered only if it uses the provider's address. Shared profile discovery, not
 the Windows driver, determines whether it must fetch readable GATT metadata.
+
+The watcher scans actively with extended advertisements allowed, and asks for
+`BluetoothLEAdvertisementScanParameters.LowLatency()` (Windows 11 24H2, build
+26100) through `SetScanParameters`. Managed scans run only while discovery is
+wanted, so the duty cycle is short. Where the class or interface is missing the
+call fails, the watcher keeps the system parameters and logs "scan parameters:
+not available"; that failure is the feature check, with no build-time switch.
+The `windows` crate is at least 0.62.2, the first with that class. If end-to-end
+runs show LE-connection or Wi-Fi regressions, `CoexistenceOptimized` is the
+fallback. A result matches the service by its UUID list or by service data under
+the service UUID.
 The driver implements reads and `set_characteristic_value` without replacing a
 live server merely to update its data. See ADR-0012 for format/cache policy.
 
@@ -127,7 +146,7 @@ stopping serving. Session/generation checks protect replacement objects.
 Logical exclusion remains distinct from physical peripheral disconnect.
 
 Linux and Android also separate visibility from server ownership. Android's
-Rust/JNI and Kotlin bridge require ABI 7. Scan-start exceptions roll back only
+Rust/JNI and Kotlin bridge require ABI 8. Scan-start exceptions roll back only
 the failed callback ownership. Source guards do not prove compiled descriptors,
 APK packaging, callback timing or native execution.
 

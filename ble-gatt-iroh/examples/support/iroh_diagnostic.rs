@@ -477,6 +477,7 @@ impl Options {
         mark(format!("READY local={id} service={}", config.service.0));
         let result = tokio::time::timeout(self.timeout, async {
         if self.initiate {
+            let scan_started = std::time::Instant::now();
             let mut scan = peer_link.discover().await.map_err(|e| format!("discovery: {e}"))?;
             let address = loop {
                 let (_core_endpoint, peer) = scan
@@ -484,10 +485,12 @@ impl Options {
                     .await
                     .ok_or("discovery ended")?
                     .map_err(|e| e.to_string())?;
+                // Scan start to item: a radio record lists a peer at once, a read takes seconds.
                 mark(format!(
-                    "DISCOVERY advertised_address={} hint_match={}",
+                    "DISCOVERY advertised_address={} hint_match={} after_ms={}",
                     peer.address.0,
-                    peer.manufacturer_data.get(&COMPANY) == Some(&Options::hint(self.peer))
+                    peer.manufacturer_data.get(&COMPANY) == Some(&Options::hint(self.peer)),
+                    scan_started.elapsed().as_millis()
                 ));
                 if peer.manufacturer_data.get(&COMPANY) == Some(&Options::hint(self.peer)) {
                     break peer.address;

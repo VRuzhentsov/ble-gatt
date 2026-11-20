@@ -106,8 +106,9 @@ served (`Driver::served_service`), and nothing if serving was stopped
 ### Scan response
 A second packet of up to 31 bytes that an advertiser sends only when a
 scanner asks for it. Scanners ask during an *active* scan, which is how both
-Android and BlueZ scan. This library puts a peer's local name there, because
-the advertisement itself is full. *Also called:* SCAN_RSP.
+Android and BlueZ scan. This library puts there what does not fit the
+advertisement: on Android the fast advertisement, otherwise the advertisement
+header or the local name. *Also called:* SCAN_RSP.
 
 ### Local name
 A short, human-readable name a peripheral advertises so a scanner can show
@@ -200,17 +201,55 @@ task has answered.
 ## This library's concepts
 
 ### Fast advertisement
-Advertisement data that travels in the radio advertisement itself, so a
-scanner reads it without connecting. Android and Linux peers can send it.
-The term comes from Google Nearby (ADR-0012).
+A radio record of at most 27 bytes that carries a managed peer's endpoint,
+its metadata hash and up to 6 bytes of the caller's manufacturer data, so a
+scanner lists the peer without connecting (`GattServiceSpec::fast_advertisement`,
+`DatagramConfig::fast_advertisement_company`). It travels as manufacturer data
+under a company the application chooses (Fini: `0xFFFF`) and replaces the
+caller's entry there; the scanner restores it. Android sends it in the scan
+response; Windows and Linux cannot. The term comes from Google Nearby, whose
+fast advertisement is the same idea in its own format (ADR-0012 §2, §5).
+
+### Advertisement header
+A 9-byte radio record, service data under the managed service: the metadata
+hash and the endpoint tag. A scanner that has read the value it names reports
+the peer from its cache; otherwise it reads once. Nearby's BLE medium
+advertises a header with a hash for the same purpose (ADR-0012 §2, §5).
+
+### Metadata hash
+FNV-1a-32 of the complete readable advertisement value (the GATT
+advertisement). It changes when the name or any advertised field changes, so
+a scanner knows when to read again. A cache key, not a security check.
+
+### Endpoint tag
+The first four bytes of an endpoint identifier, as the advertisement header
+carries them. It narrows which endpoint a header belongs to; the read checks it.
+
+### Completion read
+The one read a scanner makes after a fast advertisement whose radio fields do
+not have the advertised hash (on Android the name does not fit). It runs at
+most once per endpoint and hash, waits while a dial or another read holds the
+address, and gives way to a dial (ADR-0012 §2).
+
+### Advertising mode
+How often a peripheral advertises (`AdvertisingMode`: `LowPower`, `Balanced`,
+`LowLatency`, named after Android's `AdvertiseSettings`). More often is found
+sooner and costs more battery. BlueZ gets 1000, 250 or 100 ms; Windows has no
+setting.
+
+### Scan parameters
+How long and how often a scanner listens (scan window, scan interval). Windows
+11 24H2 lets a watcher ask for presets (`BluetoothLEAdvertisementScanParameters`
+`LowLatency`, `CoexistenceOptimized`); the Windows driver asks for `LowLatency`
+where the API exists (ADR-0011).
 
 ### GATT advertisement
 The same advertisement data, served in a readable characteristic
 (`advertisement::GATT_ADVERTISEMENT_CHARACTERISTIC`) of every datagram
 service. A scanner reads it when a peer's radio advertisement carries no
-profile data (`advertisement::complete`, ADR-0012). Select completion from received
-information, not the OS name. Nearby also retrieves full metadata through GATT;
-this library does not implement its exact header/hash protocol.
+profile data (`advertisement::complete`, ADR-0012), and a managed scanner when
+the radio records do not name a value it has read already. Select completion
+from received information, not the OS name.
 
 ### Peer
 Another device this library talks to.

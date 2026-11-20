@@ -38,31 +38,91 @@ simultaneous-role or crossed-attempt support.
 ### 2. Discovery and metadata
 
 **Reference.** Nearby separates discovery from connection requests.[5][9]
-Its BLE tracker retrieves full metadata through GATT and caches successful reads.[2]
+Its connection advertisement can travel whole in the radio ("fast advertisement",
+at most 27 bytes of service data).[14] Otherwise its BLE medium keeps the full
+advertisement in GATT, advertises a short header with a hash of it, reads each
+header once, and backs failed reads off from 1 s to 5 min.[2][15]
 Windows can use an alternate-UUID advertisement to trigger retrieval.[3]
 
 **Implementation.** `ManagedMetadata` constructs complete readable metadata with
 the unchanged version/capability and endpoint header. It rejects caller use of
 the reserved service-data key and any field omitted by the readable encoder.
-The native projection excludes the managed header and local name. Small caller
-manufacturer and nonreserved service data remain subject to platform limits.
-This changes managed field placement, not the selected bytes or raw behavior.
+The radio carries no readable value and no local name; it carries two compact
+records of it instead (§5), our own format, not Nearby's:
 
-Managed discovery uses valid radio profile data when present; otherwise, it reads
-GATT metadata through the existing bounded probe owner. Up to 64 tracked addresses
-use five-second read deadlines. Changed radio fields schedule another read; an
-active scan also uses the existing ten-second metadata refresh schedule. Three
-consecutive read failures stop that address's refresh. Refused initial probes report
-`QueueFull` for capacity or `AdapterBusy` for an address reservation. Finite scans
-finish admitted initial reads and close. Active scans defer refused work until
-refresh without consuming the read-failure budget.
+- the **advertisement header** (9 bytes): the FNV-1a-32 hash of the readable
+  value and the endpoint tag (the endpoint's first four bytes), as service data
+  under the managed service;
+- the **fast advertisement** (21 to 27 bytes), only when
+  `DatagramConfig::fast_advertisement_company` names a company: the hash, the
+  whole endpoint, and the caller's manufacturer data under that company (at most
+  6 bytes, Fini's 5). It travels as that company's manufacturer data and
+  replaces the caller's entry; a scanner restores the entry from it.
+
+The hash is a cache key, not a security boundary (ADR-0003). FNV-1a needs no new
+dependency; Nearby truncates SHA-256 for the same field.
+
+**Placement.** Core builds both records; each driver places what fits:
+
+1. Android: the scan response carries the fast advertisement, otherwise the
+   header (or, for a raw spec, the name). The advertising packet carries the UUID,
+   the other manufacturer data and service data under other UUIDs
+   (`GattServiceSpec::legacy_placement`, `AdvertisePlacement.kt`). Android's
+   `ADVERTISE_FAILED_DATA_TOO_LARGE` retries once without the fast advertisement.
+2. Windows: the provider's `ServiceData` carries the header when the hardware
+   has room; it reports `StartedWithoutAllAdvertisementData` otherwise. No fast
+   advertisement: ADR-0011 D3 keeps a separate publisher out.
+3. Linux: BlueZ has no scan response for us, and the header does not fit next to
+   the 128-bit UUID list (`legacy_advertising_len`), so it is left out. Scanners
+   read a Linux peer, as before.
+4. Mock: Android's placement (`RadioCapacity::Legacy`), or none (`RadioCapacity::None`).
+
+The fast advertisement leaves no room for the name in Android's scan response.
+The name comes from one read instead (the completion read below).
+`GattServiceSpec::advertising_mode` (`DatagramConfig::advertising_mode`, default
+`Balanced`) sets Android's advertise mode and BlueZ's interval; Windows has no API.
+`PowerProfile::advertising_mode` advises one per power profile; nothing switches it
+automatically.
+
+**Discovery.** Managed discovery reads each result's records:
+
+- *Fast advertisement:* the endpoint is known, so the peer is reported at once,
+  with the caller's manufacturer data restored. If the readable value rebuilt from
+  the radio fields has the advertised hash, the peer is complete. Otherwise (no
+  name on Android) one **completion read** per endpoint and hash fills in the rest
+  and reports again if fields changed. It is low priority: it waits while a dial,
+  another read or a retirement holds the address, a `request` to that address
+  cancels it (the request is refused once, like one meeting a probe, and a retry
+  gets the address), and its failures are not reported.
+- *Advertisement header:* a peer whose header is in the cache is reported from it
+  without a read, at its current address and signal strength, but only for a
+  fresh sighting (BlueZ re-reports cached devices without a signal strength).
+  Otherwise one read; later reads only when the hash changes.
+- *No record* (a Linux peer, an old peer, a foreign version): a read after a 1 s
+  grace for the scan response, then the ten-second refresh, as before.
+
+Reads use the existing bounded probe owner and its 10 s deadline. The cache of
+readable values lives for the worker, not one scan: up to 64 values, least
+recently seen out first, forgotten after 5 min unseen. Keys survive address
+rotation. A failed read waits 1 s, doubling to 5 min, and only the first failure
+of a peer not yet reported is reported. Refused initial probes report `QueueFull`
+for capacity or `AdapterBusy` for an address reservation. Finite scans finish
+admitted initial and completion reads and close.
+
+Scanners match on the UUID list or service data under the service UUID.
+Unknown record versions fall back to the read; the readable value itself stays
+fail-closed. Old builds do not understand the records (accepted: both PRs ship
+together).
 
 Owned attempts supply known endpoint data without opening a replacement session.
 Readable-only fields are not refreshed over those sessions. An inbound peripheral
 session has no remote characteristic-read port. This remains a consumer acceptance
 gap, not proof of continuous complete metadata refresh for connected peers.
-This is not Nearby's header/hash cache protocol. Raw scanning and its opt-in
-`advertisement::complete` behavior remain unchanged.
+Raw scanning and its opt-in `advertisement::complete` behavior remain unchanged.
+
+Not done here (phase 2): extended advertisements carrying the fast record and all
+caller fields (Android `AdvertisingSet`, BlueZ secondary channel, Windows 26100's
+extended provider), and the header bit plus 3 s read delay Nearby uses for them.
 
 A metadata read is not accepted message communication. Release only resources
 owned by the read. Acquired-resource Drop cleanup is asynchronous and needs a
@@ -175,6 +235,19 @@ legacy downgrade. Record lengths include the tag:
 | 6 | Ping | attempt | 9 bytes |
 | 7 | Pong | attempt | 9 bytes |
 
+Radio records (§2) are versioned apart from `BG` v1. Their first byte is
+`1 1 1 1 1 K V V` (`K` the kind, `VV` the version less one), never valid UTF-8,
+so no scanner reads one as a name:
+
+| First byte | Record | Fields after it | Length | Carrier |
+|---|---|---|---|---|
+| `0xF8` | Advertisement header v1 | hash (4), endpoint tag (4) | 9 bytes | service data under the managed service |
+| `0xFC` | Fast advertisement v1 | hash (4), endpoint (16), tail (0 to 6) | 21 to 27 bytes | manufacturer data under the fast company (extended advertisements: service data, phase 2) |
+
+The hash is FNV-1a-32 (offset basis `0x811C9DC5`, prime `0x01000193`) over the
+complete readable characteristic value. The tail is the caller's manufacturer
+data under the fast company; a tail over 6 bytes means no fast advertisement.
+
 Version/capability fields occur in metadata and Request, not every record.
 Reject malformed lengths, unknown tags and invalid decisions. Validate endpoint
 and attempt correlation before establishment or delivery. Application payloads
@@ -223,7 +296,8 @@ surfaces. Raw vendor APIs remain separate. See [current usage](../interface.md).
 ## Migration and verification gates for this PR
 
 The working tree now contains the handshake, managed adapter migration, initial
-service-data publication, native visibility port and Android ABI 7 forwarding.
+service-data publication, native visibility port, the radio records with their
+read cache (§2) and Android ABI 8 forwarding.
 These are source observations, not final acceptance results.
 
 Before acceptance, verify:
@@ -276,3 +350,5 @@ Keep the existing btleplug BSD notice with the Windows code.
 [11] https://raw.githubusercontent.com/google/nearby/eed92ff1567bda238e1a1a6a231d0ddace486a55/connections/implementation/endpoint_manager.cc
 [12] https://raw.githubusercontent.com/google/nearby/eed92ff1567bda238e1a1a6a231d0ddace486a55/connections/implementation/client_proxy.cc
 [13] https://raw.githubusercontent.com/google/nearby/eed92ff1567bda238e1a1a6a231d0ddace486a55/connections/implementation/proto/offline_wire_formats.proto
+[14] https://raw.githubusercontent.com/google/nearby/3dd6a16/connections/implementation/mediums/ble.cc (fast advertisement, `ble_advertisement.h` "leaves 27")
+[15] https://raw.githubusercontent.com/google/nearby/3dd6a16/connections/implementation/mediums/ble/advertisement_read_result.cc (read backoff 1 s to 5 min)

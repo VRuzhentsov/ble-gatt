@@ -172,6 +172,7 @@ async fn run_central(target: Option<String>) -> Result<(), String> {
         Some(address) => PeerAddress(address),
         None => {
             println!("HWVERIFY: INFO scanning for {SERVICE}");
+            let scan_started = std::time::Instant::now();
             let mut found = adapter
                 .central()
                 .scan(ServiceUuid(SERVICE))
@@ -183,10 +184,11 @@ async fn run_central(target: Option<String>) -> Result<(), String> {
                 .ok_or_else(|| "scan stream ended without a result".to_string())?
                 .map_err(|err| format!("scan failed: {err}"))?;
             println!(
-                "HWVERIFY: INFO discovered {} rssi={:?} services={}",
+                "HWVERIFY: INFO discovered {} rssi={:?} services={} after_ms={}",
                 discovered.address.0,
                 discovered.rssi,
-                discovered.services.len()
+                discovered.services.len(),
+                scan_started.elapsed().as_millis()
             );
             discovered.address
         }

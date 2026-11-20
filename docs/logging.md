@@ -87,6 +87,23 @@ first that did not:
 | `channel ready` with no `send` | the caller never sent; not a transport problem |
 | `send` with no matching `recv` on the peer | fragments left but did not arrive — check the peer's `reassembly:` warnings |
 
+### Managed discovery (ADR-0012 §2)
+
+| Line | Level | Meaning |
+| --- | --- | --- |
+| `discover: … complete from its fast advertisement` | debug | listed from the radio, no read |
+| `discover: … from its fast advertisement; one read completes it` | debug | listed now; a completion read follows (an Android peer's name) |
+| `discover: reading … failed (…), next try in …` | debug | a header or completion read failed; the backoff doubles from 1 s to 5 min |
+| `request: … cancels its completion read` | debug | a dial took the address from a completion read |
+| `scan parameters: LowLatency applied` / `not available (…)` | info once, then debug | Windows 11 24H2 scan preset taken, or the API is missing |
+| `advertise: started without the service data (… bytes …)` | info | Windows had no room for the header; scanners read instead |
+| `advertise: the service data under … does not fit the legacy advertisement` | info | BlueZ left the header out (always, next to a 128-bit UUID) |
+| `advertise: interval … (…)` / `BlueZ refused the advertising interval` | info | BlueZ took the advertising mode's interval, or registered without one |
+| `startAdvertising: … fast=true advertising=21B scanResponse=30B` | Kotlin debug | Android placement of a Fini-shaped advertisement |
+
+`jni onPeerDiscovered` is at `debug`: the Android driver passes on a result
+whose data did not change only every 5 s, and that line is per result.
+
 ## Android
 
 `eprintln!` was previously used for diagnostics. On Android stderr is not
