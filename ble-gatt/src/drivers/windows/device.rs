@@ -1,26 +1,24 @@
 //! Central role, one link: `BluetoothLEDevice`, `GattSession` and
 //! `GattCharacteristic`.
 //!
-//! Adapted from btleplug (`src/winrtble/ble/device.rs` and
-//! `src/winrtble/ble/characteristic.rs`), Copyright (c) 2020-2021,
-//! Nonpolynomial, BSD-3-Clause: see `LICENSES/btleplug-BSD-3-Clause.txt`.
-//! Taken from it:
-//!
-//! - Uncached GATT discovery falls back to the Windows cache after
-//!   [`GATT_CACHE_TIMEOUT`], because some Windows Bluetooth drivers never
-//!   answer an uncached request (btleplug issue #325). Unlike btleplug, only
-//!   the services are discovered uncached; their characteristics come from
-//!   the cache that this discovery refreshed.
-//! - Link loss is `BluetoothLEDevice.ConnectionStatusChanged` to
-//!   `Disconnected`.
+//! - Services are discovered from the peer (`BluetoothCacheMode::Uncached`);
+//!   a request the peer has not answered within
+//!   [`UNCACHED_DISCOVERY_TIMEOUT`] is repeated against the Windows cache,
+//!   because some Windows Bluetooth drivers never answer an uncached
+//!   request. Characteristics come from the cache that this discovery
+//!   refreshed.
+//! - Link loss is either `BluetoothLEDevice.ConnectionStatusChanged` to
+//!   `Disconnected` or `GattSession.SessionStatusChanged` to `Closed`,
+//!   whichever comes first.
 //! - `subscribe` writes Notify or Indicate to the CCCD, whichever the
-//!   characteristic has, and never leaves two `ValueChanged` handlers on one
+//!   characteristic has, and keeps at most one `ValueChanged` handler per
 //!   characteristic.
-//! - `request_connection_priority` checks the status of the WinRT request.
+//! - `request_connection_priority` keeps a request only when WinRT reports
+//!   it accepted.
 //!
-//! Kept from bluest instead: the address type from the scan for the dial,
-//! and `GattSession.MaintainConnection`, without which Windows may drop an
-//! idle link after a few seconds.
+//! As in bluest: the dial uses the address type from the scan, and
+//! `GattSession.MaintainConnection` holds the link, without which Windows may
+//! drop an idle link after a few seconds.
 
 use std::collections::HashMap;
 use std::future::IntoFuture;
@@ -54,9 +52,9 @@ use crate::entities::models::{
 };
 use crate::hal::{BoxStream, GattConnection, DEFAULT_ATT_MTU};
 
-/// How long an uncached discovery may take before the cached result is used
-/// instead. btleplug's value.
-const GATT_CACHE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a GATT discovery request waits for the peer before it is
+/// answered from the Windows cache instead.
+const UNCACHED_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How often GATT discovery checks that its link is still up.
 const LINK_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -175,6 +173,39 @@ impl OpenedLink {
         }
     }
 
+    /// Call `lost` when this open link goes down. Windows reports that in
+    /// two places: the device's `ConnectionStatusChanged` to `Disconnected`,
+    /// and the `GattSession`'s `SessionStatusChanged` to `Closed` when it
+    /// gives up on the link without a status change. Both are watched, so
+    /// `lost` can run twice; [`Inner::link_closed`] reports only the first.
+    /// Returns the two registration tokens, `None` where WinRT refused one.
+    fn watch_loss(&self, lost: impl Fn() + Send + Sync + 'static) -> (Option<i64>, Option<i64>) {
+        let lost = Arc::new(lost);
+        let on_status = {
+            let lost = lost.clone();
+            TypedEventHandler::new(
+                move |device: Ref<BluetoothLEDevice>, _: Ref<IInspectable>| {
+                    if device.ok()?.ConnectionStatus()? == BluetoothConnectionStatus::Disconnected {
+                        lost();
+                    }
+                    Ok(())
+                },
+            )
+        };
+        let on_session = TypedEventHandler::new(
+            move |_: Ref<GattSession>, args: Ref<GattSessionStatusChangedEventArgs>| {
+                if args.ok()?.Status()? == GattSessionStatus::Closed {
+                    lost();
+                }
+                Ok(())
+            },
+        );
+        (
+            self.device.ConnectionStatusChanged(&on_status).ok(),
+            self.gatt_session.SessionStatusChanged(&on_session).ok(),
+        )
+    }
+
     async fn services_with_cache_mode(
         device: &BluetoothLEDevice,
         mode: BluetoothCacheMode,
@@ -182,34 +213,42 @@ impl OpenedLink {
         device.GetGattServicesWithCacheModeAsync(mode)?.await
     }
 
+    /// Run one discovery `request` with `BluetoothCacheMode::Uncached`. When
+    /// the peer has not answered within [`UNCACHED_DISCOVERY_TIMEOUT`], drop
+    /// that request and run it again with `BluetoothCacheMode::Cached`.
+    /// `kind` names the discovery in the log.
+    async fn uncached_or_cached<T, Request, Answer>(
+        kind: &str,
+        request: Request,
+    ) -> windows::core::Result<T>
+    where
+        Request: Fn(BluetoothCacheMode) -> Answer,
+        Answer: std::future::Future<Output = windows::core::Result<T>>,
+    {
+        let from_peer = request(BluetoothCacheMode::Uncached);
+        if let Ok(answer) = tokio::time::timeout(UNCACHED_DISCOVERY_TIMEOUT, from_peer).await {
+            return answer;
+        }
+        log::warn!("connect: uncached {kind} discovery timed out, using the Windows cache");
+        request(BluetoothCacheMode::Cached).await
+    }
+
     async fn discover_services(
         device: &BluetoothLEDevice,
     ) -> std::result::Result<Vec<GattDeviceService>, String> {
-        let uncached = tokio::time::timeout(
-            GATT_CACHE_TIMEOUT,
-            Self::services_with_cache_mode(device, BluetoothCacheMode::Uncached),
-        )
-        .await;
-        let result = match uncached {
-            Ok(result) => result,
-            Err(_) => {
-                log::warn!(
-                    "connect: uncached service discovery timed out, using the Windows cache"
-                );
-                Self::services_with_cache_mode(device, BluetoothCacheMode::Cached).await
-            }
-        }
-        .map_err(|err| format!("GetGattServicesAsync: {err}"))?;
-        let status = result
-            .Status()
-            .map_err(|err| format!("GetGattServicesAsync: {err}"))?;
-        // Check the status first. An empty `Services` list can also mean discovery failed.
-        if status != GattCommunicationStatus::Success {
-            return Err(match status {
-                GattCommunicationStatus::Unreachable => "unreachable".to_string(),
-                GattCommunicationStatus::AccessDenied => "access denied".to_string(),
-                other => format!("service discovery failed (status {})", other.0),
-            });
+        let failed = |err: windows::core::Error| format!("GetGattServicesAsync: {err}");
+        let result = Self::uncached_or_cached("service", |mode| {
+            Self::services_with_cache_mode(device, mode)
+        })
+        .await
+        .map_err(failed)?;
+        // An empty `Services` list can also mean that discovery failed, so
+        // the status decides.
+        match result.Status().map_err(failed)? {
+            GattCommunicationStatus::Success => {}
+            GattCommunicationStatus::Unreachable => return Err("unreachable".to_string()),
+            GattCommunicationStatus::AccessDenied => return Err("access denied".to_string()),
+            other => return Err(format!("service discovery failed (status {})", other.0)),
         }
         // Collected into a `Vec`: the WinRT list view is not `Send`.
         Ok(result
@@ -229,9 +268,23 @@ impl OpenedLink {
             .await
     }
 
+    /// The characteristics in one discovery answer, or why there are none.
+    fn listed_characteristics(
+        answer: windows::core::Result<GattCharacteristicsResult>,
+    ) -> std::result::Result<Vec<GattCharacteristic>, String> {
+        let result = answer.map_err(|err| err.to_string())?;
+        match result.Status() {
+            Ok(GattCommunicationStatus::Success) => Ok(result
+                .Characteristics()
+                .map(|list| list.into_iter().collect())
+                .unwrap_or_default()),
+            Ok(status) => Err(format!("status {}", status.0)),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
     /// Every characteristic of `service`, or none when Windows cannot list
-    /// them. btleplug also skips such a service instead of failing the
-    /// connection.
+    /// them: one service without a list does not fail the connection.
     ///
     /// `service` comes from an uncached service discovery on this link, so
     /// the Windows cache holds its characteristics already: read them from
@@ -239,50 +292,22 @@ impl OpenedLink {
     /// request for each service took 60-90 ms on a fast link and up to 1.6 s
     /// on a link that had just come up, in every connection.
     async fn discover_characteristics(service: &GattDeviceService) -> Vec<GattCharacteristic> {
-        if let Ok(result) =
-            Self::characteristics_with_cache_mode(service, BluetoothCacheMode::Cached).await
-        {
-            if result.Status() == Ok(GattCommunicationStatus::Success) {
-                let cached: Vec<GattCharacteristic> = result
-                    .Characteristics()
-                    .map(|list| list.into_iter().collect())
-                    .unwrap_or_default();
-                if !cached.is_empty() {
-                    return cached;
-                }
+        let cached = Self::listed_characteristics(
+            Self::characteristics_with_cache_mode(service, BluetoothCacheMode::Cached).await,
+        );
+        if let Ok(cached) = cached {
+            if !cached.is_empty() {
+                return cached;
             }
         }
-        let uncached = tokio::time::timeout(
-            GATT_CACHE_TIMEOUT,
-            Self::characteristics_with_cache_mode(service, BluetoothCacheMode::Uncached),
-        )
+        let answer = Self::uncached_or_cached("characteristic", |mode| {
+            Self::characteristics_with_cache_mode(service, mode)
+        })
         .await;
-        let result = match uncached {
-            Ok(result) => result,
-            Err(_) => {
-                log::warn!(
-                    "connect: uncached characteristic discovery timed out, using the Windows cache"
-                );
-                Self::characteristics_with_cache_mode(service, BluetoothCacheMode::Cached).await
-            }
-        };
-        match result {
-            Ok(result) if result.Status() == Ok(GattCommunicationStatus::Success) => result
-                .Characteristics()
-                .map(|list| list.into_iter().collect())
-                .unwrap_or_default(),
-            Ok(result) => {
-                log::debug!(
-                    "connect: characteristics not listed (status {:?})",
-                    result.Status().map(|s| s.0)
-                );
-                Vec::new()
-            }
-            Err(err) => {
-                log::debug!("connect: characteristics not listed: {err}");
-                Vec::new()
-            }
-        }
+        Self::listed_characteristics(answer).unwrap_or_else(|reason| {
+            log::debug!("connect: characteristics not listed ({reason})");
+            Vec::new()
+        })
     }
 }
 
@@ -345,40 +370,17 @@ impl WindowsGattConnection {
     /// Watch the opened link for loss and wrap it.
     pub(super) fn new(inner: Arc<Inner>, address: String, session: u64, link: OpenedLink) -> Self {
         let closed = Arc::new(AtomicBool::new(false));
-        let connection_token = {
+        let lost = {
             let weak = Arc::downgrade(&inner);
             let closed = closed.clone();
             let watched = address.clone();
-            let handler = TypedEventHandler::new(
-                move |sender: Ref<BluetoothLEDevice>, _: Ref<IInspectable>| {
-                    if sender.ok()?.ConnectionStatus()? == BluetoothConnectionStatus::Disconnected {
-                        if let Some(inner) = weak.upgrade() {
-                            inner.link_closed(&watched, session, &closed);
-                        }
-                    }
-                    Ok(())
-                },
-            );
-            link.device.ConnectionStatusChanged(&handler).ok()
+            move || {
+                if let Some(inner) = weak.upgrade() {
+                    inner.link_closed(&watched, session, &closed);
+                }
+            }
         };
-        // A second signal: the session closes when Windows gives up on the
-        // link even if no connection status change was raised.
-        let session_token = {
-            let weak = Arc::downgrade(&inner);
-            let closed = closed.clone();
-            let watched = address.clone();
-            let handler = TypedEventHandler::new(
-                move |_: Ref<GattSession>, args: Ref<GattSessionStatusChangedEventArgs>| {
-                    if args.ok()?.Status()? == GattSessionStatus::Closed {
-                        if let Some(inner) = weak.upgrade() {
-                            inner.link_closed(&watched, session, &closed);
-                        }
-                    }
-                    Ok(())
-                },
-            );
-            link.gatt_session.SessionStatusChanged(&handler).ok()
-        };
+        let (connection_token, session_token) = link.watch_loss(lost);
         let subscriptions = Arc::new(StdMutex::new(Vec::<(Uuid, GattCharacteristic, i64)>::new()));
         let weak = Arc::downgrade(&inner);
         let watched = address.clone();
@@ -465,23 +467,33 @@ impl WindowsGattConnection {
         }
         self.characteristics.clear();
     }
-}
 
-/// Select Notify, then Indicate, then `None`, based on the characteristic
-/// properties (btleplug's `to_descriptor_value`).
-impl WindowsGattConnection {
-    fn descriptor_value(
+    /// The CCCD value that turns on updates for a characteristic with
+    /// `properties`: Notify when it has Notify, otherwise Indicate when it
+    /// has Indicate, otherwise `None` (it cannot be subscribed to).
+    fn cccd_value(
         properties: GattCharacteristicProperties,
     ) -> GattClientCharacteristicConfigurationDescriptorValue {
-        if (properties & GattCharacteristicProperties::Notify) != GattCharacteristicProperties::None
+        use GattClientCharacteristicConfigurationDescriptorValue as Cccd;
+        [
+            (GattCharacteristicProperties::Notify, Cccd::Notify),
+            (GattCharacteristicProperties::Indicate, Cccd::Indicate),
+        ]
+        .into_iter()
+        .find(|(property, _)| properties.contains(*property))
+        .map_or(Cccd::None, |(_, value)| value)
+    }
+
+    /// Unregister the `ValueChanged` handler of an earlier subscription to
+    /// `characteristic`, if there is one.
+    fn remove_subscription(&self, characteristic: Uuid) {
+        let mut subscriptions = self.subscriptions.lock().unwrap();
+        while let Some(index) = subscriptions
+            .iter()
+            .position(|(uuid, _, _)| *uuid == characteristic)
         {
-            GattClientCharacteristicConfigurationDescriptorValue::Notify
-        } else if (properties & GattCharacteristicProperties::Indicate)
-            != GattCharacteristicProperties::None
-        {
-            GattClientCharacteristicConfigurationDescriptorValue::Indicate
-        } else {
-            GattClientCharacteristicConfigurationDescriptorValue::None
+            let (_, earlier, token) = subscriptions.remove(index);
+            let _ = earlier.RemoveValueChanged(token);
         }
     }
 }
@@ -566,7 +578,7 @@ impl GattConnection for WindowsGattConnection {
         characteristic: CharacteristicUuid,
     ) -> Result<BoxStream<Result<Vec<u8>>>> {
         let target = self.characteristic(characteristic)?.clone();
-        let config = Self::descriptor_value(
+        let config = Self::cccd_value(
             target
                 .CharacteristicProperties()
                 .map_err(|err| BleError::windows_error("subscribe", err))?,
@@ -578,17 +590,7 @@ impl GattConnection for WindowsGattConnection {
             )));
         }
         // A new subscription replaces the old one: never two handlers.
-        {
-            let mut subscriptions = self.subscriptions.lock().unwrap();
-            subscriptions.retain(|(uuid, old, token)| {
-                if *uuid == characteristic.0 {
-                    let _ = old.RemoveValueChanged(*token);
-                    false
-                } else {
-                    true
-                }
-            });
-        }
+        self.remove_subscription(characteristic.0);
         let (tx, rx) = mpsc::channel(NOTIFY_QUEUE_DEPTH);
         let overflow = Arc::new(AtomicBool::new(false));
         // Registered before the CCCD write, so a notification sent right
@@ -681,19 +683,18 @@ impl GattConnection for WindowsGattConnection {
             .device
             .RequestPreferredConnectionParameters(&parameters)
             .map_err(unsupported)?;
-        let status = match request.Status() {
-            Ok(status) => status,
-            Err(error) => {
-                let _ = request.Close();
-                return Err(unsupported(error));
-            }
-        };
-        if status != BluetoothLEPreferredConnectionParametersRequestStatus::Success {
-            let _ = request.Close();
-            return Err(BleError::Unsupported(format!(
+        // Closing a request withdraws it: keep only one that WinRT accepted.
+        let accepted = match request.Status() {
+            Ok(BluetoothLEPreferredConnectionParametersRequestStatus::Success) => Ok(()),
+            Ok(refused) => Err(BleError::Unsupported(format!(
                 "connection priority refused (status {})",
-                status.0
-            )));
+                refused.0
+            ))),
+            Err(err) => Err(unsupported(err)),
+        };
+        if let Err(err) = accepted {
+            let _ = request.Close();
+            return Err(err);
         }
         if let Some(previous) = self.priority_request.lock().unwrap().replace(request) {
             let _ = previous.Close();

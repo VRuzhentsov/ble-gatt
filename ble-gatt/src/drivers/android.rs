@@ -189,7 +189,7 @@ type ReportedContent = (
 );
 
 /// Most addresses one scan remembers for that, as the Windows driver's
-/// `MATCH_CACHE_CAPACITY` (btleplug's bound).
+/// `MAX_SCAN_PEERS`.
 const SCAN_REPORTED_CAPACITY: usize = 1024;
 
 /// How often an unchanged result is passed on again. Below the 15 s after

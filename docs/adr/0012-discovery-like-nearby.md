@@ -358,7 +358,6 @@ grant trademark rights.[8]
 This design revision copies no implementation code. Before a port, inspect file
 headers, notices and dependencies. Preserve their attribution/license requirements.
 This is not blanket clearance for an interoperable implementation or replacement notices.
-Keep the existing btleplug BSD notice with the Windows code.
 
 ## Sources
 

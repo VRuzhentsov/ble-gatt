@@ -50,9 +50,9 @@ The current module responsibilities are:
 - `drivers/windows/utils.rs`: conversions and advertisement byte helpers.
 - `drivers/windows/mod.rs`: HAL implementation, session/event coordination.
 
-The central implementation adapts btleplug code under BSD-3-Clause. Preserve
-its source notices and [license](../../LICENSES/btleplug-BSD-3-Clause.txt).
-The peripheral implementation uses WinRT directly.
+Both the central and the peripheral implementation use WinRT directly. The
+central half keeps the address type from the scan for the dial and
+`GattSession.MaintainConnection`, as bluest does (MIT OR Apache-2.0).
 
 ### 2. Capabilities and addresses
 

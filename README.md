@@ -130,7 +130,7 @@ ble-gatt/src/
 └── drivers/      Frameworks & Drivers: one Driver per platform
     ├── linux.rs    BlueZ via bluer — central + peripheral       (M1)
     ├── android.rs  JNI driver with explicit context support    (M1)
-    ├── windows/    WinRT; central adapted from btleplug, own peripheral (M2)
+    ├── windows/    WinRT via the windows crate — central + peripheral (M2)
     └── mock/       in-process, radio-free — CI-safe protocol tests;
                     optionally a cross-process broker behind the
                     `mock-broker` feature — see ADR-0004

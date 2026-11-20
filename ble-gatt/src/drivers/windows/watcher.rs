@@ -1,15 +1,12 @@
 //! Central role, scanning: `BluetoothLEAdvertisementWatcher`.
 //!
-//! The scan settings and the matched-address cache are adapted from
-//! btleplug (`src/winrtble/ble/watcher.rs`, `BLEWatcher::start` and
-//! `MatchCache`), Copyright (c) 2020-2021, Nonpolynomial, BSD-3-Clause: see
-//! `LICENSES/btleplug-BSD-3-Clause.txt`. Like btleplug, a scan response is
-//! only taken from an address whose advertisement already matched the
-//! service, and that set of addresses is bounded.
-//!
-//! Unlike btleplug, the driver merges the advertisement and the scan
-//! response itself and reports a peer again when its data changes, which is
-//! the `Driver::scan` contract.
+//! The watcher scans actively, so each peer can send two `Received` events:
+//! its advertisement and its scan response. Only the advertisement carries
+//! the service UUID. [`ScanPeers`] therefore starts tracking an address when
+//! one of its events is for the service, then also merges that address's
+//! scan responses, and holds at most [`MAX_SCAN_PEERS`] addresses. A peer is
+//! reported again whenever its merged data changes, which is the
+//! `Driver::scan` contract.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -32,21 +29,72 @@ use crate::entities::models::{
     advertised_name, carries_fast_advertisement, DiscoveredPeer, PeerAddress, ServiceUuid,
 };
 
-/// Most addresses one scan tracks. Same bound as btleplug's
-/// `MATCH_CACHE_CAPACITY`; a crowded room must not grow the map without
-/// limit.
-const MATCH_CACHE_CAPACITY: usize = 1024;
+/// Most addresses one scan tracks, so a crowded room cannot grow
+/// [`ScanPeers`] without limit. An address beyond it is not reported.
+const MAX_SCAN_PEERS: usize = 1024;
 
-/// What one matched address has advertised so far. Active scanning delivers
-/// the advertisement and the scan response as separate `Received` events,
-/// and only the advertisement carries the service UUID, so the two are
-/// merged here before a peer is reported.
+/// What one tracked address has advertised so far, merged over its
+/// advertisements and scan responses.
 #[derive(Default, Clone, PartialEq)]
 struct SeenPeer {
     services: Vec<ServiceUuid>,
     manufacturer_data: BTreeMap<u16, Vec<u8>>,
     service_data: BTreeMap<ServiceUuid, Vec<u8>>,
     local_name: Option<String>,
+}
+
+impl SeenPeer {
+    /// Add one event's fields; returns whether the merged data changed.
+    fn merge(
+        &mut self,
+        services: Vec<ServiceUuid>,
+        manufacturer_data: BTreeMap<u16, Vec<u8>>,
+        service_data: BTreeMap<ServiceUuid, Vec<u8>>,
+        local_name: String,
+    ) -> bool {
+        let before = self.clone();
+        for uuid in services {
+            if !self.services.contains(&uuid) {
+                self.services.push(uuid);
+            }
+        }
+        self.manufacturer_data.extend(manufacturer_data);
+        self.service_data.extend(service_data);
+        if !local_name.is_empty() {
+            self.local_name = Some(local_name);
+        }
+        *self != before
+    }
+}
+
+/// The addresses one scan tracks, keyed by the WinRT 64-bit address.
+#[derive(Default)]
+struct ScanPeers {
+    peers: HashMap<u64, SeenPeer>,
+}
+
+impl ScanPeers {
+    /// The record one `Received` event merges into, or `None` when the event
+    /// is dropped. A tracked address takes events for the service and scan
+    /// responses. A new address needs an event for the service and a free
+    /// slot under [`MAX_SCAN_PEERS`].
+    fn record_for(
+        &mut self,
+        address: u64,
+        for_service: bool,
+        scan_response: bool,
+    ) -> Option<&mut SeenPeer> {
+        let admitted = if self.peers.contains_key(&address) {
+            for_service || scan_response
+        } else {
+            for_service && self.peers.len() < MAX_SCAN_PEERS
+        };
+        if admitted {
+            Some(self.peers.entry(address).or_default())
+        } else {
+            None
+        }
+    }
 }
 
 pub(super) struct ScanStream {
@@ -130,7 +178,7 @@ impl ScanStream {
             {
                 let tx = tx.clone();
                 let weak = Arc::downgrade(inner);
-                let seen: StdMutex<HashMap<u64, SeenPeer>> = StdMutex::new(HashMap::new());
+                let peers = StdMutex::new(ScanPeers::default());
                 TypedEventHandler::new(
             move |_: Ref<BluetoothLEAdvertisementWatcher>,
                   args: Ref<BluetoothLEAdvertisementReceivedEventArgs>| {
@@ -148,41 +196,26 @@ impl ScanStream {
                     manufacturer_data
                         .insert(data.CompanyId()?, WindowsCodec::from_buffer(&data.Data()?)?);
                 }
-                let matches_service = Self::matches_service(
+                let local_name = advertisement.LocalName()?.to_string();
+                let for_service = Self::matches_service(
                     service,
                     &advertised_uuids,
                     &service_data,
                     &manufacturer_data,
                 );
-                let is_scan_response =
+                let scan_response =
                     args.AdvertisementType() == Ok(BluetoothLEAdvertisementType::ScanResponse);
 
-                let mut seen = seen.lock().unwrap();
-                if !(matches_service || is_scan_response && seen.contains_key(&address)) {
+                let mut peers = peers.lock().unwrap();
+                let Some(entry) = peers.record_for(address, for_service, scan_response) else {
                     return Ok(());
-                }
-                if !seen.contains_key(&address) && seen.len() >= MATCH_CACHE_CAPACITY {
-                    return Ok(());
-                }
+                };
                 if let (Some(inner), Ok(kind)) = (weak.upgrade(), args.BluetoothAddressType()) {
                     inner.address_types.lock().unwrap().insert(address, kind);
                 }
-                let entry = seen.entry(address).or_default();
-                let previous_data = entry.clone();
-                for uuid in advertised_uuids {
-                    if !entry.services.contains(&uuid) {
-                        entry.services.push(uuid);
-                    }
-                }
-                entry.manufacturer_data.extend(manufacturer_data);
-                entry.service_data.extend(service_data);
-                let name = advertisement.LocalName()?.to_string();
-                if !name.is_empty() {
-                    entry.local_name = Some(name);
-                }
-                // Report new or changed peer data, including a later scan response.
-                // Ignore repeated packets with no data changes.
-                if *entry == previous_data {
+                // Report new or changed peer data, including a later scan
+                // response; a repeated packet changes nothing.
+                if !entry.merge(advertised_uuids, manufacturer_data, service_data, local_name) {
                     return Ok(());
                 }
                 let peer = DiscoveredPeer {

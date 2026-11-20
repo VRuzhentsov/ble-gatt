@@ -2,18 +2,14 @@
 //! `windows` crate (layer: Frameworks & Drivers; see `docs/architecture.md`).
 //! Design and open questions: `docs/adr/0011-windows-winrt-driver.md`.
 //!
-//! The split follows btleplug's `src/winrtble/`:
-//!
-//! | Module | Job | Source |
-//! |---|---|---|
-//! | `watcher` | Central: scanning | adapted from btleplug `ble/watcher.rs` |
-//! | `device` | Central: one link, its GATT client operations | adapted from btleplug `ble/device.rs`, `ble/characteristic.rs` |
-//! | `peripheral` | Peripheral: GATT server and advertising | this library's own (btleplug has no peripheral role) |
-//! | `utils` | WinRT ↔ `crate::entities` conversions | partly adapted from btleplug |
-//! | this file | The `Driver` port: sessions, events, radio | this library's own |
-//!
-//! btleplug is Copyright (c) 2020-2021, Nonpolynomial, BSD-3-Clause; see
-//! `LICENSES/btleplug-BSD-3-Clause.txt`.
+//! | Module | Job |
+//! |---|---|
+//! | `watcher` | Central: scanning |
+//! | `device` | Central: one link, its GATT client operations |
+//! | `peripheral` | Peripheral: GATT server and advertising |
+//! | `publisher` | Peripheral: the fast advertisement next to the GATT server |
+//! | `utils` | WinRT ↔ `crate::entities` conversions |
+//! | this file | The `Driver` port: sessions, events, radio |
 //!
 //! WinRT calls event handlers on its own thread pool, never on a Tokio
 //! thread. Handlers capture a `Weak<Inner>` so a dropped driver is not kept

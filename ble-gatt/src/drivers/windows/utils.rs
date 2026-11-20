@@ -1,9 +1,4 @@
 //! Conversions between WinRT and `crate::entities` types.
-//!
-//! `parse_service_data` is adapted from btleplug
-//! (`src/winrtble/peripheral.rs`, `parse_service_data`), Copyright (c)
-//! 2020-2021, Nonpolynomial, BSD-3-Clause: see
-//! `LICENSES/btleplug-BSD-3-Clause.txt`.
 
 use std::collections::BTreeMap;
 
@@ -101,24 +96,29 @@ impl WindowsCodec {
     /// One service data AD structure: its UUID (little-endian, 16, 32 or 128
     /// bits) and the bytes after it. `None` for other AD types.
     pub(super) fn parse_service_data(data_type: u8, data: &[u8]) -> Option<(ServiceUuid, Vec<u8>)> {
-        let expand_short_uuid =
-            |value: u32| Uuid::from_u128(BLUETOOTH_BASE_UUID | ((value as u128) << 96));
-        let (uuid, rest) = match data_type {
-            AD_SERVICE_DATA_16 => {
-                let (bytes, rest) = data.split_first_chunk::<2>()?;
-                (expand_short_uuid(u16::from_le_bytes(*bytes) as u32), rest)
-            }
-            AD_SERVICE_DATA_32 => {
-                let (bytes, rest) = data.split_first_chunk::<4>()?;
-                (expand_short_uuid(u32::from_le_bytes(*bytes)), rest)
-            }
-            AD_SERVICE_DATA_128 => {
-                let (bytes, rest) = data.split_first_chunk::<16>()?;
-                (Uuid::from_u128(u128::from_le_bytes(*bytes)), rest)
-            }
+        let uuid_len = match data_type {
+            AD_SERVICE_DATA_16 => 2,
+            AD_SERVICE_DATA_32 => 4,
+            AD_SERVICE_DATA_128 => 16,
             _ => return None,
         };
-        Some((ServiceUuid(uuid), rest.to_vec()))
+        if data.len() < uuid_len {
+            return None;
+        }
+        let (uuid_bytes, value) = data.split_at(uuid_len);
+        // AD fields are little-endian: the last byte is the most significant.
+        let number = uuid_bytes
+            .iter()
+            .rev()
+            .fold(0u128, |acc, byte| (acc << 8) | u128::from(*byte));
+        // A 16- or 32-bit UUID stands for the Base UUID with its top 32 bits
+        // replaced (Core Specification, Vol 3, Part B, 2.5.1).
+        let uuid = if uuid_len == 16 {
+            Uuid::from_u128(number)
+        } else {
+            Uuid::from_u128(BLUETOOTH_BASE_UUID | (number << 96))
+        };
+        Some((ServiceUuid(uuid), value.to_vec()))
     }
 
     /// Service data from the raw advertisement sections. WinRT parses service

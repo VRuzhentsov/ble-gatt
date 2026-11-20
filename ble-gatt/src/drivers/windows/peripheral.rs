@@ -1,8 +1,7 @@
 //! Peripheral role: `GattServiceProvider` serves the GATT service and sends
 //! its connectable advertisement.
 //!
-//! btleplug has no peripheral role, so this part is this library's own,
-//! shaped like the GATT servers of the Linux and Android drivers and like
+//! Shaped like the GATT servers of the Linux and Android drivers and like
 //! Google Nearby's Windows GATT server (`google/nearby`,
 //! `internal/platform/implementation/windows/ble_gatt_server.cc`).
 //!
