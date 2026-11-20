@@ -97,6 +97,7 @@ first that did not:
 | `request: … cancels its completion read` | debug | a dial took the address from a completion read |
 | `scan parameters: LowLatency applied` / `not available (…)` | info once, then debug | Windows 11 24H2 scan preset taken, or the API is missing |
 | `advertise: started without the service data (… bytes …)` | info | Windows had no room for the header; scanners read instead |
+| `connect: the link dropped during GATT discovery` | warn | Windows lost a new link before discovery ended; the caller retries on a fresh link |
 | `advertise: the service data under … does not fit the legacy advertisement` | info | BlueZ left the header out (always, next to a 128-bit UUID) |
 | `advertise: interval … (…)` / `BlueZ refused the advertising interval` | info | BlueZ took the advertising mode's interval, or registered without one |
 | `startAdvertising: … fast=true advertising=21B scanResponse=30B` | Kotlin debug | Android placement of a Fini-shaped advertisement |

@@ -427,8 +427,19 @@ impl AdvertisementScan {
 /// advertisement carried no record. Active scanning delivers the
 /// advertisement and its scan response as separate results, and the record
 /// can be in the scan response (the Android placement, ADR-0012 §2): a read
-/// started on the first result would connect for nothing.
-pub(crate) const SCAN_RESPONSE_GRACE: Duration = Duration::from_secs(1);
+/// started on the first result would connect for nothing. On Windows the fast
+/// record arrived within 0.1 s of the scan start; the grace also covers one
+/// lost scan request (an Android advertiser sends again after about 250 ms),
+/// and delays the read of a peer that has no record (a Windows or Linux peer)
+/// by no more than that.
+pub(crate) const SCAN_RESPONSE_GRACE: Duration = Duration::from_millis(300);
+
+/// Deadline of one completion read. Shorter than a header read's 10 s: its
+/// peer is listed already, and a read that stalls on a link the peer dropped
+/// (Windows to Android, while the phone also reads the PC) is better retried
+/// on a fresh link after the first backoff than waited for. The uncached GATT
+/// discovery inside it gives up after 5 s.
+pub(crate) const COMPLETION_READ_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// First wait after a failed read; it doubles per failure in a row.
 pub(crate) const READ_BACKOFF_FIRST: Duration = Duration::from_secs(1);

@@ -69,8 +69,13 @@ dependency; Nearby truncates SHA-256 for the same field.
    the other manufacturer data and service data under other UUIDs
    (`GattServiceSpec::legacy_placement`, `AdvertisePlacement.kt`). Android's
    `ADVERTISE_FAILED_DATA_TOO_LARGE` retries once without the fast advertisement.
-2. Windows: the provider's `ServiceData` carries the header when the hardware
-   has room; it reports `StartedWithoutAllAdvertisementData` otherwise. No fast
+2. Windows: the provider's `ServiceData` (Windows 10 1903 and later) carries the
+   header when the legacy packet has room. Windows puts the service UUID in that
+   service-data section and keeps its UUID lists too, so next to a 128-bit UUID
+   it never has room: on the Windows 11 (build 26200) test PC every start reported
+   `StartedWithoutAllAdvertisementData`, and phones read the PC as before. An
+   extended provider advertisement (`UseLowEnergyUncoded1MPhyAsSecondaryPhy`,
+   build 26100) has room but legacy scanners cannot see it: phase 2. No fast
    advertisement: ADR-0011 D3 keeps a separate publisher out.
 3. Linux: BlueZ has no scan response for us, and the header does not fit next to
    the 128-bit UUID list (`legacy_advertising_len`), so it is left out. Scanners
@@ -93,15 +98,21 @@ automatically.
   and reports again if fields changed. It is low priority: it waits while a dial,
   another read or a retirement holds the address, a `request` to that address
   cancels it (the request is refused once, like one meeting a probe, and a retry
-  gets the address), and its failures are not reported.
+  gets the address), and its failures are not reported. Its deadline is 6 s, not
+  10 s: on hardware a PC read of a phone that was reading the PC at the same time
+  lost its link ("Instant Passed") and waited out every timeout; a retry after the
+  1 s backoff runs on a fresh link. The Windows driver also ends GATT discovery as
+  soon as the link it opened drops.
 - *Advertisement header:* a peer whose header is in the cache is reported from it
   without a read, at its current address and signal strength, but only for a
   fresh sighting (BlueZ re-reports cached devices without a signal strength).
   Otherwise one read; later reads only when the hash changes.
-- *No record* (a Linux peer, an old peer, a foreign version): a read after a 1 s
-  grace for the scan response, then the ten-second refresh, as before.
+- *No record* (a Windows or Linux peer, an old peer, a foreign version): a read
+  after a 300 ms grace for the scan response (Windows reports it apart from the
+  advertisement), then the ten-second refresh, as before.
 
-Reads use the existing bounded probe owner and its 10 s deadline. The cache of
+Reads use the existing bounded probe owner and its 10 s deadline (6 s for a
+completion read). The cache of
 readable values lives for the worker, not one scan: up to 64 values, least
 recently seen out first, forgotten after 5 min unseen. Keys survive address
 rotation. A failed read waits 1 s, doubling to 5 min, and only the first failure

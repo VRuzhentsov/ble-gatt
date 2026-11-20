@@ -804,6 +804,11 @@ impl Worker {
             self.completion_reads
                 .insert(address.clone(), yielded.clone());
         }
+        let read_timeout = if completion {
+            crate::advertisement::COMPLETION_READ_TIMEOUT
+        } else {
+            crate::advertisement::GattAdvertisementPolicy::default().timeout
+        };
         self.operations.spawn(async move {
             let read = tokio::select! {
                 biased;
@@ -813,7 +818,8 @@ impl Worker {
                 // One read includes the first connection to the peer; bound it like an unmanaged
                 // GATT advertisement read. Windows took 3-5 s and more for a first connection to a
                 // phone, and a read cut at `IO_BOUND` started over after the next scan.
-                result = tokio::time::timeout(crate::advertisement::GattAdvertisementPolicy::default().timeout, crate::advertisement::GattAdvertisement::read_managed(driver.as_ref(), &peer.address)) => result.unwrap_or(Err(AttemptError::TimedOut.into())),
+                // A completion read has a shorter deadline (`COMPLETION_READ_TIMEOUT`).
+                result = tokio::time::timeout(read_timeout, crate::advertisement::GattAdvertisement::read_managed(driver.as_ref(), &peer.address)) => result.unwrap_or(Err(AttemptError::TimedOut.into())),
             };
             let result = read.and_then(|metadata| {
                 let hash = RadioRecord::metadata_hash(&metadata.encode());

@@ -76,11 +76,23 @@ independent manufacturer-data publisher to repair profile discovery.
 service data or a fixed payload limit for every Windows configuration.[1]
 
 Advertise the fields the chosen API can supply. For `PeerLink` that is the
-9-byte advertisement header (ADR-0012 §2, §5) as `ServiceData`: within the room
-Windows gives service data next to a 128-bit UUID. Scanners then read the readable
-value once per header hash instead of on a timer. Where Windows starts without it
-(`StartedWithoutAllAdvertisementData`, logged with its size), scanners read as
-before. The fast advertisement is not placed: the provider has no manufacturer
+9-byte advertisement header (ADR-0012 §2, §5) as `ServiceData` (Windows 10 1903
+and later). Scanners would then read the readable value once per header hash
+instead of on a timer. In a legacy advertisement it does not fit: Windows writes
+the service UUID again in the service-data section (2 + 16 bytes before the
+data) and keeps the flags and UUID lists (on the test PC also `0x180A`). The
+Windows 11 build 26200 test PC reported `StartedWithoutAllAdvertisementData`
+(logged with the data size) on every start, so phones read the PC as before.
+The extended provider advertisement of build 26100
+(`UseLowEnergyUncoded1MPhyAsSecondaryPhy`) has room, but legacy scanners such
+as Android's current scan cannot see an extended-only advertisement: ADR-0012
+phase 2.
+
+GATT discovery of a new link ends as soon as that link drops
+(`BluetoothLEDevice.ConnectionStatus` back to `Disconnected`), instead of
+waiting out the 5 s uncached-discovery timeout and the caller's deadline. On
+hardware an Android phone that was reading the PC at the same time dropped the
+PC's link to it with "Instant Passed" (`0x28`) about 2 s in. The fast advertisement is not placed: the provider has no manufacturer
 data, and the rule above keeps a publisher out. Phase 2 (ADR-0012) spikes
 Windows 26100's extended provider advertisement first; a Nearby-style publisher
 is reconsidered only if it uses the provider's address. Shared profile discovery, not

@@ -58,6 +58,9 @@ use crate::hal::{BoxStream, GattConnection, DEFAULT_ATT_MTU};
 /// instead. btleplug's value.
 const GATT_CACHE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How often GATT discovery checks that its link is still up.
+const LINK_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Own each acquired object before another await can cancel construction.
 #[derive(Default)]
 struct AcquiringLink {
@@ -125,13 +128,26 @@ impl OpenedLink {
             .SetMaintainConnection(true)
             .map_err(|err| format!("MaintainConnection: {err}"))?;
 
-        acquired.services = Self::discover_services(&device).await?;
         let mut characteristics = HashMap::new();
-        for service in &acquired.services {
-            for characteristic in Self::discover_characteristics(service).await {
-                if let Ok(uuid) = characteristic.Uuid() {
-                    characteristics.insert(WindowsCodec::from_guid(uuid), characteristic);
+        // Discovery waits on the peer, and its timeouts alone take 5-10 s. When
+        // the link drops meanwhile (on hardware, Android ended a PC link with
+        // "Instant Passed" while it also held its own link to the PC), fail at
+        // once so the caller can retry on a fresh link.
+        tokio::select! {
+            discovered = async {
+                acquired.services = Self::discover_services(&device).await?;
+                for service in &acquired.services {
+                    for characteristic in Self::discover_characteristics(service).await {
+                        if let Ok(uuid) = characteristic.Uuid() {
+                            characteristics.insert(WindowsCodec::from_guid(uuid), characteristic);
+                        }
+                    }
                 }
+                Ok::<(), String>(())
+            } => discovered?,
+            () = Self::link_lost(&device) => {
+                log::warn!("connect: the link dropped during GATT discovery");
+                return Err("the link dropped during GATT discovery".into());
             }
         }
         acquired.device.take();
@@ -142,6 +158,21 @@ impl OpenedLink {
             services: std::mem::take(&mut acquired.services),
             characteristics,
         })
+    }
+
+    /// Resolves once `device`'s link was up and is down again
+    /// (`BluetoothLEDevice.ConnectionStatus`, polled: WinRT opens the link
+    /// lazily, so a link not up yet is not a loss).
+    async fn link_lost(device: &BluetoothLEDevice) {
+        let mut was_connected = false;
+        loop {
+            tokio::time::sleep(LINK_POLL_INTERVAL).await;
+            match device.ConnectionStatus() {
+                Ok(BluetoothConnectionStatus::Connected) => was_connected = true,
+                Ok(_) if was_connected => return,
+                _ => {}
+            }
+        }
     }
 
     async fn services_with_cache_mode(
