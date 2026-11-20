@@ -1,6 +1,6 @@
 ---
 name: dev
-description: "Use first for any ble-gatt development task. Gives the dev process and routes to the scoped skills."
+description: "Use first for any ble-gatt development task. Gives the dev process."
 ---
 
 # ble-gatt development
@@ -23,11 +23,16 @@ Follow these steps in order. `AGENTS.md` holds the project instructions.
 
 ## 3. Write the code
 
-Load the `ble-gatt-code-style` skill before you write or review code.
+1. Before you write or review code, read `docs/code-style.md`.
+2. After coding, review the diff against its "Review checklist". Report each
+   exception it asks you to explain, and whether the change is a style rule or
+   a code migration.
 
 ## 4. Test
 
 1. Run the CI commands from `.github/workflows/ci.yml` for the crates you changed.
+   For `ble-gatt-iroh`, also run the clippy command in `ble-gatt-iroh/README.md`,
+   "Examples and checks".
 2. For more checks, use "Software checks for the current implementation"
    in `docs/hardware-verification.md`.
 3. Device testing needs separate authorization from the user.

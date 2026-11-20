@@ -26,9 +26,8 @@ This repo is a Cargo workspace with three crates:
 ## Code style
 
 Use object-oriented code as the default. The rules are in
-[docs/code-style.md](docs/code-style.md). Agents load the
-[code-style skill](.agents/skills/ble-gatt-code-style/SKILL.md) before code
-changes or review.
+[docs/code-style.md](docs/code-style.md). Agents apply them through the
+[dev skill](.agents/skills/dev/SKILL.md).
 
 ## Managed communication: working-tree implementation
 

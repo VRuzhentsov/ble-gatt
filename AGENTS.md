@@ -7,8 +7,7 @@ A reusable, cross-platform BLE library for Rust applications.
   documents; add a term there when you introduce one.
 - Decisions: `docs/adr/`.
 - Code style: `docs/code-style.md`.
-- Dev process: load the `dev` skill (`.agents/skills/dev/SKILL.md`) first. It
-  routes to the scoped skills in `.agents/skills/`.
+- Dev process: load the `dev` skill (`.agents/skills/dev/SKILL.md`) first.
 
 ## Design
 
