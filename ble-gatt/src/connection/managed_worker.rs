@@ -1,10 +1,11 @@
 //! One worker owns managed attempt state and native channel use.
 use super::{
     acquired_cleanup::Cleanup,
-    managed_codec::{self, ManagedMetadata, Record},
+    managed_codec::{self, ManagedMetadata, RadioRecord, Record},
     managed_driver::ManagedDriver,
     peer_link::*,
 };
+use crate::advertisement::{GattAdvertisement, MetadataCache, MetadataKey, TrackedPeer};
 use crate::datagram::{self, DatagramChannel};
 use crate::{
     AttemptError, BleError, BoxStream, ConnectionPriority, DiscoveredPeer, Driver, PeerAddress,
@@ -38,11 +39,13 @@ enum Operation {
         Result<BoxStream<Result<DiscoveredPeer>>>,
         Reply<BoxStream<Result<(EndpointId, DiscoveredPeer)>>>,
     ),
+    /// A metadata read finished: the endpoint, the complete peer and the
+    /// hash of the readable value read.
     Probe(
         u64,
         PeerAddress,
         DiscoveryOutput,
-        Result<(EndpointId, DiscoveredPeer)>,
+        Result<(EndpointId, DiscoveredPeer, u32)>,
     ),
     Retired(Vec<(PeerAddress, u64)>, Result<()>),
 }
@@ -135,6 +138,12 @@ pub(super) struct Worker {
     operations: tokio::task::JoinSet<Operation>,
     retiring: HashMap<(PeerAddress, u64), Retirement>,
     probing: HashMap<PeerAddress, u64>,
+    /// Completion reads in flight, cancelled when a dial to the address is
+    /// requested: a name read must not hold a link the application wants.
+    completion_reads: HashMap<PeerAddress, CancellationToken>,
+    /// Readable values by the radio record that names them, for the
+    /// worker's lifetime (not one scan): see `MetadataCache`.
+    metadata_cache: MetadataCache<(EndpointId, GattAdvertisement)>,
     acquired: HashMap<PeerAddress, u64>,
     cleanup_failure: Option<BleError>,
     next_generation: u64,
@@ -166,6 +175,8 @@ impl Worker {
             operations: tokio::task::JoinSet::new(),
             retiring: HashMap::new(),
             probing: HashMap::new(),
+            completion_reads: HashMap::new(),
+            metadata_cache: MetadataCache::default(),
             acquired: HashMap::new(),
             cleanup_failure: None,
             next_generation: 0,
@@ -184,7 +195,7 @@ impl Worker {
         };
         let mut served: Option<BoxStream<DatagramChannel>> = None;
         let mut scan: Option<DiscoveryScan> = None;
-        let mut tracked_metadata = HashMap::<PeerAddress, crate::advertisement::TrackedPeer>::new();
+        let mut tracked_metadata = HashMap::<PeerAddress, TrackedPeer>::new();
         let mut scan_exhausted = false;
         let mut scan_generation = 0u64;
         let mut advertising_pending = false;
@@ -304,10 +315,9 @@ impl Worker {
                             }
                             Operation::Probe(generation, peer, output, result) => {
                                 if self.probing.get(&peer) == Some(&generation) { self.probing.remove(&peer); }
-                                if generation == scan_generation {
-                                    let changed = tracked_metadata.get_mut(&peer).is_none_or(|entry| entry.managed_result(result.as_ref().ok().map(|(_, peer)| peer)));
-                                    if changed { let _ = output.try_send(result); }
-                                }
+                                self.completion_reads.remove(&peer);
+                                let tracked = (generation == scan_generation).then_some(&mut tracked_metadata);
+                                if let Some(item) = self.probe_finished(tracked, &peer, result) { let _ = output.try_send(item); }
                             }
                             Operation::Retired(targets, result) => {
                                 self.retired(targets, result);
@@ -322,12 +332,21 @@ impl Worker {
                         let due: Vec<_> = tracked_metadata.iter().filter(|(_, entry)| entry.managed_due(now, !scan_exhausted)).map(|(address, entry)| (address.clone(), entry.radio_peer())).collect();
                         for (address, peer) in due {
                             let entry = tracked_metadata.get_mut(&address).expect("tracked peer");
-                            match self.probe_metadata(driver.clone(), peer, output.clone(), scan_generation) {
+                            if let Some((endpoint, fields)) = entry.key().and_then(|key| self.metadata_cache.hit(key, now)) {
+                                // Another read (of this address or a rotated one) already has it.
+                                let (endpoint, peer) = (*endpoint, Self::cached_peer(fields, peer));
+                                if entry.managed_result(Some(&peer), None) { let _ = output.try_send(Ok((endpoint, peer))); }
+                                continue;
+                            }
+                            let completion = entry.is_completion();
+                            match self.probe_metadata(driver.clone(), peer, output.clone(), scan_generation, completion) {
                                 Ok(()) => entry.managed_scheduled(),
                                 Err(error) => {
                                     let initial = entry.managed_initial();
                                     entry.managed_deferred();
-                                    if initial { let _ = output.try_send(Err(error)); }
+                                    // A completion read is low priority: it waits, silently, while a
+                                    // dial or another read holds the address. Its peer is listed already.
+                                    if initial && !completion { let _ = output.try_send(Err(error)); }
                                 }
                             }
                         }
@@ -352,22 +371,10 @@ impl Worker {
                     match item {
                         Some(item) => {
                             let result = match item {
-                                Ok(mut peer) => {
-                                    let service = self.config.datagram.service;
-                                    if !peer.service_data.contains_key(&service) {
-                                        if let Some(attempt) = self.attempts.values().find(|attempt| attempt.peer == peer.address) {
-                                            // A pending dial may not have validated metadata yet. Defer it.
-                                            let Some(endpoint) = attempt.endpoint else { continue; };
-                                            peer.service_data.insert(service, ManagedMetadata { endpoint }.encode());
-                                        } else {
-                                            if let Some(entry) = tracked_metadata.get_mut(&peer.address) { entry.update_radio(peer); }
-                                            else if tracked_metadata.len() < 64 { tracked_metadata.insert(peer.address.clone(), crate::advertisement::TrackedPeer::managed(peer)); }
-                                            continue;
-                                        }
-                                    }
-                                    peer.service_data.get(&service).ok_or_else(|| PeerLink::protocol_error("missing managed profile"))
-                                        .and_then(|bytes| ManagedMetadata::decode(bytes)).map(|metadata| (metadata.endpoint, peer))
-                                }
+                                Ok(peer) => match self.sighting(peer, &mut tracked_metadata) {
+                                    Some(result) => result,
+                                    None => continue,
+                                },
                                 Err(error) => Err(error),
                             };
                             if let Some((_, output)) = &scan { if output.try_send(result).is_err() { scan = None; } }
@@ -554,12 +561,214 @@ impl Worker {
             let _ = reply.send(stopped.and(teardown));
         }
     }
+    /// One result of a managed scan (ADR-0012 §2): what to report now, if
+    /// anything. A fast advertisement is reported at once, an advertisement
+    /// header from the cache, and anything else after a read.
+    fn sighting(
+        &mut self,
+        peer: DiscoveredPeer,
+        tracked: &mut HashMap<PeerAddress, TrackedPeer>,
+    ) -> Option<Result<(EndpointId, DiscoveredPeer)>> {
+        let service = self.config.datagram.service;
+        let company = self.config.datagram.fast_advertisement_company;
+        let now = tokio::time::Instant::now();
+        let record = RadioRecord::find(&peer, service, company);
+        let mut radio = match &record {
+            Some(record) => record.radio_fields(peer, service, company),
+            None => peer,
+        };
+        if let Some(attempt) = self
+            .attempts
+            .values()
+            .find(|attempt| attempt.peer == radio.address)
+        {
+            // A pending dial may not have validated metadata yet. Defer it.
+            let endpoint = attempt.endpoint?;
+            if record.is_some() || !radio.service_data.contains_key(&service) {
+                radio
+                    .service_data
+                    .insert(service, ManagedMetadata { endpoint }.encode());
+                return Some(Ok((endpoint, radio)));
+            }
+        }
+        match record {
+            Some(RadioRecord::Fast { hash, endpoint, .. }) => {
+                let key = MetadataKey {
+                    tag: endpoint.tag(),
+                    hash,
+                };
+                if tracked
+                    .get(&radio.address)
+                    .is_some_and(|entry| entry.is_unnamed())
+                {
+                    tracked.remove(&radio.address);
+                }
+                if let Some((_, fields)) = self
+                    .metadata_cache
+                    .fresh_hit(key, &radio, now)
+                    .filter(|(cached, _)| *cached == endpoint)
+                {
+                    return Some(Ok((endpoint, Self::cached_peer(fields, radio))));
+                }
+                let complete = ManagedMetadata::radio_hash(endpoint, service, &radio) == hash;
+                radio
+                    .service_data
+                    .insert(service, ManagedMetadata { endpoint }.encode());
+                if complete {
+                    log::debug!(
+                        "discover: {} complete from its fast advertisement",
+                        radio.address.0
+                    );
+                    self.metadata_cache
+                        .succeeded(key, (endpoint, Self::fields(&radio)), now);
+                } else if let Some(entry) = tracked.get_mut(&radio.address) {
+                    let read_at = self.metadata_cache.retry_at(key, now);
+                    entry.update_keyed(radio.clone(), key, read_at, true);
+                } else if tracked.len() < crate::advertisement::METADATA_CACHE_CAPACITY {
+                    // Reported now; the fields the radio could not carry (a
+                    // name, on Android) follow from one read.
+                    log::debug!(
+                        "discover: {} from its fast advertisement; one read completes it",
+                        radio.address.0
+                    );
+                    let read_at = self.metadata_cache.retry_at(key, now);
+                    tracked.insert(
+                        radio.address.clone(),
+                        TrackedPeer::completion(radio.clone(), key, read_at),
+                    );
+                }
+                Some(Ok((endpoint, radio)))
+            }
+            Some(RadioRecord::Header { hash, tag }) => {
+                let key = MetadataKey { tag, hash };
+                if let Some((endpoint, fields)) = self.metadata_cache.fresh_hit(key, &radio, now) {
+                    let endpoint = *endpoint;
+                    return Some(Ok((endpoint, Self::cached_peer(fields, radio))));
+                }
+                if self.metadata_cache.hit(key, now).is_some() {
+                    // Cached, but a stale platform entry: not a sighting.
+                    return None;
+                }
+                let read_at = self.metadata_cache.retry_at(key, now);
+                if let Some(entry) = tracked.get_mut(&radio.address) {
+                    entry.update_keyed(radio, key, read_at, false);
+                } else if tracked.len() < crate::advertisement::METADATA_CACHE_CAPACITY {
+                    tracked.insert(
+                        radio.address.clone(),
+                        TrackedPeer::header(radio, key, read_at),
+                    );
+                }
+                None
+            }
+            None => {
+                let own = radio.service_data.get(&service).map(|bytes| {
+                    let unknown_record = bytes.first().is_some_and(|tag| tag & 0xF8 == 0xF8);
+                    (unknown_record, ManagedMetadata::decode(bytes))
+                });
+                match own {
+                    // A radio record of a version this side does not know:
+                    // read the readable value instead.
+                    Some((true, _)) => {
+                        radio.service_data.remove(&service);
+                    }
+                    Some((false, metadata)) => {
+                        return Some(metadata.map(|metadata| (metadata.endpoint, radio)));
+                    }
+                    None => {}
+                }
+                if let Some(entry) = tracked.get_mut(&radio.address) {
+                    if entry.is_unnamed() {
+                        entry.update_radio(radio);
+                    }
+                } else if tracked.len() < crate::advertisement::METADATA_CACHE_CAPACITY {
+                    tracked.insert(radio.address.clone(), TrackedPeer::managed(radio));
+                }
+                None
+            }
+        }
+    }
+
+    /// The radio fields of `peer` as a readable value.
+    fn fields(peer: &DiscoveredPeer) -> GattAdvertisement {
+        GattAdvertisement {
+            manufacturer_data: peer.manufacturer_data.clone(),
+            service_data: peer.service_data.clone(),
+            local_name: peer.name.clone(),
+        }
+    }
+
+    /// `radio` (address, services, signal strength) with the readable
+    /// fields read for it earlier.
+    fn cached_peer(fields: &GattAdvertisement, mut radio: DiscoveredPeer) -> DiscoveredPeer {
+        radio.manufacturer_data = fields.manufacturer_data.clone();
+        radio.service_data = fields.service_data.clone();
+        radio.name = fields.local_name.clone();
+        radio
+    }
+
+    /// A metadata read finished. Remembers a successful read for the
+    /// records that name it, and returns what to report: changed fields, or
+    /// the first failure of a peer not reported yet. `tracked` is `None`
+    /// for a read of an earlier scan, which reports nothing.
+    fn probe_finished(
+        &mut self,
+        tracked: Option<&mut HashMap<PeerAddress, TrackedPeer>>,
+        address: &PeerAddress,
+        result: Result<(EndpointId, DiscoveredPeer, u32)>,
+    ) -> Option<Result<(EndpointId, DiscoveredPeer)>> {
+        let now = tokio::time::Instant::now();
+        let current = tracked.is_some();
+        let entry = tracked.and_then(|tracked| tracked.get_mut(address));
+        let key = entry.as_ref().and_then(|entry| entry.key());
+        // A record names its endpoint (a tag, or the whole endpoint): a read
+        // answering for another one is a failure, not a value to remember.
+        let result = result.and_then(|(endpoint, peer, hash)| match key {
+            Some(key) if key.tag != endpoint.tag() => Err(PeerLink::protocol_error(
+                "the readable endpoint does not match the advertised one",
+            )),
+            _ => Ok((endpoint, peer, hash)),
+        });
+        match &result {
+            Ok((endpoint, peer, hash)) => {
+                let value = (*endpoint, Self::fields(peer));
+                let read = MetadataKey {
+                    tag: endpoint.tag(),
+                    hash: *hash,
+                };
+                if let Some(key) = key.filter(|key| *key != read) {
+                    // The radio named an older value: remember the newer one
+                    // under that name too, so it is not read again.
+                    self.metadata_cache.succeeded(key, value.clone(), now);
+                }
+                self.metadata_cache.succeeded(read, value, now);
+            }
+            Err(error) => {
+                if let Some(key) = key {
+                    let wait = self.metadata_cache.failed(key, now);
+                    log::debug!(
+                        "discover: reading {} failed ({error}), next try in {wait:?}",
+                        address.0
+                    );
+                }
+            }
+        }
+        let Some(entry) = entry else {
+            // This scan stopped tracking the address (a record arrived): report
+            // the read as before. A read of an earlier scan reports nothing.
+            return current.then(|| result.map(|(endpoint, peer, _)| (endpoint, peer)));
+        };
+        let retry_at = key.map(|key| self.metadata_cache.retry_at(key, now));
+        let report = entry.managed_result(result.as_ref().ok().map(|(_, peer, _)| peer), retry_at);
+        report.then(|| result.map(|(endpoint, peer, _)| (endpoint, peer)))
+    }
+
     fn probe_metadata(
         &mut self,
         driver: Arc<dyn Driver>,
         peer: DiscoveredPeer,
         output: DiscoveryOutput,
         generation: u64,
+        completion: bool,
     ) -> Result<()> {
         if self.acquired.contains_key(&peer.address)
             || self.probing.contains_key(&peer.address)
@@ -590,17 +799,27 @@ impl Worker {
         let shutdown = self.shutdown.clone();
         let address = peer.address.clone();
         self.probing.insert(address.clone(), generation);
+        let yielded = CancellationToken::new();
+        if completion {
+            self.completion_reads
+                .insert(address.clone(), yielded.clone());
+        }
         self.operations.spawn(async move {
             let read = tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => Err(AttemptError::Cancelled.into()),
                 _ = output.closed() => Err(AttemptError::Cancelled.into()),
+                _ = yielded.cancelled() => Err(AttemptError::Cancelled.into()),
                 // One read includes the first connection to the peer; bound it like an unmanaged
                 // GATT advertisement read. Windows took 3-5 s and more for a first connection to a
                 // phone, and a read cut at `IO_BOUND` started over after the next scan.
                 result = tokio::time::timeout(crate::advertisement::GattAdvertisementPolicy::default().timeout, crate::advertisement::GattAdvertisement::read_managed(driver.as_ref(), &peer.address)) => result.unwrap_or(Err(AttemptError::TimedOut.into())),
             };
-            let result = read.and_then(|metadata| ManagedMetadata::complete_peer(metadata, service, peer));
+            let result = read.and_then(|metadata| {
+                let hash = RadioRecord::metadata_hash(&metadata.encode());
+                ManagedMetadata::complete_peer(metadata, service, peer)
+                    .map(|(endpoint, peer)| (endpoint, peer, hash))
+            });
             Operation::Probe(generation, address, output, result)
         });
         Ok(())
@@ -843,6 +1062,13 @@ impl Worker {
         cancellation: CancellationToken,
         reply: Reply<ConnectionRequest>,
     ) {
+        if let Some(read) = self.completion_reads.remove(&peer) {
+            // The dial wins over a completion read. Its connection is still
+            // being released, so this request is refused like one that meets a
+            // probe, and a retry gets the address.
+            log::debug!("request: {} cancels its completion read", peer.0);
+            read.cancel();
+        }
         if self.acquired.contains_key(&peer)
             || self.probing.contains_key(&peer)
             || self.address_retiring(&peer)

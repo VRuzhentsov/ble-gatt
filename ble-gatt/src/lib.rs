@@ -31,9 +31,9 @@ pub use connection::peer_link::{
 pub use connection::Connection;
 pub use entities::error::{AttemptError, BleError, Result};
 pub use entities::models::{
-    CapabilityReport, CharacteristicUuid, ConnectionPriority, ConnectionState, DiscoveredPeer,
-    GattCharacteristicSpec, GattEvent, GattServiceSpec, PeerAddress, RadioStatus, Role,
-    ServiceUuid, WriteType,
+    AdvertisingMode, CapabilityReport, CharacteristicUuid, ConnectionPriority, ConnectionState,
+    DiscoveredPeer, FastAdvertisement, GattCharacteristicSpec, GattEvent, GattServiceSpec,
+    PeerAddress, RadioStatus, Role, ServiceUuid, WriteType, FAST_ADVERTISEMENT_MAX_LEN,
 };
 pub use hal::{BoxStream, Driver, GattConnection};
 pub use roles::{Adapter, Central, Peripheral, ServerHandle};

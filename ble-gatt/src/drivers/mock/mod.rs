@@ -63,6 +63,21 @@ enum Radio {
 /// reaches into its fields, only its methods.
 pub struct MockNetwork(Radio);
 
+/// What one mock advertiser's radio advertisement carries, so tests cover
+/// both a scanner that finds the managed records and one that must read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RadioCapacity {
+    /// A legacy advertiser with a scan response, placed as Android places
+    /// it (`GattServiceSpec::legacy_placement`): the fast advertisement if
+    /// any, otherwise the service data under the spec's own service.
+    #[default]
+    Legacy,
+    /// No room for the managed records, as on Linux with Fini's data: the
+    /// fast advertisement and the service data under the spec's own service
+    /// are left out, and the caller's manufacturer data stays as it was.
+    None,
+}
+
 impl Default for MockNetwork {
     fn default() -> Self {
         Self(Radio::Local(LocalRadio::default()))
@@ -169,6 +184,19 @@ impl MockNetwork {
     ) {
         self.as_local()
             .set_advertisement_data(peer, manufacturer_data, service_data, rssi)
+    }
+
+    /// Set the signal strength scanners see for an advertising `peer`,
+    /// keeping its advertisement data. `None` (the default) is how BlueZ
+    /// re-reports a device it cached rather than heard.
+    pub fn set_rssi(&self, peer: &PeerAddress, rssi: Option<i16>) {
+        self.as_local().set_rssi(peer, rssi)
+    }
+
+    /// Choose what `peer`'s radio advertisement carries from now on, also
+    /// for an advertisement already running. See [`RadioCapacity`].
+    pub fn set_radio_capacity(&self, peer: &PeerAddress, capacity: RadioCapacity) {
+        self.as_local().set_radio_capacity(peer, capacity)
     }
 
     // --- Dispatch to Local or Remote, identically ---

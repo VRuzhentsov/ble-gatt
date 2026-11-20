@@ -293,8 +293,11 @@ pub struct GattAdvertisementPolicy {
     /// How often a peer's GATT advertisement is read again while the scan
     /// runs. The radio advertisement of such a peer does not change when
     /// its data does, so this bounds how stale its data can be (an Add
-    /// Device flag, for example). Nearby uses a hash in its advertisement
-    /// header instead; this format has no such field.
+    /// Device flag, for example). Nearby puts a hash of the value in its
+    /// advertisement header instead, and the managed profile (`PeerLink`)
+    /// does too (ADR-0012 §5): its scanner reads again only when that hash
+    /// changes, and refreshes only peers that advertise no record. A raw
+    /// `serve` advertises no hash, so this scan refreshes.
     pub refresh: Duration,
     /// Longest one read may take, connection included.
     pub timeout: Duration,
@@ -411,13 +414,7 @@ impl AdvertisementScan {
         } else if self.tracked.len() < self.policy.max_peers {
             self.tracked.insert(
                 peer.address.clone(),
-                TrackedPeer {
-                    peer,
-                    next_read_at: Instant::now(),
-                    last_advertisement: None,
-                    consecutive_failures: 0,
-                    has_been_reported: false,
-                },
+                TrackedPeer::new(peer, ReadKind::Unnamed, Instant::now()),
             );
         } else {
             return Some(peer);
@@ -426,23 +423,221 @@ impl AdvertisementScan {
     }
 }
 
+/// How long a managed scanner waits before it reads a peer whose radio
+/// advertisement carried no record. Active scanning delivers the
+/// advertisement and its scan response as separate results, and the record
+/// can be in the scan response (the Android placement, ADR-0012 §2): a read
+/// started on the first result would connect for nothing.
+pub(crate) const SCAN_RESPONSE_GRACE: Duration = Duration::from_secs(1);
+
+/// First wait after a failed read; it doubles per failure in a row.
+pub(crate) const READ_BACKOFF_FIRST: Duration = Duration::from_secs(1);
+/// Longest wait between failed reads. Nearby's
+/// `advertisement_read_result.cc` uses the same 1 s to 5 min schedule.
+pub(crate) const READ_BACKOFF_MAX: Duration = Duration::from_secs(300);
+/// Most readable values a managed scanner remembers.
+pub(crate) const METADATA_CACHE_CAPACITY: usize = 64;
+/// How long a remembered value lasts after it was last seen.
+pub(crate) const METADATA_CACHE_EXPIRY: Duration = Duration::from_secs(300);
+
+/// The wait before the next read after `failures` failed reads in a row:
+/// 1 s, 2 s, 4 s ... up to 5 min.
+pub(crate) fn read_backoff(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    (READ_BACKOFF_FIRST * (1u32 << doublings)).min(READ_BACKOFF_MAX)
+}
+
+/// What a radio record names: the endpoint tag and the hash of one readable
+/// value (ADR-0012 §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct MetadataKey {
+    pub tag: [u8; 4],
+    pub hash: u32,
+}
+
+struct CacheEntry<V> {
+    value: Option<V>,
+    failures: u32,
+    retry_at: Instant,
+    seen: Instant,
+}
+
+/// The readable values a managed scanner has read, keyed by the radio
+/// record that names them, for the scanner's lifetime: a value read once is
+/// not read again while its record is unchanged, across scans and address
+/// rotation. Failed reads back off (see [`read_backoff`]). Bounded:
+/// [`METADATA_CACHE_CAPACITY`] entries, least recently seen first out, and
+/// none older than [`METADATA_CACHE_EXPIRY`]. Nearby's
+/// `discovered_peripheral_tracker.cc` keeps its GATT reads the same way.
+pub(crate) struct MetadataCache<V> {
+    entries: HashMap<MetadataKey, CacheEntry<V>>,
+}
+
+impl<V> Default for MetadataCache<V> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+}
+
+impl<V> MetadataCache<V> {
+    /// The value read for `key`, if any. Marks it seen.
+    pub(crate) fn hit(&mut self, key: MetadataKey, now: Instant) -> Option<&V> {
+        self.prune(now);
+        let entry = self.entries.get_mut(&key)?;
+        entry.value.as_ref()?;
+        entry.seen = now;
+        entry.value.as_ref()
+    }
+
+    /// [`hit`](Self::hit) for a fresh sighting only. BlueZ reports the
+    /// devices it cached at the start of every discovery, without a signal
+    /// strength, and a device that is gone must not be reported from them.
+    pub(crate) fn fresh_hit(
+        &mut self,
+        key: MetadataKey,
+        peer: &DiscoveredPeer,
+        now: Instant,
+    ) -> Option<&V> {
+        peer.rssi?;
+        self.hit(key, now)
+    }
+
+    /// When `key` may be read next: now, or after its backoff.
+    pub(crate) fn retry_at(&self, key: MetadataKey, now: Instant) -> Instant {
+        self.entries
+            .get(&key)
+            .map_or(now, |entry| entry.retry_at.max(now))
+    }
+
+    /// Remember `value` for `key`.
+    pub(crate) fn succeeded(&mut self, key: MetadataKey, value: V, now: Instant) {
+        self.prune(now);
+        self.make_room(key);
+        self.entries.insert(
+            key,
+            CacheEntry {
+                value: Some(value),
+                failures: 0,
+                retry_at: now,
+                seen: now,
+            },
+        );
+    }
+
+    /// Record a failed read of `key`. Returns the wait before the next one.
+    pub(crate) fn failed(&mut self, key: MetadataKey, now: Instant) -> Duration {
+        self.prune(now);
+        self.make_room(key);
+        let entry = self.entries.entry(key).or_insert(CacheEntry {
+            value: None,
+            failures: 0,
+            retry_at: now,
+            seen: now,
+        });
+        entry.failures += 1;
+        entry.seen = now;
+        let wait = read_backoff(entry.failures);
+        entry.retry_at = now + wait;
+        wait
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn prune(&mut self, now: Instant) {
+        self.entries
+            .retain(|_, entry| now.duration_since(entry.seen) < METADATA_CACHE_EXPIRY);
+    }
+
+    fn make_room(&mut self, key: MetadataKey) {
+        if self.entries.contains_key(&key) || self.entries.len() < METADATA_CACHE_CAPACITY {
+            return;
+        }
+        if let Some(oldest) = self
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.seen)
+            .map(|(key, _)| *key)
+        {
+            self.entries.remove(&oldest);
+        }
+    }
+}
+
+/// Which read a tracked peer waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadKind {
+    /// No radio record: read now and then, at the refresh interval.
+    Unnamed,
+    /// An advertisement header names the value: read once per key.
+    Header(MetadataKey),
+    /// The peer was reported from its fast advertisement; one read fills in
+    /// the fields the radio could not carry. Failures are not reported: the
+    /// peer already was.
+    Completion(MetadataKey),
+}
+
 pub(crate) struct TrackedPeer {
     peer: DiscoveredPeer,
     next_read_at: Instant,
     last_advertisement: Option<GattAdvertisement>,
     consecutive_failures: u32,
     has_been_reported: bool,
+    kind: ReadKind,
+    read_done: bool,
 }
 
 impl TrackedPeer {
+    /// A peer without a radio record. Read after [`SCAN_RESPONSE_GRACE`].
     pub(crate) fn managed(peer: DiscoveredPeer) -> Self {
+        Self::new(
+            peer,
+            ReadKind::Unnamed,
+            Instant::now() + SCAN_RESPONSE_GRACE,
+        )
+    }
+    /// A peer whose advertisement header names `key`: read at `read_at`.
+    pub(crate) fn header(peer: DiscoveredPeer, key: MetadataKey, read_at: Instant) -> Self {
+        Self::new(peer, ReadKind::Header(key), read_at)
+    }
+    /// A peer already reported from its fast advertisement, whose readable
+    /// value `key` has more than the radio carried.
+    pub(crate) fn completion(peer: DiscoveredPeer, key: MetadataKey, read_at: Instant) -> Self {
+        let mut tracked = Self::new(peer, ReadKind::Completion(key), read_at);
+        tracked.last_advertisement = Some(GattAdvertisement {
+            manufacturer_data: tracked.peer.manufacturer_data.clone(),
+            service_data: tracked.peer.service_data.clone(),
+            local_name: tracked.peer.name.clone(),
+        });
+        tracked
+    }
+    fn new(peer: DiscoveredPeer, kind: ReadKind, next_read_at: Instant) -> Self {
         Self {
             peer,
-            next_read_at: Instant::now(),
+            next_read_at,
             last_advertisement: None,
             consecutive_failures: 0,
             has_been_reported: false,
+            kind,
+            read_done: false,
         }
+    }
+    /// The key of a header or completion read.
+    pub(crate) fn key(&self) -> Option<MetadataKey> {
+        match self.kind {
+            ReadKind::Unnamed => None,
+            ReadKind::Header(key) | ReadKind::Completion(key) => Some(key),
+        }
+    }
+    pub(crate) fn is_unnamed(&self) -> bool {
+        self.kind == ReadKind::Unnamed
+    }
+    pub(crate) fn is_completion(&self) -> bool {
+        matches!(self.kind, ReadKind::Completion(_))
     }
     pub(crate) fn update_radio(&mut self, peer: DiscoveredPeer) {
         if self.peer.manufacturer_data != peer.manufacturer_data
@@ -453,10 +648,38 @@ impl TrackedPeer {
         }
         self.peer = peer;
     }
+    /// A new sighting of a keyed peer (`completion`: from its fast
+    /// advertisement). A changed key or kind is read again, at `read_at`;
+    /// an unchanged one only updates the radio fields.
+    pub(crate) fn update_keyed(
+        &mut self,
+        peer: DiscoveredPeer,
+        key: MetadataKey,
+        read_at: Instant,
+        completion: bool,
+    ) {
+        if self.key() != Some(key) || self.is_completion() != completion {
+            *self = if completion {
+                Self::completion(peer, key, read_at)
+            } else {
+                Self::header(peer, key, read_at)
+            };
+            return;
+        }
+        if completion && !self.read_done {
+            // Reported again from the radio: the read reports what differs from this.
+            *self = Self {
+                next_read_at: self.next_read_at,
+                consecutive_failures: self.consecutive_failures,
+                has_been_reported: self.has_been_reported,
+                ..Self::completion(peer, key, read_at)
+            };
+            return;
+        }
+        self.peer = peer;
+    }
     pub(crate) fn managed_due(&self, now: Instant, scan_active: bool) -> bool {
-        self.consecutive_failures < GattAdvertisementPolicy::default().max_failures
-            && (!self.has_been_reported || scan_active)
-            && self.next_read_at <= now
+        !self.read_done && (!self.has_been_reported || scan_active) && self.next_read_at <= now
     }
     pub(crate) fn managed_initial(&self) -> bool {
         !self.has_been_reported
@@ -468,18 +691,37 @@ impl TrackedPeer {
         self.next_read_at = Instant::now() + GattAdvertisementPolicy::default().refresh;
     }
     pub(crate) fn managed_deferred(&mut self) {
-        // Report admission failure once. An active scan can try again at refresh.
+        // Report admission failure once. An active scan can try again: a peer
+        // without a record at refresh, a keyed read after the first backoff.
         self.has_been_reported = true;
-        self.managed_scheduled();
+        if self.is_unnamed() {
+            self.managed_scheduled();
+        } else {
+            self.next_read_at = Instant::now() + READ_BACKOFF_FIRST;
+        }
     }
-    pub(crate) fn managed_result(&mut self, peer: Option<&DiscoveredPeer>) -> bool {
-        self.has_been_reported = true;
-        self.managed_scheduled();
+    /// A read finished: `peer` on success. `retry_at` is when a keyed read
+    /// may run again after a failure (the cache's backoff). Returns whether
+    /// to report: a success with changed fields, or the first failure of a
+    /// peer not reported yet.
+    pub(crate) fn managed_result(
+        &mut self,
+        peer: Option<&DiscoveredPeer>,
+        retry_at: Option<Instant>,
+    ) -> bool {
+        let was_reported = std::mem::replace(&mut self.has_been_reported, true);
         let Some(peer) = peer else {
             self.consecutive_failures += 1;
-            return true;
+            self.next_read_at = retry_at
+                .unwrap_or_else(|| Instant::now() + read_backoff(self.consecutive_failures));
+            return !was_reported && !self.is_completion();
         };
         self.consecutive_failures = 0;
+        if self.is_unnamed() {
+            self.managed_scheduled();
+        } else {
+            self.read_done = true;
+        }
         let metadata = GattAdvertisement {
             manufacturer_data: peer.manufacturer_data.clone(),
             service_data: peer.service_data.clone(),
@@ -571,6 +813,90 @@ mod tests {
         let decoded = GattAdvertisement::decode(&advertisement.encode()).unwrap();
         assert!(decoded.manufacturer_data.is_empty());
         assert_eq!(decoded.local_name.as_deref(), Some("ok"));
+    }
+
+    fn key(n: u32) -> MetadataKey {
+        MetadataKey {
+            tag: [1, 2, 3, 4],
+            hash: n,
+        }
+    }
+
+    fn sighting(rssi: Option<i16>) -> DiscoveredPeer {
+        DiscoveredPeer {
+            address: PeerAddress("AA".into()),
+            name: None,
+            services: Vec::new(),
+            manufacturer_data: BTreeMap::new(),
+            service_data: BTreeMap::new(),
+            rssi,
+        }
+    }
+
+    #[test]
+    fn the_metadata_cache_keeps_the_64_most_recently_seen() {
+        let start = Instant::now();
+        let mut cache = MetadataCache::default();
+        for n in 0..METADATA_CACHE_CAPACITY as u32 {
+            cache.succeeded(key(n), n, start + Duration::from_millis(n as u64));
+        }
+        let later = start + Duration::from_secs(1);
+        // Seen again, so not the oldest any more.
+        assert_eq!(cache.hit(key(0), later), Some(&0));
+        cache.succeeded(key(1000), 1000, later);
+        assert_eq!(cache.len(), METADATA_CACHE_CAPACITY);
+        assert_eq!(
+            cache.hit(key(1), later),
+            None,
+            "least recently seen went first"
+        );
+        assert_eq!(cache.hit(key(0), later), Some(&0));
+        assert_eq!(cache.hit(key(1000), later), Some(&1000));
+    }
+
+    #[test]
+    fn the_metadata_cache_forgets_after_five_minutes_unseen() {
+        let start = Instant::now();
+        let mut cache = MetadataCache::default();
+        cache.succeeded(key(1), 1, start);
+        cache.succeeded(key(2), 2, start);
+        let refreshed = start + Duration::from_secs(200);
+        assert_eq!(cache.hit(key(2), refreshed), Some(&2));
+        let expired = start + METADATA_CACHE_EXPIRY;
+        assert_eq!(cache.hit(key(1), expired), None);
+        assert_eq!(cache.hit(key(2), expired), Some(&2), "seen 200 s in");
+        assert_eq!(cache.hit(key(2), expired + METADATA_CACHE_EXPIRY), None);
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn failed_reads_back_off_from_one_second_to_five_minutes() {
+        let expected = [1, 2, 4, 8, 16, 32, 64, 128, 256, 300, 300];
+        let waits: Vec<u64> = (1..=expected.len() as u32)
+            .map(|failures| read_backoff(failures).as_secs())
+            .collect();
+        assert_eq!(waits, expected);
+        let now = Instant::now();
+        let mut cache: MetadataCache<u32> = MetadataCache::default();
+        assert_eq!(cache.retry_at(key(5), now), now, "unknown: read now");
+        assert_eq!(cache.failed(key(5), now), Duration::from_secs(1));
+        assert_eq!(cache.failed(key(5), now), Duration::from_secs(2));
+        assert_eq!(cache.retry_at(key(5), now), now + Duration::from_secs(2));
+        assert_eq!(cache.hit(key(5), now), None, "a failure is no value");
+        cache.succeeded(key(5), 5, now);
+        assert_eq!(cache.failed(key(6), now), Duration::from_secs(1), "per key");
+    }
+
+    #[test]
+    fn a_cache_hit_without_signal_strength_is_not_a_sighting() {
+        let now = Instant::now();
+        let mut cache = MetadataCache::default();
+        cache.succeeded(key(1), "value", now);
+        assert_eq!(cache.fresh_hit(key(1), &sighting(None), now), None);
+        assert_eq!(
+            cache.fresh_hit(key(1), &sighting(Some(-60)), now),
+            Some(&"value")
+        );
     }
 
     #[test]

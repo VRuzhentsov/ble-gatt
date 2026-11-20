@@ -211,6 +211,9 @@ async fn a_cancelled_probe_reserves_its_address_until_cleanup_finishes() {
     counts.mode.store(2, SeqCst);
     let owner = link_limit(counts.clone(), Some(Duration::from_millis(150)), 2);
     let stream = owner.discover().await.unwrap();
+    // The peer advertises no radio record: it is read after a 1 s grace for
+    // its scan response.
+    tokio::time::sleep(Duration::from_secs(1)).await;
     wait_count(&counts.reads, 1).await;
     drop(stream);
     wait_count(&counts.started, 1).await;

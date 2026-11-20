@@ -15,9 +15,11 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use crate::entities::error::{BleError, Result};
 use crate::entities::models::{
     CharacteristicUuid, DiscoveredPeer, GattCharacteristicSpec, GattEvent, GattServiceSpec,
-    PeerAddress, Role, ServiceUuid, WriteType,
+    PeerAddress, Role, ScanResponse, ServiceUuid, WriteType,
 };
 use crate::hal::BoxStream;
+
+use super::RadioCapacity;
 
 /// Live notify sessions for one characteristic, keyed by subscriber.
 type NotifySessions = HashMap<PeerAddress, mpsc::UnboundedSender<Result<Vec<u8>>>>;
@@ -66,9 +68,77 @@ pub(crate) struct LocalRadio {
     /// Newest session per (central, peripheral) pair, so the mock can
     /// reproduce a stale handle being superseded.
     live_sessions: Mutex<HashMap<(PeerAddress, PeerAddress), u64>>,
+    /// What each advertiser's radio carries; `Legacy` when unset.
+    radio_capacity: Mutex<HashMap<PeerAddress, RadioCapacity>>,
 }
 
 impl LocalRadio {
+    /// The radio fields scanners see for `service` from `address`: the
+    /// Android placement for `Legacy` (the advertising packet and the scan
+    /// response, merged as scanners merge them), or none of the managed
+    /// records for `None`. The mock does not enforce the 31-byte packet size.
+    fn radio_fields(
+        &self,
+        address: &PeerAddress,
+        service: &GattServiceSpec,
+    ) -> (BTreeMap<u16, Vec<u8>>, BTreeMap<ServiceUuid, Vec<u8>>) {
+        let capacity = self
+            .radio_capacity
+            .lock()
+            .unwrap()
+            .get(address)
+            .copied()
+            .unwrap_or_default();
+        match capacity {
+            RadioCapacity::Legacy => {
+                let placement = service.legacy_placement(true);
+                let mut manufacturer_data = placement.manufacturer_data;
+                let mut service_data = placement.service_data;
+                match placement.scan_response {
+                    ScanResponse::Fast(fast) => {
+                        manufacturer_data.insert(fast.company_id, fast.data);
+                    }
+                    ScanResponse::ServiceData(data) if service.local_name.is_none() => {
+                        service_data.insert(service.uuid, data);
+                    }
+                    // The mock reports the name as the name, not as service data.
+                    ScanResponse::ServiceData(_) | ScanResponse::None => {}
+                }
+                (manufacturer_data, service_data)
+            }
+            RadioCapacity::None => {
+                let mut service_data = service.service_data.clone();
+                service_data.remove(&service.uuid);
+                (service.manufacturer_data.clone(), service_data)
+            }
+        }
+    }
+
+    pub(crate) fn set_rssi(&self, peer: &PeerAddress, rssi: Option<i16>) {
+        if let Some(state) = self.peripherals.lock().unwrap().get_mut(peer) {
+            state.rssi = rssi;
+        }
+    }
+
+    pub(crate) fn set_radio_capacity(&self, peer: &PeerAddress, capacity: RadioCapacity) {
+        self.radio_capacity
+            .lock()
+            .unwrap()
+            .insert(peer.clone(), capacity);
+        let service = self
+            .peripherals
+            .lock()
+            .unwrap()
+            .get(peer)
+            .map(|state| state.service.clone());
+        if let Some(service) = service {
+            let (manufacturer_data, service_data) = self.radio_fields(peer, &service);
+            if let Some(state) = self.peripherals.lock().unwrap().get_mut(peer) {
+                state.manufacturer_data = manufacturer_data;
+                state.service_data = service_data;
+            }
+        }
+    }
     // --- Registration / fault injection (Local-only; see mock/mod.rs) ---
 
     pub(crate) fn register_events_sender(&self, address: PeerAddress, sender: EventBus) {
@@ -347,8 +417,7 @@ impl LocalRadio {
             values.insert(characteristic.uuid, characteristic.initial_value.clone());
             subscribers.insert(characteristic.uuid, HashMap::new());
         }
-        let manufacturer_data = service.manufacturer_data.clone();
-        let service_data = service.service_data.clone();
+        let (manufacturer_data, service_data) = self.radio_fields(address, &service);
         let mut peripherals = self.peripherals.lock().unwrap();
         let previous = peripherals.remove(address);
         peripherals.insert(
@@ -373,6 +442,7 @@ impl LocalRadio {
         address: &PeerAddress,
         service: GattServiceSpec,
     ) -> Result<()> {
+        let (manufacturer_data, service_data) = self.radio_fields(address, &service);
         let mut peripherals = self.peripherals.lock().unwrap();
         let state = peripherals
             .get_mut(address)
@@ -383,8 +453,8 @@ impl LocalRadio {
                 service.uuid.0
             )));
         }
-        state.manufacturer_data = service.manufacturer_data.clone();
-        state.service_data = service.service_data.clone();
+        state.manufacturer_data = manufacturer_data;
+        state.service_data = service_data;
         state.service = service;
         Ok(())
     }

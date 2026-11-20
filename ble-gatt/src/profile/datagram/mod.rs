@@ -89,8 +89,8 @@ use tokio_stream::StreamExt;
 
 use crate::entities::error::{BleError, Result};
 use crate::entities::models::{
-    CharacteristicUuid, ConnectionPriority, GattCharacteristicSpec, GattEvent, GattServiceSpec,
-    PeerAddress, RadioStatus, Role, ServiceUuid, WriteType,
+    AdvertisingMode, CharacteristicUuid, ConnectionPriority, GattCharacteristicSpec, GattEvent,
+    GattServiceSpec, PeerAddress, RadioStatus, Role, ServiceUuid, WriteType,
 };
 use crate::hal::{BoxStream, Driver, GattConnection};
 use crate::profile::datagram::fragment::{
@@ -1172,6 +1172,18 @@ pub struct DatagramConfig {
     /// `GattServiceSpec.local_name`: a short name scanners read from the
     /// scan response without connecting. `None` by default.
     pub advertised_local_name: Option<String>,
+    /// The company identifier the managed profile (`PeerLink`) sends its
+    /// fast advertisement under, and a managed scanner looks for it under:
+    /// the endpoint and the hash of the readable metadata, plus this
+    /// config's `advertised_manufacturer_data[company]` (at most 6 bytes),
+    /// which the record replaces and a scanner restores (ADR-0012 §2).
+    /// `None` by default: no fast advertisement. Both sides must agree.
+    /// Only the managed profile emits it; [`serve`] does not.
+    pub fast_advertisement_company: Option<u16>,
+    /// Becomes `GattServiceSpec.advertising_mode`. `Balanced` by default;
+    /// [`PowerProfile::advertising_mode`](crate::power::PowerProfile::advertising_mode)
+    /// suggests one per power profile.
+    pub advertising_mode: AdvertisingMode,
 }
 
 impl DatagramConfig {
@@ -1189,6 +1201,8 @@ impl DatagramConfig {
             advertised_manufacturer_data: BTreeMap::new(),
             advertised_service_data: BTreeMap::new(),
             advertised_local_name: None,
+            fast_advertisement_company: None,
+            advertising_mode: AdvertisingMode::Balanced,
         }
     }
 
@@ -1242,6 +1256,7 @@ impl DatagramConfig {
         spec.manufacturer_data = self.advertised_manufacturer_data.clone();
         spec.service_data = self.advertised_service_data.clone();
         spec.local_name = self.advertised_local_name.clone();
+        spec.advertising_mode = self.advertising_mode;
         let gatt_advertisement = crate::profile::advertisement::characteristic_spec(&spec);
         spec.characteristics.push(gatt_advertisement);
         spec

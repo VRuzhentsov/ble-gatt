@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-use crate::entities::models::ConnectionPriority;
+use crate::entities::models::{AdvertisingMode, ConnectionPriority};
 
 /// The device's situation, as the application knows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +68,9 @@ pub struct PowerProfile {
     pub max_connections: usize,
     /// Ask for this on each connection (`Connection::request_connection_priority`).
     pub connection_priority: ConnectionPriority,
+    /// Advertise this often (`DatagramConfig::advertising_mode`). Taking a
+    /// new mode means advertising again with it.
+    pub advertising_mode: AdvertisingMode,
 }
 
 /// The rules that pick a mode, and each mode's schedule. `Default` is the
@@ -95,6 +98,7 @@ impl Default for PowerPolicy {
                 scan_off: Duration::ZERO,
                 max_connections: 8,
                 connection_priority: ConnectionPriority::High,
+                advertising_mode: AdvertisingMode::LowLatency,
             },
             balanced: PowerProfile {
                 mode: PowerMode::Balanced,
@@ -102,6 +106,7 @@ impl Default for PowerPolicy {
                 scan_off: Duration::from_secs(10),
                 max_connections: 6,
                 connection_priority: ConnectionPriority::Balanced,
+                advertising_mode: AdvertisingMode::Balanced,
             },
             power_saver: PowerProfile {
                 mode: PowerMode::PowerSaver,
@@ -109,6 +114,7 @@ impl Default for PowerPolicy {
                 scan_off: Duration::from_secs(30),
                 max_connections: 3,
                 connection_priority: ConnectionPriority::LowPower,
+                advertising_mode: AdvertisingMode::LowPower,
             },
             ultra_low_power: PowerProfile {
                 mode: PowerMode::UltraLowPower,
@@ -116,6 +122,7 @@ impl Default for PowerPolicy {
                 scan_off: Duration::from_secs(60),
                 max_connections: 1,
                 connection_priority: ConnectionPriority::LowPower,
+                advertising_mode: AdvertisingMode::LowPower,
             },
         }
     }
