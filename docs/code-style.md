@@ -36,6 +36,10 @@ shared contracts.
   documentation when you move it.
 - Separate inherent blocks only when generic bounds or conditions require it.
   Explain that separation in review.
+- Split a module by responsibility when a file goes past about 2,500 lines.
+  Known exceptions to split later: `drivers/linux/mod.rs`,
+  `drivers/android/mod.rs`, `connection/managed_tests.rs`,
+  `ble-gatt-iroh/src/lib.rs`, `connection/managed_worker.rs`.
 
 ## Style-only changes
 
