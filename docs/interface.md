@@ -87,8 +87,7 @@ Managed discovery reads the radio records first (ADR-0012 §2):
 - **No record** (a Windows or Linux peer, an old build): a read after a 300 ms
   grace for the scan response, then the ten-second refresh.
 
-Every read has a 10 s deadline. On Windows a dial waits up to 4.5 s after a
-central read this device's server, so it does not cross that central's link.
+A completion read has a 6 s deadline; header and no-record reads keep 10 s.
 
 The cache lives as long as the `PeerLink`: 64 values, 5 min unseen at most,
 across scans and address rotation. A failed read waits 1 s, doubling to 5 min;

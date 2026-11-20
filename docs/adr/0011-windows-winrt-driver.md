@@ -141,12 +141,7 @@ GATT discovery of a new link ends as soon as that link drops
 (`BluetoothLEDevice.ConnectionStatus` back to `Disconnected`), instead of
 waiting out the 5 s uncached-discovery timeout and the caller's deadline. On
 hardware an Android phone that was reading the PC at the same time dropped the
-PC's link to it with "Instant Passed" (`0x28`) about 2 s in. A client link is
-also not opened within 4.5 s after a central read this server
-(`INBOUND_LINK_LINGER`): Android holds an idle link 4 s after its last GATT client
-use, and a PC discovery started next to that link stalled until it ended (the
-18.1 s name read of run p-07: first the phone's initial read, then its 10 s
-refresh read, crossed the PC's reads). Shared profile
+PC's link to it with "Instant Passed" (`0x28`) about 2 s in. Shared profile
 discovery, not the Windows driver, determines whether it must fetch readable
 GATT metadata.
 
