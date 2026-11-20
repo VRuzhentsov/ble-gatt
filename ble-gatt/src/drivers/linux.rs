@@ -101,7 +101,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::entities::error::{BleError, Result};
 use crate::entities::models::{
     advertised_name, truncate_name, CapabilityReport, CharacteristicUuid, DiscoveredPeer,
-    GattEvent, GattServiceSpec, PeerAddress, Role, ServiceUuid, WriteType, LOCAL_NAME_MAX_LEN,
+    GattEvent, GattServiceSpec, PeerAddress, Role, ServiceUuid, WriteType,
+    LEGACY_ADVERTISING_DATA_LEN, LOCAL_NAME_MAX_LEN,
 };
 use crate::hal::{BoxStream, Driver, GattConnection};
 
@@ -479,15 +480,33 @@ impl Drop for ScanGuard {
 /// The BlueZ advertisement for `service`, shared by `advertise` and
 /// `update_advertisement`.
 impl GattServiceSpec {
-    fn bluez_advertisement(&self) -> Advertisement {
+    /// `with_interval`: ask for the interval of `advertising_mode`. BlueZ
+    /// before 5.x without the experimental `MinInterval`/`MaxInterval`
+    /// refuses it; `register_advertisement` then retries without.
+    ///
+    /// BlueZ cannot place data in the scan response (its `ScanResponse*`
+    /// properties are experimental, and bluer does not expose them), so the
+    /// fast advertisement is not sent, and the service data under `uuid` is
+    /// left out when it does not fit the legacy packet: a scanner then reads
+    /// the GATT advertisement (ADR-0012 §2).
+    fn bluez_advertisement(&self, with_interval: bool) -> Advertisement {
+        let mut service_data = self.service_data.clone();
+        if self.legacy_advertising_len() > LEGACY_ADVERTISING_DATA_LEN
+            && service_data.remove(&self.uuid).is_some()
+        {
+            log::info!(
+                "advertise: the service data under {} does not fit the legacy advertisement; scanners read the GATT advertisement",
+                self.uuid.0
+            );
+        }
+        let interval = with_interval.then(|| self.advertising_mode.interval());
         Advertisement {
             service_uuids: [self.uuid.0].into_iter().collect(),
             discoverable: Some(true),
             manufacturer_data: self.manufacturer_data.clone(),
-            service_data: self
-                .service_data
-                .iter()
-                .map(|(uuid, value)| (uuid.0, value.clone()))
+            service_data: service_data
+                .into_iter()
+                .map(|(uuid, value)| (uuid.0, value))
                 .collect(),
             // BlueZ sends LocalName in the scan response. Truncated here so a
             // long name is cut on a character boundary, not by BlueZ.
@@ -495,6 +514,8 @@ impl GattServiceSpec {
                 .local_name
                 .as_deref()
                 .map(|name| truncate_name(name, LOCAL_NAME_MAX_LEN).to_string()),
+            min_interval: interval,
+            max_interval: interval,
             ..Default::default()
         }
     }
@@ -862,6 +883,34 @@ impl LinuxDriver {
 }
 
 impl LinuxDriver {
+    /// Register `service`'s advertisement with the interval of its
+    /// advertising mode, or, when BlueZ refuses that, once more without it.
+    async fn register_advertisement(
+        &self,
+        service: &GattServiceSpec,
+    ) -> bluer::Result<bluer::adv::AdvertisementHandle> {
+        match self
+            .adapter
+            .advertise(service.bluez_advertisement(true))
+            .await
+        {
+            Ok(handle) => {
+                log::info!(
+                    "advertise: interval {:?} ({:?})",
+                    service.advertising_mode.interval(),
+                    service.advertising_mode
+                );
+                Ok(handle)
+            }
+            Err(err) => {
+                log::info!("advertise: BlueZ refused the advertising interval ({err}); registering without it");
+                self.adapter
+                    .advertise(service.bluez_advertisement(false))
+                    .await
+            }
+        }
+    }
+
     async fn release_advertisement(
         &self,
         handle: &mut Option<bluer::adv::AdvertisementHandle>,
@@ -2260,14 +2309,10 @@ impl Driver for LinuxDriver {
             writers.clear();
         }
 
-        let adv_handle = self
-            .adapter
-            .advertise(service.bluez_advertisement())
-            .await
-            .map_err(|err| {
-                log::warn!("advertise: BlueZ rejected the advertisement: {err}");
-                BleError::Gatt(err.to_string())
-            })?;
+        let adv_handle = self.register_advertisement(&service).await.map_err(|err| {
+            log::warn!("advertise: BlueZ rejected the advertisement: {err}");
+            BleError::Gatt(err.to_string())
+        })?;
 
         *self.adv_handle.lock().await = Some(adv_handle);
         *self.served_service.lock().unwrap() = Some(service);
@@ -2354,7 +2399,7 @@ impl Driver for LinuxDriver {
         {
             self.release_advertisement(&mut adv_handle).await?;
         }
-        let registered = self.adapter.advertise(service.bluez_advertisement()).await;
+        let registered = self.register_advertisement(&service).await;
         match registered {
             Ok(handle) => {
                 *adv_handle = Some(handle);
@@ -2383,8 +2428,7 @@ impl Driver for LinuxDriver {
             if handle.is_none() {
                 self.wait_advertisement_release().await?;
                 *handle = Some(
-                    self.adapter
-                        .advertise(service.bluez_advertisement())
+                    self.register_advertisement(&service)
                         .await
                         .map_err(|err| BleError::Gatt(err.to_string()))?,
                 );
@@ -2877,6 +2921,43 @@ impl GattConnection for LinuxGattConnection {
 mod tests {
     use super::*;
     use dbus::channel::MatchingReceiver;
+
+    #[test]
+    fn the_bluez_advertisement_keeps_the_legacy_fit_and_asks_for_the_interval() {
+        use std::time::Duration;
+        let mut spec = GattServiceSpec::new(ServiceUuid(uuid::Uuid::from_u128(1)), vec![]);
+        spec.manufacturer_data.insert(0xFFFF, vec![1, 2, 3, 4, 5]);
+        spec.service_data.insert(spec.uuid, vec![0xF8; 9]);
+        spec.fast_advertisement = Some(crate::FastAdvertisement {
+            company_id: 0xFFFF,
+            data: vec![0xFC; 26],
+        });
+        let advertisement = spec.bluez_advertisement(true);
+        assert!(
+            advertisement.service_data.is_empty(),
+            "the header does not fit next to Fini's data"
+        );
+        assert_eq!(
+            advertisement.manufacturer_data[&0xFFFF],
+            vec![1, 2, 3, 4, 5]
+        );
+        assert_eq!(advertisement.min_interval, Some(Duration::from_millis(250)));
+        assert_eq!(advertisement.max_interval, Some(Duration::from_millis(250)));
+        assert_eq!(spec.bluez_advertisement(false).min_interval, None);
+        // Even alone: flags 3 + UUID list 18 + header 27 = 48 bytes. BlueZ has
+        // no scan response to move it to, so a Linux peer is always read.
+        spec.manufacturer_data.clear();
+        spec.advertising_mode = crate::AdvertisingMode::LowLatency;
+        let advertisement = spec.bluez_advertisement(true);
+        assert!(advertisement.service_data.is_empty());
+        assert_eq!(advertisement.min_interval, Some(Duration::from_millis(100)));
+        // Data that fits is kept.
+        spec.service_data.clear();
+        spec.service_data
+            .insert(ServiceUuid(uuid::Uuid::from_u128(2)), vec![7]);
+        let advertisement = spec.bluez_advertisement(true);
+        assert_eq!(advertisement.service_data.len(), 1);
+    }
 
     #[test]
     fn in_progress_maps_to_adapter_busy_not_unavailable() {
