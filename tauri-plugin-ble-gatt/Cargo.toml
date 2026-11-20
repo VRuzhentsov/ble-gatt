@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 links = "tauri-plugin-ble-gatt"
 
+[lints]
+workspace = true
+
 [dependencies]
 ble-gatt = { path = "../ble-gatt", version = "0.1.0" }
 async-trait.workspace = true

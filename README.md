@@ -176,6 +176,25 @@ dependency, pinned to a release tag:
 ble-gatt = { git = "https://github.com/VRuzhentsov/ble-gatt", tag = "v0.1.0" }
 ```
 
+## Contributing
+
+Turn on the pre-commit hook once per clone:
+
+```sh
+cargo xtask setup-hooks   # same as: git config core.hooksPath .githooks
+```
+
+When a commit has staged `.rs` files, the hook (`.githooks/pre-commit`,
+logic in `xtask/src/main.rs`) checks:
+
+- rustfmt: the staged content of each staged `.rs` file must be formatted.
+- clippy: `cargo clippy --workspace --all-targets --all-features` runs, and
+  only warnings on the staged lines stop the commit. Old warnings on other
+  lines do not. Compile errors always stop it.
+
+It needs the Rust toolchain with the `clippy` and `rustfmt` components. Skip
+it one time with `git commit --no-verify`.
+
 ## Releasing
 
 1. In a pull request, set `[workspace.package] version` in `Cargo.toml` to

@@ -6,6 +6,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 ble-gatt = { path = "../ble-gatt" }
 # `unstable-custom-transports` is iroh's own label: the trait this crate
