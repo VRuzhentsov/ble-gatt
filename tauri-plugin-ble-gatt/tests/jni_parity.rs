@@ -98,8 +98,64 @@ fn scan_start_status_and_abi_match_on_both_sides() {
         scan.contains("throw error"),
         "scan exceptions must reach JNI after ownership rollback"
     );
-    assert!(rust.contains("const BRIDGE_ABI_VERSION: i32 = 7;"));
-    assert!(kotlin.contains("fun bridgeAbiVersion(): Int = 7"));
+    assert!(rust.contains("const BRIDGE_ABI_VERSION: i32 = 8;"));
+    assert!(kotlin.contains("fun bridgeAbiVersion(): Int = 8"));
+}
+
+/// ABI 8: both advertising calls end with the scan response's service data,
+/// the fast advertisement (company, data) and the advertise mode, in the
+/// same order on both sides.
+#[test]
+fn advertising_descriptors_match_the_kotlin_parameters() {
+    let kotlin = read(&format!("{KOTLIN_DIR}/BleGattBridge.kt"));
+    let rust = read(DRIVER);
+    let compact = |text: &str| {
+        text.chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+    };
+    let kotlin = compact(&kotlin);
+    let rust = compact(&rust);
+    assert!(rust.contains(
+        "\"startAdvertising\",\"(Ljava/lang/String;[Ljava/lang/String;[Z[Z[Z[[B[I[[B[Ljava/lang/String;[[B[BI[BI)V\""
+    ));
+    assert!(rust.contains(
+        "\"updateAdvertising\",\"(Ljava/lang/String;[I[[B[Ljava/lang/String;[[B[BI[BI)V\""
+    ));
+    let tail = "JValue::Object(&ad.scan_response_service_data),JValue::Int(ad.fast_company_id),JValue::Object(&ad.fast_data),JValue::Int(ad.advertise_mode),]";
+    assert_eq!(
+        rust.matches(tail).count(),
+        2,
+        "both calls pass the ABI 8 tail"
+    );
+    // The parameters of startAdvertising, in order (its comments sit between them).
+    let start = kotlin
+        .split("funstartAdvertising(")
+        .nth(1)
+        .unwrap()
+        .split("stopAdvertising()")
+        .next()
+        .unwrap();
+    let mut at = 0;
+    for parameter in [
+        "manufacturerIds:IntArray,manufacturerValues:Array<ByteArray>,",
+        "serviceDataUuids:Array<String>,serviceDataValues:Array<ByteArray>,",
+        "scanResponseServiceData:ByteArray?,",
+        "fastCompanyId:Int,fastData:ByteArray?,",
+        "advertiseMode:Int,){",
+    ] {
+        let found = start[at..]
+            .find(parameter)
+            .unwrap_or_else(|| panic!("startAdvertising lacks {parameter} after byte {at}"));
+        at += found + parameter.len();
+    }
+    assert!(kotlin.contains(
+        "funupdateAdvertising(serviceUuid:String,manufacturerIds:IntArray,manufacturerValues:Array<ByteArray>,serviceDataUuids:Array<String>,serviceDataValues:Array<ByteArray>,scanResponseServiceData:ByteArray?,fastCompanyId:Int,fastData:ByteArray?,advertiseMode:Int,)"
+    ));
+    let placement = read(&format!("{KOTLIN_DIR}/AdvertisePlacement.kt"));
+    assert!(placement.contains("const val FAST_ADVERTISEMENT_MAX_LEN: Int = 27"));
+    assert!(read("../ble-gatt/src/entities/models.rs")
+        .contains("pub const FAST_ADVERTISEMENT_MAX_LEN: usize = 27;"));
 }
 
 /// Source-contract regression for duplicate Tao versions. Runtime acceptance

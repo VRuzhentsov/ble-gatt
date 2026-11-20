@@ -75,7 +75,7 @@ Historical ADR-0005 remains unchanged. Apple drivers are not implemented.
 
 Android needs compatible native packaging and Application context. The Kotlin
 bridge currently ships in [the Tauri plugin](../tauri-plugin-ble-gatt/android).
-Rust/JNI and Kotlin require bridge ABI 7. Host-neutral packaging remains open.
+Rust/JNI and Kotlin require bridge ABI 8. Host-neutral packaging remains open.
 
 ## Ownership and validation limits
 

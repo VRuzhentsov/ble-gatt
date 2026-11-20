@@ -57,8 +57,8 @@ fn android_visibility_jni_and_abi_are_coherent() {
     let kotlin = include_str!(
         "../../tauri-plugin-ble-gatt/android/src/main/kotlin/dev/blegatt/BleGattBridge.kt"
     );
-    assert!(rust.contains("const BRIDGE_ABI_VERSION: i32 = 7;"));
-    assert!(kotlin.contains("fun bridgeAbiVersion(): Int = 7"));
+    assert!(rust.contains("const BRIDGE_ABI_VERSION: i32 = 8;"));
+    assert!(kotlin.contains("fun bridgeAbiVersion(): Int = 8"));
     let toggle = body(
         rust,
         "async fn set_advertising_enabled(",

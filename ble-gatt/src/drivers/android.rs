@@ -84,9 +84,9 @@ use uuid::Uuid;
 
 use crate::entities::error::{BleError, Result};
 use crate::entities::models::{
-    advertised_name, truncate_name, CapabilityReport, CharacteristicUuid, ConnectionPriority,
-    DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress, RadioStatus, Role, ServiceUuid,
-    WriteType, NAME_SERVICE_DATA_MAX_LEN,
+    advertised_name, AdvertisingMode, CapabilityReport, CharacteristicUuid, ConnectionPriority,
+    DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress, RadioStatus, Role, ScanResponse,
+    ServiceUuid, WriteType, LEGACY_ADVERTISING_DATA_LEN,
 };
 use crate::hal::{BoxStream, Driver, GattConnection};
 
@@ -102,7 +102,11 @@ const CALLBACK_CLASS: &str = "dev/blegatt/NativeKt";
 /// `startAdvertising`. v5 added `setCharacteristicValue` (ADR-0012).
 /// v6 changed `startScan` from a boolean to a scan-start status code.
 /// v7 added visibility-only `setAdvertisingEnabled`.
-const BRIDGE_ABI_VERSION: i32 = 7;
+/// v8 made the scan response's byte array service data chosen by Rust (the
+/// advertisement header or the name) and added the fast advertisement
+/// (company, data) and the advertise mode to `startAdvertising` and
+/// `updateAdvertising` (ADR-0012 §2).
+const BRIDGE_ABI_VERSION: i32 = 8;
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 
@@ -168,7 +172,28 @@ struct ScanState {
     /// The service this scan looks for, under whose service data an
     /// Android peer sends its name (`advertised_name`).
     service: Option<ServiceUuid>,
+    /// What this scan last reported per address, and when. Android calls
+    /// back for every advertisement, several times a second per peer; a
+    /// result whose data did not change is passed on only every
+    /// `SCAN_REPORT_REFRESH`, so a consumer still sees the peer as present.
+    reported: HashMap<String, (ReportedContent, std::time::Instant)>,
 }
+
+/// The data of one reported result, without the signal strength.
+type ReportedContent = (
+    Option<String>,
+    Vec<ServiceUuid>,
+    BTreeMap<u16, Vec<u8>>,
+    BTreeMap<ServiceUuid, Vec<u8>>,
+);
+
+/// Most addresses one scan remembers for that, as the Windows driver's
+/// `MATCH_CACHE_CAPACITY` (btleplug's bound).
+const SCAN_REPORTED_CAPACITY: usize = 1024;
+
+/// How often an unchanged result is passed on again. Below the 15 s after
+/// which a consumer like Fini drops a device it has not heard.
+const SCAN_REPORT_REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[path = "advertisement_outcome.rs"]
 mod advertisement_outcome;
@@ -181,7 +206,14 @@ struct AdvertisementArgs<'local> {
     manufacturer_values: JObjectArray<'local>,
     service_data_uuids: JObjectArray<'local>,
     service_data_values: JObjectArray<'local>,
-    scan_response_name: JObject<'local>,
+    /// Service data under the served UUID for the scan response: the
+    /// caller's (the managed advertisement header) or the local name.
+    scan_response_service_data: JObject<'local>,
+    /// The fast advertisement's company identifier, -1 for none.
+    fast_company_id: i32,
+    fast_data: JObject<'local>,
+    /// `AdvertiseSettings.ADVERTISE_MODE_*`.
+    advertise_mode: i32,
 }
 
 impl<'local> AdvertisementArgs<'local> {
@@ -212,17 +244,34 @@ impl<'local> AdvertisementArgs<'local> {
                 .map_err(|err| BleError::Gatt(err.to_string()))?;
         }
 
+        // The placement (ADR-0012 §2): the advertising packet carries the
+        // UUID, the manufacturer data and service data under other UUIDs; the
+        // scan response carries the fast advertisement, which Kotlin folds
+        // over `manufacturer_data[company]` (`AdvertisePlacement.kt`), or
+        // else the service data under the served UUID, or else the name.
+        let placement = service.legacy_placement(true);
+        if placement.advertising_len() > LEGACY_ADVERTISING_DATA_LEN {
+            log::warn!(
+                "advertise: the advertising packet needs {} bytes, more than {LEGACY_ADVERTISING_DATA_LEN}; Android will refuse it",
+                placement.advertising_len()
+            );
+        }
+        let other_service_data: Vec<_> = service
+            .service_data
+            .iter()
+            .filter(|(uuid, _)| **uuid != service.uuid)
+            .collect();
         let service_data_uuids = env
             .new_object_array(
-                service.service_data.len() as i32,
+                other_service_data.len() as i32,
                 "java/lang/String",
                 JObject::null(),
             )
             .map_err(|err| BleError::Gatt(err.to_string()))?;
         let service_data_values = env
-            .new_object_array(service.service_data.len() as i32, "[B", JObject::null())
+            .new_object_array(other_service_data.len() as i32, "[B", JObject::null())
             .map_err(|err| BleError::Gatt(err.to_string()))?;
-        for (i, (uuid, value)) in service.service_data.iter().enumerate() {
+        for (i, (uuid, value)) in other_service_data.into_iter().enumerate() {
             let uuid_str = env
                 .new_string(uuid.0.to_string())
                 .map_err(|err| BleError::Gatt(err.to_string()))?;
@@ -237,15 +286,28 @@ impl<'local> AdvertisementArgs<'local> {
 
         // Android cannot set a name per advertisement, so the name travels
         // as service data under the service UUID in the scan response
-        // (`GattServiceSpec::local_name`). Null when there is none.
-        let scan_response_name = match service.local_name.as_deref() {
-            Some(name) if !name.is_empty() => JObject::from(
-                env.byte_array_from_slice(
-                    truncate_name(name, NAME_SERVICE_DATA_MAX_LEN).as_bytes(),
-                )
-                .map_err(|err| BleError::Gatt(err.to_string()))?,
+        // (`GattServiceSpec::local_name`), unless the caller's service data
+        // under it does. Null when there is neither.
+        let own = match service.legacy_placement(false).scan_response {
+            ScanResponse::ServiceData(data) => Some(data),
+            _ => None,
+        };
+        let scan_response_service_data = match own {
+            Some(data) => JObject::from(
+                env.byte_array_from_slice(&data)
+                    .map_err(|err| BleError::Gatt(err.to_string()))?,
             ),
-            _ => JObject::null(),
+            None => JObject::null(),
+        };
+        let (fast_company_id, fast_data) = match &service.fast_advertisement {
+            Some(fast) => (
+                fast.company_id as i32,
+                JObject::from(
+                    env.byte_array_from_slice(&fast.data)
+                        .map_err(|err| BleError::Gatt(err.to_string()))?,
+                ),
+            ),
+            None => (-1, JObject::null()),
         };
 
         Ok(Self {
@@ -253,8 +315,24 @@ impl<'local> AdvertisementArgs<'local> {
             manufacturer_values,
             service_data_uuids,
             service_data_values,
-            scan_response_name,
+            scan_response_service_data,
+            fast_company_id,
+            fast_data,
+            advertise_mode: AdvertiseMode::of(service.advertising_mode),
         })
+    }
+}
+
+/// `android.bluetooth.le.AdvertiseSettings` modes.
+struct AdvertiseMode;
+
+impl AdvertiseMode {
+    fn of(mode: AdvertisingMode) -> i32 {
+        match mode {
+            AdvertisingMode::LowPower => 0,
+            AdvertisingMode::Balanced => 1,
+            AdvertisingMode::LowLatency => 2,
+        }
     }
 }
 
@@ -593,6 +671,7 @@ impl Driver for AndroidDriver {
         scan.error = None;
         scan.generation = generation;
         scan.service = Some(service);
+        scan.reported.clear();
         drop(scan);
 
         Ok(Box::pin(ScanStream {
@@ -800,7 +879,7 @@ impl Driver for AndroidDriver {
             self.inner.call_void(
                 &mut env,
                 "startAdvertising",
-                "(Ljava/lang/String;[Ljava/lang/String;[Z[Z[Z[[B[I[[B[Ljava/lang/String;[[B[B)V",
+                "(Ljava/lang/String;[Ljava/lang/String;[Z[Z[Z[[B[I[[B[Ljava/lang/String;[[B[BI[BI)V",
                 &[
                     JValue::Object(&service_uuid),
                     JValue::Object(&char_uuids),
@@ -812,7 +891,10 @@ impl Driver for AndroidDriver {
                     JValue::Object(&ad.manufacturer_values),
                     JValue::Object(&ad.service_data_uuids),
                     JValue::Object(&ad.service_data_values),
-                    JValue::Object(&ad.scan_response_name),
+                    JValue::Object(&ad.scan_response_service_data),
+                    JValue::Int(ad.fast_company_id),
+                    JValue::Object(&ad.fast_data),
+                    JValue::Int(ad.advertise_mode),
                 ],
             )?;
             rx
@@ -941,14 +1023,17 @@ impl Driver for AndroidDriver {
             let result = self.inner.call_void(
                 &mut env,
                 "updateAdvertising",
-                "(Ljava/lang/String;[I[[B[Ljava/lang/String;[[B[B)V",
+                "(Ljava/lang/String;[I[[B[Ljava/lang/String;[[B[BI[BI)V",
                 &[
                     JValue::Object(&service_uuid),
                     JValue::Object(&ad.manufacturer_ids),
                     JValue::Object(&ad.manufacturer_values),
                     JValue::Object(&ad.service_data_uuids),
                     JValue::Object(&ad.service_data_values),
-                    JValue::Object(&ad.scan_response_name),
+                    JValue::Object(&ad.scan_response_service_data),
+                    JValue::Int(ad.fast_company_id),
+                    JValue::Object(&ad.fast_data),
+                    JValue::Int(ad.advertise_mode),
                 ],
             );
             if let Err(error) = result {
@@ -985,9 +1070,9 @@ impl Driver for AndroidDriver {
         let rx = {
             let mut env = self.inner.env()?;
             if self.inner.call_int(&mut env, "bridgeAbiVersion", "()I")? != BRIDGE_ABI_VERSION {
-                return Err(BleError::Unsupported(
-                    "advertising visibility requires Android bridge ABI 7".into(),
-                ));
+                return Err(BleError::Unsupported(format!(
+                    "advertising visibility requires Android bridge ABI {BRIDGE_ABI_VERSION}"
+                )));
             }
             let bridge = self.inner.bridge()?;
             let _monitor = env
@@ -1907,7 +1992,7 @@ impl Inner {
             }
         }
 
-        let scan = inner.scan.lock().unwrap();
+        let mut scan = inner.scan.lock().unwrap();
         // Discard results belonging to a scan that has already been replaced.
         // A callback can already be executing when its scan is stopped, and
         // without this it would be delivered as a *later* scan's discovery —
@@ -1918,14 +2003,31 @@ impl Inner {
         );
             return;
         }
-        if let Some(tx) = scan.tx.as_ref() {
-            // try_send on a bounded queue: this runs on a JVM callback thread
-            // that must not block, and in a dense advertising environment the
-            // radio can outpace any consumer indefinitely.
+        if scan.tx.is_some() {
             let name = match scan.service {
                 Some(service) => advertised_name(service, &service_data, name),
                 None => name,
             };
+            let content: ReportedContent = (
+                name.clone(),
+                services.clone(),
+                manufacturer_data.clone(),
+                service_data.clone(),
+            );
+            let now = std::time::Instant::now();
+            match scan.reported.get(&address) {
+                Some((last, at))
+                    if *last == content && now.duration_since(*at) < SCAN_REPORT_REFRESH =>
+                {
+                    return;
+                }
+                None if scan.reported.len() >= SCAN_REPORTED_CAPACITY => {
+                    // Full: report without remembering, as before.
+                }
+                _ => {
+                    scan.reported.insert(address.clone(), (content, now));
+                }
+            }
             let peer = DiscoveredPeer {
                 address: PeerAddress(address),
                 name,
@@ -1934,8 +2036,15 @@ impl Inner {
                 service_data,
                 rssi: Some(rssi as i16),
             };
-            log::info!("jni onPeerDiscovered: {} rssi={rssi}", peer.address.0);
+            log::debug!("jni onPeerDiscovered: {} rssi={rssi}", peer.address.0);
+            // try_send on a bounded queue: this runs on a JVM callback thread
+            // that must not block, and in a dense advertising environment the
+            // radio can outpace any consumer indefinitely.
+            let address = peer.address.0.clone();
+            let tx = scan.tx.as_ref().expect("checked above");
             if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(Ok(peer)) {
+                // Not reported, so not remembered either.
+                scan.reported.remove(&address);
                 log::warn!(
                     "jni onPeerDiscovered: discovery queue full, dropping scan result; \
                  the peer will reappear on its next advertisement"
