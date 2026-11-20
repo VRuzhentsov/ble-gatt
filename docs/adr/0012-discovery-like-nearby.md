@@ -75,8 +75,11 @@ dependency; Nearby truncates SHA-256 for the same field.
    it never has room: on the Windows 11 (build 26200) test PC every start reported
    `StartedWithoutAllAdvertisementData`, and phones read the PC as before. An
    extended provider advertisement (`UseLowEnergyUncoded1MPhyAsSecondaryPhy`,
-   build 26100) has room but legacy scanners cannot see it: phase 2. No fast
-   advertisement: ADR-0011 D3 keeps a separate publisher out.
+   build 26100) has room but legacy scanners cannot see it: phase 2. Instead,
+   as Nearby's Windows medium does, a `BluetoothLEAdvertisementPublisher` sends
+   the fast advertisement next to the provider (legacy, non-connectable). On the
+   test PC it advertises from another address than the provider, so scanners join
+   the two by endpoint (below; ADR-0011 §3, amended).
 3. Linux: BlueZ has no scan response for us, and the header does not fit next to
    the 128-bit UUID list (`legacy_advertising_len`), so it is left out. Scanners
    read a Linux peer, as before.
@@ -103,6 +106,11 @@ automatically.
   lost its link ("Instant Passed") and waited out every timeout; a retry after the
   1 s backoff runs on a fresh link. The Windows driver also ends GATT discovery as
   soon as the link it opened drops.
+- *Fast advertisement without the service UUID* (a Windows publisher, at an
+  address of its own, not connectable): never reported at that address. Once a
+  read of a connectable address found the same endpoint, the record is reported
+  at that address, and later sightings of that address without a record are
+  answered from the record's key: one read per hash, also across scans.
 - *Advertisement header:* a peer whose header is in the cache is reported from it
   without a read, at its current address and signal strength, but only for a
   fresh sighting (BlueZ re-reports cached devices without a signal strength).

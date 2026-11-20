@@ -21,6 +21,8 @@ Applications such as Fini consume this contract but do not define the driver.
 
 Use the GATT provider, not the earlier unmerged manufacturer-publisher proposal.
 Shared metadata completion handles information omitted from radio advertisements.
+A publisher now carries only the managed fast advertisement next to the
+provider (§3, amended with hardware evidence).
 
 ## Decision
 
@@ -69,11 +71,19 @@ roles, crossed establishment, background execution or every adapter model.
 
 ### 3. Provider advertising and readable metadata
 
-Use `GattServiceProvider` for connectable service advertising. Do not add an
-independent manufacturer-data publisher to repair profile discovery.
+Use `GattServiceProvider` for connectable service advertising and GATT.
 `ServiceData` is optional when capacity permits; Windows can report
 `StartedWithoutAllAdvertisementData`. This is not a universal prohibition on
 service data or a fixed payload limit for every Windows configuration.[1]
+
+**Amended (ADR-0012 §2): a publisher for the fast advertisement.** This section
+first said not to add an independent manufacturer-data publisher. That stays true
+for repairing discovery: the publisher does not replace the provider, its
+advertisement is not connectable, and a scanner never dials its address. It now
+carries the managed fast advertisement next to the provider, as Google Nearby's
+Windows medium does (`internal/platform/implementation/windows/ble.cc`, a
+`BluetoothLEAdvertisementPublisher` for the fast advertisement next to the GATT
+server). Evidence that led to it, and that it works, below.
 
 Advertise the fields the chosen API can supply. For `PeerLink` that is the
 9-byte advertisement header (ADR-0012 §2, §5) as `ServiceData` (Windows 10 1903
@@ -88,15 +98,40 @@ The extended provider advertisement of build 26100
 as Android's current scan cannot see an extended-only advertisement: ADR-0012
 phase 2.
 
+So the driver starts a `BluetoothLEAdvertisementPublisher` (`publisher.rs`)
+while the provider is visible: the fast advertisement as manufacturer data under
+its company (Fini: `0xFFFF`, no SIG 16-bit UUID needed), 30 bytes, a legacy
+advertisement. Like Nearby, it would use an extended advertisement with
+`IsAnonymous = false` only when the record does not fit a legacy one and
+`BluetoothAdapter.IsExtendedAdvertisingSupported`; the record always fits, and
+legacy scanners cannot see extended-only advertisements. The publisher follows
+show, hide and advertisement updates, and stops with the server.
+
+Evidence on the test PC (Windows 11 build 26200) and the Android test phone:
+
+- The publisher started (`Status` Waiting, then Started, error 0).
+- The phone saw it from another address than the provider: `1B:D5:4E:4C:44:6B`,
+  non-connectable, manufacturer `ffff:26`, against the provider's
+  `7F:98:EF:FD:52:61`, connectable, with the service UUID and the name.
+- The phone connected to the provider's address and read the GATT advertisement
+  (one read), which gave the endpoint.
+
+Because the addresses differ, the shared managed worker (ADR-0012 §2) joins them
+by endpoint: a read of the provider's address records where the endpoint is;
+the publisher's record (the whole endpoint) is then reported at that address, and
+a later sighting of the provider's address is answered from the publisher's
+record key, one read per hash. A publisher's record is never reported at its
+own address, which a central cannot dial. Scanners let an advertisement through
+when it carries only a fast advertisement (`carries_fast_advertisement`), and
+the Android driver merges the advertisements of one address, as the watcher does.
+
 GATT discovery of a new link ends as soon as that link drops
 (`BluetoothLEDevice.ConnectionStatus` back to `Disconnected`), instead of
 waiting out the 5 s uncached-discovery timeout and the caller's deadline. On
 hardware an Android phone that was reading the PC at the same time dropped the
-PC's link to it with "Instant Passed" (`0x28`) about 2 s in. The fast advertisement is not placed: the provider has no manufacturer
-data, and the rule above keeps a publisher out. Phase 2 (ADR-0012) spikes
-Windows 26100's extended provider advertisement first; a Nearby-style publisher
-is reconsidered only if it uses the provider's address. Shared profile discovery, not
-the Windows driver, determines whether it must fetch readable GATT metadata.
+PC's link to it with "Instant Passed" (`0x28`) about 2 s in. Shared profile
+discovery, not the Windows driver, determines whether it must fetch readable
+GATT metadata.
 
 The watcher scans actively with extended advertisements allowed, and asks for
 `BluetoothLEAdvertisementScanParameters.LowLatency()` (Windows 11 24H2, build
@@ -106,8 +141,8 @@ call fails, the watcher keeps the system parameters and logs "scan parameters:
 not available"; that failure is the feature check, with no build-time switch.
 The `windows` crate is at least 0.62.2, the first with that class. If end-to-end
 runs show LE-connection or Wi-Fi regressions, `CoexistenceOptimized` is the
-fallback. A result matches the service by its UUID list or by service data under
-the service UUID.
+fallback. A result matches the service by its UUID list, by service data under
+the service UUID, or by a fast advertisement in its manufacturer data.
 The driver implements reads and `set_characteristic_value` without replacing a
 live server merely to update its data. See ADR-0012 for format/cache policy.
 

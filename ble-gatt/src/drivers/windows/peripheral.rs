@@ -63,8 +63,8 @@ type Tokens = (
 /// `validate` rejects specifications that supply both.
 /// Windows omits data that cannot fit with a 128-bit UUID
 /// (`StartedWithoutAllAdvertisementData`). The GATT advertisement carries it instead.
-/// The fast advertisement is not placed: the provider has no manufacturer
-/// data, and ADR-0011 D3 keeps a separate publisher out.
+/// The fast advertisement goes in a publisher of its own (`publisher.rs`):
+/// the provider has no manufacturer data (ADR-0011 §3).
 impl GattServiceSpec {
     pub(super) fn provider_service_data(&self) -> Option<Vec<u8>> {
         match &self.local_name {

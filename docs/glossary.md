@@ -207,7 +207,9 @@ scanner lists the peer without connecting (`GattServiceSpec::fast_advertisement`
 `DatagramConfig::fast_advertisement_company`). It travels as manufacturer data
 under a company the application chooses (Fini: `0xFFFF`) and replaces the
 caller's entry there; the scanner restores it. Android sends it in the scan
-response; Windows and Linux cannot. The term comes from Google Nearby, whose
+response, Windows in a publisher advertisement of its own next to the GATT
+provider (from another address; scanners join the two by endpoint), and Linux
+cannot. The term comes from Google Nearby, whose
 fast advertisement is the same idea in its own format (ADR-0012 §2, §5).
 
 ### Advertisement header
