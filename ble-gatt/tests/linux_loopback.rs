@@ -25,16 +25,21 @@
 use std::time::Duration;
 
 use ble_gatt::drivers::linux::LinuxDriver;
-use ble_gatt::{Driver, CharacteristicUuid, GattCharacteristicSpec, GattServiceSpec, ServiceUuid};
+use ble_gatt::{CharacteristicUuid, Driver, GattCharacteristicSpec, GattServiceSpec, ServiceUuid};
 use uuid::Uuid;
 
 #[tokio::test]
 #[ignore = "requires a real, powered BlueZ adapter"]
 async fn peripheral_advertise_and_serve_smoke_test() {
-    let driver = LinuxDriver::new().await.expect("bring up BlueZ session + default adapter");
+    let driver = LinuxDriver::new()
+        .await
+        .expect("bring up BlueZ session + default adapter");
 
     let capabilities = driver.capabilities().await;
-    assert!(capabilities.central, "BlueZ adapters are always capable of the central role");
+    assert!(
+        capabilities.central,
+        "BlueZ adapters are always capable of the central role"
+    );
 
     let service = GattServiceSpec::new(
         ServiceUuid(Uuid::new_v4()),
@@ -57,7 +62,10 @@ async fn peripheral_advertise_and_serve_smoke_test() {
     // alongside `cargo test -- --ignored --nocapture` if desired.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    driver.stop_advertising().await.expect("stop_advertising should succeed");
+    driver
+        .stop_advertising()
+        .await
+        .expect("stop_advertising should succeed");
 }
 
 #[tokio::test]

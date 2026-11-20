@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ble_gatt::{
-    Driver, CharacteristicUuid, GattCharacteristicSpec, GattConnection, GattEvent, GattServiceSpec,
+    CharacteristicUuid, Driver, GattCharacteristicSpec, GattConnection, GattEvent, GattServiceSpec,
     PeerAddress, ServiceUuid, WriteType,
 };
 use serde::{Deserialize, Serialize};
@@ -194,7 +194,9 @@ impl From<GattEvent> for GattEventDto {
 }
 
 #[tauri::command]
-pub async fn ble_capabilities(state: tauri::State<'_, PluginState>) -> Result<CapabilitiesResponse, String> {
+pub async fn ble_capabilities(
+    state: tauri::State<'_, PluginState>,
+) -> Result<CapabilitiesResponse, String> {
     let caps = state.driver.capabilities().await;
     Ok(CapabilitiesResponse {
         central: caps.central,
@@ -204,7 +206,9 @@ pub async fn ble_capabilities(state: tauri::State<'_, PluginState>) -> Result<Ca
 
 #[tauri::command]
 pub async fn ble_advertise(
-    state: tauri::State<'_, PluginState>, service_uuid: String, characteristics: Vec<CharacteristicSpecDto>,
+    state: tauri::State<'_, PluginState>,
+    service_uuid: String,
+    characteristics: Vec<CharacteristicSpecDto>,
 ) -> Result<(), String> {
     let uuid = parse_uuid(&service_uuid)?;
     let specs = characteristics
@@ -228,12 +232,18 @@ pub async fn ble_advertise(
 
 #[tauri::command]
 pub async fn ble_stop_advertising(state: tauri::State<'_, PluginState>) -> Result<(), String> {
-    state.driver.stop_advertising().await.map_err(|err| err.to_string())
+    state
+        .driver
+        .stop_advertising()
+        .await
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
 pub async fn ble_notify(
-    state: tauri::State<'_, PluginState>, characteristic_uuid: String, value: Vec<u8>,
+    state: tauri::State<'_, PluginState>,
+    characteristic_uuid: String,
+    value: Vec<u8>,
 ) -> Result<(), String> {
     let uuid = parse_uuid(&characteristic_uuid)?;
     state
@@ -245,7 +255,9 @@ pub async fn ble_notify(
 
 #[tauri::command]
 pub async fn ble_scan_once(
-    state: tauri::State<'_, PluginState>, service_uuid: String, timeout_ms: u64,
+    state: tauri::State<'_, PluginState>,
+    service_uuid: String,
+    timeout_ms: u64,
 ) -> Result<Vec<DiscoveredPeerDto>, String> {
     let uuid = parse_uuid(&service_uuid)?;
     let mut stream = state
@@ -297,7 +309,10 @@ pub async fn ble_scan_once(
 }
 
 #[tauri::command]
-pub async fn ble_connect(state: tauri::State<'_, PluginState>, address: String) -> Result<u64, String> {
+pub async fn ble_connect(
+    state: tauri::State<'_, PluginState>,
+    address: String,
+) -> Result<u64, String> {
     let connection = state
         .driver
         .connect(&PeerAddress(address))
@@ -314,12 +329,17 @@ pub async fn ble_connect(state: tauri::State<'_, PluginState>, address: String) 
 
 #[tauri::command]
 pub async fn ble_read(
-    state: tauri::State<'_, PluginState>, handle: u64, characteristic_uuid: String,
+    state: tauri::State<'_, PluginState>,
+    handle: u64,
+    characteristic_uuid: String,
 ) -> Result<Vec<u8>, String> {
     let uuid = parse_uuid(&characteristic_uuid)?;
     let connection = state.connection(handle).await?;
     let mut connection = connection.lock().await;
-    connection.read(CharacteristicUuid(uuid)).await.map_err(|err| err.to_string())
+    connection
+        .read(CharacteristicUuid(uuid))
+        .await
+        .map_err(|err| err.to_string())
 }
 
 /// `without_response` opts into ATT Write Command: much faster for bulk
@@ -327,7 +347,10 @@ pub async fn ble_read(
 /// or `false` means the acknowledged write, which is the safe default.
 #[tauri::command]
 pub async fn ble_write(
-    state: tauri::State<'_, PluginState>, handle: u64, characteristic_uuid: String, value: Vec<u8>,
+    state: tauri::State<'_, PluginState>,
+    handle: u64,
+    characteristic_uuid: String,
+    value: Vec<u8>,
     without_response: Option<bool>,
 ) -> Result<(), String> {
     let uuid = parse_uuid(&characteristic_uuid)?;
@@ -357,7 +380,8 @@ pub struct ConnectionMtuResponse {
 
 #[tauri::command]
 pub async fn ble_connection_mtu(
-    state: tauri::State<'_, PluginState>, handle: u64,
+    state: tauri::State<'_, PluginState>,
+    handle: u64,
 ) -> Result<ConnectionMtuResponse, String> {
     let connection = state.connection(handle).await?;
     let connection = connection.lock().await;
@@ -380,7 +404,8 @@ pub async fn ble_connection_mtu(
 /// Returns a subscription id; pass it to `ble_unwatch_events` to stop.
 #[tauri::command]
 pub async fn ble_watch_events(
-    state: tauri::State<'_, PluginState>, on_event: Channel<GattEventDto>,
+    state: tauri::State<'_, PluginState>,
+    on_event: Channel<GattEventDto>,
 ) -> Result<u64, String> {
     let mut events = state.driver.events();
     let id = state.next_handle.fetch_add(1, Ordering::SeqCst);
@@ -416,7 +441,8 @@ pub async fn ble_watch_events(
 
 #[tauri::command]
 pub async fn ble_unwatch_events(
-    state: tauri::State<'_, PluginState>, subscription: u64,
+    state: tauri::State<'_, PluginState>,
+    subscription: u64,
 ) -> Result<(), String> {
     if let Some(task) = state.watchers.lock().await.remove(&subscription) {
         task.abort();
@@ -425,7 +451,10 @@ pub async fn ble_unwatch_events(
 }
 
 #[tauri::command]
-pub async fn ble_disconnect(state: tauri::State<'_, PluginState>, handle: u64) -> Result<(), String> {
+pub async fn ble_disconnect(
+    state: tauri::State<'_, PluginState>,
+    handle: u64,
+) -> Result<(), String> {
     // Look up without removing. Removing first made a failed disconnect
     // unrecoverable: the caller loses the handle it would retry or clean up
     // with, while on Android the platform GATT may well still be live — so
