@@ -202,6 +202,20 @@ release tag for released APIs. The example tag does not include this working-tre
 ble-gatt = { git = "https://github.com/VRuzhentsov/ble-gatt", tag = "v0.1.0" }
 ```
 
+## Contributing
+
+Turn on the pre-commit hook once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+When a commit has staged `.rs` files, the hook (`.githooks/pre-commit`) runs
+the same checks as CI: `cargo fmt --all --check` and
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`. It
+needs the Rust toolchain with the `clippy` and `rustfmt` components. Skip it
+one time with `git commit --no-verify`.
+
 ## Releasing
 
 1. In a pull request, set `[workspace.package] version` in `Cargo.toml` to
