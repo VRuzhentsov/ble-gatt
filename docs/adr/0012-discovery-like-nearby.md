@@ -101,11 +101,13 @@ automatically.
   and reports again if fields changed. It is low priority: it waits while a dial,
   another read or a retirement holds the address, a `request` to that address
   cancels it (the request is refused once, like one meeting a probe, and a retry
-  gets the address), and its failures are not reported. Its deadline is 6 s, not
-  10 s: on hardware a PC read of a phone that was reading the PC at the same time
-  lost its link ("Instant Passed") and waited out every timeout; a retry after the
-  1 s backoff runs on a fresh link. The Windows driver also ends GATT discovery as
-  soon as the link it opened drops.
+  gets the address), and its failures are not reported. On hardware a PC read of
+  a phone that was reading the PC at the same time stalled: the phone dropped the
+  PC's link ("Instant Passed"), or the PC's discovery ran over the phone's own
+  link until the phone's 4 s idle timer ended it, and a retry met the phone's next
+  read. The Windows driver therefore waits up to 4.5 s after a central read its
+  server before it opens a client link (`INBOUND_LINK_LINGER`), and ends GATT
+  discovery as soon as the link it opened drops; the read keeps the 10 s deadline.
 - *Fast advertisement without the service UUID* (a Windows publisher, at an
   address of its own, not connectable): never reported at that address. Once a
   read of a connectable address found the same endpoint, the record is reported
@@ -119,8 +121,7 @@ automatically.
   after a 300 ms grace for the scan response (Windows reports it apart from the
   advertisement), then the ten-second refresh, as before.
 
-Reads use the existing bounded probe owner and its 10 s deadline (6 s for a
-completion read). The cache of
+Reads use the existing bounded probe owner and its 10 s deadline. The cache of
 readable values lives for the worker, not one scan: up to 64 values, least
 recently seen out first, forgotten after 5 min unseen. Keys survive address
 rotation. A failed read waits 1 s, doubling to 5 min, and only the first failure

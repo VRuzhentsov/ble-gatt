@@ -95,8 +95,18 @@ struct Inner {
     server_generation: StdMutex<u64>,
     served_service: StdMutex<Option<GattServiceSpec>>,
     server_peers: StdMutex<HashMap<String, ServerPeer>>,
+    /// When a central last read this server (a scanner reading the GATT
+    /// advertisement). See `INBOUND_LINK_LINGER`.
+    last_inbound_read: StdMutex<Option<std::time::Instant>>,
     radio: Option<Radio>,
 }
+
+/// How long a central's link stays up after it read this server. Android
+/// keeps an idle link 4 s after its last GATT client use ("link idle timer for
+/// 4 seconds"), and the ACL went down 4.5 s after the read on hardware. A
+/// client link opened in that time ran over or next to that link to the same
+/// phone, and its GATT discovery stalled until the phone dropped it.
+const INBOUND_LINK_LINGER: Duration = Duration::from_millis(4500);
 
 impl Inner {
     fn next_id(&self) -> u64 {
@@ -139,6 +149,7 @@ impl WindowsDriver {
             server_generation: StdMutex::new(0),
             served_service: StdMutex::new(None),
             server_peers: StdMutex::new(HashMap::new()),
+            last_inbound_read: StdMutex::new(None),
             radio,
         });
         let radio_token = inner.radio.as_ref().and_then(|radio| {
@@ -281,6 +292,22 @@ impl Driver for WindowsDriver {
             armed: true,
         };
 
+        // A central that just read this server is likely the peer being dialled:
+        // wait for its link to end rather than cross it (`INBOUND_LINK_LINGER`).
+        let linger = self
+            .inner
+            .last_inbound_read
+            .lock()
+            .unwrap()
+            .map(|at| INBOUND_LINK_LINGER.saturating_sub(at.elapsed()))
+            .unwrap_or_default();
+        if !linger.is_zero() {
+            log::info!(
+                "connect: a central read this server {:?} ago; waiting {linger:?} for its link to end",
+                INBOUND_LINK_LINGER - linger
+            );
+            tokio::time::sleep(linger).await;
+        }
         let address_type = self
             .inner
             .address_types

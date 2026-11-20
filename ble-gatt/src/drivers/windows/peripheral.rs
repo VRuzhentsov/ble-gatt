@@ -712,11 +712,16 @@ impl ServerRequest {
                     inner.handle_write(generation, characteristic, &args).await,
                     deferral,
                 ),
-                ServerRequest::Read(characteristic, args, deferral) => (
-                    characteristic,
-                    Self::handle_read(&values, characteristic, &args).await,
-                    deferral,
-                ),
+                ServerRequest::Read(characteristic, args, deferral) => {
+                    // The reading central's link stays up for a few seconds:
+                    // `WindowsDriver::connect` waits that out (ADR-0011 §4).
+                    *inner.last_inbound_read.lock().unwrap() = Some(std::time::Instant::now());
+                    (
+                        characteristic,
+                        Self::handle_read(&values, characteristic, &args).await,
+                        deferral,
+                    )
+                }
             };
             // Completes the deferral now that the request is answered.
             drop(deferral);

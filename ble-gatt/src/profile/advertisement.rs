@@ -434,12 +434,13 @@ impl AdvertisementScan {
 /// by no more than that.
 pub(crate) const SCAN_RESPONSE_GRACE: Duration = Duration::from_millis(300);
 
-/// Deadline of one completion read. Shorter than a header read's 10 s: its
-/// peer is listed already, and a read that stalls on a link the peer dropped
-/// (Windows to Android, while the phone also reads the PC) is better retried
-/// on a fresh link after the first backoff than waited for. The uncached GATT
-/// discovery inside it gives up after 5 s.
-pub(crate) const COMPLETION_READ_TIMEOUT: Duration = Duration::from_secs(6);
+/// Deadline of one completion read: the header read's 10 s. It was 6 s, so
+/// a read that stalled on a link the phone also used was retried sooner; on
+/// hardware the retry stalled again, because the phone's next read of the PC
+/// crossed it. The Windows driver now waits out a reading central's link
+/// before it dials (up to 4.5 s, inside this deadline) and ends discovery when
+/// its own link drops, so the read needs the full time instead.
+pub(crate) const COMPLETION_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// First wait after a failed read; it doubles per failure in a row.
 pub(crate) const READ_BACKOFF_FIRST: Duration = Duration::from_secs(1);

@@ -100,6 +100,7 @@ first that did not:
 | `advertise: fast advertisement published (… bytes under 0xffff, legacy)` | info | Windows publisher started next to the provider |
 | `advertise: fast advertisement publisher aborted, error …` / `not started: …` | warn | the publisher failed; scanners read the PC as before |
 | `onScanResult: … connectable=false manufacturer=ffff:26` | Kotlin debug | a Windows publisher's advertisement, at its own address |
+| `connect: a central read this server … ago; waiting … for its link to end` | info | Windows delays a dial so it does not cross a reading phone's link |
 | `connect: the link dropped during GATT discovery` | warn | Windows lost a new link before discovery ended; the caller retries on a fresh link |
 | `advertise: the service data under … does not fit the legacy advertisement` | info | BlueZ left the header out (always, next to a 128-bit UUID) |
 | `advertise: interval … (…)` / `BlueZ refused the advertising interval` | info | BlueZ took the advertising mode's interval, or registered without one |
