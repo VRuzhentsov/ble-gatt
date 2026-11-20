@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::entities::error::Result;
 use crate::entities::models::{
-    CharacteristicUuid, ConnectionPriority, ConnectionState, GattEvent, PeerAddress, RadioStatus, Role,
-    WriteType,
+    CharacteristicUuid, ConnectionPriority, ConnectionState, GattEvent, PeerAddress, RadioStatus,
+    Role, WriteType,
 };
 use crate::hal::{BoxStream, GattConnection};
 
@@ -82,21 +82,36 @@ impl Connection {
         self.conn_mut().read(characteristic).await
     }
 
-    pub async fn write(&mut self, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
+    pub async fn write(
+        &mut self,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
+    ) -> Result<()> {
         self.conn_mut().write(characteristic, value).await
     }
 
     pub async fn write_with_type(
-        &mut self, characteristic: CharacteristicUuid, value: Vec<u8>, write_type: WriteType,
+        &mut self,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
+        write_type: WriteType,
     ) -> Result<()> {
-        self.conn_mut().write_with_type(characteristic, value, write_type).await
+        self.conn_mut()
+            .write_with_type(characteristic, value, write_type)
+            .await
     }
 
-    pub async fn subscribe(&mut self, characteristic: CharacteristicUuid) -> Result<BoxStream<Result<Vec<u8>>>> {
+    pub async fn subscribe(
+        &mut self,
+        characteristic: CharacteristicUuid,
+    ) -> Result<BoxStream<Result<Vec<u8>>>> {
         self.conn_mut().subscribe(characteristic).await
     }
 
-    pub async fn request_connection_priority(&mut self, priority: ConnectionPriority) -> Result<()> {
+    pub async fn request_connection_priority(
+        &mut self,
+        priority: ConnectionPriority,
+    ) -> Result<()> {
         self.conn_mut().request_connection_priority(priority).await
     }
 
@@ -117,11 +132,15 @@ impl Connection {
     }
 
     fn conn(&self) -> &dyn GattConnection {
-        self.inner.as_deref().expect("only Drop takes the connection")
+        self.inner
+            .as_deref()
+            .expect("only Drop takes the connection")
     }
 
     fn conn_mut(&mut self) -> &mut dyn GattConnection {
-        self.inner.as_deref_mut().expect("only Drop takes the connection")
+        self.inner
+            .as_deref_mut()
+            .expect("only Drop takes the connection")
     }
 }
 
@@ -178,8 +197,11 @@ fn ends_connection(event: &GattEvent, peer: &PeerAddress, session: Option<u64>) 
 }
 
 async fn watch_for_end(
-    mut events: BoxStream<GattEvent>, peer: PeerAddress, session: Option<u64>,
-    state_tx: watch::Sender<ConnectionState>, cancel: CancellationToken,
+    mut events: BoxStream<GattEvent>,
+    peer: PeerAddress,
+    session: Option<u64>,
+    state_tx: watch::Sender<ConnectionState>,
+    cancel: CancellationToken,
 ) {
     while let Some(event) = events.next().await {
         if ends_connection(&event, &peer, session) {
@@ -204,12 +226,32 @@ mod tests {
     #[test]
     fn only_this_connections_disconnect_ends_it() {
         let peer = PeerAddress("AA".into());
-        assert!(ends_connection(&disconnected("AA", Role::Central, Some(1)), &peer, Some(1)));
-        assert!(ends_connection(&disconnected("AA", Role::Central, None), &peer, Some(1)));
-        assert!(!ends_connection(&disconnected("AA", Role::Central, Some(2)), &peer, Some(1)));
-        assert!(!ends_connection(&disconnected("BB", Role::Central, Some(1)), &peer, Some(1)));
+        assert!(ends_connection(
+            &disconnected("AA", Role::Central, Some(1)),
+            &peer,
+            Some(1)
+        ));
+        assert!(ends_connection(
+            &disconnected("AA", Role::Central, None),
+            &peer,
+            Some(1)
+        ));
+        assert!(!ends_connection(
+            &disconnected("AA", Role::Central, Some(2)),
+            &peer,
+            Some(1)
+        ));
+        assert!(!ends_connection(
+            &disconnected("BB", Role::Central, Some(1)),
+            &peer,
+            Some(1)
+        ));
         // The same peer connected to our GATT server is a different link.
-        assert!(!ends_connection(&disconnected("AA", Role::Peripheral, Some(1)), &peer, Some(1)));
+        assert!(!ends_connection(
+            &disconnected("AA", Role::Peripheral, Some(1)),
+            &peer,
+            Some(1)
+        ));
     }
 
     #[test]
@@ -218,7 +260,9 @@ mod tests {
         let off = GattEvent::RadioChanged {
             status: RadioStatus::Off,
         };
-        let on = GattEvent::RadioChanged { status: RadioStatus::On };
+        let on = GattEvent::RadioChanged {
+            status: RadioStatus::On,
+        };
         assert!(ends_connection(&off, &peer, None));
         assert!(!ends_connection(&on, &peer, None));
     }

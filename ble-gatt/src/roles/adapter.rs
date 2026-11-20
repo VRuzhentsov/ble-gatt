@@ -6,7 +6,7 @@ use tokio_stream::StreamExt;
 
 use super::{Central, Peripheral};
 use crate::entities::models::{CapabilityReport, GattEvent, RadioStatus};
-use crate::hal::{Driver, BoxStream};
+use crate::hal::{BoxStream, Driver};
 
 /// The device's Bluetooth adapter: whether it is usable, published as it
 /// changes, and what it can do (ADR-0007 D7). Follows `bluest`'s `Adapter`

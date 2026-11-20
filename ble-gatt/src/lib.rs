@@ -24,15 +24,16 @@ pub use connection::peer_link;
 pub use entities::{error, models};
 pub use profile::datagram;
 
-pub use entities::error::{BleError, Result};
-pub use entities::models::{
-    CapabilityReport, CharacteristicUuid, ConnectionPriority, ConnectionState, DiscoveredPeer, GattCharacteristicSpec, GattEvent,
-    GattServiceSpec, PeerAddress, RadioStatus, Role, ServiceUuid, WriteType,
-};
 pub use connection::peer_link::{
     LinkId, LinkRole, MaxLinks, PeerChannel, PeerLink, PeerLinkConfig, PeerLinkEvent, PeerStatus,
     RetryBudget,
 };
 pub use connection::Connection;
-pub use hal::{Driver, BoxStream, GattConnection};
+pub use entities::error::{BleError, Result};
+pub use entities::models::{
+    CapabilityReport, CharacteristicUuid, ConnectionPriority, ConnectionState, DiscoveredPeer,
+    GattCharacteristicSpec, GattEvent, GattServiceSpec, PeerAddress, RadioStatus, Role,
+    ServiceUuid, WriteType,
+};
+pub use hal::{BoxStream, Driver, GattConnection};
 pub use roles::{Adapter, Central, Peripheral, ServerHandle};

@@ -12,8 +12,8 @@ use tokio_stream::Stream;
 
 use crate::entities::error::Result;
 use crate::entities::models::{
-    CapabilityReport, CharacteristicUuid, ConnectionPriority, DiscoveredPeer, GattEvent, GattServiceSpec,
-    PeerAddress, ServiceUuid, WriteType,
+    CapabilityReport, CharacteristicUuid, ConnectionPriority, DiscoveredPeer, GattEvent,
+    GattServiceSpec, PeerAddress, ServiceUuid, WriteType,
 };
 
 pub type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
@@ -77,7 +77,10 @@ pub trait GattConnection: Send {
     /// Write with an explicit delivery mode — see [`WriteType`]. Implementors
     /// provide this; `write` is a convenience wrapper over it.
     async fn write_with_type(
-        &mut self, characteristic: CharacteristicUuid, value: Vec<u8>, write_type: WriteType,
+        &mut self,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
+        write_type: WriteType,
     ) -> Result<()>;
 
     /// Stream of server-initiated notifications for `characteristic`.
@@ -90,7 +93,8 @@ pub trait GattConnection: Send {
     /// vanishes or expires with no error. An error item does not end the
     /// stream; it reports a gap.
     async fn subscribe(
-        &mut self, characteristic: CharacteristicUuid,
+        &mut self,
+        characteristic: CharacteristicUuid,
     ) -> Result<BoxStream<Result<Vec<u8>>>>;
     async fn disconnect(&mut self) -> Result<()>;
 
@@ -109,7 +113,9 @@ pub trait GattConnection: Send {
     /// [`BleError::Unsupported`]: crate::BleError::Unsupported
     async fn request_connection_priority(&mut self, priority: ConnectionPriority) -> Result<()> {
         let _ = priority;
-        Err(crate::BleError::Unsupported("connection priority on this driver".into()))
+        Err(crate::BleError::Unsupported(
+            "connection priority on this driver".into(),
+        ))
     }
 }
 
@@ -168,7 +174,9 @@ pub trait Driver: Send + Sync {
     /// [`BleError::Unsupported`]: crate::BleError::Unsupported
     async fn update_advertisement(&self, service: GattServiceSpec) -> Result<()> {
         let _ = service;
-        Err(crate::BleError::Unsupported("updating the advertisement on this driver".into()))
+        Err(crate::BleError::Unsupported(
+            "updating the advertisement on this driver".into(),
+        ))
     }
 
     /// The service `advertise` serves, with the advertisement data of its
@@ -222,7 +230,10 @@ pub trait Driver: Send + Sync {
     /// subscription that replaced it — where they are reassembled as
     /// current data. `None` targets whatever currently holds the address.
     async fn notify_peer(
-        &self, peer: &PeerAddress, session: Option<u64>, characteristic: CharacteristicUuid,
+        &self,
+        peer: &PeerAddress,
+        session: Option<u64>,
+        characteristic: CharacteristicUuid,
         value: Vec<u8>,
     ) -> Result<()>;
 

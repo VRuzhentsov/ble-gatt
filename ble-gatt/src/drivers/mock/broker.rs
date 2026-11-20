@@ -36,7 +36,10 @@ struct ConnHandle {
 pub(super) async fn serve(listener: TcpListener) -> Result<()> {
     let radio = Arc::new(LocalRadio::default());
     loop {
-        let (socket, _) = listener.accept().await.map_err(|e| BleError::Transport(e.to_string()))?;
+        let (socket, _) = listener
+            .accept()
+            .await
+            .map_err(|e| BleError::Transport(e.to_string()))?;
         tokio::spawn(handle_connection(socket, radio.clone()));
     }
 }
@@ -78,7 +81,10 @@ async fn handle_connection(socket: TcpStream, radio: Arc<LocalRadio>) {
         };
         let response = dispatch(request, &radio, &conn).await;
         if env.correlation_id != 0 {
-            let _ = conn.outbox.send(Envelope { correlation_id: env.correlation_id, frame: Frame::Resp(response) });
+            let _ = conn.outbox.send(Envelope {
+                correlation_id: env.correlation_id,
+                frame: Frame::Resp(response),
+            });
         }
     }
 
@@ -91,7 +97,13 @@ async fn handle_connection(socket: TcpStream, radio: Arc<LocalRadio>) {
     // closed cleanly without calling stop_advertising/disconnect itself) —
     // synthesize what that teardown would have done, or a surviving peer's
     // events() stream never learns this address is gone.
-    let addresses: Vec<PeerAddress> = conn.owned_addresses.lock().unwrap().iter().cloned().collect();
+    let addresses: Vec<PeerAddress> = conn
+        .owned_addresses
+        .lock()
+        .unwrap()
+        .iter()
+        .cloned()
+        .collect();
     for address in addresses {
         radio.disconnect_all_for(&address).await;
     }
@@ -110,7 +122,10 @@ async fn dispatch(request: Request, radio: &Arc<LocalRadio>, conn: &Arc<ConnHand
                         Ok(event) => {
                             let env = Envelope {
                                 correlation_id: 0,
-                                frame: Frame::Push(Push::Event { address: address.clone(), event }),
+                                frame: Frame::Push(Push::Event {
+                                    address: address.clone(),
+                                    event,
+                                }),
                             };
                             if outbox.send(env).is_err() {
                                 break;
@@ -151,7 +166,10 @@ async fn dispatch(request: Request, radio: &Arc<LocalRadio>, conn: &Arc<ConnHand
             Response::Unit
         }
         Request::Scan { requester, service } => match radio.scan(&requester, service).await {
-            Ok((peers, armed_failure)) => Response::ScanSnapshot { peers, armed_failure },
+            Ok((peers, armed_failure)) => Response::ScanSnapshot {
+                peers,
+                armed_failure,
+            },
             Err(e) => Response::Err(e),
         },
         Request::Connect { central, peer } => match radio.connect(&central, &peer).await {
@@ -172,45 +190,95 @@ async fn dispatch(request: Request, radio: &Arc<LocalRadio>, conn: &Arc<ConnHand
             Ok(()) => Response::Unit,
             Err(e) => Response::Err(e),
         },
-        Request::Notify { address, characteristic, value } => {
-            match radio.notify(&address, characteristic, value).await {
+        Request::Notify {
+            address,
+            characteristic,
+            value,
+        } => match radio.notify(&address, characteristic, value).await {
+            Ok(()) => Response::Unit,
+            Err(e) => Response::Err(e),
+        },
+        Request::NotifyPeer {
+            address,
+            peer,
+            session,
+            characteristic,
+            value,
+        } => {
+            match radio
+                .notify_peer(&address, &peer, session, characteristic, value)
+                .await
+            {
                 Ok(()) => Response::Unit,
                 Err(e) => Response::Err(e),
             }
         }
-        Request::NotifyPeer { address, peer, session, characteristic, value } => {
-            match radio.notify_peer(&address, &peer, session, characteristic, value).await {
-                Ok(()) => Response::Unit,
-                Err(e) => Response::Err(e),
-            }
-        }
-        Request::DisconnectPeer { address, peer, session } => {
-            match radio.disconnect_peer(&address, &peer, session).await {
-                Ok(()) => Response::Unit,
-                Err(e) => Response::Err(e),
-            }
-        }
-        Request::Read { session, central, peripheral, characteristic } => {
-            match radio.read(session, &central, &peripheral, characteristic).await {
+        Request::DisconnectPeer {
+            address,
+            peer,
+            session,
+        } => match radio.disconnect_peer(&address, &peer, session).await {
+            Ok(()) => Response::Unit,
+            Err(e) => Response::Err(e),
+        },
+        Request::Read {
+            session,
+            central,
+            peripheral,
+            characteristic,
+        } => {
+            match radio
+                .read(session, &central, &peripheral, characteristic)
+                .await
+            {
                 Ok(bytes) => Response::Bytes(bytes),
                 Err(e) => Response::Err(e),
             }
         }
-        Request::WriteWithType { session, central, peripheral, characteristic, value, write_type } => {
-            match radio.write_with_type(session, &central, &peripheral, characteristic, value, write_type).await {
+        Request::WriteWithType {
+            session,
+            central,
+            peripheral,
+            characteristic,
+            value,
+            write_type,
+        } => {
+            match radio
+                .write_with_type(
+                    session,
+                    &central,
+                    &peripheral,
+                    characteristic,
+                    value,
+                    write_type,
+                )
+                .await
+            {
                 Ok(()) => Response::Unit,
                 Err(e) => Response::Err(e),
             }
         }
-        Request::Subscribe { session, central, peripheral, characteristic, subscription_id } => {
-            match radio.subscribe(session, &central, &peripheral, characteristic).await {
+        Request::Subscribe {
+            session,
+            central,
+            peripheral,
+            characteristic,
+            subscription_id,
+        } => {
+            match radio
+                .subscribe(session, &central, &peripheral, characteristic)
+                .await
+            {
                 Ok(mut stream) => {
                     let outbox = conn.outbox.clone();
                     let handle = tokio::spawn(async move {
                         while let Some(item) = stream.next().await {
                             let env = Envelope {
                                 correlation_id: 0,
-                                frame: Frame::Push(Push::NotifyItem { subscription_id, item }),
+                                frame: Frame::Push(Push::NotifyItem {
+                                    subscription_id,
+                                    item,
+                                }),
                             };
                             if outbox.send(env).is_err() {
                                 break;
@@ -223,11 +291,13 @@ async fn dispatch(request: Request, radio: &Arc<LocalRadio>, conn: &Arc<ConnHand
                 Err(e) => Response::Err(e),
             }
         }
-        Request::Disconnect { session, central, peripheral } => {
-            match radio.disconnect(session, &central, &peripheral).await {
-                Ok(()) => Response::Unit,
-                Err(e) => Response::Err(e),
-            }
-        }
+        Request::Disconnect {
+            session,
+            central,
+            peripheral,
+        } => match radio.disconnect(session, &central, &peripheral).await {
+            Ok(()) => Response::Unit,
+            Err(e) => Response::Err(e),
+        },
     }
 }

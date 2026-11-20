@@ -47,7 +47,12 @@ pub fn ensure() -> Result<(), String> {
         .map_err(|err| format!("JNI attach failed: {err}"))?;
     let activity = unsafe { JObject::from_raw(ctx.context_jobject.cast()) };
     let application = env
-        .call_method(&activity, "getApplicationContext", "()Landroid/content/Context;", &[])
+        .call_method(
+            &activity,
+            "getApplicationContext",
+            "()Landroid/content/Context;",
+            &[],
+        )
         .and_then(|value| value.l())
         .and_then(|application| env.new_global_ref(application))
         .map_err(|err| {

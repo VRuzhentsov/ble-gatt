@@ -62,7 +62,10 @@ fn every_kotlin_external_fun_has_a_rust_export_and_back() {
     let declared = names_after(&kotlin, "external fun ");
     let exported = names_after(&rust, &format!("fn {JNI_EXPORT_PREFIX}"));
     assert!(!declared.is_empty(), "no external funs found in Native.kt");
-    assert_eq!(declared, exported, "Native.kt externs (left) and Rust JNI exports (right) differ");
+    assert_eq!(
+        declared, exported,
+        "Native.kt externs (left) and Rust JNI exports (right) differ"
+    );
 }
 
 #[test]
@@ -71,7 +74,13 @@ fn every_bridge_method_rust_calls_exists_in_kotlin() {
     let rust = read(DRIVER);
     let defined = names_after(&kotlin, "fun ");
     let called = called_methods(&rust);
-    assert!(!called.is_empty(), "no JNI method calls found in the Android driver");
+    assert!(
+        !called.is_empty(),
+        "no JNI method calls found in the Android driver"
+    );
     let missing: Vec<_> = called.difference(&defined).collect();
-    assert!(missing.is_empty(), "Rust calls BleGattBridge methods Kotlin does not define: {missing:?}");
+    assert!(
+        missing.is_empty(),
+        "Rust calls BleGattBridge methods Kotlin does not define: {missing:?}"
+    );
 }

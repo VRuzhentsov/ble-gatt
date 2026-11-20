@@ -48,10 +48,13 @@ use std::time::{Duration, Instant};
 use ble_gatt::datagram::{DatagramChannel, DatagramConfig};
 use ble_gatt::{Adapter, ConnectionPriority, PeerAddress, Role};
 use iroh::address_lookup::{self, AddressLookup, EndpointData, EndpointInfo, Item};
-use iroh::endpoint::{
-    AfterHandshakeOutcome, Connection, ConnectionError, EndpointHooks, PathEvent, WeakConnectionHandle,
+use iroh::endpoint::transports::{
+    CustomEndpoint, CustomSender, CustomTransport, RecvInfo, Transmit,
 };
-use iroh::endpoint::transports::{CustomEndpoint, CustomSender, CustomTransport, RecvInfo, Transmit};
+use iroh::endpoint::{
+    AfterHandshakeOutcome, Connection, ConnectionError, EndpointHooks, PathEvent,
+    WeakConnectionHandle,
+};
 use iroh_base::{CustomAddr, EndpointId, TransportAddr};
 use n0_future::StreamExt;
 use tokio::sync::{mpsc, oneshot, watch, Notify};
@@ -132,8 +135,14 @@ pub fn dial_with(adapter: Adapter, config: DatagramConfig) -> Dialer {
         let config = config.clone();
         Box::pin(async move {
             let mut channel = ble_gatt::datagram::connect(&adapter, &peer, &config).await?;
-            if let Err(err) = channel.request_connection_priority(ConnectionPriority::High).await {
-                log::debug!("link to {}: high connection priority not applied: {err}", peer.0);
+            if let Err(err) = channel
+                .request_connection_priority(ConnectionPriority::High)
+                .await
+            {
+                log::debug!(
+                    "link to {}: high connection priority not applied: {err}",
+                    peer.0
+                );
             }
             Ok(channel)
         })
@@ -150,7 +159,9 @@ pub fn peer_address(addr: &CustomAddr) -> Option<PeerAddress> {
     if addr.id() != TRANSPORT_ID {
         return None;
     }
-    String::from_utf8(addr.data().to_vec()).ok().map(PeerAddress)
+    String::from_utf8(addr.data().to_vec())
+        .ok()
+        .map(PeerAddress)
 }
 
 /// Whether `packet` can be the first datagram a dialler sends over a new
@@ -222,7 +233,9 @@ impl BleGattTransportBuilder {
                 dialer: self.dialer,
                 local: n0_watcher::Watchable::new(local),
                 link_idle_timeout: self.link_idle_timeout.unwrap_or(DEFAULT_LINK_IDLE_TIMEOUT),
-                link_release_delay: self.link_release_delay.unwrap_or(DEFAULT_LINK_RELEASE_DELAY),
+                link_release_delay: self
+                    .link_release_delay
+                    .unwrap_or(DEFAULT_LINK_RELEASE_DELAY),
             }),
         }
     }
@@ -332,7 +345,13 @@ impl BleGattTransport {
     /// phone's old address made BlueZ abort every dial to its new one
     /// (`le-connection-abort-by-local`).
     pub fn close_link(&self, peer: &PeerAddress) {
-        let closers = self.inner.closers.lock().expect("poisoned").get(peer).cloned();
+        let closers = self
+            .inner
+            .closers
+            .lock()
+            .expect("poisoned")
+            .get(peer)
+            .cloned();
         for close in closers.into_iter().flatten() {
             // Stores a permit when the link is not waiting yet.
             close.notify_one();
@@ -375,14 +394,20 @@ impl BleGattTransport {
     /// `Connection` clone, `SendStream` or `RecvStream` the application
     /// keeps is alive, since a lost connection ends only when those go.
     pub fn hooks(&self) -> BleGattHooks {
-        BleGattHooks { inner: self.inner.clone() }
+        BleGattHooks {
+            inner: self.inner.clone(),
+        }
     }
 
     /// Like [`attach`](Self::attach), for a channel whose first datagram
     /// the caller already read, typically to tell QUIC from its own traffic
     /// with [`is_quic_initial`]. `first` is handed to iroh before anything
     /// else from the channel.
-    pub fn attach_after(&self, channel: DatagramChannel, first: Vec<u8>) -> tokio::task::JoinHandle<()> {
+    pub fn attach_after(
+        &self,
+        channel: DatagramChannel,
+        first: Vec<u8>,
+    ) -> tokio::task::JoinHandle<()> {
         let _ = self.inner.inbound_tx.try_send((channel.peer(), first));
         self.attach(channel)
     }
@@ -412,7 +437,11 @@ impl BleGattTransport {
         let mut peers = self.inner.peers.lock().expect("poisoned");
         if let Some(old) = peers.remove(endpoint) {
             if !peers.values().any(|current| *current == old) {
-                self.inner.retired.lock().expect("poisoned").insert(old, *endpoint);
+                self.inner
+                    .retired
+                    .lock()
+                    .expect("poisoned")
+                    .insert(old, *endpoint);
             }
         }
     }
@@ -568,7 +597,8 @@ async fn run_link(
     // peripheral kept made BlueZ abort the next dial to the phone on
     // hardware. Not on Android, where disconnecting a central that dialled
     // in does not end the link but forgets its subscription (ADR-0008 D3).
-    let disconnect_central = released_here && role == Role::Peripheral && !cfg!(target_os = "android");
+    let disconnect_central =
+        released_here && role == Role::Peripheral && !cfg!(target_os = "android");
     if closed_by_application || disconnect_central {
         let _ = channel.disconnect().await;
     } else {
@@ -595,7 +625,10 @@ async fn run_link(
     // back. Without the hooks nothing is known, and the yield starts.
     {
         let mut links = inner.links.lock().expect("poisoned");
-        if links.get(&peer).is_some_and(|current| current.same_channel(&link)) {
+        if links
+            .get(&peer)
+            .is_some_and(|current| current.same_channel(&link))
+        {
             if role == Role::Peripheral {
                 let all_closing = inner
                     .learned
@@ -604,7 +637,11 @@ async fn run_link(
                     .get(&peer)
                     .is_some_and(|learned| learned.open.is_empty());
                 let dropped = (!closed_here && !all_closing).then(Instant::now);
-                inner.answered.lock().expect("poisoned").insert(peer.clone(), dropped);
+                inner
+                    .answered
+                    .lock()
+                    .expect("poisoned")
+                    .insert(peer.clone(), dropped);
             }
             links.remove(&peer);
             // No link is left at the address. A connection still using it
@@ -681,8 +718,12 @@ fn addresses_of(inner: &Inner, endpoint: &EndpointId) -> Vec<PeerAddress> {
 
 /// Records that iroh connection `connection` to `endpoint` uses `addr`.
 fn learn(inner: &Inner, endpoint: EndpointId, connection: u64, addr: &TransportAddr) {
-    let TransportAddr::Custom(addr) = addr else { return };
-    let Some(address) = peer_address(addr) else { return };
+    let TransportAddr::Custom(addr) = addr else {
+        return;
+    };
+    let Some(address) = peer_address(addr) else {
+        return;
+    };
     let mut learned = inner.learned.lock().expect("poisoned");
     let entry = learned.entry(address.clone()).or_insert_with(|| Learned {
         endpoint,
@@ -741,10 +782,16 @@ fn forget_connection(inner: &Inner, connection: u64) {
 fn connection_drained(inner: &Inner, connection: u64) {
     // `links` before `learned`, as in `run_link`.
     let links = inner.links.lock().expect("poisoned");
-    inner.learned.lock().expect("poisoned").retain(|address, learned| {
-        learned.ended.remove(&connection);
-        !learned.connections.is_empty() || !learned.ended.is_empty() || links.contains_key(address)
-    });
+    inner
+        .learned
+        .lock()
+        .expect("poisoned")
+        .retain(|address, learned| {
+            learned.ended.remove(&connection);
+            !learned.connections.is_empty()
+                || !learned.ended.is_empty()
+                || links.contains_key(address)
+        });
 }
 
 /// Whether only connections that have ended use `peer`.
@@ -841,7 +888,11 @@ impl EndpointHooks for BleGattHooks {
                     log::debug!(
                         "connection {connection} to {}: {} after {:?}",
                         endpoint.fmt_short(),
-                        if sent { "CONNECTION_CLOSE sent" } else { "drained" },
+                        if sent {
+                            "CONNECTION_CLOSE sent"
+                        } else {
+                            "drained"
+                        },
                         closing.elapsed()
                     );
                 }
@@ -870,7 +921,12 @@ impl EndpointHooks for BleGattHooks {
 /// dropped one since the close started (`closing`, when the hooks saw it,
 /// less one check interval for the wake-up between the two), the close may
 /// be the one lost, and this waits for the drain, as before.
-async fn close_sent(inner: &Inner, weak: &WeakConnectionHandle, connection: u64, closing: Instant) -> bool {
+async fn close_sent(
+    inner: &Inner,
+    weak: &WeakConnectionHandle,
+    connection: u64,
+    closing: Instant,
+) -> bool {
     loop {
         // Dropped before the sleep: a kept `Connection` would hold the
         // drain off.
@@ -895,7 +951,10 @@ async fn close_sent(inner: &Inner, weak: &WeakConnectionHandle, connection: u64,
         .collect();
     let links: Vec<mpsc::Sender<Outgoing>> = {
         let links = inner.links.lock().expect("poisoned");
-        addresses.iter().filter_map(|address| links.get(address).cloned()).collect()
+        addresses
+            .iter()
+            .filter_map(|address| links.get(address).cloned())
+            .collect()
     };
     let sent = async {
         for link in links {
@@ -916,10 +975,14 @@ async fn close_sent(inner: &Inner, weak: &WeakConnectionHandle, connection: u64,
         () = sent => {}
         () = &mut drained => return false,
     }
-    let since = closing.checked_sub(DRAINED_CHECK_INTERVAL).unwrap_or(closing);
+    let since = closing
+        .checked_sub(DRAINED_CHECK_INTERVAL)
+        .unwrap_or(closing);
     let lost = {
         let dropped = inner.dropped.lock().expect("poisoned");
-        addresses.iter().any(|address| dropped.get(address).is_some_and(|at| *at >= since))
+        addresses
+            .iter()
+            .any(|address| dropped.get(address).is_some_and(|at| *at >= since))
     };
     if lost {
         log::debug!("connection {connection}: a packet was dropped while it closed, waiting for it to drain");
@@ -965,7 +1028,10 @@ fn remove_closer(inner: &Inner, peer: &PeerAddress, close: &Arc<Notify>) {
 /// meanwhile stays.
 fn remove_link(inner: &Inner, peer: &PeerAddress, link: &mpsc::Sender<Outgoing>) {
     let mut links = inner.links.lock().expect("poisoned");
-    if links.get(peer).is_some_and(|current| current.same_channel(link)) {
+    if links
+        .get(peer)
+        .is_some_and(|current| current.same_channel(link))
+    {
         links.remove(peer);
     }
 }
@@ -1016,7 +1082,11 @@ impl CustomEndpoint for Endpoint {
         recv_infos: &mut [RecvInfo],
     ) -> Poll<io::Result<usize>> {
         assert_eq!(bufs.len(), metas.len(), "bufs and metas differ in length");
-        assert_eq!(bufs.len(), recv_infos.len(), "bufs and recv_infos differ in length");
+        assert_eq!(
+            bufs.len(),
+            recv_infos.len(),
+            "bufs and recv_infos differ in length"
+        );
         if bufs.is_empty() {
             return Poll::Ready(Ok(0));
         }
@@ -1030,7 +1100,11 @@ impl CustomEndpoint for Endpoint {
             };
             let buf = &mut bufs[filled];
             if buf.len() < packet.len() {
-                log::debug!("dropping a {} byte packet from {}: too large", packet.len(), peer.0);
+                log::debug!(
+                    "dropping a {} byte packet from {}: too large",
+                    packet.len(),
+                    peer.0
+                );
                 continue;
             }
             buf[..packet.len()].copy_from_slice(&packet);
@@ -1072,7 +1146,10 @@ impl CustomSender for Sender {
         let Some(peer) = peer_address(dst) else {
             return Poll::Ready(Err(io::Error::other("not a ble-gatt address")));
         };
-        let segment = transmit.segment_size.unwrap_or(transmit.contents.len()).max(1);
+        let segment = transmit
+            .segment_size
+            .unwrap_or(transmit.contents.len())
+            .max(1);
         Poll::Ready(
             transmit
                 .contents
@@ -1091,7 +1168,11 @@ impl Sender {
             Some(link) => match link.try_send(Outgoing::Packet(packet)) {
                 Ok(()) => return Ok(()),
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    self.inner.dropped.lock().expect("poisoned").insert(peer.clone(), Instant::now());
+                    self.inner
+                        .dropped
+                        .lock()
+                        .expect("poisoned")
+                        .insert(peer.clone(), Instant::now());
                     return Ok(());
                 }
                 // The link ended; dial again below.
@@ -1104,7 +1185,13 @@ impl Sender {
         };
         // An address the caller replaced; see `set_peer_address`. Dropped
         // like any packet with no link: QUIC uses its other paths.
-        if self.inner.retired.lock().expect("poisoned").contains_key(peer) {
+        if self
+            .inner
+            .retired
+            .lock()
+            .expect("poisoned")
+            .contains_key(peer)
+        {
             log::debug!("not dialling {}: replaced by set_peer_address", peer.0);
             return Ok(());
         }
@@ -1114,22 +1201,40 @@ impl Sender {
         // release. A new connection starts with an Initial, which dials.
         if let Outgoing::Packet(bytes) = &packet {
             if !is_quic_initial(bytes) && only_ended(&self.inner, peer) {
-                log::debug!("not dialling {}: only connections that have ended use it", peer.0);
+                log::debug!(
+                    "not dialling {}: only connections that have ended use it",
+                    peer.0
+                );
                 return Ok(());
             }
         }
         // The last link with this address was one the peer dialled. Dropping
         // the packet reads to QUIC as loss, and it resends once a link exists.
-        let answered = self.inner.answered.lock().expect("poisoned").get(peer).copied();
+        let answered = self
+            .inner
+            .answered
+            .lock()
+            .expect("poisoned")
+            .get(peer)
+            .copied();
         if let Some(dropped) = answered {
             // Seen only as the source of the peer's own connection: iroh
             // remembers it as a path, but a phone dials from a private
             // address it never accepts connections on and soon drops, so
             // dialling it hung 20s on hardware while the address the caller
             // set went unused. Only an address the caller set is dialled.
-            let set_by_caller = self.inner.peers.lock().expect("poisoned").values().any(|address| address == peer);
+            let set_by_caller = self
+                .inner
+                .peers
+                .lock()
+                .expect("poisoned")
+                .values()
+                .any(|address| address == peer);
             if !set_by_caller {
-                log::debug!("not dialling {}: only known as the source of its own connection", peer.0);
+                log::debug!(
+                    "not dialling {}: only known as the source of its own connection",
+                    peer.0
+                );
                 return Ok(());
             }
             // An address the caller set: the peer re-dials after a drop, and
@@ -1163,7 +1268,10 @@ impl Sender {
             // (`le-connection-abort-by-local`), and the redial cost ~5s.
             let dial = async {
                 if !earlier.is_empty() {
-                    log::debug!("dial to {}: waiting for the endpoint's other links to close", peer.0);
+                    log::debug!(
+                        "dial to {}: waiting for the endpoint's other links to close",
+                        peer.0
+                    );
                     let _ = tokio::time::timeout(CLOSE_WAIT_LIMIT, async {
                         for mut closing in earlier {
                             // Ends with an error once the close is done.
@@ -1223,12 +1331,20 @@ impl AddressLookup for BleGattAddressLookup {
         &self,
         endpoint_id: EndpointId,
     ) -> Option<n0_future::stream::Boxed<Result<Item, address_lookup::Error>>> {
-        let peer = self.inner.peers.lock().expect("poisoned").get(&endpoint_id)?.clone();
+        let peer = self
+            .inner
+            .peers
+            .lock()
+            .expect("poisoned")
+            .get(&endpoint_id)?
+            .clone();
         let info = EndpointInfo {
             endpoint_id,
             data: EndpointData::from_iter([TransportAddr::Custom(custom_addr(&peer))]),
         };
-        Some(Box::pin(n0_future::stream::once(Ok(Item::new(info, "ble-gatt", None)))))
+        Some(Box::pin(n0_future::stream::once(Ok(Item::new(
+            info, "ble-gatt", None,
+        )))))
     }
 }
 

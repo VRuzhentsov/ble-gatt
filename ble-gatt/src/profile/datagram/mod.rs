@@ -133,15 +133,17 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
-use crate::hal::{Driver, BoxStream, GattConnection};
-use crate::roles::Adapter;
-use crate::profile::datagram::fragment::{split, FragmentHeader, FRAGMENT_HEADER_LEN, MAX_FRAGMENTS};
-use crate::profile::datagram::reassembly::{Accept, Reassembler, ReassemblyLimits};
 use crate::entities::error::{BleError, Result};
 use crate::entities::models::{
     CharacteristicUuid, ConnectionPriority, GattCharacteristicSpec, GattEvent, GattServiceSpec,
     PeerAddress, RadioStatus, Role, ServiceUuid, WriteType,
 };
+use crate::hal::{BoxStream, Driver, GattConnection};
+use crate::profile::datagram::fragment::{
+    split, FragmentHeader, FRAGMENT_HEADER_LEN, MAX_FRAGMENTS,
+};
+use crate::profile::datagram::reassembly::{Accept, Reassembler, ReassemblyLimits};
+use crate::roles::Adapter;
 
 pub const DEFAULT_MAX_MESSAGE_LEN: usize = 1024 * 1024;
 pub const DEFAULT_REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -491,7 +493,10 @@ impl DatagramChannel {
     /// this side dialled (`connect`) can ask: the priority is a central-side
     /// request, so a channel accepted by `serve` returns
     /// [`BleError::Unsupported`].
-    pub async fn request_connection_priority(&mut self, priority: ConnectionPriority) -> Result<()> {
+    pub async fn request_connection_priority(
+        &mut self,
+        priority: ConnectionPriority,
+    ) -> Result<()> {
         match &mut *self.sink.lock().await {
             Sink::Connection { connection: Some(connection), .. } => {
                 connection.request_connection_priority(priority).await
@@ -538,7 +543,10 @@ impl DatagramChannel {
             // buffered: "you have lost data" is more useful now than after
             // draining everything that survived.
             if self.overflow.take() {
-                log::warn!("recv: inbound overflow from {} — a message was lost", self.peer.0);
+                log::warn!(
+                    "recv: inbound overflow from {} — a message was lost",
+                    self.peer.0
+                );
                 return Some(Err(BleError::Gatt(format!(
                     "inbound overflow from {}: fragments were dropped and at least one \
                      message is lost",
@@ -611,7 +619,11 @@ impl DatagramChannel {
             },
             Sink::Notify { driver, active } => {
                 active.store(false, Ordering::SeqCst);
-                log::info!("disconnect: central {} session={:?}", self.peer.0, self.session);
+                log::info!(
+                    "disconnect: central {} session={:?}",
+                    self.peer.0,
+                    self.session
+                );
                 driver.disconnect_peer(&self.peer, self.session).await
             }
         }
@@ -675,8 +687,9 @@ impl DatagramSender {
                         );
                         return Err(BleError::NotConnected(self.peer.0.clone()));
                     };
-                    if let Err(err) =
-                        connection.write_with_type(characteristic, fragment, *write_type).await
+                    if let Err(err) = connection
+                        .write_with_type(characteristic, fragment, *write_type)
+                        .await
                     {
                         log::warn!(
                             "send: write of msg_id={msg_id} fragment {index} to {} failed: {err}",
@@ -746,9 +759,15 @@ struct ServedPeer {
 /// and, unless the caller closed it first, drop the peer so it is not left
 /// subscribed to a server that is no longer reading from it.
 async fn release_peer(
-    inbound: &mut HashMap<PeerAddress, ServedPeer>, released: Released, driver: &dyn Driver,
+    inbound: &mut HashMap<PeerAddress, ServedPeer>,
+    released: Released,
+    driver: &dyn Driver,
 ) {
-    let Released { peer, generation, keep_peer } = released;
+    let Released {
+        peer,
+        generation,
+        keep_peer,
+    } = released;
     let peer = &peer;
     // Only if this release belongs to the channel currently holding the
     // slot. A late release from a superseded generation must not evict the
@@ -759,14 +778,22 @@ async fn release_peer(
     if let Some(served) = inbound.remove(peer) {
         served.active.store(false, Ordering::SeqCst);
         if keep_peer {
-            log::info!("release: central {} session={:?}, kept connected", peer.0, served.driver_session);
+            log::info!(
+                "release: central {} session={:?}, kept connected",
+                peer.0,
+                served.driver_session
+            );
             return;
         }
         // Named by the driver session this channel was serving. Releasing a
         // channel from a superseded `serve` generation would otherwise
         // disconnect whatever now holds the address — the peer's own
         // replacement session, established by the server that replaced us.
-        log::info!("release: central {} session={:?}", peer.0, served.driver_session);
+        log::info!(
+            "release: central {} session={:?}",
+            peer.0,
+            served.driver_session
+        );
         if let Err(err) = driver.disconnect_peer(peer, served.driver_session).await {
             log::warn!("release: could not disconnect central {}: {err}", peer.0);
         }
@@ -780,7 +807,10 @@ async fn release_peer(
 /// `Driver::notify` is a broadcast that cannot be addressed to one peer on
 /// BlueZ. Disconnecting is the only portable exclusion.
 async fn disconnect_refused(driver: &dyn Driver, peer: &PeerAddress, session: Option<u64>) {
-    log::info!("refuse: disconnecting central {} session={session:?}", peer.0);
+    log::info!(
+        "refuse: disconnecting central {} session={session:?}",
+        peer.0
+    );
     if let Err(err) = driver.disconnect_peer(peer, session).await {
         log::warn!(
             "refuse: could not disconnect central {}: {err} \
@@ -799,8 +829,11 @@ async fn disconnect_refused(driver: &dyn Driver, peer: &PeerAddress, session: Op
 /// link-loss watcher as well, so dropping the watcher's copy closed nothing
 /// and `recv()` hung forever on a dead link.
 fn spawn_reassembly<S>(
-    mut fragments: S, limits: ReassemblyLimits, out: mpsc::Sender<Result<Vec<u8>>>,
-    overflow: Arc<OverflowSignal>, peer: PeerAddress,
+    mut fragments: S,
+    limits: ReassemblyLimits,
+    out: mpsc::Sender<Result<Vec<u8>>>,
+    overflow: Arc<OverflowSignal>,
+    peer: PeerAddress,
 ) -> tokio::task::JoinHandle<()>
 where
     S: tokio_stream::Stream<Item = Result<Vec<u8>>> + Send + Unpin + 'static,
@@ -924,14 +957,18 @@ impl Drop for PendingConnection {
 /// Central role: connect to `peer` and bring up a channel over `config`'s
 /// service.
 pub async fn connect(
-    adapter: &Adapter, peer: &PeerAddress, config: &DatagramConfig,
+    adapter: &Adapter,
+    peer: &PeerAddress,
+    config: &DatagramConfig,
 ) -> Result<DatagramChannel> {
     connect_driver(adapter.driver(), peer, config).await
 }
 
 /// [`connect`] over a driver directly, for `PeerLink`, which holds one.
 pub(crate) async fn connect_driver(
-    driver: Arc<dyn Driver>, peer: &PeerAddress, config: &DatagramConfig,
+    driver: Arc<dyn Driver>,
+    peer: &PeerAddress,
+    config: &DatagramConfig,
 ) -> Result<DatagramChannel> {
     config.validate()?;
     log::info!("connect: dialling {} service={}", peer.0, config.service.0);
@@ -990,8 +1027,13 @@ pub(crate) async fn connect_driver(
 
     let (tx, rx) = mpsc::channel(config.inbound_queue_depth);
     let overflow = Arc::new(OverflowSignal::default());
-    let reassembly =
-        spawn_reassembly(notifications, config.limits(), tx, overflow.clone(), peer.clone());
+    let reassembly = spawn_reassembly(
+        notifications,
+        config.limits(),
+        tx,
+        overflow.clone(),
+        peer.clone(),
+    );
     // The watcher gets an *AbortHandle*, not the JoinHandle. Handing over
     // the JoinHandle meant aborting the watcher merely dropped it — and
     // dropping a Tokio JoinHandle detaches its task rather than cancelling
@@ -1043,8 +1085,11 @@ pub(crate) async fn connect_driver(
 /// driver a subscription outlives the link, so waiting for it to close
 /// would be waiting forever.
 fn spawn_link_loss_watch(
-    mut events: BoxStream<GattEvent>, peer: PeerAddress, reassembly: tokio::task::AbortHandle,
-    overflow: Arc<OverflowSignal>, session: Option<u64>,
+    mut events: BoxStream<GattEvent>,
+    peer: PeerAddress,
+    reassembly: tokio::task::AbortHandle,
+    overflow: Arc<OverflowSignal>,
+    session: Option<u64>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(event) = events.next().await {
@@ -1062,7 +1107,9 @@ fn spawn_link_loss_watch(
                     local_role: Role::Central,
                     session: lost_session,
                 } if *lost == peer
-                    && (lost_session.is_none() || session.is_none() || *lost_session == session) =>
+                    && (lost_session.is_none()
+                        || session.is_none()
+                        || *lost_session == session) =>
                 {
                     log::info!(
                         "link-loss watch: {} session={session:?} disconnected; closing channel",
@@ -1119,7 +1166,10 @@ fn spawn_link_loss_watch(
 /// this needs a per-peer notify on the `Driver` port: straightforward on
 /// Android (`notifyCharacteristicChanged` already takes a device),
 /// unresolved on BlueZ.
-pub async fn serve(adapter: &Adapter, config: &DatagramConfig) -> Result<BoxStream<DatagramChannel>> {
+pub async fn serve(
+    adapter: &Adapter,
+    config: &DatagramConfig,
+) -> Result<BoxStream<DatagramChannel>> {
     serve_driver(adapter.driver(), config).await
 }
 
@@ -1136,7 +1186,10 @@ pub async fn serve(adapter: &Adapter, config: &DatagramConfig) -> Result<BoxStre
 pub async fn update_advertisement(adapter: &Adapter, config: &DatagramConfig) -> Result<()> {
     config.validate()?;
     log::info!("serve: updating the advertisement for {}", config.service.0);
-    adapter.driver().update_advertisement(config.service_spec()).await
+    adapter
+        .driver()
+        .update_advertisement(config.service_spec())
+        .await
 }
 
 /// Stop a running [`serve`]: its advertisement and its GATT server, which
@@ -1162,7 +1215,8 @@ pub async fn stop_serving(adapter: &Adapter) -> Result<()> {
 
 /// [`serve`] over a driver directly, for `PeerLink`, which holds one.
 pub(crate) async fn serve_driver(
-    driver: Arc<dyn Driver>, config: &DatagramConfig,
+    driver: Arc<dyn Driver>,
+    config: &DatagramConfig,
 ) -> Result<BoxStream<DatagramChannel>> {
     config.validate()?;
     // Subscribe *before* advertising. `events()` is a broadcast subscription,
@@ -1187,9 +1241,8 @@ pub(crate) async fn serve_driver(
     // (`Driver::notify_max_len`): the spec-minimum. Conservative on purpose:
     // undersized fragments always fit, oversized ones would be truncated by
     // the stack with no error.
-    let default_peripheral_budget = crate::hal::DEFAULT_ATT_MTU as usize
-        - crate::hal::ATT_HEADER_LEN
-        - FRAGMENT_HEADER_LEN;
+    let default_peripheral_budget =
+        crate::hal::DEFAULT_ATT_MTU as usize - crate::hal::ATT_HEADER_LEN - FRAGMENT_HEADER_LEN;
 
     tokio::spawn(async move {
         // At most one entry: see the doc comment on why concurrent centrals
@@ -1460,11 +1513,9 @@ pub(crate) async fn serve_driver(
                             );
                         }
                         Err(mpsc::error::TrySendError::Full(value)) => {
-                            let queued = tokio::time::timeout(
-                                FRAGMENT_BACKPRESSURE_TIMEOUT,
-                                tx.send(value),
-                            )
-                            .await;
+                            let queued =
+                                tokio::time::timeout(FRAGMENT_BACKPRESSURE_TIMEOUT, tx.send(value))
+                                    .await;
                             if queued.is_err() {
                                 // Report the loss to the receiver rather
                                 // than letting the message quietly time
@@ -1558,7 +1609,9 @@ pub(crate) async fn serve_driver(
                 // bluetoothd itself dies, nothing is left to emit them, and a
                 // peer kept in `inbound` would refuse every central after
                 // recovery.
-                GattEvent::RadioChanged { status: RadioStatus::Off | RadioStatus::Unsupported } => {
+                GattEvent::RadioChanged {
+                    status: RadioStatus::Off | RadioStatus::Unsupported,
+                } => {
                     for (peer, served) in inbound.drain() {
                         log::info!("serve: radio lost; ending session with central {}", peer.0);
                         served.active.store(false, Ordering::SeqCst);
@@ -1570,7 +1623,9 @@ pub(crate) async fn serve_driver(
                 // The platform forgot the GATT application and advertisement
                 // along with the radio (an adapter power-cycle, or a
                 // bluetoothd restart), and nothing else re-registers them.
-                GattEvent::RadioChanged { status: RadioStatus::On } => {
+                GattEvent::RadioChanged {
+                    status: RadioStatus::On,
+                } => {
                     if accept_closed {
                         continue;
                     }
@@ -1582,10 +1637,16 @@ pub(crate) async fn serve_driver(
                         .served_service()
                         .filter(|served| served.same_service(&config.service_spec()))
                     else {
-                        log::info!("serve: radio back; service {} was stopped, not re-advertising", config.service.0);
+                        log::info!(
+                            "serve: radio back; service {} was stopped, not re-advertising",
+                            config.service.0
+                        );
                         continue;
                     };
-                    log::info!("serve: radio back; re-advertising service {}", config.service.0);
+                    log::info!(
+                        "serve: radio back; re-advertising service {}",
+                        config.service.0
+                    );
                     if let Err(err) = driver.advertise(spec).await {
                         log::warn!("serve: re-advertising after radio recovery failed: {err}");
                     }

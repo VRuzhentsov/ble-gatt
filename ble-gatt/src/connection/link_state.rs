@@ -242,9 +242,13 @@ impl CentralLink {
             // and whether the consumer knew it as a live link.
             (state, E::RadioLost) => {
                 let effects = if state.has_connection() {
-                    vec![TearDown { emit_disconnected: true }]
+                    vec![TearDown {
+                        emit_disconnected: true,
+                    }]
                 } else if state.holds_resource() {
-                    vec![TearDown { emit_disconnected: false }]
+                    vec![TearDown {
+                        emit_disconnected: false,
+                    }]
                 } else {
                     vec![]
                 };
@@ -252,7 +256,13 @@ impl CentralLink {
             }
             (S::RadioOff, E::RadioBack) => (S::Idle, vec![]),
 
-            (S::Idle, E::DialStarted { session }) => (S::Dialing { since: now, session }, vec![]),
+            (S::Idle, E::DialStarted { session }) => (
+                S::Dialing {
+                    since: now,
+                    session,
+                },
+                vec![],
+            ),
 
             (S::Dialing { session, .. }, E::DialSucceeded) => {
                 (S::Connected { session: *session }, vec![])
@@ -260,19 +270,32 @@ impl CentralLink {
             // A dial that failed or timed out: close the half-open attempt,
             // but no `Disconnected` event — the caller learns via its
             // `connect()` return, not the lifecycle stream.
-            (S::Dialing { .. }, E::DialFailed) => {
-                (S::Idle, vec![TearDown { emit_disconnected: false }])
-            }
-            (S::Dialing { since, .. }, E::Tick) if now.duration_since(*since) >= DIAL_WINDOW => {
-                (S::Idle, vec![TearDown { emit_disconnected: false }])
-            }
+            (S::Dialing { .. }, E::DialFailed) => (
+                S::Idle,
+                vec![TearDown {
+                    emit_disconnected: false,
+                }],
+            ),
+            (S::Dialing { since, .. }, E::Tick) if now.duration_since(*since) >= DIAL_WINDOW => (
+                S::Idle,
+                vec![TearDown {
+                    emit_disconnected: false,
+                }],
+            ),
 
-            (S::Connected { session }, E::DisconnectRequested) => {
-                (S::Disconnecting { since: now, session: *session }, vec![])
-            }
-            (S::Connected { .. }, E::LinkDropped) => {
-                (S::Idle, vec![TearDown { emit_disconnected: true }])
-            }
+            (S::Connected { session }, E::DisconnectRequested) => (
+                S::Disconnecting {
+                    since: now,
+                    session: *session,
+                },
+                vec![],
+            ),
+            (S::Connected { .. }, E::LinkDropped) => (
+                S::Idle,
+                vec![TearDown {
+                    emit_disconnected: true,
+                }],
+            ),
 
             // The caller asked for this and its `disconnect()` returned — it
             // already knows, so no event. The one legitimate silent loss of
@@ -281,7 +304,12 @@ impl CentralLink {
             (S::Disconnecting { since, .. }, E::Tick)
                 if now.duration_since(*since) >= DISCONNECT_WINDOW =>
             {
-                (S::Idle, vec![TearDown { emit_disconnected: true }])
+                (
+                    S::Idle,
+                    vec![TearDown {
+                        emit_disconnected: true,
+                    }],
+                )
             }
 
             (S::Idle | S::Dialing { .. }, E::CleanupStarted) => {
@@ -292,9 +320,12 @@ impl CentralLink {
             // re-arm the window). Matches the former `pending_cleanup` retry
             // loop: the address stays quarantined until a disconnect
             // genuinely completes.
-            (S::Draining { since }, E::Tick) if now.duration_since(*since) >= DRAIN_WINDOW => {
-                (S::Draining { since: now }, vec![TearDown { emit_disconnected: false }])
-            }
+            (S::Draining { since }, E::Tick) if now.duration_since(*since) >= DRAIN_WINDOW => (
+                S::Draining { since: now },
+                vec![TearDown {
+                    emit_disconnected: false,
+                }],
+            ),
 
             (state, _) => (*state, vec![]),
         }
@@ -330,7 +361,9 @@ pub(crate) enum PeripheralLink {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PeripheralEvent {
     /// A central connected to our server.
-    CentralConnected { session: Session },
+    CentralConnected {
+        session: Session,
+    },
     /// It wrote the CCCD — a notify route now exists.
     CentralSubscribed,
     /// It disabled the CCCD while staying connected — gone, from the
@@ -371,7 +404,9 @@ impl PeripheralLink {
     }
 
     pub(crate) fn apply(
-        &self, event: PeripheralEvent, now: Instant,
+        &self,
+        event: PeripheralEvent,
+        now: Instant,
     ) -> (PeripheralLink, Vec<TearDown>) {
         use PeripheralEvent as E;
         use PeripheralLink as S;
@@ -379,7 +414,9 @@ impl PeripheralLink {
         match (self, event) {
             (state, E::RadioLost) => {
                 let effects = if state.holds_slot() {
-                    vec![TearDown { emit_disconnected: true }]
+                    vec![TearDown {
+                        emit_disconnected: true,
+                    }]
                 } else {
                     vec![]
                 };
@@ -391,27 +428,46 @@ impl PeripheralLink {
             // supersedes it — the map now holds the newer session, and the
             // old session's `notify_peer` is refused because it no longer
             // matches (the former `superseded` guard).
-            (S::Absent | S::Accepted { .. } | S::Serving { .. }, E::CentralConnected { session }) => {
-                (S::Accepted { session }, vec![])
-            }
+            (
+                S::Absent | S::Accepted { .. } | S::Serving { .. },
+                E::CentralConnected { session },
+            ) => (S::Accepted { session }, vec![]),
             (S::Accepted { session }, E::CentralSubscribed) => {
                 (S::Serving { session: *session }, vec![])
             }
-            (S::Serving { .. } | S::Accepted { .. }, E::CentralUnsubscribed | E::CentralDropped) => {
-                (S::Absent, vec![TearDown { emit_disconnected: true }])
-            }
+            (
+                S::Serving { .. } | S::Accepted { .. },
+                E::CentralUnsubscribed | E::CentralDropped,
+            ) => (
+                S::Absent,
+                vec![TearDown {
+                    emit_disconnected: true,
+                }],
+            ),
 
-            (S::Accepted { session } | S::Serving { session }, E::DisconnectRequested) => {
-                (S::Disconnecting { since: now, session: *session }, vec![])
-            }
+            (S::Accepted { session } | S::Serving { session }, E::DisconnectRequested) => (
+                S::Disconnecting {
+                    since: now,
+                    session: *session,
+                },
+                vec![],
+            ),
             (S::Disconnecting { .. }, E::DisconnectConfirmed) => (S::Absent, vec![]),
-            (S::Disconnecting { .. }, E::CentralDropped) => {
-                (S::Absent, vec![TearDown { emit_disconnected: true }])
-            }
+            (S::Disconnecting { .. }, E::CentralDropped) => (
+                S::Absent,
+                vec![TearDown {
+                    emit_disconnected: true,
+                }],
+            ),
             (S::Disconnecting { since, .. }, E::Tick)
                 if now.duration_since(*since) >= DISCONNECT_WINDOW =>
             {
-                (S::Absent, vec![TearDown { emit_disconnected: true }])
+                (
+                    S::Absent,
+                    vec![TearDown {
+                        emit_disconnected: true,
+                    }],
+                )
             }
 
             (state, _) => (*state, vec![]),
@@ -470,7 +526,13 @@ mod tests {
         assert!(s.may_dial());
 
         let (s, e) = s.apply(CentralEvent::DialStarted { session: 7 }, start);
-        assert_eq!(s, CentralLink::Dialing { since: start, session: 7 });
+        assert_eq!(
+            s,
+            CentralLink::Dialing {
+                since: start,
+                session: 7
+            }
+        );
         assert!(e.is_empty());
         assert!(!s.may_dial(), "a dial is already in flight");
 
@@ -480,13 +542,25 @@ mod tests {
         assert!(s.has_connection());
 
         let (s, e) = s.apply(CentralEvent::DisconnectRequested, start);
-        assert_eq!(s, CentralLink::Disconnecting { since: start, session: 7 });
+        assert_eq!(
+            s,
+            CentralLink::Disconnecting {
+                since: start,
+                session: 7
+            }
+        );
         assert!(e.is_empty());
-        assert!(s.has_connection(), "still connected until the platform confirms");
+        assert!(
+            s.has_connection(),
+            "still connected until the platform confirms"
+        );
 
         let (s, e) = s.apply(CentralEvent::DisconnectConfirmed, start);
         assert_eq!(s, CentralLink::Idle);
-        assert!(e.is_empty(), "the caller asked and already knows — no event");
+        assert!(
+            e.is_empty(),
+            "the caller asked and already knows — no event"
+        );
         assert!(!s.has_connection());
     }
 
@@ -494,18 +568,28 @@ mod tests {
     fn an_unsolicited_drop_tells_the_consumer() {
         let (s, e) = CentralLink::Connected { session: 1 }.apply(CentralEvent::LinkDropped, t0());
         assert_eq!(s, CentralLink::Idle);
-        assert_eq!(e, vec![TearDown { emit_disconnected: true }]);
+        assert_eq!(
+            e,
+            vec![TearDown {
+                emit_disconnected: true
+            }]
+        );
     }
 
     #[test]
     fn a_dial_that_never_completes_is_abandoned_without_an_event() {
         let start = t0();
-        let dialing = CentralLink::Dialing { since: start, session: 1 };
+        let dialing = CentralLink::Dialing {
+            since: start,
+            session: 1,
+        };
         let (s, e) = dialing.apply(CentralEvent::Tick, start + DIAL_WINDOW);
         assert_eq!(s, CentralLink::Idle);
         assert_eq!(
             e,
-            vec![TearDown { emit_disconnected: false }],
+            vec![TearDown {
+                emit_disconnected: false
+            }],
             "close the half-open dial, but the caller learns via connect()'s return"
         );
     }
@@ -514,7 +598,12 @@ mod tests {
     fn radio_loss_from_connected_tears_down_and_emits() {
         let (s, e) = CentralLink::Connected { session: 1 }.apply(CentralEvent::RadioLost, t0());
         assert_eq!(s, CentralLink::RadioOff);
-        assert_eq!(e, vec![TearDown { emit_disconnected: true }]);
+        assert_eq!(
+            e,
+            vec![TearDown {
+                emit_disconnected: true
+            }]
+        );
 
         let (s, e) = s.apply(CentralEvent::RadioBack, t0());
         assert_eq!(s, CentralLink::Idle);
@@ -523,10 +612,18 @@ mod tests {
 
     #[test]
     fn radio_loss_while_dialing_closes_the_attempt_silently() {
-        let (s, e) = CentralLink::Dialing { since: t0(), session: 1 }
-            .apply(CentralEvent::RadioLost, t0());
+        let (s, e) = CentralLink::Dialing {
+            since: t0(),
+            session: 1,
+        }
+        .apply(CentralEvent::RadioLost, t0());
         assert_eq!(s, CentralLink::RadioOff);
-        assert_eq!(e, vec![TearDown { emit_disconnected: false }]);
+        assert_eq!(
+            e,
+            vec![TearDown {
+                emit_disconnected: false
+            }]
+        );
     }
 
     #[test]
@@ -545,8 +642,18 @@ mod tests {
 
         // Timed out: retry, re-arm the window, still quarantined.
         let (s, e) = s.apply(CentralEvent::Tick, start + DRAIN_WINDOW);
-        assert_eq!(s, CentralLink::Draining { since: start + DRAIN_WINDOW });
-        assert_eq!(e, vec![TearDown { emit_disconnected: false }]);
+        assert_eq!(
+            s,
+            CentralLink::Draining {
+                since: start + DRAIN_WINDOW
+            }
+        );
+        assert_eq!(
+            e,
+            vec![TearDown {
+                emit_disconnected: false
+            }]
+        );
 
         let (s, e) = s.apply(CentralEvent::CleanupConfirmed, start + DRAIN_WINDOW);
         assert_eq!(s, CentralLink::Idle);
@@ -569,7 +676,10 @@ mod tests {
             CentralLink::Connected { session: 1 },
         ] {
             let (next, effects) = state.apply(CentralEvent::DialSucceeded, start);
-            assert_eq!(next, state, "a stale DialSucceeded must not move a settled link");
+            assert_eq!(
+                next, state,
+                "a stale DialSucceeded must not move a settled link"
+            );
             assert!(effects.is_empty());
         }
     }
@@ -584,9 +694,15 @@ mod tests {
         let start = t0();
         let states = [
             CentralLink::Idle,
-            CentralLink::Dialing { since: start, session: 1 },
+            CentralLink::Dialing {
+                since: start,
+                session: 1,
+            },
             CentralLink::Connected { session: 1 },
-            CentralLink::Disconnecting { since: start, session: 1 },
+            CentralLink::Disconnecting {
+                since: start,
+                session: 1,
+            },
             CentralLink::Draining { since: start },
             CentralLink::RadioOff,
         ];
@@ -639,9 +755,15 @@ mod tests {
         let start = t0();
         let states = [
             CentralLink::Idle,
-            CentralLink::Dialing { since: start, session: 1 },
+            CentralLink::Dialing {
+                since: start,
+                session: 1,
+            },
             CentralLink::Connected { session: 1 },
-            CentralLink::Disconnecting { since: start, session: 1 },
+            CentralLink::Disconnecting {
+                since: start,
+                session: 1,
+            },
             CentralLink::Draining { since: start },
             CentralLink::RadioOff,
         ];
@@ -685,7 +807,8 @@ mod tests {
     #[test]
     fn a_central_connects_subscribes_and_leaves() {
         let start = t0();
-        let (s, e) = PeripheralLink::new().apply(PeripheralEvent::CentralConnected { session: 3 }, start);
+        let (s, e) =
+            PeripheralLink::new().apply(PeripheralEvent::CentralConnected { session: 3 }, start);
         assert_eq!(s, PeripheralLink::Accepted { session: 3 });
         assert!(e.is_empty());
 
@@ -696,7 +819,12 @@ mod tests {
 
         let (s, e) = s.apply(PeripheralEvent::CentralDropped, start);
         assert_eq!(s, PeripheralLink::Absent);
-        assert_eq!(e, vec![TearDown { emit_disconnected: true }]);
+        assert_eq!(
+            e,
+            vec![TearDown {
+                emit_disconnected: true
+            }]
+        );
         assert!(!s.holds_slot());
     }
 
@@ -705,7 +833,10 @@ mod tests {
         let (s, e) = PeripheralLink::Serving { session: 3 }
             .apply(PeripheralEvent::CentralConnected { session: 4 }, t0());
         assert_eq!(s, PeripheralLink::Accepted { session: 4 });
-        assert!(e.is_empty(), "the map now holds session 4; session 3's notify is refused by mismatch");
+        assert!(
+            e.is_empty(),
+            "the map now holds session 4; session 3's notify is refused by mismatch"
+        );
     }
 
     #[test]
@@ -713,7 +844,13 @@ mod tests {
         let start = t0();
         let (s, e) = PeripheralLink::Serving { session: 1 }
             .apply(PeripheralEvent::DisconnectRequested, start);
-        assert_eq!(s, PeripheralLink::Disconnecting { since: start, session: 1 });
+        assert_eq!(
+            s,
+            PeripheralLink::Disconnecting {
+                since: start,
+                session: 1
+            }
+        );
         assert!(e.is_empty());
         let (s, e) = s.apply(PeripheralEvent::DisconnectConfirmed, start);
         assert_eq!(s, PeripheralLink::Absent);
@@ -724,7 +861,12 @@ mod tests {
     fn radio_loss_drops_a_serving_central() {
         let (s, e) = PeripheralLink::Serving { session: 1 }.apply(PeripheralEvent::RadioLost, t0());
         assert_eq!(s, PeripheralLink::RadioOff);
-        assert_eq!(e, vec![TearDown { emit_disconnected: true }]);
+        assert_eq!(
+            e,
+            vec![TearDown {
+                emit_disconnected: true
+            }]
+        );
     }
 
     #[test]
@@ -734,7 +876,10 @@ mod tests {
             PeripheralLink::Absent,
             PeripheralLink::Accepted { session: 1 },
             PeripheralLink::Serving { session: 1 },
-            PeripheralLink::Disconnecting { since: start, session: 1 },
+            PeripheralLink::Disconnecting {
+                since: start,
+                session: 1,
+            },
             PeripheralLink::RadioOff,
         ];
         let events = [
@@ -775,8 +920,7 @@ mod tests {
 
     #[test]
     fn peripheral_late_events_are_ignored() {
-        let (next, effects) =
-            PeripheralLink::Absent.apply(PeripheralEvent::CentralDropped, t0());
+        let (next, effects) = PeripheralLink::Absent.apply(PeripheralEvent::CentralDropped, t0());
         assert_eq!(next, PeripheralLink::Absent);
         assert!(effects.is_empty());
     }

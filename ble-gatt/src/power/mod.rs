@@ -135,7 +135,9 @@ impl PowerPolicy {
             return PowerMode::Performance;
         }
         match inputs.battery_percent {
-            Some(level) if level <= self.critical_battery_percent => return PowerMode::UltraLowPower,
+            Some(level) if level <= self.critical_battery_percent => {
+                return PowerMode::UltraLowPower
+            }
             Some(level) if level <= self.low_battery_percent => return PowerMode::PowerSaver,
             _ => {}
         }
@@ -221,12 +223,30 @@ mod tests {
     #[test]
     fn rules_apply_in_order() {
         let policy = PowerPolicy::default();
-        assert_eq!(policy.mode(&inputs(false, Some(5), true, 0)), PowerMode::Performance);
-        assert_eq!(policy.mode(&inputs(true, Some(10), false, 3)), PowerMode::UltraLowPower);
-        assert_eq!(policy.mode(&inputs(true, Some(20), false, 3)), PowerMode::PowerSaver);
-        assert_eq!(policy.mode(&inputs(true, Some(21), false, 0)), PowerMode::Balanced);
-        assert_eq!(policy.mode(&inputs(false, None, false, 2)), PowerMode::Balanced);
-        assert_eq!(policy.mode(&inputs(false, None, false, 0)), PowerMode::PowerSaver);
+        assert_eq!(
+            policy.mode(&inputs(false, Some(5), true, 0)),
+            PowerMode::Performance
+        );
+        assert_eq!(
+            policy.mode(&inputs(true, Some(10), false, 3)),
+            PowerMode::UltraLowPower
+        );
+        assert_eq!(
+            policy.mode(&inputs(true, Some(20), false, 3)),
+            PowerMode::PowerSaver
+        );
+        assert_eq!(
+            policy.mode(&inputs(true, Some(21), false, 0)),
+            PowerMode::Balanced
+        );
+        assert_eq!(
+            policy.mode(&inputs(false, None, false, 2)),
+            PowerMode::Balanced
+        );
+        assert_eq!(
+            policy.mode(&inputs(false, None, false, 0)),
+            PowerMode::PowerSaver
+        );
     }
 
     #[test]
@@ -235,7 +255,10 @@ mod tests {
             low_battery_percent: 50,
             ..PowerPolicy::default()
         };
-        assert_eq!(policy.mode(&inputs(true, Some(40), false, 0)), PowerMode::PowerSaver);
+        assert_eq!(
+            policy.mode(&inputs(true, Some(40), false, 0)),
+            PowerMode::PowerSaver
+        );
     }
 
     #[test]

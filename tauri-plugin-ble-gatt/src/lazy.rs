@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ble_gatt::{
-    Driver, BleError, BoxStream, CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattConnection,
-    GattEvent, GattServiceSpec, PeerAddress, Result, ServiceUuid,
+    BleError, BoxStream, CapabilityReport, CharacteristicUuid, DiscoveredPeer, Driver,
+    GattConnection, GattEvent, GattServiceSpec, PeerAddress, Result, ServiceUuid,
 };
 use tokio::sync::{broadcast, OnceCell};
 use tokio_stream::wrappers::BroadcastStream;
@@ -125,7 +125,10 @@ impl Driver for LazyDriver {
     }
 
     async fn notify_peer(
-        &self, peer: &PeerAddress, session: Option<u64>, characteristic: CharacteristicUuid,
+        &self,
+        peer: &PeerAddress,
+        session: Option<u64>,
+        characteristic: CharacteristicUuid,
         value: Vec<u8>,
     ) -> Result<()> {
         self.inner()
@@ -172,7 +175,11 @@ mod tests {
                 if attempt == 0 {
                     return Err(BleError::AdapterUnavailable("off".into()));
                 }
-                let driver = MockDriver::new(PeerAddress("AA".into()), network, CapabilityReport::default());
+                let driver = MockDriver::new(
+                    PeerAddress("AA".into()),
+                    network,
+                    CapabilityReport::default(),
+                );
                 Ok(Arc::new(driver) as Arc<dyn Driver>)
             }
         });

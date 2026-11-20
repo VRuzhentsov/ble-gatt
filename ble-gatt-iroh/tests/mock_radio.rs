@@ -58,7 +58,10 @@ async fn adapter(network: &Arc<MockNetwork>, address: &str) -> Adapter {
     Adapter::new(Arc::new(MockDriver::new(
         PeerAddress(address.to_string()),
         network.clone(),
-        CapabilityReport { central: true, peripheral: true },
+        CapabilityReport {
+            central: true,
+            peripheral: true,
+        },
     )))
     .await
 }
@@ -106,7 +109,10 @@ async fn pair() -> Pair {
     let router = Router::builder(listener).accept(ECHO_ALPN, Echo).spawn();
 
     let dialer_transport = BleGattTransport::builder()
-        .dialer(dial_with(adapter(&network, "AA:00:00:00:00:01").await, config()))
+        .dialer(dial_with(
+            adapter(&network, "AA:00:00:00:00:01").await,
+            config(),
+        ))
         .build();
     dialer_transport.set_peer_address(listener_id, listener_address.clone());
     let dialer = endpoint(SecretKey::generate(), &dialer_transport).await;
@@ -124,7 +130,9 @@ async fn echo(connection: &Connection, payload: &[u8]) -> Vec<u8> {
     let (mut send, mut recv) = connection.open_bi().await.expect("open stream");
     send.write_all(payload).await.expect("write");
     send.finish().expect("finish");
-    recv.read_to_end(payload.len() + 1).await.expect("read echo")
+    recv.read_to_end(payload.len() + 1)
+        .await
+        .expect("read echo")
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -138,7 +146,11 @@ async fn quic_echoes_over_the_mock_radio_by_address() {
         .await
         .expect("connect in time")
         .expect("connect");
-    assert_eq!(connection.remote_id(), pair.listener_id, "TLS proved the listener's key");
+    assert_eq!(
+        connection.remote_id(),
+        pair.listener_id,
+        "TLS proved the listener's key"
+    );
 
     let reply = tokio::time::timeout(TIMEOUT, echo(&connection, b"hello over ble-gatt"))
         .await
@@ -149,10 +161,11 @@ async fn quic_echoes_over_the_mock_radio_by_address() {
 #[tokio::test(flavor = "multi_thread")]
 async fn quic_dials_by_key_through_the_address_lookup() {
     let pair = pair().await;
-    let connection = tokio::time::timeout(TIMEOUT, pair.dialer.connect(pair.listener_id, ECHO_ALPN))
-        .await
-        .expect("connect in time")
-        .expect("connect");
+    let connection =
+        tokio::time::timeout(TIMEOUT, pair.dialer.connect(pair.listener_id, ECHO_ALPN))
+            .await
+            .expect("connect in time")
+            .expect("connect");
 
     // Larger than one QUIC packet, so it takes many datagrams each way.
     let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
@@ -178,8 +191,15 @@ async fn a_channel_routed_by_its_first_datagram_still_carries_quic() {
     tokio::spawn(async move {
         let mut incoming = incoming;
         while let Some(mut channel) = incoming.next().await {
-            let first = channel.recv().await.expect("a first datagram").expect("not a gap");
-            assert!(ble_gatt_iroh::is_quic_initial(&first), "a dialler opens with a QUIC Initial");
+            let first = channel
+                .recv()
+                .await
+                .expect("a first datagram")
+                .expect("not a gap");
+            assert!(
+                ble_gatt_iroh::is_quic_initial(&first),
+                "a dialler opens with a QUIC Initial"
+            );
             attach_to.attach_after(channel, first);
         }
     });
@@ -189,7 +209,10 @@ async fn a_channel_routed_by_its_first_datagram_still_carries_quic() {
     let _router = Router::builder(listener).accept(ECHO_ALPN, Echo).spawn();
 
     let dialer_transport = BleGattTransport::builder()
-        .dialer(dial_with(adapter(&network, "AA:00:00:00:00:03").await, config()))
+        .dialer(dial_with(
+            adapter(&network, "AA:00:00:00:00:03").await,
+            config(),
+        ))
         .build();
     dialer_transport.set_peer_address(listener_id, listener_address);
     let dialer = endpoint(SecretKey::generate(), &dialer_transport).await;
@@ -224,9 +247,13 @@ async fn an_idle_channel_is_closed() {
     let mut incoming = datagram::serve(&adapter(&network, &listener_address.0).await, &config())
         .await
         .expect("serve");
-    let _client = datagram::connect(&adapter(&network, "AA:00:00:00:00:05").await, &listener_address, &config())
-        .await
-        .expect("connect");
+    let _client = datagram::connect(
+        &adapter(&network, "AA:00:00:00:00:05").await,
+        &listener_address,
+        &config(),
+    )
+    .await
+    .expect("connect");
     let channel = tokio::time::timeout(TIMEOUT, incoming.next())
         .await
         .expect("accepted in time")
@@ -267,7 +294,9 @@ async fn an_idle_inbound_channel_does_not_hold_back_a_dial() {
         let key = SecretKey::generate();
         let id = key.public();
         let endpoint = endpoint(key, &transport).await;
-        let router = Router::builder(endpoint.clone()).accept(ECHO_ALPN, Echo).spawn();
+        let router = Router::builder(endpoint.clone())
+            .accept(ECHO_ALPN, Echo)
+            .spawn();
         sides.push((transport, endpoint, id, router, other.clone()));
     }
     let (a_transport, a_endpoint, a_id, _a_router, _) = &sides[0];
@@ -280,7 +309,12 @@ async fn an_idle_inbound_channel_does_not_hold_back_a_dial() {
         .await
         .expect("connect in time")
         .expect("connect");
-    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&connection, b"b to a")).await.expect("echo in time"), b"b to a");
+    assert_eq!(
+        tokio::time::timeout(TIMEOUT, echo(&connection, b"b to a"))
+            .await
+            .expect("echo in time"),
+        b"b to a"
+    );
     connection.close(0u32.into(), b"done");
     tokio::time::timeout(TIMEOUT, async {
         while !a_transport.linked_peers().is_empty() || !b_transport.linked_peers().is_empty() {
@@ -291,11 +325,19 @@ async fn an_idle_inbound_channel_does_not_hold_back_a_dial() {
     .expect("both links close idle");
 
     // Well inside REDIAL_YIELD (30s): A dials B at once.
-    let connection = tokio::time::timeout(Duration::from_secs(10), a_endpoint.connect(*b_id, ECHO_ALPN))
-        .await
-        .expect("A dials without waiting for B to dial back")
-        .expect("connect");
-    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&connection, b"a to b")).await.expect("echo in time"), b"a to b");
+    let connection = tokio::time::timeout(
+        Duration::from_secs(10),
+        a_endpoint.connect(*b_id, ECHO_ALPN),
+    )
+    .await
+    .expect("A dials without waiting for B to dial back")
+    .expect("connect");
+    assert_eq!(
+        tokio::time::timeout(TIMEOUT, echo(&connection, b"a to b"))
+            .await
+            .expect("echo in time"),
+        b"a to b"
+    );
 }
 
 /// An address `set_peer_address` replaced is not dialled, even when iroh
@@ -346,8 +388,16 @@ async fn a_replaced_address_is_not_dialled() {
         .await
         .expect("connect in time")
         .expect("connect");
-    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&connection, b"current")).await.expect("echo in time"), b"current");
-    assert!(!dialled.lock().unwrap().contains(&old_address), "dialled the replaced address");
+    assert_eq!(
+        tokio::time::timeout(TIMEOUT, echo(&connection, b"current"))
+            .await
+            .expect("echo in time"),
+        b"current"
+    );
+    assert!(
+        !dialled.lock().unwrap().contains(&old_address),
+        "dialled the replaced address"
+    );
 }
 
 /// `close_link` closes an attached channel long before the idle timeout.
@@ -360,9 +410,13 @@ async fn close_link_closes_an_attached_channel() {
     let mut incoming = datagram::serve(&adapter(&network, &listener_address.0).await, &config())
         .await
         .expect("serve");
-    let _client = datagram::connect(&adapter(&network, &client_address.0).await, &listener_address, &config())
-        .await
-        .expect("connect");
+    let _client = datagram::connect(
+        &adapter(&network, &client_address.0).await,
+        &listener_address,
+        &config(),
+    )
+    .await
+    .expect("connect");
     let channel = tokio::time::timeout(TIMEOUT, incoming.next())
         .await
         .expect("accepted in time")
@@ -382,16 +436,27 @@ async fn close_link_closes_an_attached_channel() {
 #[tokio::test(flavor = "multi_thread")]
 async fn close_links_closes_a_channel_to_a_replaced_address() {
     let pair = pair().await;
-    let connection = tokio::time::timeout(TIMEOUT, pair.dialer.connect(pair.listener_id, ECHO_ALPN))
-        .await
-        .expect("connect in time")
-        .expect("connect");
-    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&connection, b"old")).await.expect("echo in time"), b"old");
+    let connection =
+        tokio::time::timeout(TIMEOUT, pair.dialer.connect(pair.listener_id, ECHO_ALPN))
+            .await
+            .expect("connect in time")
+            .expect("connect");
+    assert_eq!(
+        tokio::time::timeout(TIMEOUT, echo(&connection, b"old"))
+            .await
+            .expect("echo in time"),
+        b"old"
+    );
     connection.close(0u32.into(), b"done");
-    assert_eq!(pair.dialer_transport.linked_peers(), vec![pair.listener_address.clone()]);
+    assert_eq!(
+        pair.dialer_transport.linked_peers(),
+        vec![pair.listener_address.clone()]
+    );
 
-    pair.dialer_transport
-        .set_peer_address(pair.listener_id, PeerAddress("AA:00:00:00:00:0E".to_string()));
+    pair.dialer_transport.set_peer_address(
+        pair.listener_id,
+        PeerAddress("AA:00:00:00:00:0E".to_string()),
+    );
     pair.dialer_transport.close_links(&pair.listener_id);
     tokio::time::timeout(Duration::from_secs(5), async {
         while !pair.dialer_transport.linked_peers().is_empty() {
@@ -452,7 +517,10 @@ async fn hooked_pair(listener: &str, dialer: &str, release_delay: Duration) -> H
 /// A listener's release delay longer than the test keeps its side of the
 /// link, so only the dialer's own release can close it.
 async fn hooked_pair_with_delays(
-    listener: &str, dialer: &str, listener_delay: Duration, release_delay: Duration,
+    listener: &str,
+    dialer: &str,
+    listener_delay: Duration,
+    release_delay: Duration,
 ) -> HookedPair {
     let network = MockNetwork::new();
     let listener_address = PeerAddress(listener.to_string());
@@ -527,12 +595,23 @@ async fn until_no_links(transport: &BleGattTransport, within: Duration) -> bool 
 /// is longer than the test, so only `close_links` can close it.
 #[tokio::test(flavor = "multi_thread")]
 async fn close_links_reaches_a_link_the_peer_dialled() {
-    let pair = hooked_pair("AA:00:00:00:00:12", "AA:00:00:00:00:11", Duration::from_secs(60)).await;
-    let connection = tokio::time::timeout(TIMEOUT, pair.dialer.connect(pair.listener_id, ECHO_ALPN))
-        .await
-        .expect("connect in time")
-        .expect("connect");
-    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&connection, b"in")).await.expect("echo in time"), b"in");
+    let pair = hooked_pair(
+        "AA:00:00:00:00:12",
+        "AA:00:00:00:00:11",
+        Duration::from_secs(60),
+    )
+    .await;
+    let connection =
+        tokio::time::timeout(TIMEOUT, pair.dialer.connect(pair.listener_id, ECHO_ALPN))
+            .await
+            .expect("connect in time")
+            .expect("connect");
+    assert_eq!(
+        tokio::time::timeout(TIMEOUT, echo(&connection, b"in"))
+            .await
+            .expect("echo in time"),
+        b"in"
+    );
     // Ended first, or the dialer's iroh would dial the link straight back.
     connection.close(0u32.into(), b"done");
     drop(connection);
@@ -550,12 +629,23 @@ async fn close_links_reaches_a_link_the_peer_dialled() {
 /// ends, long before the idle timeout (ADR-0008 D3).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_link_closes_when_its_last_connection_ends() {
-    let pair = hooked_pair("AA:00:00:00:00:14", "AA:00:00:00:00:13", Duration::from_millis(300)).await;
-    let connection = tokio::time::timeout(TIMEOUT, pair.dialer.connect(pair.listener_id, ECHO_ALPN))
-        .await
-        .expect("connect in time")
-        .expect("connect");
-    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&connection, b"once")).await.expect("echo in time"), b"once");
+    let pair = hooked_pair(
+        "AA:00:00:00:00:14",
+        "AA:00:00:00:00:13",
+        Duration::from_millis(300),
+    )
+    .await;
+    let connection =
+        tokio::time::timeout(TIMEOUT, pair.dialer.connect(pair.listener_id, ECHO_ALPN))
+            .await
+            .expect("connect in time")
+            .expect("connect");
+    assert_eq!(
+        tokio::time::timeout(TIMEOUT, echo(&connection, b"once"))
+            .await
+            .expect("echo in time"),
+        b"once"
+    );
     connection.close(0u32.into(), b"done");
     drop(connection);
     assert!(
@@ -580,12 +670,20 @@ async fn a_link_closes_when_the_peer_closes_its_connection() {
         Duration::ZERO,
     )
     .await;
-    let connection = tokio::time::timeout(TIMEOUT, pair.dialer.connect(pair.listener_id, CLOSE_ALPN))
+    let connection =
+        tokio::time::timeout(TIMEOUT, pair.dialer.connect(pair.listener_id, CLOSE_ALPN))
+            .await
+            .expect("connect in time")
+            .expect("connect");
+    assert_eq!(
+        tokio::time::timeout(TIMEOUT, echo(&connection, b"once"))
+            .await
+            .expect("echo in time"),
+        b"once"
+    );
+    tokio::time::timeout(TIMEOUT, connection.closed())
         .await
-        .expect("connect in time")
-        .expect("connect");
-    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&connection, b"once")).await.expect("echo in time"), b"once");
-    tokio::time::timeout(TIMEOUT, connection.closed()).await.expect("closed by the peer in time");
+        .expect("closed by the peer in time");
     drop(connection);
     assert!(
         until_no_links(&pair.dialer_transport, Duration::from_secs(5)).await,
@@ -604,11 +702,17 @@ async fn the_closing_side_releases_its_link_once_its_close_is_sent() {
         Duration::ZERO,
     )
     .await;
-    let connection = tokio::time::timeout(TIMEOUT, pair.dialer.connect(pair.listener_id, ECHO_ALPN))
-        .await
-        .expect("connect in time")
-        .expect("connect");
-    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&connection, b"once")).await.expect("echo in time"), b"once");
+    let connection =
+        tokio::time::timeout(TIMEOUT, pair.dialer.connect(pair.listener_id, ECHO_ALPN))
+            .await
+            .expect("connect in time")
+            .expect("connect");
+    assert_eq!(
+        tokio::time::timeout(TIMEOUT, echo(&connection, b"once"))
+            .await
+            .expect("echo in time"),
+        b"once"
+    );
     connection.close(0u32.into(), b"done");
     assert!(
         until_no_links(&pair.dialer_transport, Duration::from_secs(5)).await,
@@ -629,11 +733,17 @@ async fn the_receiving_peripheral_disconnects_the_central() {
         Duration::from_secs(60),
     )
     .await;
-    let connection = tokio::time::timeout(TIMEOUT, pair.dialer.connect(pair.listener_id, ECHO_ALPN))
-        .await
-        .expect("connect in time")
-        .expect("connect");
-    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&connection, b"once")).await.expect("echo in time"), b"once");
+    let connection =
+        tokio::time::timeout(TIMEOUT, pair.dialer.connect(pair.listener_id, ECHO_ALPN))
+            .await
+            .expect("connect in time")
+            .expect("connect");
+    assert_eq!(
+        tokio::time::timeout(TIMEOUT, echo(&connection, b"once"))
+            .await
+            .expect("echo in time"),
+        b"once"
+    );
     connection.close(0u32.into(), b"done");
     assert!(
         until_no_links(&pair.listener_transport, Duration::from_secs(5)).await,
@@ -650,12 +760,22 @@ async fn the_receiving_peripheral_disconnects_the_central() {
 /// (ADR-0008 D3).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_new_connection_keeps_a_released_link() {
-    let pair = hooked_pair("AA:00:00:00:00:16", "AA:00:00:00:00:15", Duration::from_millis(300)).await;
+    let pair = hooked_pair(
+        "AA:00:00:00:00:16",
+        "AA:00:00:00:00:15",
+        Duration::from_millis(300),
+    )
+    .await;
     let first = tokio::time::timeout(TIMEOUT, pair.dialer.connect(pair.listener_id, ECHO_ALPN))
         .await
         .expect("connect in time")
         .expect("connect");
-    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&first, b"first")).await.expect("echo in time"), b"first");
+    assert_eq!(
+        tokio::time::timeout(TIMEOUT, echo(&first, b"first"))
+            .await
+            .expect("echo in time"),
+        b"first"
+    );
     let second = tokio::time::timeout(TIMEOUT, pair.dialer.connect(pair.listener_id, ECHO_ALPN))
         .await
         .expect("connect in time")
@@ -663,8 +783,17 @@ async fn a_new_connection_keeps_a_released_link() {
     first.close(0u32.into(), b"done");
     drop(first);
     tokio::time::sleep(Duration::from_secs(1)).await;
-    assert_eq!(pair.dialer_transport.linked_peers().len(), 1, "the link stays for the second connection");
-    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&second, b"second")).await.expect("echo in time"), b"second");
+    assert_eq!(
+        pair.dialer_transport.linked_peers().len(),
+        1,
+        "the link stays for the second connection"
+    );
+    assert_eq!(
+        tokio::time::timeout(TIMEOUT, echo(&second, b"second"))
+            .await
+            .expect("echo in time"),
+        b"second"
+    );
 }
 
 /// Both sides connect to each other at the same moment. Both connections
@@ -702,7 +831,9 @@ async fn crossed_connects_both_work_and_their_links_close() {
             .bind()
             .await
             .expect("bind");
-        let router = Router::builder(endpoint.clone()).accept(ECHO_ALPN, Echo).spawn();
+        let router = Router::builder(endpoint.clone())
+            .accept(ECHO_ALPN, Echo)
+            .spawn();
         sides.push((transport, endpoint, id, router));
     }
     let (a_transport, a, a_id, _a_router) = &sides[0];
@@ -716,14 +847,30 @@ async fn crossed_connects_both_work_and_their_links_close() {
     );
     let a_to_b = a_to_b.expect("a connects in time").expect("a connects");
     let b_to_a = b_to_a.expect("b connects in time").expect("b connects");
-    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&a_to_b, b"a to b")).await.expect("echo in time"), b"a to b");
-    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&b_to_a, b"b to a")).await.expect("echo in time"), b"b to a");
+    assert_eq!(
+        tokio::time::timeout(TIMEOUT, echo(&a_to_b, b"a to b"))
+            .await
+            .expect("echo in time"),
+        b"a to b"
+    );
+    assert_eq!(
+        tokio::time::timeout(TIMEOUT, echo(&b_to_a, b"b to a"))
+            .await
+            .expect("echo in time"),
+        b"b to a"
+    );
 
     a_to_b.close(0u32.into(), b"done");
     b_to_a.close(0u32.into(), b"done");
     drop((a_to_b, b_to_a));
-    assert!(until_no_links(a_transport, Duration::from_secs(5)).await, "a's links close");
-    assert!(until_no_links(b_transport, Duration::from_secs(5)).await, "b's links close");
+    assert!(
+        until_no_links(a_transport, Duration::from_secs(5)).await,
+        "a's links close"
+    );
+    assert!(
+        until_no_links(b_transport, Duration::from_secs(5)).await,
+        "b's links close"
+    );
 }
 
 /// A refuses the connection B dialled in, and B's release then drops the
@@ -737,7 +884,10 @@ async fn a_refused_connection_does_not_hold_back_a_dial() {
     let mut sides = Vec::new();
     // A's release delay is longer than the test, so only B's release can
     // drop the link, as on hardware.
-    for (own, release_delay) in [(&a_address, Duration::from_secs(60)), (&b_address, Duration::ZERO)] {
+    for (own, release_delay) in [
+        (&a_address, Duration::from_secs(60)),
+        (&b_address, Duration::ZERO),
+    ] {
         let adapter = adapter(&network, &own.0).await;
         let transport = BleGattTransport::builder()
             .dialer(dial_with(adapter.clone(), config()))
@@ -778,16 +928,34 @@ async fn a_refused_connection_does_not_hold_back_a_dial() {
         .await
         .expect("connect in time")
         .expect("connect");
-    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&refused, b"b to a")).await.expect("echo in time"), b"b to a");
-    tokio::time::timeout(TIMEOUT, refused.closed()).await.expect("closed by A in time");
+    assert_eq!(
+        tokio::time::timeout(TIMEOUT, echo(&refused, b"b to a"))
+            .await
+            .expect("echo in time"),
+        b"b to a"
+    );
+    tokio::time::timeout(TIMEOUT, refused.closed())
+        .await
+        .expect("closed by A in time");
     drop(refused);
-    assert!(until_no_links(b_transport, Duration::from_secs(5)).await, "b's link closes");
-    assert!(until_no_links(a_transport, Duration::from_secs(5)).await, "a sees the link drop");
+    assert!(
+        until_no_links(b_transport, Duration::from_secs(5)).await,
+        "b's link closes"
+    );
+    assert!(
+        until_no_links(a_transport, Duration::from_secs(5)).await,
+        "a sees the link drop"
+    );
 
     // Well inside REDIAL_YIELD (30s): A dials B at once.
     let connection = tokio::time::timeout(Duration::from_secs(10), a.connect(*b_id, ECHO_ALPN))
         .await
         .expect("A dials without waiting for B to dial back")
         .expect("connect");
-    assert_eq!(tokio::time::timeout(TIMEOUT, echo(&connection, b"a to b")).await.expect("echo in time"), b"a to b");
+    assert_eq!(
+        tokio::time::timeout(TIMEOUT, echo(&connection, b"a to b"))
+            .await
+            .expect("echo in time"),
+        b"a to b"
+    );
 }

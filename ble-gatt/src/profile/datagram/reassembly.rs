@@ -362,7 +362,7 @@ mod tests {
             ..limits()
         });
         let base = Instant::now();
-        r.accept(header(1, 0, 2), b"a", base, );
+        r.accept(header(1, 0, 2), b"a", base);
         r.accept(header(2, 0, 2), b"b", base + Duration::from_millis(1));
         assert_eq!(r.pending_count(), 2);
 
@@ -447,5 +447,4 @@ mod tests {
             other => panic!("expected the new message to complete, got {other:?}"),
         }
     }
-
 }

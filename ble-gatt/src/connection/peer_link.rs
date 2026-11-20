@@ -27,10 +27,10 @@ use tokio_stream::StreamExt;
 use crate::connection::link_state::{
     CentralEvent, CentralLink, PeripheralEvent, PeripheralLink, RadioEvent, RadioState,
 };
-use crate::hal::{Driver, BoxStream};
-use crate::profile::datagram::{self, DatagramChannel, DatagramConfig};
 use crate::entities::error::{BleError, Result};
 use crate::entities::models::{ConnectionPriority, GattEvent, PeerAddress, RadioStatus, Role};
+use crate::hal::{BoxStream, Driver};
+use crate::profile::datagram::{self, DatagramChannel, DatagramConfig};
 
 const EVENT_CHANNEL_CAPACITY: usize = 128;
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
@@ -157,7 +157,10 @@ pub enum PeerLinkEvent {
     /// The link is gone; the channel from `Up` is dead.
     Down { peer: PeerAddress },
     /// Coarse status changed. No channel.
-    Status { peer: PeerAddress, status: PeerStatus },
+    Status {
+        peer: PeerAddress,
+        status: PeerStatus,
+    },
     /// The radio's usability changed.
     RadioChanged { status: RadioStatus },
 }
@@ -319,7 +322,10 @@ impl PeerLink {
             events_tx,
             status,
             radio,
-            _worker: WorkerHandle { shutdown: Some(shutdown_tx), join: Some(join) },
+            _worker: WorkerHandle {
+                shutdown: Some(shutdown_tx),
+                join: Some(join),
+            },
         })
     }
 
@@ -427,9 +433,9 @@ impl Worker {
             Some(b) => b,
             None => {
                 self.set_radio(RadioStatus::Unsupported);
-                let _ = self
-                    .events_tx
-                    .send(PeerLinkEvent::RadioChanged { status: RadioStatus::Unsupported });
+                let _ = self.events_tx.send(PeerLinkEvent::RadioChanged {
+                    status: RadioStatus::Unsupported,
+                });
                 self.idle_until_shutdown(shutdown).await;
                 return;
             }
@@ -627,7 +633,9 @@ impl Worker {
     /// The earliest instant the worker needs to wake — a backoff expiring, a
     /// give-up clock running out, or the inbound server's restart backoff.
     fn next_wake(
-        &self, peers: &HashMap<PeerAddress, Peer>, radio: RadioState,
+        &self,
+        peers: &HashMap<PeerAddress, Peer>,
+        radio: RadioState,
         serve_retry_at: Option<Instant>,
     ) -> Option<tokio::time::Instant> {
         let now = Instant::now();
@@ -664,7 +672,9 @@ impl Worker {
     }
 
     fn spawn_serve(
-        &self, driver: &Arc<dyn Driver>, inbound_tx: &mpsc::UnboundedSender<DatagramChannel>,
+        &self,
+        driver: &Arc<dyn Driver>,
+        inbound_tx: &mpsc::UnboundedSender<DatagramChannel>,
     ) -> tokio::task::JoinHandle<()> {
         let driver = driver.clone();
         let cfg = self.config.datagram.clone();
@@ -684,7 +694,10 @@ impl Worker {
     }
 
     fn on_inbound(
-        &self, peers: &mut HashMap<PeerAddress, Peer>, channel: DatagramChannel, radio: RadioState,
+        &self,
+        peers: &mut HashMap<PeerAddress, Peer>,
+        channel: DatagramChannel,
+        radio: RadioState,
         linkgone_tx: &mpsc::UnboundedSender<(PeerAddress, u64)>,
     ) {
         let peer = channel.peer();
@@ -709,7 +722,9 @@ impl Worker {
         }
         let now = Instant::now();
         let session = now.elapsed().as_nanos() as u64;
-        let (pl, _) = p.peripheral.apply(PeripheralEvent::CentralConnected { session }, now);
+        let (pl, _) = p
+            .peripheral
+            .apply(PeripheralEvent::CentralConnected { session }, now);
         p.peripheral = pl;
         let (pl, _) = p.peripheral.apply(PeripheralEvent::CentralSubscribed, now);
         p.peripheral = pl;
@@ -777,7 +792,10 @@ impl Worker {
     }
 
     fn on_track(
-        &self, peers: &mut HashMap<PeerAddress, Peer>, peer: PeerAddress, peer_id: LinkId,
+        &self,
+        peers: &mut HashMap<PeerAddress, Peer>,
+        peer: PeerAddress,
+        peer_id: LinkId,
         radio: RadioState,
     ) {
         let dials = match &self.config.role {
@@ -806,7 +824,9 @@ impl Worker {
     }
 
     fn pump_dials(
-        &self, driver: &Arc<dyn Driver>, peers: &mut HashMap<PeerAddress, Peer>,
+        &self,
+        driver: &Arc<dyn Driver>,
+        peers: &mut HashMap<PeerAddress, Peer>,
         radio: RadioState,
         conn_tx: &mpsc::UnboundedSender<(PeerAddress, u64, Result<DatagramChannel>)>,
     ) {
@@ -840,7 +860,12 @@ impl Worker {
             }
             budget -= 1;
             next_session = next_session.wrapping_add(1);
-            let (next, _) = p.central.apply(CentralEvent::DialStarted { session: next_session }, now);
+            let (next, _) = p.central.apply(
+                CentralEvent::DialStarted {
+                    session: next_session,
+                },
+                now,
+            );
             p.central = next;
             p.attempts += 1;
             // The give-up clock starts here, on the first real attempt — not
@@ -873,8 +898,12 @@ impl Worker {
     }
 
     fn on_dial_result(
-        &self, peers: &mut HashMap<PeerAddress, Peer>, peer: PeerAddress, session: u64,
-        result: Result<DatagramChannel>, linkgone_tx: &mpsc::UnboundedSender<(PeerAddress, u64)>,
+        &self,
+        peers: &mut HashMap<PeerAddress, Peer>,
+        peer: PeerAddress,
+        session: u64,
+        result: Result<DatagramChannel>,
+        linkgone_tx: &mpsc::UnboundedSender<(PeerAddress, u64)>,
     ) {
         let Some(p) = peers.get_mut(&peer) else {
             return;
@@ -917,7 +946,8 @@ impl Worker {
                 p.retry_at = None;
                 let gen = self.alloc_link_gen();
                 let max_len = channel.max_message_len();
-                let (link, handle) = self.start_pump(channel, peer.clone(), gen, linkgone_tx.clone());
+                let (link, handle) =
+                    self.start_pump(channel, peer.clone(), gen, linkgone_tx.clone());
                 p.link = Some(link);
                 let _ = self.events_tx.send(PeerLinkEvent::Up {
                     peer,
@@ -982,15 +1012,20 @@ impl Worker {
     }
 
     fn start_pump(
-        &self, mut channel: DatagramChannel, peer: PeerAddress, gen: u64,
+        &self,
+        mut channel: DatagramChannel,
+        peer: PeerAddress,
+        gen: u64,
         linkgone_tx: mpsc::UnboundedSender<(PeerAddress, u64)>,
     ) -> (LiveLink, Arc<PeerChannel>) {
         let max_message_len = channel.max_message_len();
         let (send_tx, mut send_rx) =
             mpsc::channel::<(Vec<u8>, oneshot::Sender<Result<()>>)>(CHANNEL_SEND_QUEUE);
         let (recv_tx, recv_rx) = mpsc::channel::<Result<Vec<u8>>>(CHANNEL_RECV_QUEUE);
-        let (priority_tx, mut priority_rx) =
-            mpsc::channel::<(ConnectionPriority, oneshot::Sender<Result<()>>)>(CHANNEL_PRIORITY_QUEUE);
+        let (priority_tx, mut priority_rx) = mpsc::channel::<(
+            ConnectionPriority,
+            oneshot::Sender<Result<()>>,
+        )>(CHANNEL_PRIORITY_QUEUE);
         let (teardown_tx, mut teardown_rx) = oneshot::channel::<()>();
 
         let peer2 = peer.clone();
@@ -1058,11 +1093,21 @@ impl Worker {
             priority_tx,
             recv_rx: AsyncMutex::new(recv_rx),
         });
-        (LiveLink { gen, pump: task.abort_handle(), _teardown: teardown_tx }, handle)
+        (
+            LiveLink {
+                gen,
+                pump: task.abort_handle(),
+                _teardown: teardown_tx,
+            },
+            handle,
+        )
     }
 
     fn on_driver_event(
-        &self, peers: &mut HashMap<PeerAddress, Peer>, radio: &mut RadioState, ev: GattEvent,
+        &self,
+        peers: &mut HashMap<PeerAddress, Peer>,
+        radio: &mut RadioState,
+        ev: GattEvent,
     ) {
         match ev {
             GattEvent::RadioChanged { status } => {
@@ -1086,7 +1131,9 @@ impl Worker {
                         Self::clear_stale_dial(p);
                         if let Some(link) = p.link.take() {
                             link.pump.abort();
-                            let _ = self.events_tx.send(PeerLinkEvent::Down { peer: peer.clone() });
+                            let _ = self
+                                .events_tx
+                                .send(PeerLinkEvent::Down { peer: peer.clone() });
                         }
                         p.gave_up = false;
                         p.attempts = 0;
@@ -1108,7 +1155,11 @@ impl Worker {
                     }
                 }
             }
-            GattEvent::Disconnected { peer, local_role: Role::Central, .. } => {
+            GattEvent::Disconnected {
+                peer,
+                local_role: Role::Central,
+                ..
+            } => {
                 if let Some(p) = peers.get_mut(&peer) {
                     if p.link.is_none() {
                         let now = Instant::now();
@@ -1186,7 +1237,10 @@ impl Worker {
     }
 
     fn refresh_status(
-        &self, peers: &HashMap<PeerAddress, Peer>, peer: &PeerAddress, radio: RadioState,
+        &self,
+        peers: &HashMap<PeerAddress, Peer>,
+        peer: &PeerAddress,
+        radio: RadioState,
     ) {
         if let Some(p) = peers.get(peer) {
             let over_cap = Self::committed(peers) >= self.config.max_links.0;
@@ -1203,9 +1257,10 @@ impl Worker {
             }
         };
         if changed {
-            let _ = self
-                .events_tx
-                .send(PeerLinkEvent::Status { peer: peer.clone(), status });
+            let _ = self.events_tx.send(PeerLinkEvent::Status {
+                peer: peer.clone(),
+                status,
+            });
         }
     }
 
