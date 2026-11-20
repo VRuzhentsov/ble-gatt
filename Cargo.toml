@@ -21,3 +21,4 @@ uuid = { version = "1", features = ["v4"] }
 # pre-commit hook run clippy with `-D warnings`.
 [workspace.lints.clippy]
 all = "warn"
+too_many_lines = "warn"

@@ -40,6 +40,7 @@ shared contracts.
   Known exceptions to split later: `drivers/linux/mod.rs`,
   `drivers/android/mod.rs`, `connection/managed_tests.rs`,
   `ble-gatt-iroh/src/lib.rs`, `connection/managed_worker.rs`.
+- Functions: clippy `too_many_lines` at 400 lines; lower it as long functions are split.
 
 ## Style-only changes
 
