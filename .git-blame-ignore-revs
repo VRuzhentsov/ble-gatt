@@ -1,0 +1,5 @@
+# Commits that only reformat code; `git blame` skips them with
+# `git config blame.ignoreRevsFile .git-blame-ignore-revs` (GitHub does this itself).
+
+# Format the workspace with rustfmt (`cargo fmt --all`)
+2e73c228dd736d9d0f94c80477730f2dcd8839f5
