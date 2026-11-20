@@ -5,6 +5,11 @@ description: "Use first for any ble-gatt development task. Gives the dev process
 
 # ble-gatt development
 
+The development pattern is **Spike and Stabilize** (Dan North). Spike:
+implement the requested feature first, without writing tests, then verify it
+manually against the requirements. Stabilize: only then refactor and bring the
+tests up to date.
+
 Follow these steps in order. `AGENTS.md` holds the project instructions.
 
 ## 1. Understand the change
@@ -21,25 +26,25 @@ Follow these steps in order. `AGENTS.md` holds the project instructions.
 2. When the user must choose, follow "Asking the user for a decision" in `AGENTS.md`.
 3. Record a new design decision as an ADR in `docs/adr/`.
 
-## 3. Write the code
+## 3. Spike: write the code
 
 1. Before you write or review code, read `docs/code-style.md`.
-2. After coding, review the diff against its "Review checklist". Report each
-   exception it asks you to explain, and whether the change is a style rule or
-   a code migration.
+2. Implement the requested feature. Do not write tests yet.
 
-## 4. Test
+## 4. Spike: verify manually
 
-1. Run the CI commands from `.github/workflows/ci.yml` for the crates you changed.
-   For `ble-gatt-iroh`, also run the clippy command in `ble-gatt-iroh/README.md`,
-   "Examples and checks".
-2. For more checks, use "Software checks for the current implementation"
-   in `docs/hardware-verification.md`.
-3. Device testing needs separate authorization from the user.
-   Follow `docs/hardware-verification.md`, and ADR-0011 for Windows.
-4. Report software checks and hardware acceptance as separate claims.
+1. Check the feature by hand against the requirements until it works as
+   expected. Keep the evidence for the stabilize step.
 
-## 5. Update docs and hand off
+## 5. Stabilize
+
+1. Refactor, then review the diff against the "Review checklist" in
+   `docs/code-style.md`. Report each exception it asks you to explain, and
+   whether the change is a style rule or a code migration.
+2. Bring the tests up to date with the `testing` skill
+   (`.agents/skills/testing/SKILL.md`).
+
+## 6. Update docs and hand off
 
 1. Update the docs that describe the changed behavior, and `docs/glossary.md`
    for new terms.

@@ -27,7 +27,8 @@ This repo is a Cargo workspace with three crates:
 
 Use object-oriented code as the default. The rules are in
 [docs/code-style.md](docs/code-style.md). Agents apply them through the
-[dev skill](.agents/skills/dev/SKILL.md).
+[dev skill](.agents/skills/dev/SKILL.md), which follows Spike and Stabilize;
+tests are brought up to date with the [testing skill](.agents/skills/testing/SKILL.md).
 
 ## Managed communication: working-tree implementation
 
