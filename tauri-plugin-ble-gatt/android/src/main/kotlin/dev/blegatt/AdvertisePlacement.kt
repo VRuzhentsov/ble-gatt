@@ -42,6 +42,15 @@ internal class AdvertisePlacement(
         const val FAST_ADVERTISEMENT_MAX_LEN: Int = 27
         const val NO_COMPANY: Int = -1
 
+        /**
+         * Whether manufacturer data holds a managed fast advertisement (first byte
+         * `0b1111_11VV`, 21 to 27 bytes; Rust's `carries_fast_advertisement`). A
+         * Windows peer publishes it in an advertisement without the service UUID.
+         */
+        fun isFastAdvertisement(data: ByteArray?): Boolean =
+            data != null && data.size in 21..FAST_ADVERTISEMENT_MAX_LEN &&
+                (data[0].toInt() and 0xFC) == 0xFC
+
         /** `withFast = false` is the placement after Android refused the fast one. */
         fun place(
             manufacturerIds: IntArray, manufacturerValues: Array<ByteArray>,

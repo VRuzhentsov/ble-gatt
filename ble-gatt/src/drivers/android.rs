@@ -172,7 +172,8 @@ struct ScanState {
     /// The service this scan looks for, under whose service data an
     /// Android peer sends its name (`advertised_name`).
     service: Option<ServiceUuid>,
-    /// What this scan last reported per address, and when. Android calls
+    /// What this scan last reported per address (merged over the address's
+    /// advertisements), and when. Android calls
     /// back for every advertisement, several times a second per peer; a
     /// result whose data did not change is passed on only every
     /// `SCAN_REPORT_REFRESH`, so a consumer still sees the peer as present.
@@ -2004,10 +2005,37 @@ impl Inner {
             return;
         }
         if scan.tx.is_some() {
+            // Android reports each advertisement of an address on its own. A
+            // Windows peer sends two (its GATT provider's, with the service
+            // UUID, and its fast advertisement), so merge what one address
+            // advertised during this scan, as the Windows driver does.
+            let (mut services, manufacturer_data, service_data, name) =
+                match scan.reported.get(&address) {
+                    Some(((last_name, last_services, last_manufacturer, last_service), _)) => {
+                        let mut merged_services = last_services.clone();
+                        for uuid in services {
+                            if !merged_services.contains(&uuid) {
+                                merged_services.push(uuid);
+                            }
+                        }
+                        let mut merged_manufacturer = last_manufacturer.clone();
+                        merged_manufacturer.extend(manufacturer_data);
+                        let mut merged_service = last_service.clone();
+                        merged_service.extend(service_data);
+                        (
+                            merged_services,
+                            merged_manufacturer,
+                            merged_service,
+                            name.or_else(|| last_name.clone()),
+                        )
+                    }
+                    None => (services, manufacturer_data, service_data, name),
+                };
             let name = match scan.service {
                 Some(service) => advertised_name(service, &service_data, name),
                 None => name,
             };
+            services.sort();
             let content: ReportedContent = (
                 name.clone(),
                 services.clone(),

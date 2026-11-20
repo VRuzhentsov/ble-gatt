@@ -2840,3 +2840,74 @@ async fn the_folded_manufacturer_data_reaches_the_scanner_as_it_was_set() {
     reader.close().await.unwrap();
     advertiser.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_publisher_at_its_own_address_joins_the_provider_read_once() {
+    // A Windows peer: its provider's advertisement has the service and no record,
+    // and a publisher at another address sends the fast advertisement.
+    let network = MockNetwork::new();
+    let provider = PeerAddress("windows-provider".into());
+    network.set_radio_capacity(&provider, crate::drivers::mock::RadioCapacity::None);
+    let (windows, _, advertiser) = BlockingVisibility::metadata_with(
+        network.clone(),
+        "windows-provider",
+        fast_config(Some("Desk")),
+    );
+    advertiser.set_advertising(true).await.unwrap();
+    network.set_rssi(&provider, Some(-50));
+    let fast = windows
+        .served_service()
+        .unwrap()
+        .fast_advertisement
+        .unwrap();
+    let publisher = crate::DiscoveredPeer {
+        address: PeerAddress("windows-publisher".into()),
+        name: None,
+        services: Vec::new(),
+        manufacturer_data: [(fast.company_id, fast.data)].into(),
+        service_data: Default::default(),
+        rssi: Some(-50),
+    };
+    let (_, control, reader) =
+        BlockingVisibility::metadata_with(network, "publisher-reader", fast_config(None));
+    let (input, receiver) = tokio::sync::mpsc::channel(4);
+    *control.scan_input.lock().unwrap() = Some(receiver);
+    let mut discovery = reader.discover().await.unwrap();
+    // Before any read the publisher's address is not reported: it is not connectable.
+    input.send(Ok(publisher.clone())).await.unwrap();
+    let (endpoint, read) = next_item(&mut discovery, Duration::from_secs(2))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(endpoint, advertiser.endpoint_id());
+    assert_eq!(read.address, provider);
+    assert_eq!(read.name.as_deref(), Some("Desk"));
+    assert_eq!(connects(&control), 1, "the provider is read once");
+    // Now the publisher's record is reported at the provider's address, from the cache.
+    input.send(Ok(publisher)).await.unwrap();
+    let (endpoint, joined) = next_item(&mut discovery, Duration::from_millis(300))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(endpoint, advertiser.endpoint_id());
+    assert_eq!(joined.address, provider);
+    assert_eq!(joined.name.as_deref(), Some("Desk"));
+    assert_eq!(
+        joined.manufacturer_data[&FINI_COMPANY],
+        FINI_RECORD.to_vec()
+    );
+    drop(input);
+    drop(discovery);
+    // The next scan: the provider's address is answered from the publisher's key.
+    let mut again = reader.discover().await.unwrap();
+    let (endpoint, cached) = next_item(&mut again, Duration::from_millis(300))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(endpoint, advertiser.endpoint_id());
+    assert_eq!(cached.name.as_deref(), Some("Desk"));
+    assert_eq!(connects(&control), 1, "no second read");
+    drop(again);
+    reader.close().await.unwrap();
+    advertiser.close().await.unwrap();
+}

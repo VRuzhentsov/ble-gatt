@@ -144,6 +144,13 @@ pub(super) struct Worker {
     /// Readable values by the radio record that names them, for the
     /// worker's lifetime (not one scan): see `MetadataCache`.
     metadata_cache: MetadataCache<(EndpointId, GattAdvertisement)>,
+    /// Where a read found each endpoint, and the reverse: joins a fast
+    /// advertisement sent from an address of its own (a Windows publisher,
+    /// not connectable) to the connectable address of the same endpoint.
+    endpoint_addresses: HashMap<EndpointId, PeerAddress>,
+    address_endpoints: HashMap<PeerAddress, EndpointId>,
+    /// The newest record key each such publisher advertised.
+    published: HashMap<EndpointId, MetadataKey>,
     acquired: HashMap<PeerAddress, u64>,
     cleanup_failure: Option<BleError>,
     next_generation: u64,
@@ -177,6 +184,9 @@ impl Worker {
             probing: HashMap::new(),
             completion_reads: HashMap::new(),
             metadata_cache: MetadataCache::default(),
+            endpoint_addresses: HashMap::new(),
+            address_endpoints: HashMap::new(),
+            published: HashMap::new(),
             acquired: HashMap::new(),
             cleanup_failure: None,
             next_generation: 0,
@@ -597,6 +607,17 @@ impl Worker {
                     tag: endpoint.tag(),
                     hash,
                 };
+                if !radio.services.contains(&service) {
+                    // A publisher's advertisement of its own, without the service
+                    // and not connectable (a Windows peer, ADR-0011 §3). Remember its
+                    // record. Report it at the connectable address a read found for
+                    // this endpoint; until a read did, the provider's advertisement
+                    // is read as a peer without a record.
+                    self.remember_published(endpoint, key);
+                    let address = self.endpoint_addresses.get(&endpoint).cloned()?;
+                    radio.address = address;
+                    radio.services.push(service);
+                }
                 if tracked
                     .get(&radio.address)
                     .is_some_and(|entry| entry.is_unnamed())
@@ -676,6 +697,31 @@ impl Worker {
                     }
                     None => {}
                 }
+                let published = self
+                    .address_endpoints
+                    .get(&radio.address)
+                    .and_then(|endpoint| self.published.get(endpoint))
+                    .copied();
+                if let Some(key) = published {
+                    // A read found this address's endpoint, and its publisher names
+                    // the current value: answer from the cache, or read once per key.
+                    if let Some((endpoint, fields)) =
+                        self.metadata_cache.fresh_hit(key, &radio, now)
+                    {
+                        let endpoint = *endpoint;
+                        return Some(Ok((endpoint, Self::cached_peer(fields, radio))));
+                    }
+                    let read_at = self.metadata_cache.retry_at(key, now);
+                    if let Some(entry) = tracked.get_mut(&radio.address) {
+                        entry.update_keyed(radio, key, read_at, false);
+                    } else if tracked.len() < crate::advertisement::METADATA_CACHE_CAPACITY {
+                        tracked.insert(
+                            radio.address.clone(),
+                            TrackedPeer::header(radio, key, read_at),
+                        );
+                    }
+                    return None;
+                }
                 if let Some(entry) = tracked.get_mut(&radio.address) {
                     if entry.is_unnamed() {
                         entry.update_radio(radio);
@@ -686,6 +732,31 @@ impl Worker {
                 None
             }
         }
+    }
+
+    /// Remember the record a publisher advertises for `endpoint`. Bounded
+    /// like the cache: a crowd of endpoints starts the maps over.
+    fn remember_published(&mut self, endpoint: EndpointId, key: MetadataKey) {
+        if self.published.len() >= crate::advertisement::METADATA_CACHE_CAPACITY
+            && !self.published.contains_key(&endpoint)
+        {
+            self.published.clear();
+        }
+        self.published.insert(endpoint, key);
+    }
+
+    /// Remember that a read at `address` found `endpoint`.
+    fn remember_address(&mut self, endpoint: EndpointId, address: &PeerAddress) {
+        if self.endpoint_addresses.len() >= crate::advertisement::METADATA_CACHE_CAPACITY
+            && !self.endpoint_addresses.contains_key(&endpoint)
+        {
+            self.endpoint_addresses.clear();
+            self.address_endpoints.clear();
+        }
+        if let Some(old) = self.endpoint_addresses.insert(endpoint, address.clone()) {
+            self.address_endpoints.remove(&old);
+        }
+        self.address_endpoints.insert(address.clone(), endpoint);
     }
 
     /// The radio fields of `peer` as a readable value.
@@ -730,6 +801,7 @@ impl Worker {
         });
         match &result {
             Ok((endpoint, peer, hash)) => {
+                self.remember_address(*endpoint, address);
                 let value = (*endpoint, Self::fields(peer));
                 let read = MetadataKey {
                     tag: endpoint.tag(),

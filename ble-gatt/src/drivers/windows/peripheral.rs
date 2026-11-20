@@ -30,6 +30,7 @@ use windows::Devices::Bluetooth::GenericAttributeProfile::{
 };
 use windows::Foundation::{Deferral, TypedEventHandler};
 
+use super::publisher::FastPublisher;
 use super::utils::WindowsCodec;
 use super::{Inner, ADVERTISE_START_TIMEOUT, STATUS_POLL_INTERVAL};
 use crate::entities::error::{BleError, Result};
@@ -178,6 +179,33 @@ impl Inner {
         }
     }
 
+    /// Publish `spec`'s fast advertisement next to the visible provider,
+    /// replacing the published one when the record changed. The old
+    /// publisher stops first: one record at a time.
+    pub(super) async fn republish(&self, spec: &GattServiceSpec) {
+        let current = self.server.lock().unwrap().as_ref().map(|server| {
+            server
+                .publisher
+                .as_ref()
+                .map(|publisher| publisher.record.clone())
+        });
+        let Some(current) = current else { return };
+        if current.is_some() && current == spec.fast_advertisement {
+            return;
+        }
+        let old = self
+            .server
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|server| server.publisher.take());
+        drop(old);
+        let started = FastPublisher::start(spec).await;
+        if let Some(server) = self.server.lock().unwrap().as_mut() {
+            server.publisher = started;
+        }
+    }
+
     pub(super) fn forget_server_peers(&self) {
         let peers: Vec<(String, ServerPeer)> = self.server_peers.lock().unwrap().drain().collect();
         for (address, peer) in peers {
@@ -281,6 +309,7 @@ impl Inner {
             desired_visibility: true,
             tokens: Vec::new(),
             request_task: None,
+            publisher: None,
         };
         for characteristic_spec in &spec.characteristics {
             let parameters = GattLocalCharacteristicParameters::new()
@@ -409,6 +438,7 @@ impl Inner {
             requests_rx,
         )));
         Server::start_provider_advertising(&provider, spec).await?;
+        server.publisher = FastPublisher::start(spec).await;
         Ok(server)
     }
     async fn handle_write(
@@ -471,6 +501,9 @@ pub(super) struct Server {
     tokens: Vec<Tokens>,
     /// Answers reads and writes in arrival order.
     request_task: Option<tokio::task::JoinHandle<()>>,
+    /// The fast advertisement, published next to the provider while it is
+    /// visible (`publisher.rs`).
+    pub(super) publisher: Option<FastPublisher>,
 }
 
 impl Drop for Server {

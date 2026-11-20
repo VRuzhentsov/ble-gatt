@@ -318,6 +318,18 @@ impl AdvertisingMode {
     }
 }
 
+/// Whether `manufacturer_data` holds a managed fast advertisement (first
+/// byte `0b1111_11VV`, 21 to 27 bytes; ADR-0012 §5). Scanners let such a
+/// result through even without the service UUID: a Windows peer publishes it
+/// in an advertisement of its own, next to its GATT provider's.
+pub fn carries_fast_advertisement<'a>(
+    mut manufacturer_data: impl Iterator<Item = &'a Vec<u8>>,
+) -> bool {
+    manufacturer_data.any(|data| {
+        (21..=FAST_ADVERTISEMENT_MAX_LEN).contains(&data.len()) && data[0] & 0xFC == 0xFC
+    })
+}
+
 /// Bytes of one legacy advertising packet (Core Specification Vol 6 Part B
 /// 2.3.1.1: 31 bytes of advertising data).
 pub const LEGACY_ADVERTISING_DATA_LEN: usize = 31;

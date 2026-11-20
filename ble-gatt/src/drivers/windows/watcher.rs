@@ -28,7 +28,9 @@ use windows::Foundation::TypedEventHandler;
 use super::utils::WindowsCodec;
 use super::{Inner, DISCOVERY_QUEUE_DEPTH};
 use crate::entities::error::{BleError, Result};
-use crate::entities::models::{advertised_name, DiscoveredPeer, PeerAddress, ServiceUuid};
+use crate::entities::models::{
+    advertised_name, carries_fast_advertisement, DiscoveredPeer, PeerAddress, ServiceUuid,
+};
 
 /// Most addresses one scan tracks. Same bound as btleplug's
 /// `MATCH_CACHE_CAPACITY`; a crowded room must not grow the map without
@@ -87,14 +89,19 @@ impl ScanStream {
     }
 
     /// Whether one advertisement event is for `service`: its UUID list
-    /// names it, or it carries service data under it (a scan response or an
-    /// extended advertisement may hold only that).
+    /// names it, it carries service data under it (a scan response or an
+    /// extended advertisement may hold only that), or it carries a managed
+    /// fast advertisement (a Windows peer publishes that in an advertisement
+    /// of its own; the managed scanner checks the record).
     fn matches_service(
         service: ServiceUuid,
         advertised_uuids: &[ServiceUuid],
         service_data: &BTreeMap<ServiceUuid, Vec<u8>>,
+        manufacturer_data: &BTreeMap<u16, Vec<u8>>,
     ) -> bool {
-        advertised_uuids.contains(&service) || service_data.contains_key(&service)
+        advertised_uuids.contains(&service)
+            || service_data.contains_key(&service)
+            || carries_fast_advertisement(manufacturer_data.values())
     }
 }
 
@@ -136,8 +143,17 @@ impl ScanStream {
                     .map(|guid| ServiceUuid(WindowsCodec::from_guid(guid)))
                     .collect();
                 let service_data = WindowsCodec::service_data_of(advertisement.DataSections()?);
-                let matches_service =
-                    Self::matches_service(service, &advertised_uuids, &service_data);
+                let mut manufacturer_data = BTreeMap::new();
+                for data in advertisement.ManufacturerData()? {
+                    manufacturer_data
+                        .insert(data.CompanyId()?, WindowsCodec::from_buffer(&data.Data()?)?);
+                }
+                let matches_service = Self::matches_service(
+                    service,
+                    &advertised_uuids,
+                    &service_data,
+                    &manufacturer_data,
+                );
                 let is_scan_response =
                     args.AdvertisementType() == Ok(BluetoothLEAdvertisementType::ScanResponse);
 
@@ -158,11 +174,7 @@ impl ScanStream {
                         entry.services.push(uuid);
                     }
                 }
-                for data in advertisement.ManufacturerData()? {
-                    entry
-                        .manufacturer_data
-                        .insert(data.CompanyId()?, WindowsCodec::from_buffer(&data.Data()?)?);
-                }
+                entry.manufacturer_data.extend(manufacturer_data);
                 entry.service_data.extend(service_data);
                 let name = advertisement.LocalName()?.to_string();
                 if !name.is_empty() {
@@ -304,11 +316,37 @@ mod tests {
         let service = ServiceUuid(uuid::Uuid::from_u128(0xB1E6));
         let other = ServiceUuid(uuid::Uuid::from_u128(7));
         let none = BTreeMap::new();
-        assert!(ScanStream::matches_service(service, &[service], &none));
-        assert!(!ScanStream::matches_service(service, &[other], &none));
+        let no_company = BTreeMap::new();
+        assert!(ScanStream::matches_service(
+            service,
+            &[service],
+            &none,
+            &no_company
+        ));
+        assert!(!ScanStream::matches_service(
+            service,
+            &[other],
+            &none,
+            &no_company
+        ));
         let data: BTreeMap<_, _> = [(service, vec![0xF8; 9])].into();
-        assert!(ScanStream::matches_service(service, &[], &data));
+        assert!(ScanStream::matches_service(
+            service,
+            &[],
+            &data,
+            &no_company
+        ));
         let foreign: BTreeMap<_, _> = [(other, vec![1])].into();
-        assert!(!ScanStream::matches_service(service, &[], &foreign));
+        assert!(!ScanStream::matches_service(
+            service,
+            &[],
+            &foreign,
+            &no_company
+        ));
+        // A Windows peer's own publisher: only the fast advertisement.
+        let fast: BTreeMap<u16, Vec<u8>> = [(0xFFFF, vec![0xFC; 26])].into();
+        assert!(ScanStream::matches_service(service, &[], &none, &fast));
+        let fini: BTreeMap<u16, Vec<u8>> = [(0xFFFF, vec![1, 2, 3, 4, 5])].into();
+        assert!(!ScanStream::matches_service(service, &[], &none, &fini));
     }
 }

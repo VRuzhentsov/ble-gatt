@@ -24,6 +24,7 @@
 
 mod device;
 mod peripheral;
+mod publisher;
 mod utils;
 mod watcher;
 
@@ -361,6 +362,9 @@ impl Driver for WindowsDriver {
                 .map_err(|err| BleError::windows_error("StopAdvertising", err))?;
             Server::start_provider_advertising(&provider, &service).await?;
         }
+        if desired_visibility {
+            self.inner.republish(&service).await;
+        }
         *self.inner.served_service.lock().unwrap() = Some(service);
         log::info!("update_advertisement: applied");
         Ok(())
@@ -407,7 +411,10 @@ impl Driver for WindowsDriver {
         if !enabled {
             if let Some(server) = self.inner.server.lock().unwrap().as_mut() {
                 server.desired_visibility = false;
+                server.publisher = None;
             }
+        } else {
+            self.inner.republish(&service).await;
         }
         Ok(())
     }

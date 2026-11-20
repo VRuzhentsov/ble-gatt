@@ -306,11 +306,20 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             override fun onScanResult(callbackType: Int, result: ScanResult) {
                 val record = result.scanRecord
                 val uuids = record?.serviceUuids
-                Log.d(TAG, "onScanResult: ${result.device.address} name=${record?.deviceName} advertisedUuids=$uuids")
+                Log.d(
+                    TAG,
+                    "onScanResult: ${result.device.address} name=${record?.deviceName} advertisedUuids=$uuids " +
+                        "connectable=${if (android.os.Build.VERSION.SDK_INT >= 26) result.isConnectable else null} manufacturer=${record?.manufacturerSpecificData?.let { data ->
+                            (0 until data.size()).joinToString(",") { "%04x:%d".format(data.keyAt(it), data.valueAt(it)?.size ?: 0) }
+                        }}",
+                )
                 // The UUID list, or service data under the target: a result can
                 // carry only the latter (ADR-0012 §2).
                 val matches = uuids?.contains(ParcelUuid(target)) == true ||
-                    record?.serviceData?.containsKey(ParcelUuid(target)) == true
+                    record?.serviceData?.containsKey(ParcelUuid(target)) == true ||
+                    record?.manufacturerSpecificData?.let { data ->
+                        (0 until data.size()).any { AdvertisePlacement.isFastAdvertisement(data.valueAt(it)) }
+                    } == true
                 if (record == null || !matches) {
                     return
                 }

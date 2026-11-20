@@ -55,6 +55,11 @@ fun main(args: Array<String>) {
     )
     check(!oversized.fastPlaced)
     check(oversized.scanResponseLength() == 0)
-    println("AdvertisePlacement: fast fold, too-large fallback, other companies, name, oversize passed")
+    // A Windows peer's own publisher carries only the record.
+    check(AdvertisePlacement.isFastAdvertisement(fast))
+    check(!AdvertisePlacement.isFastAdvertisement(fini))
+    check(!AdvertisePlacement.isFastAdvertisement(ByteArray(28) { 0xFC.toByte() }))
+    check(!AdvertisePlacement.isFastAdvertisement(null))
+    println("AdvertisePlacement: fast fold, too-large fallback, other companies, name, oversize, fast match passed")
 }
 }
