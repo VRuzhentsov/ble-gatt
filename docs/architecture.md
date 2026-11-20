@@ -23,32 +23,8 @@ Application context, even in a non-Tauri host.
 
 ## Object-oriented code
 
-Use object-oriented programming (OOP) as the default for new and changed code.
-In Rust, use structs or enums with `impl` methods and associated functions.
-Put behavior on the type that owns its state, rules or protocol.
-
-- Put state access on the owning object. A helper that takes `inner` or a
-  context object belongs on that object or its existing service.
-- Put protocol parsing, validation and conversion on the protocol type or its
-  codec. A pure operation still has an owner.
-- Reuse existing types and traits. Give a new type a real responsibility,
-  rather than making one wrapper type for each function.
-- Keep language and framework entry points as thin calls to owning objects.
-  Keep a generic free helper only when no domain type owns the operation;
-  explain that exception in review.
-- Place a type near its inherent implementation. Group related methods, such
-  as encode/decode pairs, and consolidate compatible `impl` blocks.
-- Keep trait implementations separate. Group compatibility functions and foreign
-  entry points apart from implementations. Preserve attributes, visibility and
-  conditional compilation. Explain separate inherent blocks with different bounds
-  or conditions in review.
-- Use existing interfaces. Add traits for concrete shared contracts or interchangeable
-  implementations, rather than for every internal object.
-- Check ownership and source organization in each code review. Keep current
-  interfaces and wire bytes until a separate implementation change updates them.
-
-Load [the code-style skill](../.agents/skills/ble-gatt-code-style/SKILL.md)
-before writing or reviewing code.
+New and changed code is object-oriented: behavior lives on the type that owns
+its state, rules or protocol. The rules are in [the code style](code-style.md).
 
 This PR puts acquisition and packet accounting on the iroh adapter's `Inner`.
 `ManagedMetadata` owns profile metadata encoding and decoding; `Record` owns

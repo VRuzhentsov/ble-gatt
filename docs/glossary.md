@@ -38,7 +38,7 @@ certification. Do not copy the copyrighted ASD dictionary into this repository.
 
 Code organized around objects that own state and behavior. A class defines
 such objects. Rust uses structs or enums with `impl` blocks for this purpose.
-See [the code rule](architecture.md#object-oriented-code).
+See [the code rule](code-style.md#object-oriented-code).
 
 ## Bluetooth basics
 
