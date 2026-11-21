@@ -195,11 +195,11 @@ a historical record, not the current managed state-machine specification.
 Under active development. Implemented APIs, target design and device acceptance
 are separate claims. The architecture does not certify native roles or background scenarios. See
 [hardware verification and current iroh diagnostic checklist](docs/hardware-verification.md).
-Not yet published to crates.io/npm — consume as a git dependency, pinned to a
-release tag for released APIs. The example tag does not include this working-tree refactor:
+Not published to crates.io/npm — consume as a git dependency, pinned to a
+release tag (Fini pins it this way):
 
 ```toml
-ble-gatt = { git = "https://github.com/VRuzhentsov/ble-gatt", tag = "v0.1.0" }
+ble-gatt = { git = "https://github.com/VRuzhentsov/ble-gatt", tag = "v0.2.0" }
 ```
 
 ## Contributing
@@ -218,14 +218,16 @@ one time with `git commit --no-verify`.
 
 ## Releasing
 
-1. In a pull request, set `[workspace.package] version` in `Cargo.toml` to
-   the new version, and merge it.
-2. Actions → **Release Button** → Run workflow, on `main`.
+[release-plz](https://release-plz.dev) (`release-plz.toml`,
+`.github/workflows/release-plz.yml`) runs on every push to `main`. When the
+`[workspace.package] version` is not tagged yet, it tags that commit `vX.Y.Z`
+and publishes a GitHub release with the `CHANGELOG.md` entry. Otherwise it
+opens or updates a release pull request with the next version (from the
+commits and cargo-semver-checks) and the changelog; merging that pull request
+releases it. Nothing is uploaded to crates.io.
 
-The button refuses a version that is already tagged, and refuses if main
-moves while it runs. It runs CI on main's last commit, tags that commit
-`vX.Y.Z` (annotated, unsigned) and publishes a GitHub release with generated
-notes.
+**Release Button** (Actions → Run workflow, on `main`) stays as a manual
+fallback: it runs CI and tags an untagged version the same way.
 
 ## License
 
