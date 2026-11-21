@@ -1320,6 +1320,9 @@ impl Worker {
         cancellation: CancellationToken,
     ) -> Attempt {
         let random = uuid::Uuid::new_v4();
+        // Bytes 0..4 of a version 4 UUID are all random (its version and
+        // variant bits are in bytes 6 and 8): a full 32-bit nonce (ADR-0012).
+        let nonce = uuid::Uuid::new_v4();
         Attempt {
             outcome: Arc::new(Mutex::new(None)),
             last_received: tokio::time::Instant::now(),
@@ -1327,7 +1330,7 @@ impl Worker {
             peer,
             endpoint: None,
             wire_attempt: u64::from_be_bytes(random.as_bytes()[..8].try_into().unwrap()),
-            nonce: i32::from_be_bytes(random.as_bytes()[8..12].try_into().unwrap()),
+            nonce: i32::from_be_bytes(nonce.as_bytes()[..4].try_into().unwrap()),
             outgoing,
             initiation: None,
             accepted: None,
