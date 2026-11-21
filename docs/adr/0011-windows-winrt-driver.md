@@ -5,7 +5,8 @@
 PR #38 contains the Windows implementation and native ownership fixes.
 Native cross-device acceptance remains pending. Software checks are not physical proof.
 This ADR covers Windows-native choices; [ADR-0012](0012-discovery-like-nearby.md)
-covers the implemented core protocol. The PR remains draft.
+covers the implemented core protocol. The PR is open for review, not merge
+or release acceptance.
 
 ## Decision question
 
