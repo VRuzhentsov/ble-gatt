@@ -1594,6 +1594,37 @@ enum ScannedPeer {
 /// `ManufacturerData` read per tick.
 const SCAN_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// The radio records a scan last reported for one device. RSSI is left out:
+/// it changes with nearly every advertisement.
+#[derive(PartialEq)]
+struct ReportedRecords {
+    manufacturer_data: std::collections::BTreeMap<u16, Vec<u8>>,
+    service_data: std::collections::BTreeMap<ServiceUuid, Vec<u8>>,
+    name: Option<String>,
+}
+
+/// What one scan has reported, per device.
+#[derive(Default)]
+struct ScanReports(HashMap<bluer::Address, ReportedRecords>);
+
+impl ScanReports {
+    /// Records `peer` as reported at `address`. Returns `false`, and records
+    /// nothing, when its manufacturer data, service data and name are the
+    /// ones last reported there.
+    fn record(&mut self, address: bluer::Address, peer: &DiscoveredPeer) -> bool {
+        let now = ReportedRecords {
+            manufacturer_data: peer.manufacturer_data.clone(),
+            service_data: peer.service_data.clone(),
+            name: peer.name.clone(),
+        };
+        if self.0.get(&address) == Some(&now) {
+            return false;
+        }
+        self.0.insert(address, now);
+        true
+    }
+}
+
 impl ScannedPeer {
     /// Whether a device is for `target`: BlueZ lists the target among its
     /// services, or it carries a managed fast advertisement (a Windows peer
@@ -1731,14 +1762,13 @@ impl Driver for LinuxDriver {
         // A matched device stays watched after it is reported, too: its name
         // arrives in the scan response, possibly after the first report, and
         // BlueZ's name can change from a cached one to the advertised one. A
-        // device is reported again when it gains manufacturer data or its
-        // name changes.
+        // device is reported again when its manufacturer data, service data
+        // or name changes, so a peer's changed radio records reach the
+        // caller.
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<DiscoveredPeer>>(32);
         tokio::spawn(async move {
             let _scan_guard = scan_guard;
-            // What was last reported per device: whether it had manufacturer
-            // data, and its name.
-            let mut reported: HashMap<bluer::Address, (bool, Option<String>)> = HashMap::new();
+            let mut reported = ScanReports::default();
             let mut pending: HashSet<bluer::Address> = HashSet::new();
             let mut events = Box::pin(events);
             let mut tick = tokio::time::interval(SCAN_RECHECK_INTERVAL);
@@ -1770,8 +1800,7 @@ impl Driver for LinuxDriver {
                         ScannedPeer::NoManufacturerData(peer) => (peer, false),
                         _ => continue,
                     };
-                    let now = (complete, peer.name.clone());
-                    if reported.get(&address) == Some(&now) {
+                    if !reported.record(address, &peer) {
                         continue;
                     }
                     log::info!(
@@ -1780,7 +1809,6 @@ impl Driver for LinuxDriver {
                         peer.rssi,
                         if complete { "yes" } else { "not yet" }
                     );
-                    reported.insert(address, now);
                     if tx.send(Ok(peer)).await.is_err() {
                         return;
                     }
@@ -3001,6 +3029,45 @@ mod tests {
         assert!(ScannedPeer::is_target(&[other].into(), target, &fast));
         let fini: std::collections::BTreeMap<u16, Vec<u8>> = [(0xFFFF, vec![1, 2, 3, 4, 5])].into();
         assert!(!ScannedPeer::is_target(&[other].into(), target, &fini));
+    }
+
+    #[test]
+    fn a_scan_reports_a_device_again_when_its_radio_records_change() {
+        let address = bluer::Address::new([1, 2, 3, 4, 5, 6]);
+        let service = ServiceUuid(uuid::Uuid::from_u128(0xB1E6));
+        let mut peer = DiscoveredPeer {
+            address: PeerAddress(address.to_string()),
+            name: None,
+            services: vec![service],
+            manufacturer_data: Default::default(),
+            service_data: Default::default(),
+            rssi: Some(-60),
+        };
+        let mut reported = ScanReports::default();
+        assert!(reported.record(address, &peer), "first sighting");
+        assert!(!reported.record(address, &peer), "nothing changed");
+        peer.rssi = Some(-40);
+        assert!(!reported.record(address, &peer), "RSSI alone is no change");
+
+        peer.manufacturer_data.insert(0xFFFF, vec![0xFC; 26]);
+        assert!(reported.record(address, &peer), "manufacturer data arrived");
+        // After the first complete report: new bytes under the same company.
+        peer.manufacturer_data.insert(0xFFFF, vec![0xFD; 26]);
+        assert!(reported.record(address, &peer), "manufacturer data changed");
+        assert!(!reported.record(address, &peer));
+        peer.service_data.insert(service, vec![0xF8; 9]);
+        assert!(reported.record(address, &peer), "service data arrived");
+        peer.service_data.insert(service, vec![0xF9; 9]);
+        assert!(reported.record(address, &peer), "service data changed");
+        peer.name = Some("peer".to_string());
+        assert!(reported.record(address, &peer), "name changed");
+        assert!(!reported.record(address, &peer));
+
+        let other = bluer::Address::new([6, 5, 4, 3, 2, 1]);
+        assert!(
+            reported.record(other, &peer),
+            "each device is tracked apart"
+        );
     }
 
     #[test]
