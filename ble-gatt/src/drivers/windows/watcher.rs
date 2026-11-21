@@ -4,7 +4,8 @@
 //! its advertisement and its scan response. Only the advertisement carries
 //! the service UUID. [`ScanPeers`] therefore starts tracking an address when
 //! one of its events is for the service, then also merges that address's
-//! scan responses, and holds at most [`MAX_SCAN_PEERS`] addresses. For each
+//! scan responses. It holds at most [`MAX_SCAN_PEERS`] addresses and forgets
+//! the least recently seen one to take a new one. For each
 //! address it keeps the latest packet of each advertisement type and reports
 //! their merge, so a field the peer stops sending leaves the result. A peer
 //! is reported again whenever its merged data changes, which is the
@@ -32,7 +33,8 @@ use crate::entities::models::{
 };
 
 /// Most addresses one scan tracks, so a crowded room cannot grow
-/// [`ScanPeers`] without limit. An address beyond it is not reported.
+/// [`ScanPeers`] without limit. A new address beyond it replaces the least
+/// recently seen one.
 const MAX_SCAN_PEERS: usize = 1024;
 
 /// The fields of one advertising packet, or of several merged.
@@ -62,10 +64,10 @@ impl AdvertisedData {
 }
 
 /// What one tracked address advertises now: the latest packet of each
-/// advertisement type it sent. A Windows peer sends two advertisements of
-/// different types (its GATT provider's, connectable, and its fast
-/// advertisement publisher's, non-connectable), and a scan response is a
-/// type of its own, so a newer packet replaces only its own type's fields.
+/// advertisement type it sent. One address can send advertisements of two
+/// types (a Windows peer's GATT provider is connectable, its fast
+/// advertisement publisher non-connectable), and a scan response is a type
+/// of its own, so a newer packet replaces only its own type's fields.
 #[derive(Default)]
 struct SeenPeer {
     /// Keyed by the `BluetoothLEAdvertisementType` value.
@@ -73,6 +75,8 @@ struct SeenPeer {
     /// The merged data last put in the result queue. A result the full
     /// queue refused is not delivered, so the next event tries it again.
     delivered: Option<AdvertisedData>,
+    /// [`ScanPeers::events`] when this address last sent an event taken.
+    last_seen: u64,
 }
 
 impl SeenPeer {
@@ -107,13 +111,17 @@ impl SeenPeer {
 #[derive(Default)]
 struct ScanPeers {
     peers: HashMap<u64, SeenPeer>,
+    /// Counts the events taken, so [`SeenPeer::last_seen`] orders the
+    /// addresses from least to most recently seen.
+    events: u64,
 }
 
 impl ScanPeers {
     /// The record one `Received` event merges into, or `None` when the event
     /// is dropped. A tracked address takes events for the service and scan
-    /// responses. A new address needs an event for the service and a free
-    /// slot under [`MAX_SCAN_PEERS`].
+    /// responses. A new address needs an event for the service; when
+    /// [`MAX_SCAN_PEERS`] addresses are tracked, it replaces the least
+    /// recently seen one.
     fn record_for(
         &mut self,
         address: u64,
@@ -123,12 +131,30 @@ impl ScanPeers {
         let admitted = if self.peers.contains_key(&address) {
             for_service || scan_response
         } else {
-            for_service && self.peers.len() < MAX_SCAN_PEERS
+            for_service
         };
-        if admitted {
-            Some(self.peers.entry(address).or_default())
-        } else {
-            None
+        if !admitted {
+            return None;
+        }
+        if !self.peers.contains_key(&address) && self.peers.len() >= MAX_SCAN_PEERS {
+            self.evict_least_recent();
+        }
+        self.events += 1;
+        let entry = self.peers.entry(address).or_default();
+        entry.last_seen = self.events;
+        Some(entry)
+    }
+
+    /// Forget the address seen longest ago. The search is linear, and runs
+    /// only when a new address arrives at the limit.
+    fn evict_least_recent(&mut self) {
+        let oldest = self
+            .peers
+            .iter()
+            .min_by_key(|(_, peer)| peer.last_seen)
+            .map(|(address, _)| *address);
+        if let Some(address) = oldest {
+            self.peers.remove(&address);
         }
     }
 }
@@ -537,5 +563,24 @@ mod tests {
             Type::ConnectableUndirected,
             named("peer")
         ));
+    }
+
+    #[test]
+    fn a_new_address_at_the_limit_replaces_the_least_recently_seen_one() {
+        let mut scan = ScanPeers::default();
+        for address in 0..MAX_SCAN_PEERS as u64 {
+            assert!(scan.record_for(address, true, false).is_some());
+        }
+        // Address 0 sends a scan response, so address 1 is now the oldest.
+        assert!(scan.record_for(0, false, true).is_some());
+        let new = MAX_SCAN_PEERS as u64;
+        assert!(scan.record_for(new, true, false).is_some());
+        assert_eq!(scan.peers.len(), MAX_SCAN_PEERS);
+        assert!(scan.peers.contains_key(&0));
+        assert!(!scan.peers.contains_key(&1));
+        assert!(scan.peers.contains_key(&new));
+        // A new address still needs an event for the service.
+        assert!(scan.record_for(new + 1, false, true).is_none());
+        assert_eq!(scan.peers.len(), MAX_SCAN_PEERS);
     }
 }

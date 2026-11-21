@@ -240,14 +240,16 @@ fn windows_scan_filter_has_the_complete_truth_table() {
     let source = include_str!("../src/drivers/windows/watcher.rs");
     assert!(source.contains("let admitted = if self.peers.contains_key(&address) {"));
     assert!(source.contains("for_service || scan_response"));
-    assert!(source.contains("for_service && self.peers.len() < MAX_SCAN_PEERS"));
+    assert!(source.contains("self.peers.len() >= MAX_SCAN_PEERS"));
+    assert!(source.contains("self.evict_least_recent();"));
     for matches_service in [false, true] {
         for is_scan_response in [false, true] {
             for known in [false, true] {
                 let missing_service = !matches_service;
                 let not_known_scan_response = !(is_scan_response && known);
                 let old_rejection = missing_service && not_known_scan_response;
-                // `ScanPeers::record_for` with a free slot.
+                // `ScanPeers::record_for`; at the limit a new address
+                // replaces the least recently seen one.
                 let admitted = if known {
                     matches_service || is_scan_response
                 } else {
