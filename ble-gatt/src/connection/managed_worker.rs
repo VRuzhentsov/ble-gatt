@@ -417,13 +417,7 @@ impl Worker {
                                 Err(error) => Err(error),
                             };
                             // A full output holds the result (backpressure); only a closed one ends the scan.
-                            if let Some((_, output)) = &scan {
-                                match output.try_send(result) {
-                                    Err(mpsc::error::TrySendError::Full(result)) => scan_held = Some(result),
-                                    Err(mpsc::error::TrySendError::Closed(_)) => scan = None,
-                                    Ok(()) => {}
-                                }
-                            }
+                            if let Some((_, output)) = &scan { match output.try_send(result) { Err(mpsc::error::TrySendError::Full(result)) => scan_held = Some(result), Err(mpsc::error::TrySendError::Closed(_)) => scan = None, Ok(()) => {} } }
                         }
                         None => {
                             scan_exhausted = true;
