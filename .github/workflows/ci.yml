@@ -38,3 +38,20 @@ jobs:
           cargo check --target aarch64-linux-android -p tauri-plugin-ble-gatt
       - name: cargo test (ble-gatt-iroh)
         run: cargo test -p ble-gatt-iroh
+
+  # The Windows driver compiles only for Windows, so the Linux job never
+  # builds, lints or tests it. `cargo fmt` stays in the Linux job: rustfmt
+  # formats every module regardless of `cfg`. Tests that need a real radio
+  # are `#[ignore]`d and stay excluded.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo clippy
+        run: cargo clippy -p ble-gatt --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test -p ble-gatt
