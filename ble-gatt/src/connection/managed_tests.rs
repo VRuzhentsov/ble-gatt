@@ -2849,6 +2849,51 @@ async fn a_rotated_address_with_the_same_header_is_not_read_again() {
 }
 
 #[tokio::test]
+async fn managed_discovery_reads_a_header_named_while_an_earlier_read_ran() {
+    let network = MockNetwork::new();
+    let address = PeerAddress("renamed-peer".into());
+    let advertiser = advertiser_with(&network, "renamed-peer", config());
+    advertiser.set_advertising(true).await.unwrap();
+    network.set_rssi(&address, Some(-50));
+    let (driver, control, reader) = BlockingVisibility::metadata(network, "renamed-reader");
+    let first = first_sighting(&driver).await;
+    // Hidden from the mock scan: only the sightings below reach the reader.
+    advertiser.set_advertising(false).await.unwrap();
+    let mut renamed = first.clone();
+    // Another hash under the same endpoint tag: the radio names a newer value.
+    renamed.service_data.get_mut(&config().service).unwrap()[1] ^= 1;
+    driver
+        .inner
+        .stall_connect(&address, Duration::from_millis(400));
+    let (input, receiver) = tokio::sync::mpsc::channel(2);
+    *control.scan_input.lock().unwrap() = Some(receiver);
+    let mut discovery = reader.discover().await.unwrap();
+    input.send(Ok(first)).await.unwrap();
+    while connects(&control) == 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    driver.inner.stall_connect(&address, Duration::ZERO);
+    input.send(Ok(renamed)).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(2500);
+    let mut found = Vec::new();
+    while let Ok(Some(item)) = tokio::time::timeout_at(deadline, discovery.next()).await {
+        if let Ok((endpoint, _)) = item {
+            found.push(endpoint);
+        }
+    }
+    assert_eq!(found, vec![advertiser.endpoint_id()]);
+    assert_eq!(
+        connects(&control),
+        2,
+        "the first read does not answer for the newer header"
+    );
+    drop(input);
+    drop(discovery);
+    reader.close().await.unwrap();
+    advertiser.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn an_advertisement_update_changes_the_header_hash_with_the_readable_fields() {
     use crate::advertisement::{GattAdvertisement, GATT_ADVERTISEMENT_CHARACTERISTIC};
     let network = MockNetwork::new();

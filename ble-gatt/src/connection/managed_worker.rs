@@ -45,11 +45,13 @@ enum Operation {
         Result<BoxStream<Result<DiscoveredPeer>>>,
         Reply<BoxStream<Result<(EndpointId, DiscoveredPeer)>>>,
     ),
-    /// A metadata read finished: the endpoint, the complete peer and the
-    /// hash of the readable value read.
+    /// A metadata read finished: the scan generation, the address, the key
+    /// the read was scheduled for, and the endpoint, the complete peer and
+    /// the hash of the readable value read.
     Probe(
         u64,
         PeerAddress,
+        Option<MetadataKey>,
         DiscoveryOutput,
         Result<(EndpointId, DiscoveredPeer, u32)>,
     ),
@@ -347,11 +349,11 @@ impl Worker {
                                 });
                                 let _ = reply.send(result);
                             }
-                            Operation::Probe(generation, peer, output, result) => {
+                            Operation::Probe(generation, peer, key, output, result) => {
                                 if self.probing.get(&peer) == Some(&generation) { self.probing.remove(&peer); }
                                 self.completion_reads.remove(&peer);
                                 let tracked = (generation == scan_generation).then_some(&mut tracked_metadata);
-                                if let Some(item) = self.probe_finished(tracked, &peer, result) { let _ = output.try_send(item); }
+                                if let Some(item) = self.probe_finished(tracked, &peer, key, result) { let _ = output.try_send(item); }
                             }
                             Operation::Retired(targets, result) => {
                                 self.retired(targets, result);
@@ -373,7 +375,7 @@ impl Worker {
                                 continue;
                             }
                             let completion = entry.is_completion();
-                            match self.probe_metadata(driver.clone(), peer, output.clone(), scan_generation, completion) {
+                            match self.probe_metadata(driver.clone(), peer, entry.key(), output.clone(), scan_generation, completion) {
                                 Ok(()) => entry.managed_scheduled(),
                                 Err(error) => {
                                     let initial = entry.managed_initial();
@@ -845,17 +847,19 @@ impl Worker {
     /// A metadata read finished. Remembers a successful read for the
     /// records that name it, and returns what to report: changed fields, or
     /// the first failure of a peer not reported yet. `tracked` is `None`
-    /// for a read of an earlier scan, which reports nothing.
+    /// for a read of an earlier scan, which reports nothing. `key` is the
+    /// value the read was scheduled for: a sighting during the read may
+    /// have named another one since.
     fn probe_finished(
         &mut self,
         tracked: Option<&mut HashMap<PeerAddress, TrackedPeer>>,
         address: &PeerAddress,
+        key: Option<MetadataKey>,
         result: Result<(EndpointId, DiscoveredPeer, u32)>,
     ) -> Option<Result<(EndpointId, DiscoveredPeer)>> {
         let now = tokio::time::Instant::now();
         let current = tracked.is_some();
         let entry = tracked.and_then(|tracked| tracked.get_mut(address));
-        let key = entry.as_ref().and_then(|entry| entry.key());
         // A record names its endpoint (a tag, or the whole endpoint): a read
         // answering for another one is a failure, not a value to remember.
         let result = result.and_then(|(endpoint, peer, hash)| match key {
@@ -894,6 +898,11 @@ impl Worker {
             // the read as before. A read of an earlier scan reports nothing.
             return current.then(|| result.map(|(endpoint, peer, _)| (endpoint, peer)));
         };
+        if entry.key() != key {
+            // The radio named another value during the read: this read does
+            // not complete the entry, which waits for its own.
+            return None;
+        }
         let retry_at = key.map(|key| self.metadata_cache.retry_at(key, now));
         let report = entry.managed_result(result.as_ref().ok().map(|(_, peer, _)| peer), retry_at);
         if result.is_ok() && entry.is_unnamed() {
@@ -904,10 +913,13 @@ impl Worker {
         report.then(|| result.map(|(endpoint, peer, _)| (endpoint, peer)))
     }
 
+    /// Read the metadata of `peer`, scheduled for `key` (the value its radio
+    /// record named, if any).
     fn probe_metadata(
         &mut self,
         driver: Arc<dyn Driver>,
         peer: DiscoveredPeer,
+        key: Option<MetadataKey>,
         output: DiscoveryOutput,
         generation: u64,
         completion: bool,
@@ -968,7 +980,7 @@ impl Worker {
                 ManagedMetadata::complete_peer(metadata, service, peer)
                     .map(|(endpoint, peer)| (endpoint, peer, hash))
             });
-            Operation::Probe(generation, address, output, result)
+            Operation::Probe(generation, address, key, output, result)
         });
         Ok(())
     }
