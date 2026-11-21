@@ -609,6 +609,8 @@ pub(crate) struct TrackedPeer {
     has_been_reported: bool,
     kind: ReadKind,
     read_done: bool,
+    /// The last sighting: a full managed table forgets its stalest peer.
+    last_seen: Instant,
 }
 
 impl TrackedPeer {
@@ -657,6 +659,7 @@ impl TrackedPeer {
             has_been_reported: false,
             kind,
             read_done: false,
+            last_seen: Instant::now(),
         }
     }
     /// The key of a header or completion read.
@@ -672,7 +675,11 @@ impl TrackedPeer {
     pub(crate) fn is_completion(&self) -> bool {
         matches!(self.kind, ReadKind::Completion(_))
     }
+    pub(crate) fn last_seen(&self) -> Instant {
+        self.last_seen
+    }
     pub(crate) fn update_radio(&mut self, peer: DiscoveredPeer) {
+        self.last_seen = Instant::now();
         if self.peer.manufacturer_data != peer.manufacturer_data
             || self.peer.service_data != peer.service_data
             || self.peer.name != peer.name
@@ -709,6 +716,7 @@ impl TrackedPeer {
             };
             return;
         }
+        self.last_seen = Instant::now();
         self.peer = peer;
     }
     pub(crate) fn managed_due(&self, now: Instant, scan_active: bool) -> bool {

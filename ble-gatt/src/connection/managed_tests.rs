@@ -2894,6 +2894,47 @@ async fn managed_discovery_reads_a_header_named_while_an_earlier_read_ran() {
 }
 
 #[tokio::test]
+async fn managed_discovery_tracks_a_new_peer_when_its_table_is_full() {
+    let network = MockNetwork::new();
+    let address = PeerAddress("crowded-peer".into());
+    let advertiser = advertiser_with(&network, "crowded-peer", config());
+    advertiser.set_advertising(true).await.unwrap();
+    network.set_rssi(&address, Some(-50));
+    let (driver, control, reader) = BlockingVisibility::metadata(network, "crowded-reader");
+    let header = first_sighting(&driver).await;
+    // Hidden from the mock scan: only the sightings below reach the reader.
+    advertiser.set_advertising(false).await.unwrap();
+    let (input, receiver) = tokio::sync::mpsc::channel(128);
+    // A crowd without records fills the 64-peer table before the header arrives.
+    let mut crowd = header.clone();
+    crowd.service_data.clear();
+    for n in 0..64 {
+        crowd.address = PeerAddress(format!("crowd-{n}"));
+        input.send(Ok(crowd.clone())).await.unwrap();
+    }
+    input.send(Ok(header)).await.unwrap();
+    *control.scan_input.lock().unwrap() = Some(receiver);
+    let mut discovery = reader.discover().await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut found = None;
+    while let Ok(Some(item)) = tokio::time::timeout_at(deadline, discovery.next()).await {
+        if let Ok((endpoint, _)) = item {
+            found = Some(endpoint);
+            break;
+        }
+    }
+    assert_eq!(
+        found,
+        Some(advertiser.endpoint_id()),
+        "the stalest peer makes room"
+    );
+    drop(input);
+    drop(discovery);
+    reader.close().await.unwrap();
+    advertiser.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn an_advertisement_update_changes_the_header_hash_with_the_readable_fields() {
     use crate::advertisement::{GattAdvertisement, GATT_ADVERTISEMENT_CHARACTERISTIC};
     let network = MockNetwork::new();

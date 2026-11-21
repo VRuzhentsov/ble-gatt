@@ -692,7 +692,7 @@ impl Worker {
                 } else if let Some(entry) = tracked.get_mut(&radio.address) {
                     let read_at = self.metadata_cache.retry_at(key, now);
                     entry.update_keyed(radio.clone(), key, read_at, true);
-                } else if tracked.len() < crate::advertisement::METADATA_CACHE_CAPACITY {
+                } else if self.tracked_room(tracked) {
                     // Reported now; the fields the radio could not carry (a
                     // name, on Android) follow from one read.
                     log::debug!(
@@ -720,7 +720,7 @@ impl Worker {
                 let read_at = self.metadata_cache.retry_at(key, now);
                 if let Some(entry) = tracked.get_mut(&radio.address) {
                     entry.update_keyed(radio, key, read_at, false);
-                } else if tracked.len() < crate::advertisement::METADATA_CACHE_CAPACITY {
+                } else if self.tracked_room(tracked) {
                     tracked.insert(
                         radio.address.clone(),
                         TrackedPeer::header(radio, key, read_at),
@@ -761,7 +761,7 @@ impl Worker {
                     let read_at = self.metadata_cache.retry_at(key, now);
                     if let Some(entry) = tracked.get_mut(&radio.address) {
                         entry.update_keyed(radio, key, read_at, false);
-                    } else if tracked.len() < crate::advertisement::METADATA_CACHE_CAPACITY {
+                    } else if self.tracked_room(tracked) {
                         tracked.insert(
                             radio.address.clone(),
                             TrackedPeer::header(radio, key, read_at),
@@ -783,7 +783,7 @@ impl Worker {
                     if entry.is_unnamed() {
                         entry.update_radio(radio.clone());
                     }
-                } else if tracked.len() < crate::advertisement::METADATA_CACHE_CAPACITY {
+                } else if self.tracked_room(tracked) {
                     let entry = match known {
                         Some(_) => TrackedPeer::known(radio.clone()),
                         None => TrackedPeer::managed(radio.clone()),
@@ -795,6 +795,27 @@ impl Worker {
                 let endpoint = *endpoint;
                 Some(Ok((endpoint, Self::cached_peer(fields, radio))))
             }
+        }
+    }
+
+    /// Whether a scan's table of tracked peers has room for one more. A full
+    /// table forgets its stalest peer without a read in flight (that read
+    /// still needs its entry); with none such, there is no room.
+    fn tracked_room(&self, tracked: &mut HashMap<PeerAddress, TrackedPeer>) -> bool {
+        if tracked.len() < crate::advertisement::METADATA_CACHE_CAPACITY {
+            return true;
+        }
+        let stalest = tracked
+            .iter()
+            .filter(|(address, _)| !self.probing.contains_key(*address))
+            .min_by_key(|(_, entry)| entry.last_seen())
+            .map(|(address, _)| address.clone());
+        match stalest {
+            Some(address) => {
+                tracked.remove(&address);
+                true
+            }
+            None => false,
         }
     }
 
