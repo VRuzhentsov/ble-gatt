@@ -1,7 +1,7 @@
 package dev.blegatt
 
 /**
- * Native callbacks implemented in Rust (`ble-gatt/src/drivers/android.rs`,
+ * Native callbacks implemented in Rust (`ble-gatt/src/drivers/android/mod.rs`,
  * `#[no_mangle] extern "system" fn Java_dev_blegatt_NativeKt_<name>`).
  * Declared as top-level functions (not class members) so Kotlin compiles
  * them as static methods on `NativeKt` — a fixed, unmangled JNI symbol name

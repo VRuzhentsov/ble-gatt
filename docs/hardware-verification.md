@@ -1,291 +1,220 @@
 # Hardware verification
 
-Everything else in this repository is verified against a mock driver. That
-mock has repeatedly certified behaviour both real drivers reject — writes to
-characteristics no peer declared writable, operations through connections
-that had already been closed, and for several revisions a `session: None`
-that made an entire class of session checks unreachable from any test. None
-of the library's behaviour is confirmed until two radios exchange bytes.
+Verify raw datagram examples and managed communication in
+[ADR-0012](adr/0012-discovery-like-nearby.md) separately. This guide lists required
+checks, not passed scenarios.
 
-This document is how that is done.
+## Status and scope
 
-## Status
+The shared iroh diagnostic now uses core managed discovery, requests and
+independent incoming acceptance. Hardware acceptance remains pending;
+software checks are separate. Old candidate-model results
+do not certify the new protocol. Windows acceptance is listed in
+[ADR-0011](adr/0011-windows-winrt-driver.md#verification-and-known-limits).
 
-**No two-device round trip has passed yet.** What is confirmed so far:
+Historical discovery, release-JNI and crossed-start failures describe specific runs,
+not permanent platform limits. Zero scan callbacks in one emulator run do not
+prove universal emulator failure. Missing native scan results block discovery;
+arbitration cannot repair them.
 
-| Claim | Evidence |
-| --- | --- |
-| Linux peripheral genuinely on the air | `LEAdvertisingManager1.ActiveInstances = 1` |
-| Android peripheral role end to end | `HWVERIFY: READY peripheral` + `onAdvertisingSetStarted … status=0` |
-| Android↔Android discovery | **Blocked** — platform gap, see below |
-| Android central → Linux peripheral: connect, MTU, service discovery, subscribe | All succeed — see "First live attempt", below |
-| Android central → Linux peripheral: the auth write | **Blocked** — two independent causes found, neither is the platform gap above |
-| Android peripheral role (advertise) against a real release build | **Blocked** — `NoSuchMethodError`, see below |
+Device testing requires separate authorization and exact build/input provenance.
+This documentation revision changes no hardware, phone settings or consumer source.
+Source checks, mocks, packaged JNI, native events and physical teardown prove different things.
 
-The remaining route to a round trip is Linux ↔ Android or Linux ↔ Linux,
-both of which need real radios.
+## Software checks for the current implementation
 
-### First live attempt: real fini release build ↔ real Android phone (2026-08-17)
+Suggested checks from the repository root; this guide does not record them as run:
 
-Not the `hw_peer`/datagram-tier harness below — this was fini's actual
-production app (`v0.1.45`, pinning this repo at `af4ed1e`) against a real
-Android phone, both already paired, diagnosed read-only over `adb logcat` +
-`journalctl` + a user-run `btmon` capture (no reinstall, no rebuild). Two
-independent defects, plus a third contributing factor, all found from the
-same session:
-
-**1. Android peripheral role: `startAdvertising` `NoSuchMethodError`, every
-retry, forever.**
-
-```
-System.err: java.lang.NoSuchMethodError: no non-static method
-  "Ldev/blegatt/BleGattBridge;.startAdvertising(Ljava/lang/String;[Ljava/lang/String;[Z[Z[Z[[B[I[[B[Ljava/lang/String;[[B)V"
-[transport][ble] advertise failed, retrying in 60s: ...
+```sh
+cargo test --workspace --locked --offline
+cargo test -p ble-gatt --test peer_link --test peer_protocol --locked --offline
+cargo test -p ble-gatt --test advertising_visibility --test native_advertisement_state --locked --offline
+cargo test -p ble-gatt --features mock-broker --locked --offline
+cargo test -p tauri-plugin-ble-gatt --test jni_parity --locked --offline
+cargo test -p ble-gatt-iroh --test hardware_diagnostic --locked --offline
+cargo build -p ble-gatt-iroh --example hw_iroh_peer --locked --offline
 ```
 
-Current source (`BleGattBridge.kt:623`) has a matching 10-arg
-`startAdvertising` and the JNI call site (`android.rs:701`) matches it
-exactly — so this isn't a source-level mismatch today. Leading hypothesis:
-build/version skew between the Rust JNI signature and the Kotlin bytecode
-actually baked into that specific release APK. The `manufacturer_data`/
-`service_data` fields (this branch, `feat/advertise-manufacturer-service-
-data`) are a recent addition to that exact signature — a release built
-before the two sides were rebuilt from the same rev would reproduce exactly
-this. Worth confirming against the actual `v0.1.45` build provenance before
-assuming this is the whole story; an R8/consumer-rules gap (see below) is a
-second plausible contributor and hasn't been ruled out.
+The shared runner is `ble-gatt-iroh/examples/support/iroh_diagnostic.rs`.
+The Linux entrypoint, sample Android application and integration tests use it.
+The radio-free tests run actual iroh endpoints over mock GATT; this proves the
+managed software path, not physical crossed-attempt safety or OS teardown.
 
-The plugin module ships no `consumer-rules.pro` / `consumerProguardFiles`
-(`tauri-plugin-ble-gatt/android/build.gradle.kts` has neither), so a
-consuming app's release R8 pass has nothing telling it `BleGattBridge`'s
-JNI-invoked methods are reachable. Whether or not it's the cause of this
-specific error, it's a live gap: add a consumer ProGuard rule keeping
-`dev.blegatt.**` (or at least the methods called by name from
-`android.rs`) before shipping another release.
+## Android diagnostic packaging
 
-**2. Android central role: connects, negotiates MTU, discovers services,
-subscribes — then the very first characteristic write is rejected locally,
-never reaching the air.**
+Use the sample's normal SDK/NDK/JDK prerequisites:
 
-```
-D BleGattBridge: onMtuChanged: AA:BB:… negotiated mtu=517
-W BleGattBridge: writeCharacteristic rejected by the stack: AA:BB:…/b1e6a001-...
-[transport][ble] auth with ... failed: GATT operation failed: characteristic write failed
+```sh
+cd examples/tauri-app
+npm ci
+npm run tauri -- android init --ci
+sh android-diagnostic/prepare.sh
+npm run tauri -- android build --ci --debug --apk --target aarch64
 ```
 
-A `btmon` capture across this exact window is conclusive: BlueZ correctly
-declares the characteristic as `Properties: 0x1e` (Read | Write | Write
-Without Response | Notify) — service discovery reads this straight off the
-air — and the CCCD subscribe write completes cleanly (`ATT Write Request` →
-`Write Response`, sub-millisecond). No `ATT Write Request` for the
-characteristic itself ever appears on the air; the link goes quiet and
-times out (`Disconnect Complete … Reason: Connection Timeout`) about 5s
-later. So this rules out a declared-property mismatch (the mock's own
-blind spot per this doc's opening paragraph) — `gatt.writeCharacteristic()`
-is refusing locally, before attempting anything over the air.
+The overlay applies only to this sample's ignored generated Android project.
+Reapply it after initialization. It does not edit a consumer or the production
+plugin. The debug-only, non-exported, non-sticky foreground service keeps the
+process alive and stops on completion or within 190 seconds; it holds no wake
+lock. The Rust diagnostic requires this process's service marker.
 
-**3. Contributing factor: classic-profile radio contention can turn "rejected
-by the stack" from rare into routine.**
+Use package `dev.blegatt.example.debug` and activity
+`dev.blegatt.example.MainActivity`. Verify the packaged ABI, manifest and bridge
+bytecode, including bridge ABI 8. Source parity alone is insufficient. Diagnostic properties
+are read only by debug builds. Do not run the interactive/datagram buttons at
+the same time as the iroh runner.
 
-The same capture shows normal ATT round trips (30-90ms) degrading to
-**3.7-3.8 second** per-packet latencies during service discovery, correlated
-with `bluetoothd`'s `policy.c:reconnect_timeout()` repeatedly retrying a
-*classic* (BR/EDR) Audio Source/Handsfree profile connection to the same
-phone address — bonded for an entirely unrelated reason (using the phone as
-a Bluetooth audio device with this machine). Each retry re-runs Inquiry/Page
-scanning, which shares the same radio as the BLE link. This is not
-something fini can prevent — pairing a phone for audio with the same
-machine it also uses fini on is an ordinary, unpreventable user scenario,
-not a lab artifact.
+## Device and privacy boundary
 
-Android's local single-outstanding-GATT-operation rule (a second op called
-before the previous op's callback lands returns `false` immediately) is the
-standard explanation for exactly this failure shape, and radio contention
-that stretches every op's air time by 100x is exactly what turns a rare
-race into a reliable repro. This doesn't need to be the *only* explanation
-for defect 2 above, but it's a real, evidenced amplifier and worth fixing
-regardless of whether it's the sole cause.
+Before device discovery, installation, launch or log capture, obtain explicit
+authorization and select a connected, authorized serial. Placeholder inputs are
+not verified targets. Never install over Fini or another application.
 
-**Proposed fix (not yet implemented):** `BleGattBridge`'s GATT operations
-(write, and likely read/subscribe — same failure shape) treat a `false`
-return from the underlying `BluetoothGatt` call as terminal today, failing
-the whole connection on the very first rejection. Android's own guidance
-(and every mature Android BLE library) treats "stack busy" as expected and
-transient, not an error — the standard mitigation is a small bounded retry
-with backoff (e.g. 3 attempts, ~150-300ms apart) before giving up. Adding
-that at the point of rejection would absorb both transient scheduling
-jitter and exactly this kind of external radio contention, at a fraction of
-the cost of the current behaviour (tear down the whole link, wait for the
-outer ~35-45s reconnect loop). Needs a design pass before implementing:
-where the retry lives (Kotlin-side in `BleGattBridge`, closest to the
-platform quirk, vs. Rust-side in `android.rs`), how many attempts, whether
-it's shared plumbing across write/read/subscribe, and how a still-failing
-retry should surface (today's `BleError::Gatt` path is probably still
-right, just reached later).
+- Preserve the protected lock screen. Do not wake/unlock or automate native input.
+- Do not change radio, location, power, security or background settings implicitly.
+- Check existing permission prerequisites; request any needed interaction through
+  the sample's foreground permission UI and the user.
+- The sample's debug `neverForLocation` assertion is app-specific, not a library
+  default for all consumers. A foreground service does not itself prove locked
+  or background discovery eligibility on every Android version.
+- Capture only the diagnostic process; do not clear unrelated logcat.
+- Keep generated secrets, full keys, addresses, device identifiers and private logs
+  outside tracked source. Retain third-party licensing notices.
 
-## The harness
+The service's 190-second bound does not prove five-minute idle survival.
+Do not extend a run by silently disabling security or keeping a display awake.
 
-Two halves that speak the same protocol, use the same UUIDs and the same
-probe payload, and emit the same `HWVERIFY:` markers:
+## Current runner inputs
 
-| Half | Where | Driven by |
-| --- | --- | --- |
-| Linux | `ble-gatt/examples/hw_peer.rs` | `--role peripheral\|central`, exits 0/1 |
-| Android | `examples/tauri-app` (`src-tauri/src/hw_verify.rs`) | `debug.blegatt.role` system property, logs to logcat |
+Generate fresh diagnostic iroh identities in a private host directory outside
+this repository. `hw_iroh_peer --keygen` does not touch a radio. Keep the secret
+values out of commits and public logs; these are not production pairing keys.
 
-Both run the *datagram* tier rather than raw GATT, so a pass exercises
-advertising, scanning, connection, subscription, MTU negotiation,
-fragmentation and reassembly together. The probe payload is 512 bytes —
-deliberately larger than one fragment at any plausible MTU, so a passing run
-proves fragmentation over the air rather than a single-write happy path.
+Linux environment inputs:
 
-The peripheral **echoes** what it receives rather than merely accepting it.
-That is deliberate: echoing exercises the peripheral notify path, which is
-where most of this library's review findings landed and which no mock test
-can confirm.
+- `BLE_DIAG_SECRET`: local throwaway secret.
+- `BLE_DIAG_PEER`: the remote full public key.
+- `BLE_DIAG_SIDE=linux`.
+- `BLE_DIAG_MODE`: `phone-initiate`, `linux-initiate` or `both`.
+- `BLE_DIAG_START`: optional common scheduled Unix-second start.
 
-Markers:
+Android debug properties:
 
-- `HWVERIFY: READY <role>` — that half is up and waiting
-- `HWVERIFY: INFO …` — progress, including negotiated `max_message_len`
-- `HWVERIFY: PASS round-trip complete`
-- `HWVERIFY: FAIL <reason>`
+- Clear `debug.blegatt.role` when selecting the iroh diagnostic.
+- `debug.blegatt.iroh.mode`, `.secret`, `.peer`, `.start` carry the matching
+  mode, phone secret, Linux public key and optional schedule.
+- Only after install/run authorization, launch the diagnostic package. Between
+  runs, stop only that package; clear only its own debug properties afterward.
 
-## Topologies
+Use the built binary with those Linux inputs. The main scenario's 180-second
+timeout includes discovery and scheduled waiting. Some early returns and final
+shutdown awaits remain outside it; failure cleanup is not fully bounded.
+Start the host promptly after the phone, or use separate terminals and a common schedule.
+Check clocks read-only. Discovery must complete before the scheduled time for
+truly crossed native attempts; the schedule alone proves nothing about overlap.
 
-### Two Android emulators (RootCanal)
+The side/mode mapping must be demonstrated by native callbacks:
 
-> **This topology cannot complete a round trip.** LE discovery does not work
-> between two emulators — see "Why discovery fails" below. It still proves
-> the peripheral role, so it is documented rather than deleted.
+- `phone-initiate`: phone central, Linux peripheral.
+- `linux-initiate`: Linux central, phone peripheral.
+- `both`: both applications initiate; this does not imply two physical links.
 
-No physical hardware. Exercises the Android driver, the Kotlin bridge and
-the JNI boundary — where the majority of review findings landed.
+Do not install an incoming private source address as an outgoing discovery
+mapping. A short advertisement fingerprint is only a prefilter; iroh TLS
+checks the configured public key.
 
-The emulator log line to look for at startup is:
+## Required evidence for the current iroh runner
 
-```
-INFO | Activated packet streamer for bluetooth emulation
-```
+Each initiator opens two authenticated QUIC connections, transfers a synthetic
+4096-byte payload with distinct rounds, verifies exact echoes and confirms
+that connection reuse does not increase its dial-attempt counter. It closes
+only the first QUIC connection, waits beyond the unused-link backstop, and
+proves the survivor still transfers round 3 without another dial.
 
-That is RootCanal, the virtual Bluetooth controller. Without it the emulator
-has no Bluetooth at all and every run will fail at `capabilities`.
+Correlate both peers' logs:
 
-```bash
-# two instances, different ports; -no-snapshot so state is clean each run.
-# -gpu host is required: see "Emulator crashes on start" below.
-emulator -avd ble-test-2 -gpu host -no-window -no-audio -no-boot-anim -no-snapshot -port 5554 &
-emulator -avd fini-e2e   -gpu host -no-window -no-audio -no-boot-anim -no-snapshot -port 5556 &
+- `START`, `READY` and authenticated `QUIC` events. Android additionally needs
+  `EitherPeerService READY` and the marker from the current process.
+- Native central/client and peripheral/server callbacks and session generations,
+  not just requested modes or QUIC incoming/outgoing labels.
+- Initiator `PAYLOAD matched` for rounds 1/2/3, `REUSE`, and `SURVIVOR`.
+  Listener evidence includes distinct received rounds with `echo_ack=true` and
+  `rounds_mask=111`, not repeats of one round.
+- Stream `send.stopped() == Ok(None)` is receipt acknowledgement, not proof that
+  the remote application's business operation completed.
+- Before shutdown, `NATIVE_CLEANUP active_sessions=0 ... evidence=driver_events
+  before_shutdown=true`, then `CLEANUP address_queues=0 ... before_shutdown=true`
+  and joined incoming carrier tasks. Lagged/missing lifecycle evidence fails.
+- The current `PASS payload-reuse-survivor-cleanup` remains software evidence
+  with `native_teardown=unverified` unless all native/OS sessions are separately
+  correlated. An empty queue map or observed ready-session closure is not proof
+  of every raw ACL/session ending. Shutdown-induced teardown is not last-user
+  cleanup. Emergency force-close cannot turn a failure into a pass.
 
-# install on both. Debug builds get a `.debug` package suffix; the activity
-# keeps the base name. Using the unsuffixed id makes `pm grant` silently
-# grant nothing and `am start` fail with "Activity class does not exist".
-for s in emulator-5554 emulator-5556; do
-  adb -s $s install -r <apk>
-  adb -s $s shell cmd bluetooth_manager enable
-  for p in BLUETOOTH_SCAN BLUETOOTH_CONNECT BLUETOOTH_ADVERTISE; do
-    adb -s $s shell pm grant dev.blegatt.example.debug android.permission.$p
-  done
-done
+A unilateral listener need not scan/dial or emit initiator-only markers. Both
+peers in `both` mode must satisfy the applicable evidence. A surviving QUIC
+handle alone does not prove unchanged native carrier continuity; the remote
+peer or OS may have replaced it. A failed required role is not a pass because
+another role subsequently connected. Repeat after cleanup for reconnect evidence.
 
-# assign roles, then launch
-adb -s emulator-5554 shell setprop debug.blegatt.role peripheral
-adb -s emulator-5556 shell setprop debug.blegatt.role central
-adb -s emulator-5554 shell am start -n dev.blegatt.example.debug/dev.blegatt.example.MainActivity
-```
+## Managed core: separate acceptance gates
 
-Start the **peripheral first** and wait for its `READY` marker before
-launching the central, or the central's scan window can open and close
-before anything is advertising.
+The working tree contains non-iroh protocol tests and the migrated adapter.
+Require fresh evidence, independent of historical diagnostic passes, for:
 
-#### Emulator crashes on start
+1. Non-iroh establishment in either direction and matching endpoint correlation.
+2. Crossed attempts with both nonce orderings; equal nonces fail both.
+3. Losing outgoing failure/rejection and separate accepted incoming delivery;
+   no silent success handoff and no false global disconnection.
+4. Rejection, duplicate requests, cancellation and explicit disconnect without
+   unintended reconnect. Old QUIC retransmissions must not authorize replacement;
+   fresh explicit connects/attachment can authorize it. Test unexpected loss separately.
+5. Stale completion, replacement generations and loser cleanup preserving the
+   winner, existing users and healthy established communication.
+6. Discovery metadata reads while another user is active, bounded failures,
+   stopping discovery/advertising during communication and idle liveness.
+7. Version mismatch/control framing and opaque payload preservation; raw vendor
+   GATT must remain unaffected.
+8. iroh multi-user/path accounting with core-owned establishment, then native
+   visibility, cancellation and physical checks on each required platform pair.
 
-The emulator segfaults (exit 139) during boot under the default GPU mode.
-The coredump backtrace puts frames 1–5 in `gles_swiftshader/libGLESv2.so`
-with frame 0 at an unmapped JIT address — SwiftShader's LLVM JIT. `-gpu off`
-does **not** avoid it, because SwiftShader is loaded regardless. `-gpu host`
-uses the real DRM node (`/dev/dri/renderD128`) and avoids the JIT entirely.
+9. Discovery from radio records (ADR-0012 §2), on real radios:
+   - Windows scanning an Android Fini peer lists it with no GATT connection
+     before the hand-off (`DISCOVERY ... after_ms=` in the iroh diagnostic,
+     `after_ms=` in `hw_peer`); the name follows from one completion read.
+   - Android scanning Windows: the first scan window reads once, later
+     windows do not; an Add Device change on Windows reaches the phone in
+     under 2 s (a new header hash).
+   - Captures (nRF Connect, btmon): Android's scan response holds an `0xFF`
+     structure with company `FFFF` and data starting `FC`; Windows' advertisement
+     holds a `0x21` structure starting `F8`, unless Windows logs
+     `started without the service data` (then record that evidence).
+   - Windows 11 24H2 logs `scan parameters: LowLatency applied`; older builds log
+     `not available`.
+   - Linux: btmon shows an advertising interval of about 250 ms (Balanced), and
+     scanners still read a Linux peer with Fini's data.
 
-#### Why discovery fails
+Review metadata partial failure and WinRT watcher overflow/cache behavior.
+Source ownership guards and ABI checks do not prove native cancellation,
+compiled JNI descriptors, sample packaging or callback timing.
 
-The central's scan starts cleanly, reports no error, and returns nothing.
-The cause is below this library, and the stack's own counters show it:
+Keep unsupported capabilities and the current single-inbound-peer profile limit
+explicit. Do not claim Cluster/M-to-N, locked-device reliability or exhaustive
+physical teardown from a mock or emulator pass.
 
-```bash
-adb -s emulator-5556 shell dumpsys bluetooth_manager | grep -A 30 "GATT Scanner Map"
-```
+## Existing datagram echo example
 
-```
-dev.blegatt.example.debug
-  Scan time in ms (active/suspend/total) : 90036 / 0 / 90036
-  Total number of results                : 0
-com.google.uid.shared:10126 (Registered)
-  Scan time in ms (active/suspend/total) : 1612286 / 0 / 1612286
-  Total number of results                : 0
-```
+`ble-gatt/examples/hw_peer.rs` and the sample's `src-tauri/src/hw_verify.rs`
+still provide the older fragmented echo path. An authorized Linux run selects
+`cargo run -p ble-gatt --example hw_peer -- --role peripheral` or `--role central`.
+The sample selects `debug.blegatt.role` instead of the iroh properties.
 
-**Every** scanner on the device gets zero results, including Google Play
-services' — not just ours. Meanwhile RootCanal is bridging correctly at the
-controller level; its log shows the exchange in both directions:
+Look for `HWVERIFY: READY`, `HWVERIFY: PASS round-trip complete`, or failure
+markers. One round trip proves that scenario, not churn/recovery, mixed-role
+concurrency, background scanning or the new handshake. Do not mix this run with
+the iroh diagnostic or infer its current results from old logs.
 
-```
-le_controller.cc:2836  1  Sending LE Scan request to advertising address 4d:…
-le_controller.cc:4303  0  Accepting LE Scan request to extended advertiser 0
-le_controller.cc:4392  1  Accepting LE Scan response from advertising address 4d:…
-```
+## Prerequisite references
 
-So the advertisement reaches the scanner's controller and is answered, but
-no advertising report is ever delivered up to the host. A plausible reading
-is that RootCanal drives its advertiser through the extended state machine
-while the emulated controller advertises `extended_scan_support: 0` (visible
-in the same `dumpsys` output) — but that is a hypothesis about netsim, not a
-finding about this library, and nothing here can work around it.
-
-Related and recorded earlier in `docs/adr/0002-android-jni-bridge.md`: a
-*filtered* scan against RootCanal also returned zero results with the target
-confirmed advertising and the filter accepted (`status=0`). The Android
-driver therefore scans unfiltered and matches in code. Both observations
-now look like the same underlying gap.
-
-#### What this topology does prove
-
-The peripheral half runs end to end: `ndk_context` bridging, the classloader
-lookup, the Kotlin bridge, the GATT server, and the async advertise
-handshake, confirmed by `HWVERIFY: READY peripheral` and the stack's own
-`onAdvertisingSetStarted … status=0`. Only discovery is blocked.
-
-### Linux ↔ Android
-
-Two real radios, and the cross-platform pair Fini's plan calls for. The
-Linux half runs directly:
-
-```bash
-cargo run --example hw_peer -- --role peripheral
-```
-
-Confirm it is genuinely on the air rather than merely not erroring:
-
-```bash
-busctl get-property org.bluez /org/bluez/hci0 \
-  org.bluez.LEAdvertisingManager1 ActiveInstances
-# y 1   <- the controller has an active advertising instance
-```
-
-That check matters. `serve()` returning `Ok` only means BlueZ accepted the
-registration; `ActiveInstances` is the controller confirming it.
-
-### Linux ↔ Linux
-
-Needs a second controller — a USB dongle or a second machine. This is what
-`two_adapter_central_to_peripheral_round_trip` in
-`ble-gatt/tests/linux_loopback.rs` is `#[ignore]`d for.
-
-## What a pass does and does not prove
-
-A pass proves the two drivers interoperate for one connection, one
-fragmented message and one echo. It does **not** prove the behaviour that
-dominated this library's review findings: reconnection with the same
-address, session identity across a stop/restart, cancellation mid-operation,
-lock ordering under concurrent callbacks. Those need the churn scenarios —
-connect/disconnect/reconnect loops, advertise/stop/advertise cycles — which
-belong on top of this harness once a single round trip is reliable.
+- https://developer.android.com/develop/connectivity/bluetooth/bt-permissions
+- https://developer.android.com/develop/background-work/services/fgs/service-types

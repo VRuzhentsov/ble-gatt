@@ -12,8 +12,8 @@ use tokio_stream::Stream;
 
 use crate::entities::error::Result;
 use crate::entities::models::{
-    CapabilityReport, CharacteristicUuid, ConnectionPriority, DiscoveredPeer, GattEvent, GattServiceSpec,
-    PeerAddress, ServiceUuid, WriteType,
+    CapabilityReport, CharacteristicUuid, ConnectionPriority, DiscoveredPeer, GattEvent,
+    GattServiceSpec, PeerAddress, ServiceUuid, WriteType,
 };
 
 pub type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
@@ -77,20 +77,21 @@ pub trait GattConnection: Send {
     /// Write with an explicit delivery mode — see [`WriteType`]. Implementors
     /// provide this; `write` is a convenience wrapper over it.
     async fn write_with_type(
-        &mut self, characteristic: CharacteristicUuid, value: Vec<u8>, write_type: WriteType,
+        &mut self,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
+        write_type: WriteType,
     ) -> Result<()>;
 
     /// Stream of server-initiated notifications for `characteristic`.
     ///
-    /// Items are `Result` for the same reason `scan`'s are: the failure is
-    /// asynchronous. A driver that must bound its inbound buffering drops
-    /// payloads when the consumer falls behind, and the peer has *already*
-    /// been told the notification was delivered — so unless the loss is
-    /// reported here, neither endpoint ever learns, and a message either
-    /// vanishes or expires with no error. An error item does not end the
-    /// stream; it reports a gap.
+    /// Item errors report asynchronous failures. Use
+    /// `crate::BleError::ReceiveGap` for known dropped notifications; later
+    /// items remain usable after that gap. Raw datagram consumers treat other
+    /// errors as terminal, rather than guessing that a native failure is loss.
     async fn subscribe(
-        &mut self, characteristic: CharacteristicUuid,
+        &mut self,
+        characteristic: CharacteristicUuid,
     ) -> Result<BoxStream<Result<Vec<u8>>>>;
     async fn disconnect(&mut self) -> Result<()>;
 
@@ -109,7 +110,9 @@ pub trait GattConnection: Send {
     /// [`BleError::Unsupported`]: crate::BleError::Unsupported
     async fn request_connection_priority(&mut self, priority: ConnectionPriority) -> Result<()> {
         let _ = priority;
-        Err(crate::BleError::Unsupported("connection priority on this driver".into()))
+        Err(crate::BleError::Unsupported(
+            "connection priority on this driver".into(),
+        ))
     }
 }
 
@@ -168,7 +171,9 @@ pub trait Driver: Send + Sync {
     /// [`BleError::Unsupported`]: crate::BleError::Unsupported
     async fn update_advertisement(&self, service: GattServiceSpec) -> Result<()> {
         let _ = service;
-        Err(crate::BleError::Unsupported("updating the advertisement on this driver".into()))
+        Err(crate::BleError::Unsupported(
+            "updating the advertisement on this driver".into(),
+        ))
     }
 
     /// The service `advertise` serves, with the advertisement data of its
@@ -179,6 +184,31 @@ pub trait Driver: Send + Sync {
     /// so a stopped server stays stopped. No default: a wrapping driver must
     /// forward it, or serving never recovers (ADR-0010).
     fn served_service(&self) -> Option<GattServiceSpec>;
+
+    /// Replace the local value returned when a central reads `characteristic`.
+    /// Preserve the server, connected centrals and subscriptions. Do not send notifications.
+    /// `advertise` sets the first value from `GattCharacteristicSpec::initial_value`; this method changes it later.
+    ///
+    /// The GATT advertisement uses this method when its advertisement data changes (ADR-0012).
+    /// Return an error if no service is served or the served service does not contain the characteristic.
+    ///
+    /// Like `served_service`, this method has no default implementation.
+    /// Wrapping drivers must forward it to avoid silently serving a stale value.
+    async fn set_characteristic_value(
+        &self,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
+    ) -> Result<()>;
+
+    /// Change visibility without replacing the served service or its sessions.
+    /// Preserve callbacks, characteristic values and subscriptions. A service must already be served.
+    /// This operation does not disconnect peers. Raw `stop_advertising` remains destructive.
+    async fn set_advertising_enabled(&self, enabled: bool) -> Result<()> {
+        let _ = enabled;
+        Err(crate::BleError::Unsupported(
+            "advertising visibility on this driver".into(),
+        ))
+    }
 
     async fn stop_advertising(&self) -> Result<()>;
 
@@ -222,7 +252,10 @@ pub trait Driver: Send + Sync {
     /// subscription that replaced it — where they are reassembled as
     /// current data. `None` targets whatever currently holds the address.
     async fn notify_peer(
-        &self, peer: &PeerAddress, session: Option<u64>, characteristic: CharacteristicUuid,
+        &self,
+        peer: &PeerAddress,
+        session: Option<u64>,
+        characteristic: CharacteristicUuid,
         value: Vec<u8>,
     ) -> Result<()>;
 
@@ -271,6 +304,18 @@ pub trait Driver: Send + Sync {
     /// Characteristic *values* are not carried here — client-side
     /// notifications come back through `GattConnection::subscribe`.
     fn events(&self) -> BoxStream<GattEvent>;
+
+    /// Critical connection/radio events, subscribed before acquiring a session.
+    /// Native drivers isolate this bounded port from characteristic payloads.
+    /// The compatibility default cannot promise isolation: unknown loss is
+    /// retained as `Lagged`, so consumers must fail closed on it.
+    fn lifecycle_events(&self) -> BoxStream<GattEvent> {
+        use tokio_stream::StreamExt;
+        Box::pin(
+            self.events()
+                .filter(|event| !matches!(event, GattEvent::CharacteristicWritten { .. })),
+        )
+    }
 
     /// The radio's usability *right now*. `events()` carries the
     /// [`GattEvent::RadioChanged`] transitions; this is the initial value a

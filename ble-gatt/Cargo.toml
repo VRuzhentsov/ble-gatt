@@ -6,6 +6,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 async-trait.workspace = true
 log.workspace = true
@@ -23,7 +26,7 @@ bluer = { version = "0.17", features = ["bluetoothd"] }
 # Same versions `bluer` already depends on (no new crates): discovery runs on
 # a D-Bus connection of our own, because `bluer` neither exposes
 # `StopDiscovery` nor reports its result. See `DiscoveryBus` in
-# `drivers/linux.rs`.
+# `drivers/linux/mod.rs`.
 dbus = "0.9"
 dbus-tokio = "0.7"
 futures = "0.3"
@@ -32,7 +35,23 @@ futures = "0.3"
 jni = "0.21"
 ndk-context = "0.1"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+# Microsoft's own WinRT projection (MIT OR Apache-2.0), the crate btleplug
+# and bluest use for their Windows drivers. See docs/adr/0011.
+# 0.62.2 is the first with `BluetoothLEAdvertisementScanParameters`.
+windows = { version = "0.62.2", features = [
+    "Devices_Bluetooth",
+    "Devices_Bluetooth_Advertisement",
+    "Devices_Bluetooth_GenericAttributeProfile",
+    "Devices_Radios",
+    "Foundation",
+    "Foundation_Collections",
+    "Storage_Streams",
+] }
+
 [dev-dependencies]
+# Integration tests use poll_fn on every target, including Windows.
+futures = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 # So `hw_peer` can actually show the library's `log` output. Without a
 # logger installed the facade discards every record, and the hardware
@@ -41,7 +60,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 env_logger = "0.11"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-# A fake `org.bluez` adapter for the discovery tests in `drivers/linux.rs`.
+# A fake `org.bluez` adapter for the discovery tests in `drivers/linux/mod.rs`.
 # Same version `bluer` already depends on.
 dbus-crossroads = "0.5"
 

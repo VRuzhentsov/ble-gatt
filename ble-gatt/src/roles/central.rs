@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::connection::Connection;
 use crate::entities::error::Result;
 use crate::entities::models::{DiscoveredPeer, PeerAddress, ServiceUuid};
-use crate::hal::{Driver, BoxStream};
+use crate::hal::{BoxStream, Driver};
 
 /// The central role: finds peripherals and connects to them. Created by
 /// `Adapter::central`.
@@ -26,7 +26,7 @@ impl Central {
     /// Connects to `peer`. The returned `Connection` publishes its state
     /// (ADR-0007 D5).
     pub async fn connect(&self, peer: &PeerAddress) -> Result<Connection> {
-        let events = self.driver.events();
+        let events = self.driver.lifecycle_events();
         let inner = self.driver.connect(peer).await?;
         Ok(Connection::new(inner, events))
     }

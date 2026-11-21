@@ -5,7 +5,10 @@
 Accepted. D1–D3 and D6 are implemented in `ble-gatt-iroh`; D3 was revised
 after hardware runs (see its history). D4 and D5 needed no transport code:
 on the mock radio iroh already does both (see their notes). What is left is
-Fini's side and hardware.
+Fini's side and hardware. The current PR adds explicit initiation policy,
+protects active links from idle cleanup, and prevents late traffic from
+recreating a released incoming candidate. These describe the current adapter,
+not [ADR-0012's target core protocol](0012-discovery-like-nearby.md).
 
 ## Context
 
@@ -55,7 +58,13 @@ itself.
 `ble-gatt-iroh` provides endpoint hooks (`BleGattTransport::hooks()`), which
 the application installs once with `Endpoint::builder().hooks(..)`. After
 each handshake they record the connection's peer key against the BLE
-addresses of its paths, and follow `path_events` for later paths. This covers
+addresses of its paths, and follow `path_events` for later paths. Current
+path ownership is reconciled separately from that history: subscribe before
+the first snapshot and resnapshot on every event, including `Closed` and
+`Lagged` (see [current implementation gap](0012-discovery-like-nearby.md#current-implementation-gap)).
+A historically used but now closed path must not prevent idle cleanup while
+its connection survives elsewhere. History remains for
+key-based force-close, close barriers and D6. This covers
 links the peer dialled in. `set_peer_address` stays for what iroh cannot know
 yet: where to dial a peer before any connection exists.
 

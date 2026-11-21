@@ -1,260 +1,197 @@
-# Architecture: layers, crates and modules
+# Architecture: crates, roles and ownership
 
-This file is the map of `ble-gatt`. Every module belongs to exactly one
-layer, and every layer has one job. The decisions behind the map are in
-[ADR-0007](adr/0007-layered-architecture.md).
+The shared design is [ADR-0012](adr/0012-discovery-like-nearby.md).
+[ADR-0011](adr/0011-windows-winrt-driver.md) owns Windows-native choices.
+The managed core and iroh migration are implemented in this PR. Software checks
+do not establish native hardware acceptance.
 
-The aim is a reusable, cross-platform BLE library for Rust applications:
-the same API on Linux, Android, Windows and, later, Apple platforms, with a
-network stack such as iroh plugged in from outside, never wired in.
+## Workspace boundaries
 
-## Naming rule
+- [`ble-gatt`](../ble-gatt/README.md): generic GATT operations, complete messages,
+  core peer coordination, resource ownership and native/mock drivers.
+- [`ble-gatt-iroh`](../ble-gatt-iroh/README.md): custom packet/address adaptation,
+  authenticated iroh key mapping and accounting of iroh users of a BLE carrier.
+- [`tauri-plugin-ble-gatt`](../tauri-plugin-ble-gatt/README.md): host access,
+  permissions, lazy construction and Android bridge/context setup.
+- **External iroh:** authenticated QUIC connections, encryption, streams and paths.
+- **Applications:** eligibility, product pairing, acceptance and application data.
 
-Nothing here is a home-grown scheme:
+The core works without iroh or Tauri. A Tauri app can obtain a shared core
+`Adapter` from the plugin while using the Rust data path directly; packet traffic
+need not cross frontend IPC. Android still needs a compatible native bridge and
+Application context, even in a non-Tauri host.
 
-- **Layers** are named after [Clean Architecture](https://blog.cleancoder.com/uncle-bob/2012/08/13/the-clean-architecture.html)
-  (Robert C. Martin): Entities, Use Cases, Interface Adapters, Frameworks &
-  Drivers.
-- **Modules inside a layer** are named after the Bluetooth Core
-  Specification (GAP roles, connection, GATT profile) and, for the platform
-  interface, after Rust's [`embedded-hal`](https://docs.rs/embedded-hal)
-  (a HAL of traits, implemented by drivers).
-- **`L` followed by a number always means an OSI layer** (L2 = data link).
-  It is never used for this library's layers. See
-  [How the layers map onto OSI](#how-the-layers-map-onto-osi).
+## Object-oriented code
 
-## Layers
+New and changed code is object-oriented: behavior lives on the type that owns
+its state, rules or protocol. The rules are in [the code style](code-style.md).
 
-Clean Architecture's dependency rule applies: source code depends only
-inwards. Entities depend on nothing; Use Cases depend on Entities and declare
-the interfaces (ports) they need; Drivers and Interface Adapters depend on
-Use Cases and implement or call those interfaces.
+This PR puts acquisition and packet accounting on the iroh adapter's `Inner`.
+`ManagedMetadata` owns profile metadata encoding and decoding; `Record` owns
+managed records. Native codecs own SDK value conversion. Existing public free
+functions and JNI entry points delegate to these owners without duplicating behavior.
 
-| Layer (Clean Architecture) | Job | Modules or crates | Never does |
-|---|---|---|---|
-| **Entities** | Data types and rules that hold everywhere | `entities/`: `PeerAddress`, peer identity, connection states, errors, the fragment format | Any I/O, any platform call |
-| **Use Cases** | What the library does | `hal/` (the port traits drivers implement), `roles/` (`Adapter`, `Central`, `Peripheral`, `Advertiser`), `connection/` (one connection's lifecycle), `profile/` (the datagram profile: message channel, peer identity in the advertisement, finding a known peer), `power/` (power profiles) | Call an operating system directly; know about iroh, Tauri or any application |
-| **Interface Adapters** | Connect the library to a specific outside system | Crates `ble-gatt-iroh` (iroh custom transport) and `tauri-plugin-ble-gatt` (Tauri host integration) | Anything the core needs to work |
-| **Frameworks & Drivers** | Talk to one operating system's Bluetooth API | `drivers/`: Linux (BlueZ via `bluer`), Android (JNI + Kotlin), Windows (WinRT), Apple (CoreBluetooth), mock radio | Policy, retries, protocol framing |
-| *(outside)* Application | Product logic | Which network stack to use, sessions, sync, routing, UI | (lives outside this repository) |
+## Ownership map
 
-### The Use Cases modules
-
-| Module | Job | Name taken from |
-|---|---|---|
-| `hal/` | Traits a driver implements: scanning, connecting, GATT client and server operations, advertising | `embedded-hal` (traits) and its drivers |
-| `roles/` | The BLE roles as a uniform API, created from the `Adapter` object | GAP roles in the Bluetooth Core Specification; Nordic's `client` / `server` / `advertiser` |
-| `connection/` | Keep a connection to one peer healthy: state machine, one operation queue per device with timeouts, connection-scoped tasks, MTU and connection priority | GAP connection procedures; Kable's and Nordic's `connect()` |
-| `profile/` | The datagram profile: whole messages over a connection (fragmentation, reassembly), peer identity in the advertisement, finding a known peer, deduplicating crossing connections | GATT-based profile in the Bluetooth Core Specification; Nordic's `profile()` |
-| `power/` | Advise how hard the radio should work: inputs (foreground or background, battery level, charging, peers nearby) resolve to a schedule (scan on and off times, connection limit) | bitchat's `PowerManager` |
-
-## How the layers map onto OSI
-
-The two schemes answer different questions. The OSI model says what a
-protocol does to the bytes on their way between devices. Clean Architecture
-says how code is split and which part depends on which. All of this
-library's protocol work falls inside OSI layer 2.
-
-| OSI layer | What it does | Who does it, with `ble-gatt` and iroh (as in Fini) | `ble-gatt` part |
-|---|---|---|---|
-| L1 Physical | Radio signal | Bluetooth chip | — |
-| L2 Data link | Frames between two devices in range | The operating system's Bluetooth stack (BLE link layer, L2CAP, ATT/GATT); on top of it, `ble-gatt` turns GATT into a message channel between two peers | Drivers, `roles/`, `connection/`, `profile/` |
-| L3 Network | Addressing and choosing a path | iroh: a peer is addressed by its public key, and iroh picks Bluetooth or IP | `ble-gatt-iroh` connects `profile/` to it |
-| L4 Transport | Reliable delivery, streams | QUIC inside iroh | — |
-| L5–L7 Session, presentation, application | Sessions, message format, product logic | The application (for Fini: its ALPN, `PeerFrame`, sync) | — |
-| — | Not a protocol layer | Power profiles, the Tauri integration | `power/`, `tauri-plugin-ble-gatt` |
-
-Fini's `DataLink` is named after OSI L2 and corresponds to this library's
-`profile/` (Fini `docs/glossary.md`).
-
-## Who owns which layer
-
-| Layer | Owner |
-|---|---|
-| Entities, Use Cases, Frameworks & Drivers | `ble-gatt` (this repository, core crate) |
-| Interface Adapter for iroh | `ble-gatt-iroh` (this repository). All iroh coupling lives here and nowhere else. A different network stack gets its own adapter crate next to it. |
-| Interface Adapter for Tauri | `tauri-plugin-ble-gatt` (this repository) |
-| Application | The application. Fini decides that Fini uses iroh (Fini ADR-0009); `ble-gatt` takes no such decision. |
-
-## Crates
-
-| Crate | Layers | Depends on |
-|---|---|---|
-| `ble-gatt` | Entities, Use Cases, Frameworks & Drivers | platform SDKs only |
-| `ble-gatt-iroh` | Interface Adapters | `ble-gatt`, `iroh` |
-| `tauri-plugin-ble-gatt` | Interface Adapters | `ble-gatt`, `tauri` |
-
-## A connection end to end
-
-This section shows how one iroh connection between two Fini devices crosses
-every part, from the application down to the Bluetooth chip. The example
-devices are a Linux desktop and an Android phone. Each level of the tree sits
-on top of the level below it, like nested folders, and every line names the
-crate or file it lives in.
-
-```
-desktop (Linux)
-└── Fini                                    application (outside this repo)
-    └── iroh Endpoint                       crate iroh (outside): QUIC + TLS,
-        │                                     a peer is addressed by its public key
-        └── BleGattTransport                crate ble-gatt-iroh, src/lib.rs
-            │                                 iroh custom transport: EndpointId ↔ PeerAddress,
-            │                                 one link per address, redial yield,
-            │                                 retired addresses, close_link / close_links
-            │                                 (cancel a dial, disconnect either role);
-            │                                 a dial waits for the peer's old links to close;
-            │                                 hooks(): learn key ↔ link from iroh (ADR-0008),
-            │                                 close a link once no connection uses it
-            └── DatagramChannel             crate ble-gatt, profile/datagram/
-                │                             whole messages: fragmentation, reassembly;
-                │                             connect() = central, serve() = peripheral
-                └── Adapter → hal::Driver   crate ble-gatt, roles/ + hal/
-                    │                         (in a Tauri app built by tauri-plugin-ble-gatt's
-                    │                          LazyDriver on first use)
-                    └── LinuxDriver         crate ble-gatt, drivers/linux.rs (via bluer)
-                        └── bluetoothd      BlueZ over D-Bus: Device1, GattManager1,
-                            │                 LEAdvertisingManager1
-                            └── kernel HCI  Linux Bluetooth subsystem
-                                └── chip    Bluetooth controller:
-                                              link layer + radio
-
-phone (Android)
-└── Fini                                    application, Tauri app (Rust in the APK)
-    └── iroh Endpoint                       crate iroh (outside)
-        └── BleGattTransport                crate ble-gatt-iroh
-            └── DatagramChannel             crate ble-gatt, profile/datagram/
-                └── Adapter → hal::Driver   crate ble-gatt; built by tauri-plugin-ble-gatt
-                    │                         (src/lazy.rs, src/android_context.rs)
-                    └── AndroidDriver       crate ble-gatt, drivers/android.rs
-                        │                     Rust half of the bridge: calls Kotlin over JNI,
-                        │                     receives Java_dev_blegatt_NativeKt_* callbacks
-                        └── JNI bridge      tauri-plugin-ble-gatt/android/…/dev/blegatt/
-                            ├── Native.kt   external funs: the callbacks into Rust
-                            ├── BleGattPlugin.kt
-                            │                 Tauri plugin: runtime permissions
-                            └── BleGattBridge.kt
-                                │             BluetoothLeScanner, BluetoothGatt (central),
-                                │             BluetoothGattServer + BluetoothLeAdvertiser
-                                │             (peripheral)
-                                └── Android Bluetooth service
-                                    │         com.android.bluetooth, over Binder
-                                    └── HCI
-                                        └── chip
-                                              Bluetooth controller:
-                                              link layer + radio
-```
-
-The two chips share one BLE link. On it, the device that dialled is the
-central and writes to the other device's GATT characteristic; the other
-device is the peripheral and answers with notifications on the same
-characteristic. Either device can take either role. iroh's QUIC packets ride
-inside those writes and notifications, so the BLE link and GATT see only
-encrypted bytes.
+Boxes group responsibilities; arrows show selected caller/provider dependencies,
+not every call. One `PeerLink` worker owns managed communication.
 
 ```mermaid
 flowchart TB
-    subgraph desktop["Desktop (Linux)"]
-        direction TB
-        dApp["Fini<br/>(application)"]
-        dIroh["iroh Endpoint<br/>QUIC + TLS"]
-        dTransport["ble-gatt-iroh<br/>BleGattTransport"]
-        dDatagram["ble-gatt profile/datagram<br/>DatagramChannel"]
-        dAdapter["ble-gatt Adapter<br/>hal::Driver"]
-        dDriver["ble-gatt drivers/linux.rs<br/>(bluer)"]
-        dBluez["BlueZ bluetoothd<br/>D-Bus"]
-        dHci["kernel HCI"]
-        dChip["Bluetooth chip"]
-        dApp --> dIroh --> dTransport --> dDatagram --> dAdapter --> dDriver --> dBluez --> dHci --> dChip
+    subgraph apps["Apps: product policy outside this workspace"]
+        direct["Rust / non-iroh apps"]
+        tauriApp["Tauri apps / frontend"]
     end
-
-    subgraph phone["Phone (Android)"]
-        direction TB
-        pApp["Fini<br/>(Tauri app)"]
-        pIroh["iroh Endpoint<br/>QUIC + TLS"]
-        pTransport["ble-gatt-iroh<br/>BleGattTransport"]
-        pDatagram["ble-gatt profile/datagram<br/>DatagramChannel"]
-        pAdapter["ble-gatt Adapter<br/>hal::Driver<br/>(tauri-plugin-ble-gatt LazyDriver)"]
-        pDriver["ble-gatt drivers/android.rs<br/>Rust side of JNI"]
-        pKotlin["tauri-plugin-ble-gatt Kotlin<br/>BleGattBridge.kt + Native.kt"]
-        pStack["Android Bluetooth service<br/>Binder"]
-        pHci["HCI"]
-        pChip["Bluetooth chip"]
-        pApp --> pIroh --> pTransport --> pDatagram --> pAdapter --> pDriver
-        pDriver -- "JNI calls" --> pKotlin
-        pKotlin -- "Native.kt callbacks" --> pDriver
-        pKotlin --> pStack --> pHci --> pChip
+    subgraph external["External iroh"]
+        endpoint["Endpoint / QUIC / TLS / streams / paths"]
     end
-
-    dChip <-->|"BLE link: GATT writes (central → peripheral)<br/>and notifications (peripheral → central)"| pChip
-    dIroh -.-|"one QUIC connection, end-to-end encrypted"| pIroh
+    subgraph integrations["Our adapter crates"]
+        irohAdapter["ble-gatt-iroh: packet/address adapter"]
+        tauriAdapter["tauri-plugin-ble-gatt: host access/setup"]
+    end
+    subgraph core["ble-gatt: reusable core and native implementations"]
+        peer["PeerLink worker: discovery / handshake / tie-break"]
+        adapter["Adapter: radio / capabilities / role access"]
+        central["Central: scan / connect / GATT client"]
+        peripheral["Peripheral: advertise / serve / notify"]
+        owned["Connection ownership / generation-safe cleanup"]
+        messages["Datagram profile: fragmentation / reassembly"]
+        discovery["Advertisement data / profile completion"]
+        power["Power-profile advice"]
+        hal["HAL: Driver / GattConnection ports"]
+        entities["Entities: types / errors / role-session events"]
+        subgraph drivers["Drivers: native OS effects"]
+            linux["Linux / BlueZ"]
+            android["Android / JNI"]
+            windows["Windows / WinRT"]
+            mock["Mock / optional broker"]
+        end
+    end
+    direct --> peer
+    direct -. "raw GATT when needed" .-> adapter
+    tauriApp --> tauriAdapter
+    tauriApp --> endpoint
+    endpoint --> irohAdapter
+    irohAdapter --> peer
+    tauriAdapter --> adapter
+    peer --> central
+    peer --> peripheral
+    peer --> owned
+    peer --> messages
+    peer --> discovery
+    adapter --> central
+    adapter --> peripheral
+    central --> hal
+    peripheral --> hal
+    owned --> hal
+    messages --> hal
+    discovery --> hal
+    hal --> entities
+    power --> entities
+    linux -. "implements" .-> hal
+    android -. "implements" .-> hal
+    windows -. "implements" .-> hal
+    mock -. "implements" .-> hal
 ```
 
-## Module map of the core crate
+Drivers keep native objects/callbacks and session-scoped effects behind the
+ports. Core policy does not replace their ownership guards or serialization.
+Power profiles provide advice rather than mandatory radio control.
 
-The target layout. Moving today's modules into it is planned work
-(ADR-0007, Plan).
+## Roles and lifecycle
 
-```
-ble-gatt/src/
-  entities/          Entities      types, errors, fragment format
-  hal/               Use Cases     port traits the drivers implement
-  roles/             Use Cases     public role API; holds injected drivers
-    adapter.rs                     the device's Bluetooth adapter: on/off, events, capabilities
-    central.rs
-    peripheral.rs
-    advertiser.rs
-  connection/        Use Cases     connection lifecycle, op queue, connection scope
-  profile/           Use Cases     datagram profile, peer identity, finding peers
-  power/             Use Cases     power profiles and the resolver
-  drivers/           Frameworks & Drivers   one sub-module per OS, all implementing hal/
-    linux/
-    android/
-    windows/         (planned)
-    apple/           (planned)
-    mock/
+A central initiates a BLE connection; a peripheral serves GATT. Writes in one
+direction and notifications in the other already provide bidirectional traffic.
+Either eligible application peer can initiate the managed protocol. No permanent
+identity ranking or caller-selected initiation mode controls the initiator.
+Raw role operations remain available for vendor devices without our handshake.
+
+```text
+advertise / discover -> peer information -> request connection
+    -> acceptance on both sides -> messages -> disconnected
 ```
 
-Today's modules map onto it as:
+Metadata completion is an internal discovery procedure, not an accepted message
+connection. Stopping discovery or advertising must preserve active communication
+and the native resources it needs. Finishing a message does not release a healthy
+connection. Explicit disconnect/cancel must not be undone by an independent loop.
 
-| Today | Target |
-|---|---|
-| `backend/{linux,android,mock}` | `drivers/` |
-| the `Backend` trait | `hal/` |
-| `backend/link_state.rs`, `peer_link.rs` | `connection/` |
-| `datagram/` | `profile/` |
-| `models.rs`, `error.rs` | `entities/` |
+The new core tie-break compares per-attempt nonces for the same endpoint. The
+larger wins; equal nonces fail both. The losing outgoing request reports failure;
+the winning incoming request is processed separately. Do not transfer its success
+to the outgoing caller. Closing a loser is not global peer disconnection.
+Endpoint correlation, native session generation and authenticated identity are
+different facts. See ADR-0012 for selected bytes, typed outcomes and acceptance gates.
 
-## Designing a module
+## Core coordinator and independent raw paths
 
-**Dependency injection.** Use Cases declare their dependencies as traits in
-`hal/` and receive implementations from the caller. `roles/` holds
-`Arc<dyn …>` values supplied at construction; tests supply mocks. A
-convenience constructor (`platform()`) builds the real drivers for the
-current OS, but nothing in the core creates its own dependencies behind the
-caller's back.
+The managed iroh path is:
 
-**One interface, several platforms (drivers).** Every driver:
+```text
+Application -> external iroh -> BleGattTransport
+            -> PeerLink worker -> datagram profile -> HAL -> native driver
+```
 
-- implements the same `hal/` traits, with the same behaviour, so callers
-  cannot tell platforms apart;
-- reports what it cannot do through `Adapter` capabilities or a typed
-  `Unsupported` error, never by silently doing nothing;
-- keeps platform quirks (Android's one-operation-at-a-time GATT, BlueZ
-  caching, Windows permission prompts) inside the module, documented next to
-  the code that handles them;
-- has its native code (Kotlin, etc.) shipped by the crate itself, never
-  copied into an application;
-- is covered by the shared behaviour tests that run against the mock, plus
-  hardware checks listed in `docs/hardware-verification.md`.
+Non-iroh applications use the same worker directly, including standalone CLIs.
+Raw `Central`, `Peripheral` and datagram APIs remain independent for vendor or
+caller-owned protocols. They do not run the managed handshake.
 
-**Lifetimes.** Anything that keeps the radio busy (advertising, a GATT
-server, a scan) is returned as a handle that stops it when dropped, as
-`bluer` does (ADR-0007 D6).
+The refactor replaces the existing worker's tracking/ranking contract. It does
+not add a second manager. The unused crate-private `link_state` implementation
+is retired; historical ADR-0005 remains unchanged.
 
-**Errors and events: pub/sub.** Errors are typed per layer. State is
-published, never polled: a value that changes (adapter on or off, a
-connection's state) is a `tokio::sync::watch` channel, and a sequence of
-events is a broadcast stream; any number of subscribers can follow either
-(ADR-0007 D5).
+Managed discovery completes missing metadata through bounded GATT reads and
+reuses the existing metadata tracker for continuous refresh. Owned sessions do
+not open parallel probes; their readable-only refresh remains an acceptance gap.
+Managed advertisement construction, update, visibility, and radio recovery belong
+to the existing metadata owner and Worker lane. Raw scan completion and raw
+server recovery remain independent. Neither path implements Nearby's exact wire protocol.
+The datagram server still admits one inbound peer; `MaxLinks` does not establish
+Cluster/M-to-N or universal crossed-attempt support.
 
-**Runtime.** Async, Tokio only.
+Each generation's existing transport task waits for bounded application capacity.
+It holds at most one pending record and pauses raw reads, not the shared worker.
+Native send and control paths remain responsive. Admission keeps the five-second
+I/O bound; native end and retirement interrupt the wait. Queue pressure alone
+does not create a receive gap.
+
+Drivers publish bounded lifecycle events separately from characteristic writes.
+Native/mock drivers, the broker and wrappers preserve this separation through
+`Driver::lifecycle_events()`. The third-party default filters the legacy stream;
+it cannot isolate loss. Critical lag remains terminal for an affected raw channel,
+unlike known payload gaps. The two streams share no order, so each
+`CharacteristicWritten` carries its driver session, and `serve` drops a write
+whose session is not the one its channel serves. The managed advertisement owner treats its lifecycle
+lag as unknown native state, not confirmed radio loss. It guards updates and show
+until hide and a full hidden retry succeed. This guard does not stop a surviving channel.
+See [event-stream limits](interface.md#driver-event-streams-and-receive-loss).
+
+Core handles separate scoped release from generation-wide disconnect. The iroh
+adapter accounts for current users/paths separately from address history.
+It uses core close reasons to block automatic reacquisition after terminal
+disconnect. Old packets cannot authorize replacement; unexpected loss remains
+recoverable. See [API usage](interface.md) and the [adapter](../ble-gatt-iroh/README.md).
+
+## Layers and validation
+
+The layer vocabulary remains that of [ADR-0007](adr/0007-layered-architecture.md):
+
+- **Entities:** reusable data and pure rules; no I/O.
+- **Use Cases:** `hal`, `roles`, `connection`, `profile` and `power`.
+- **Interface Adapters:** the iroh and Tauri crates.
+- **Frameworks & Drivers:** native and mock implementations of the ports.
+
+### How the layers map onto OSI
+
+OSI is an explanatory protocol analogy, not a crate or ownership rule. The
+Bluetooth radio/OS stack supplies physical/link mechanisms; the GATT profile
+adds complete messages. In the iroh composition, QUIC supplies transport streams
+and security above that carrier, and the application supplies its data protocol.
+Tauri setup and power advice are not packet layers. A type named `DataLink`
+does not establish its actual protocol layer.
+
+Follow [ADR-0012's migration gates](adr/0012-discovery-like-nearby.md#migration-and-verification-gates-for-this-pr).
+Mock checks, JNI bytecode/packaging checks, observed native sessions and physical
+OS teardown are separate evidence levels. Old candidate-model results do not
+certify the new handshake. Procedures and limits live in
+[hardware-verification.md](hardware-verification.md).

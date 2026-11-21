@@ -21,72 +21,22 @@
 //! - central → peripheral: characteristic write
 //! - peripheral → central: notify on that same characteristic
 //!
-//! ## Known limitation: the peripheral role serves one central at a time
+//! ## Raw and managed connections
 //!
-//! `Driver::notify` pushes to *every* subscribed central — the only
-//! per-characteristic primitive both platform drivers expose today. With a
-//! single connected central this is exactly point-to-point, which is what
-//! both current consumers need.
+//! The raw peripheral path currently serves one central at a time. It uses
+//! `Driver::notify_peer` to address that central. Additional centrals are
+//! refused; this does not provide Cluster or M-to-N service.
 //!
-//! With several it would be actively unsafe rather than merely wasteful:
-//! each central receives the others' fragments, and since every channel
-//! starts its `msg_id` at 0, the first message on two channels shares both
-//! `msg_id` and usually `total`. The `InconsistentTotal` guard only fires
-//! when `total` differs, so those fragments interleave in a third party's
-//! reassembler and complete into a blend of two messages — delivered as
-//! valid, with no error.
+//! Raw `connect` and `serve` are independent. They do not arbitrate crossed
+//! attempts or share native ownership. Use the core `PeerLink` request/accept
+//! path when both applications can initiate. Its endpoint and attempt protocol
+//! selects a carrier without a permanent identity-ranked dialer.
 //!
-//! `serve` therefore refuses additional centrals while one is active.
-//! Lifting that needs a per-peer notify on the `Driver` port:
-//! straightforward on Android (`notifyCharacteristicChanged` already takes a
-//! device), unresolved on BlueZ where `bluer`'s notifier does not identify
-//! its subscriber.
-//!
-//! ## Known limitation: one link per peer is the consumer's responsibility
-//!
-//! `connect` (central role) and `serve` (peripheral role) are independent.
-//! They share no state, draw separate sessions, and build different channel
-//! kinds — a `connect` channel writes out and subscribes for inbound; a
-//! `serve` channel notifies out and takes characteristic writes for inbound.
-//! Neither is bidirectional *across roles*, and nothing here reconciles the
-//! two: a peer this process has dialled with `connect` can also be accepted
-//! by `serve`, and vice versa.
-//!
-//! A consumer that speaks *both* roles to the *same* peer (two app-to-app
-//! devices that each advertise and each dial) must ensure exactly one link
-//! per peer itself, because the layers below cannot:
-//!
-//! - BlueZ keeps a single address-keyed device object per peer, and a pair
-//!   of LE devices does not reliably hold two concurrent links — a second
-//!   connection between an already-connected pair races, briefly
-//!   double-links, then collapses, leaving whichever role's channel
-//!   survived pointing at a dead link (`serve`'s `superseded` guard is
-//!   *not* a cross-role takeover — it only stops a stale fragment from a
-//!   re-served address leaking into the new peripheral-role session).
-//! - Simultaneous dials (both peers call `connect` before either link
-//!   exists) are glare. The tiebreaker that resolves it must be
-//!   *identity-based* — keyed on a stable value both peers can compare and
-//!   agree orders them the same way — so both independently name the *same*
-//!   physical link. A symmetric rule such as "keep my inbound link" or
-//!   "keep my own `connect` channel" does the opposite: each peer's inbound
-//!   is the other's outbound, so the two ends drop different links and both
-//!   collapse. That comparable identity is the *application's* to establish
-//!   (e.g. node IDs exchanged during its own handshake): `PeerAddress` is
-//!   opaque and unordered by contract, and no local counterpart is exposed
-//!   here, so it cannot be the basis. Given such an identity, a workable
-//!   convention is to make one peer the sole dialer (no second link ever
-//!   forms), or — if both links did briefly form — to keep the one whose
-//!   *central* is the agreed-lower peer. Which convention to use is a
-//!   protocol decision this library cannot make for its consumers.
-//!
-//! The two directions of any single link are also not symmetric: the
-//! central→peripheral direction fragments against the *negotiated* MTU,
-//! while the peripheral→central (notify) direction is fixed at the 23-byte
-//! spec minimum because the peripheral has no `GattConnection` to query.
-//! The negotiated MTU is only ever *potentially* larger — the peer may
-//! leave it at the 23-byte minimum (see `GattConnection::att_mtu`) — so the
-//! sole-dialer choice decides which peer *can* get the larger outbound
-//! budget when negotiation succeeds, not that it always will.
+//! Each raw channel already carries messages in both directions. Its write
+//! and notification budgets use the reported native MTU when available and
+//! the ATT minimum otherwise. A larger negotiated budget is not guaranteed.
+//! Stopping the raw server is destructive. The visibility-only driver toggle
+//! retains the server and active channels.
 
 pub mod fragment;
 pub mod reassembly;
@@ -111,7 +61,7 @@ pub(crate) struct OverflowSignal {
 }
 
 impl OverflowSignal {
-    fn raise(&self) {
+    pub(crate) fn raise(&self) {
         self.flagged.store(true, Ordering::SeqCst);
         // notify_one, not notify_waiters: `notify_waiters` only wakes
         // receivers already registered, so a gap raised between `recv`
@@ -123,8 +73,12 @@ impl OverflowSignal {
         self.notify.notify_one();
     }
 
-    fn take(&self) -> bool {
+    pub(crate) fn take(&self) -> bool {
         self.flagged.swap(false, Ordering::SeqCst)
+    }
+
+    pub(crate) async fn notified(&self) {
+        self.notify.notified().await;
     }
 }
 use std::time::{Duration, Instant};
@@ -133,15 +87,17 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
-use crate::hal::{Driver, BoxStream, GattConnection};
-use crate::roles::Adapter;
-use crate::profile::datagram::fragment::{split, FragmentHeader, FRAGMENT_HEADER_LEN, MAX_FRAGMENTS};
-use crate::profile::datagram::reassembly::{Accept, Reassembler, ReassemblyLimits};
 use crate::entities::error::{BleError, Result};
 use crate::entities::models::{
-    CharacteristicUuid, ConnectionPriority, GattCharacteristicSpec, GattEvent, GattServiceSpec,
-    PeerAddress, RadioStatus, Role, ServiceUuid, WriteType,
+    AdvertisingMode, CharacteristicUuid, ConnectionPriority, GattCharacteristicSpec, GattEvent,
+    GattServiceSpec, PeerAddress, RadioStatus, Role, ServiceUuid, WriteType,
 };
+use crate::hal::{BoxStream, Driver, GattConnection};
+use crate::profile::datagram::fragment::{
+    split, FragmentHeader, FRAGMENT_HEADER_LEN, MAX_FRAGMENTS,
+};
+use crate::profile::datagram::reassembly::{Accept, Reassembler, ReassemblyLimits};
+use crate::roles::Adapter;
 
 pub const DEFAULT_MAX_MESSAGE_LEN: usize = 1024 * 1024;
 pub const DEFAULT_REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -160,132 +116,8 @@ pub const DEFAULT_FRAGMENT_QUEUE_DEPTH: usize = 256;
 /// accepting.
 pub const DEFAULT_ACCEPT_QUEUE_DEPTH: usize = 8;
 
-/// How long `serve` will block on a full fragment queue before dropping a
-/// fragment and reporting the loss.
-///
-/// Bounded rather than unbounded because the same loop carries disconnects:
-/// waiting forever on a peer that has stopped draining would stall cleanup
-/// for every peer, including that one.
-const FRAGMENT_BACKPRESSURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-
-#[derive(Debug, Clone)]
-pub struct DatagramConfig {
-    pub service: ServiceUuid,
-    pub characteristic: CharacteristicUuid,
-    pub max_message_len: usize,
-    pub reassembly_timeout: Duration,
-    pub max_concurrent_reassemblies: usize,
-    /// Defaults to `WithResponse`: ATT write
-    /// requests are acknowledged. `WithoutResponse` trades that for
-    /// throughput and will silently drop under load — opt in only where the
-    /// layer above tolerates loss.
-    pub write_type: WriteType,
-    /// How many *completed* messages may sit unread before the reassembler
-    /// stops accepting more. The reassembly limits bound only partial
-    /// messages, so without this a slow or stalled consumer is a memory
-    /// exhaustion vector.
-    pub inbound_queue_depth: usize,
-    /// Raw fragments buffered per peer before the oldest are dropped.
-    /// Bounding the *completed* queue alone is not enough: once reassembly
-    /// blocks on a full completed queue it stops draining fragments, and an
-    /// unbounded fragment queue then grows without limit instead.
-    pub fragment_queue_depth: usize,
-    /// Accepted-but-not-yet-taken peripheral channels buffered by [`serve`]
-    /// before further centrals are refused. Each queued channel pins a
-    /// driver `Arc`, its reassembly buffers and a live task, so an
-    /// unbounded queue lets a peer that connects and disconnects in a loop
-    /// grow the process without limit while the caller is slow to accept.
-    pub accept_queue_depth: usize,
-    /// Merged into [`service_spec`](Self::service_spec)'s `GattServiceSpec.manufacturer_data`.
-    /// Empty by default — [`serve`] otherwise has no way to carry anything
-    /// beyond the bare service UUID in its advertisement, since it builds
-    /// the spec internally from this config. A caller that needs the
-    /// advertised payload to change between `serve` calls (e.g. a
-    /// discoverability flag toggled on and off) re-advertises by ending the
-    /// current `serve` stream and calling it again with an updated config.
-    pub advertised_manufacturer_data: BTreeMap<u16, Vec<u8>>,
-    /// Becomes [`service_spec`](Self::service_spec)'s
-    /// `GattServiceSpec.local_name`: a short name scanners read from the
-    /// scan response without connecting. `None` by default.
-    pub advertised_local_name: Option<String>,
-}
-
-impl DatagramConfig {
-    pub fn new(service: ServiceUuid, characteristic: CharacteristicUuid) -> Self {
-        Self {
-            service,
-            characteristic,
-            max_message_len: DEFAULT_MAX_MESSAGE_LEN,
-            reassembly_timeout: DEFAULT_REASSEMBLY_TIMEOUT,
-            max_concurrent_reassemblies: DEFAULT_MAX_CONCURRENT_REASSEMBLIES,
-            write_type: WriteType::WithResponse,
-            inbound_queue_depth: DEFAULT_INBOUND_QUEUE_DEPTH,
-            fragment_queue_depth: DEFAULT_FRAGMENT_QUEUE_DEPTH,
-            accept_queue_depth: DEFAULT_ACCEPT_QUEUE_DEPTH,
-            advertised_manufacturer_data: BTreeMap::new(),
-            advertised_local_name: None,
-        }
-    }
-
-    /// `mpsc::channel(0)` panics, and `inbound_queue_depth` is a public
-    /// field with no non-zero invariant — validate rather than letting a
-    /// caller's zero crash `connect`, or worse, panic `serve`'s detached
-    /// background task where nothing observes it.
-    fn validate(&self) -> Result<()> {
-        if self.inbound_queue_depth == 0 {
-            return Err(BleError::Gatt(
-                "inbound_queue_depth must be at least 1".to_string(),
-            ));
-        }
-        if self.fragment_queue_depth == 0 {
-            return Err(BleError::Gatt(
-                "fragment_queue_depth must be at least 1".to_string(),
-            ));
-        }
-        if self.accept_queue_depth == 0 {
-            return Err(BleError::Gatt(
-                "accept_queue_depth must be at least 1".to_string(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn limits(&self) -> ReassemblyLimits {
-        ReassemblyLimits {
-            max_message_len: self.max_message_len,
-            reassembly_timeout: self.reassembly_timeout,
-            max_concurrent_reassemblies: self.max_concurrent_reassemblies,
-        }
-    }
-
-    /// The GATT service this tier expects on the wire. Both roles must agree,
-    /// so both derive it from here rather than hand-rolling a spec.
-    pub fn service_spec(&self) -> GattServiceSpec {
-        let mut spec = GattServiceSpec::new(
-            self.service,
-            vec![GattCharacteristicSpec {
-                uuid: self.characteristic,
-                readable: true,
-                writable: true,
-                notifiable: true,
-                initial_value: Vec::new(),
-            }],
-        );
-        spec.manufacturer_data = self.advertised_manufacturer_data.clone();
-        spec.local_name = self.advertised_local_name.clone();
-        spec
-    }
-}
-
-/// The configured ceiling, lowered to whatever the fragment budget can
-/// actually carry. Without this the two limits disagree: a peripheral
-/// budgets 14-byte fragments against the spec-minimum MTU, capping a
-/// message at ~896 KiB, while `max_message_len` defaults to 1 MiB — so
-/// messages in the gap passed the size check and then failed inside
-/// `split()` one call later.
-fn effective_max_message_len(configured: usize, fragment_budget: usize) -> usize {
-    configured.min(fragment_budget.saturating_mul(MAX_FRAGMENTS))
-}
+/// Let receive and lifecycle tasks run even when native sends complete immediately.
+const FRAGMENT_SEND_BATCH: usize = 8;
 
 /// How a channel pushes bytes at its peer — the only thing that differs
 /// between the two roles once fragmentation is factored out.
@@ -327,8 +159,8 @@ enum Sink {
 /// `WithResponse` write is acknowledged by the receiving *stack* before this
 /// library ever sees the payload, so when the receiver is not draining fast
 /// enough there is no longer any way to fail the sender's write: the ack has
-/// already gone out. `serve` applies backpressure for
-/// [`FRAGMENT_BACKPRESSURE_TIMEOUT`] before giving up, and reports the loss
+/// already gone out. `serve` uses nonblocking `try_send` for fragment admission;
+/// a full queue drops the arriving fragment and reports the loss
 /// to the *receiving* side as an error item from [`Self::recv`] — the only
 /// endpoint that can still be told.
 ///
@@ -341,6 +173,8 @@ pub struct DatagramChannel {
     characteristic: CharacteristicUuid,
     sink: Arc<Mutex<Sink>>,
     inbound: ReceiverStream<Result<Vec<u8>>>,
+    /// Native/source termination, independent of application queue drainage.
+    ended: tokio_util::sync::CancellationToken,
     /// Tells `serve` this channel is gone, so it can free the single-central
     /// slot and drop the peer.
     ///
@@ -376,6 +210,9 @@ pub struct DatagramChannel {
     /// reassembly and link-loss tasks running until the peer or the OS
     /// happens to end the link.
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Managed central connections transfer native cleanup to their reserved
+    /// worker slot on Drop, including when a send still holds the sink.
+    managed_cleanup: bool,
 }
 
 impl Drop for DatagramChannel {
@@ -412,6 +249,9 @@ impl Drop for DatagramChannel {
         // Taken now when the sink is free. A `DatagramSender` mid-send
         // holds it; then a task waits for it rather than leaving the
         // connection open.
+        if self.managed_cleanup {
+            return;
+        }
         let peer = self.peer.clone();
         let connection = match self.sink.try_lock() {
             Ok(mut sink) => match &mut *sink {
@@ -446,7 +286,23 @@ impl Drop for DatagramChannel {
     }
 }
 
+/// The configured ceiling, lowered to whatever the fragment budget can
+/// actually carry. Without this the two limits disagree: a peripheral
+/// budgets 14-byte fragments against the spec-minimum MTU, capping a
+/// message at ~896 KiB, while `max_message_len` defaults to 1 MiB — so
+/// messages in the gap passed the size check and then failed inside
+/// `split()` one call later.
 impl DatagramChannel {
+    fn message_limit(configured: usize, fragment_budget: usize) -> usize {
+        configured.min(fragment_budget.saturating_mul(MAX_FRAGMENTS))
+    }
+}
+
+impl DatagramChannel {
+    pub(crate) fn termination(&self) -> tokio_util::sync::CancellationToken {
+        self.ended.clone()
+    }
+
     pub fn peer(&self) -> PeerAddress {
         self.peer.clone()
     }
@@ -491,7 +347,10 @@ impl DatagramChannel {
     /// this side dialled (`connect`) can ask: the priority is a central-side
     /// request, so a channel accepted by `serve` returns
     /// [`BleError::Unsupported`].
-    pub async fn request_connection_priority(&mut self, priority: ConnectionPriority) -> Result<()> {
+    pub async fn request_connection_priority(
+        &mut self,
+        priority: ConnectionPriority,
+    ) -> Result<()> {
         match &mut *self.sink.lock().await {
             Sink::Connection { connection: Some(connection), .. } => {
                 connection.request_connection_priority(priority).await
@@ -538,8 +397,11 @@ impl DatagramChannel {
             // buffered: "you have lost data" is more useful now than after
             // draining everything that survived.
             if self.overflow.take() {
-                log::warn!("recv: inbound overflow from {} — a message was lost", self.peer.0);
-                return Some(Err(BleError::Gatt(format!(
+                log::warn!(
+                    "recv: inbound overflow from {} — a message was lost",
+                    self.peer.0
+                );
+                return Some(Err(BleError::ReceiveGap(format!(
                     "inbound overflow from {}: fragments were dropped and at least one \
                      message is lost",
                     self.peer.0
@@ -611,10 +473,224 @@ impl DatagramChannel {
             },
             Sink::Notify { driver, active } => {
                 active.store(false, Ordering::SeqCst);
-                log::info!("disconnect: central {} session={:?}", self.peer.0, self.session);
+                log::info!(
+                    "disconnect: central {} session={:?}",
+                    self.peer.0,
+                    self.session
+                );
                 driver.disconnect_peer(&self.peer, self.session).await
             }
         }
+    }
+}
+
+/// [`connect`] over a driver directly, for `PeerLink`, which holds one.
+impl DatagramChannel {
+    pub(crate) async fn connect_driver(
+        driver: Arc<dyn Driver>,
+        peer: &PeerAddress,
+        config: &DatagramConfig,
+    ) -> Result<DatagramChannel> {
+        Self::connect_owned(driver, peer, config, false).await
+    }
+
+    pub(crate) async fn connect_managed(
+        driver: Arc<dyn Driver>,
+        peer: &PeerAddress,
+        config: &DatagramConfig,
+    ) -> Result<DatagramChannel> {
+        Self::connect_owned(driver, peer, config, true).await
+    }
+
+    async fn connect_owned(
+        driver: Arc<dyn Driver>,
+        peer: &PeerAddress,
+        config: &DatagramConfig,
+        managed_cleanup: bool,
+    ) -> Result<DatagramChannel> {
+        config.validate()?;
+        log::info!("connect: dialling {} service={}", peer.0, config.service.0);
+        // Subscribe before connecting, for the same reason `serve` subscribes
+        // before advertising: `events()` is a broadcast, so a disconnect landing
+        // between `connect`/`subscribe` succeeding and this call is lost. The
+        // driver contract explicitly does not promise that a notification
+        // stream closes with the link, so losing it leaves `recv()` pending
+        // forever with nothing left to wake it.
+        let events = driver.lifecycle_events();
+        // Past this point the platform connection exists, so *every* way out has
+        // to tear it down — including the caller dropping this future mid-setup,
+        // where no code on this path runs at all. Dropping the `GattConnection`
+        // cleans up nothing: on Android it leaves `ConnectionState.live` set and
+        // the Kotlin GATT open, after which every retry to that address is
+        // refused as "already open". A retryable setup failure, or a plain
+        // timeout, would otherwise kill the address permanently.
+        let mut pending = PendingConnection {
+            connection: Some(driver.connect(peer).await?),
+            peer: peer.clone(),
+            managed_cleanup,
+        };
+
+        log::debug!("connect: link up to {}, subscribing", peer.0);
+
+        let setup = async {
+            let connection = pending.connection.as_mut().expect("armed above");
+            let notifications = connection.subscribe(config.characteristic).await?;
+            let budget = connection
+                .max_write_len()
+                .checked_sub(FRAGMENT_HEADER_LEN)
+                .filter(|budget| *budget > 0)
+                .ok_or_else(|| {
+                    BleError::Gatt(format!(
+                        "negotiated MTU leaves no room for payload after the \
+                     {FRAGMENT_HEADER_LEN}-byte fragment header"
+                    ))
+                })?;
+            Ok::<_, BleError>((notifications, budget))
+        }
+        .await;
+
+        let (notifications, budget) = match setup {
+            Ok(ready) => ready,
+            // Returning here drops `pending`, which disconnects.
+            Err(err) => {
+                log::warn!("connect: setup failed for {}: {err}", peer.0);
+                return Err(err);
+            }
+        };
+        // Setup succeeded: take ownership back so the guard becomes inert.
+        let connection = pending.connection.take().expect("armed above");
+        // Captured before the connection is moved into the channel: this is what
+        // lets the link-loss watcher tell our own disconnect from one belonging
+        // to a previous connection to the same address.
+        let session = connection.session();
+
+        let (tx, rx) = mpsc::channel(config.inbound_queue_depth);
+        let overflow = Arc::new(OverflowSignal::default());
+        let ended = tokio_util::sync::CancellationToken::new();
+        let reassembly = Reassembler::spawn(
+            notifications,
+            config.limits(),
+            tx,
+            overflow.clone(),
+            peer.clone(),
+            ended.clone(),
+        );
+        // The watcher gets an *AbortHandle*, not the JoinHandle. Handing over
+        // the JoinHandle meant aborting the watcher merely dropped it — and
+        // dropping a Tokio JoinHandle detaches its task rather than cancelling
+        // it, so reassembly outlived the channel that owned it.
+        let watcher = Self::watch_link_loss(
+            events,
+            peer.clone(),
+            reassembly.abort_handle(),
+            overflow.clone(),
+            connection.session(),
+        );
+
+        log::info!(
+            "connect: channel ready to {} session={session:?} fragment_budget={budget} \
+         max_message_len={}",
+            peer.0,
+            DatagramChannel::message_limit(config.max_message_len, budget)
+        );
+
+        Ok(DatagramChannel {
+            peer: peer.clone(),
+            characteristic: config.characteristic,
+            sink: Arc::new(Mutex::new(Sink::Connection {
+                connection: Some(connection),
+                write_type: config.write_type,
+            })),
+            inbound: ReceiverStream::new(rx),
+            ended,
+            // Central channels are not held in anyone's slot, so nothing needs
+            // telling when this one goes away.
+            release: None,
+            keep_peer: false,
+            session,
+            // Set when the driver reports it dropped notifications — the
+            // central-side equivalent of `serve`'s fragment-queue overflow.
+            overflow,
+            next_msg_id: Arc::default(),
+            max_message_len: DatagramChannel::message_limit(config.max_message_len, budget),
+            fragment_budget: budget,
+            tasks: vec![reassembly, watcher],
+            managed_cleanup,
+        })
+    }
+
+    /// Turn link loss into `recv() -> None` by aborting the reassembly task,
+    /// which drops the only sender on the inbound channel.
+    ///
+    /// No error is delivered — "the peer walked away" is not a fault of the
+    /// caller, and a closed channel already says everything it needs to. The
+    /// notification stream itself cannot be relied on to end here: on a real
+    /// driver a subscription outlives the link, so waiting for it to close
+    /// would be waiting forever.
+    fn watch_link_loss(
+        mut events: BoxStream<GattEvent>,
+        peer: PeerAddress,
+        reassembly: tokio::task::AbortHandle,
+        overflow: Arc<OverflowSignal>,
+        session: Option<u64>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            while let Some(event) = events.next().await {
+                match &event {
+                    // Address *and* session must match. Subscribing happens
+                    // before the connection is established (a disconnect landing
+                    // in that gap would otherwise be lost), so this stream can
+                    // legitimately carry a loss event belonging to a *previous*
+                    // connection to the same address — and acting on it would
+                    // tear down a channel that is working. When the driver
+                    // cannot distinguish sessions it reports `None`, and address
+                    // matching alone is the best available.
+                    GattEvent::Disconnected {
+                        peer: lost,
+                        local_role: Role::Central,
+                        session: lost_session,
+                    } if *lost == peer
+                        && (lost_session.is_none()
+                            || session.is_none()
+                            || *lost_session == session) =>
+                    {
+                        log::info!(
+                            "link-loss watch: {} session={session:?} disconnected; closing channel",
+                            peer.0
+                        );
+                        reassembly.abort();
+                        return;
+                    }
+                    GattEvent::RadioChanged {
+                        status: RadioStatus::Off | RadioStatus::Unsupported,
+                    } => {
+                        reassembly.abort();
+                        return;
+                    }
+                    // Lag is terminal here for the same reason it is in `serve`:
+                    // the discarded events may include this peer's
+                    // `Disconnected`, and the notification stream is explicitly
+                    // not guaranteed to close with the link — so a caller parked
+                    // in `recv()` would wait forever on a peer that is gone.
+                    // Report the gap first so that wait ends with an error
+                    // rather than a silent close.
+                    GattEvent::Lagged { dropped } => {
+                        log::warn!(
+                            "link-loss watch: lifecycle stream lagged by {dropped} events; \
+                         ending the channel to {}, since its disconnect may have been lost",
+                            peer.0
+                        );
+                        overflow.raise();
+                        reassembly.abort();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            // Event stream ended: nothing more can arrive, so the reassembly
+            // task would otherwise linger for the life of the process.
+            reassembly.abort();
+        })
     }
 }
 
@@ -658,6 +734,9 @@ impl DatagramSender {
         let characteristic = self.characteristic;
         let mut sink = self.sink.lock().await;
         for (index, fragment) in fragments.into_iter().enumerate() {
+            if index > 0 && index % FRAGMENT_SEND_BATCH == 0 {
+                tokio::task::yield_now().await;
+            }
             log::trace!(
                 "send: msg_id={msg_id} fragment {index} ({} bytes) to {}",
                 fragment.len(),
@@ -675,8 +754,9 @@ impl DatagramSender {
                         );
                         return Err(BleError::NotConnected(self.peer.0.clone()));
                     };
-                    if let Err(err) =
-                        connection.write_with_type(characteristic, fragment, *write_type).await
+                    if let Err(err) = connection
+                        .write_with_type(characteristic, fragment, *write_type)
+                        .await
                     {
                         log::warn!(
                             "send: write of msg_id={msg_id} fragment {index} to {} failed: {err}",
@@ -716,7 +796,62 @@ impl DatagramSender {
             }
         }
         log::trace!("send: msg_id={msg_id} fully written to {}", self.peer.0);
+        drop(sink);
+        // Short ready sends must not bypass fairness between fragment batches.
+        tokio::task::yield_now().await;
         Ok(())
+    }
+}
+
+struct ServedPeer {
+    /// The driver's own session id for this peer's connection, so a
+    /// lifecycle event from a previous one can be recognised and ignored.
+    driver_session: Option<u64>,
+    fragments: mpsc::Sender<Vec<u8>>,
+    active: Arc<AtomicBool>,
+    overflow: Arc<OverflowSignal>,
+    /// Distinguishes successive channels for the same address, so a release
+    /// from a superseded channel cannot evict its replacement.
+    generation: u64,
+    ended: tokio_util::sync::CancellationToken,
+}
+
+impl Drop for ServedPeer {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::SeqCst);
+        self.ended.cancel();
+    }
+}
+
+/// Exclude a central this server has refused.
+///
+/// Every refusal path must go through this. Refusing to allocate state does
+/// not stop the peer receiving traffic: it is still subscribed, and
+/// `Driver::notify` is a broadcast that cannot be addressed to one peer on
+/// BlueZ. Disconnecting is the only portable exclusion.
+impl ServedPeer {
+    async fn refuse(driver: &dyn Driver, peer: &PeerAddress, session: Option<u64>) {
+        log::info!(
+            "refuse: disconnecting central {} session={session:?}",
+            peer.0
+        );
+        if let Err(err) = driver.disconnect_peer(peer, session).await {
+            log::warn!(
+                "refuse: could not disconnect central {}: {err} \
+             — it may still receive broadcast notifications",
+                peer.0
+            );
+        }
+    }
+
+    /// Whether an event naming `session` belongs to the connection this peer
+    /// is served on. A driver that cannot tell sessions apart reports `None`,
+    /// which matches any session.
+    fn owns_session(&self, session: Option<u64>) -> bool {
+        match (self.driver_session, session) {
+            (Some(current), Some(event)) => current == event,
+            _ => true,
+        }
     }
 }
 
@@ -730,63 +865,51 @@ struct Released {
     keep_peer: bool,
 }
 
-struct ServedPeer {
-    /// The driver's own session id for this peer's connection, so a
-    /// lifecycle event from a previous one can be recognised and ignored.
-    driver_session: Option<u64>,
-    fragments: mpsc::Sender<Vec<u8>>,
-    active: Arc<AtomicBool>,
-    overflow: Arc<OverflowSignal>,
-    /// Distinguishes successive channels for the same address, so a release
-    /// from a superseded channel cannot evict its replacement.
-    generation: u64,
-}
-
 /// Free the single-central slot for a peer whose channel the caller dropped,
 /// and, unless the caller closed it first, drop the peer so it is not left
 /// subscribed to a server that is no longer reading from it.
-async fn release_peer(
-    inbound: &mut HashMap<PeerAddress, ServedPeer>, released: Released, driver: &dyn Driver,
-) {
-    let Released { peer, generation, keep_peer } = released;
-    let peer = &peer;
-    // Only if this release belongs to the channel currently holding the
-    // slot. A late release from a superseded generation must not evict the
-    // peer that replaced it.
-    if inbound.get(peer).map(|served| served.generation) != Some(generation) {
-        return;
-    }
-    if let Some(served) = inbound.remove(peer) {
-        served.active.store(false, Ordering::SeqCst);
-        if keep_peer {
-            log::info!("release: central {} session={:?}, kept connected", peer.0, served.driver_session);
-            return;
+impl Released {
+    async fn release_peer(
+        self,
+        inbound: &mut HashMap<PeerAddress, ServedPeer>,
+        driver: &dyn Driver,
+    ) -> Option<(PeerAddress, Option<u64>)> {
+        let Released {
+            peer,
+            generation,
+            keep_peer,
+        } = self;
+        let peer = &peer;
+        // Only if this release belongs to the channel currently holding the
+        // slot. A late release from a superseded generation must not evict the
+        // peer that replaced it.
+        if inbound.get(peer).map(|served| served.generation) != Some(generation) {
+            return None;
         }
-        // Named by the driver session this channel was serving. Releasing a
-        // channel from a superseded `serve` generation would otherwise
-        // disconnect whatever now holds the address — the peer's own
-        // replacement session, established by the server that replaced us.
-        log::info!("release: central {} session={:?}", peer.0, served.driver_session);
-        if let Err(err) = driver.disconnect_peer(peer, served.driver_session).await {
-            log::warn!("release: could not disconnect central {}: {err}", peer.0);
+        if let Some(served) = inbound.remove(peer) {
+            served.active.store(false, Ordering::SeqCst);
+            if keep_peer {
+                log::info!(
+                    "release: central {} session={:?}, kept connected",
+                    peer.0,
+                    served.driver_session
+                );
+                return Some((peer.clone(), served.driver_session));
+            }
+            // Named by the driver session this channel was serving. Releasing a
+            // channel from a superseded `serve` generation would otherwise
+            // disconnect whatever now holds the address — the peer's own
+            // replacement session, established by the server that replaced us.
+            log::info!(
+                "release: central {} session={:?}",
+                peer.0,
+                served.driver_session
+            );
+            if let Err(err) = driver.disconnect_peer(peer, served.driver_session).await {
+                log::warn!("release: could not disconnect central {}: {err}", peer.0);
+            }
         }
-    }
-}
-
-/// Exclude a central this server has refused.
-///
-/// Every refusal path must go through this. Refusing to allocate state does
-/// not stop the peer receiving traffic: it is still subscribed, and
-/// `Driver::notify` is a broadcast that cannot be addressed to one peer on
-/// BlueZ. Disconnecting is the only portable exclusion.
-async fn disconnect_refused(driver: &dyn Driver, peer: &PeerAddress, session: Option<u64>) {
-    log::info!("refuse: disconnecting central {} session={session:?}", peer.0);
-    if let Err(err) = driver.disconnect_peer(peer, session).await {
-        log::warn!(
-            "refuse: could not disconnect central {}: {err} \
-             — it may still receive broadcast notifications",
-            peer.0
-        );
+        None
     }
 }
 
@@ -798,96 +921,107 @@ async fn disconnect_refused(driver: &dyn Driver, peer: &PeerAddress, session: Op
 /// aborting drops the only sender. An earlier version handed a clone to the
 /// link-loss watcher as well, so dropping the watcher's copy closed nothing
 /// and `recv()` hung forever on a dead link.
-fn spawn_reassembly<S>(
-    mut fragments: S, limits: ReassemblyLimits, out: mpsc::Sender<Result<Vec<u8>>>,
-    overflow: Arc<OverflowSignal>, peer: PeerAddress,
-) -> tokio::task::JoinHandle<()>
-where
-    S: tokio_stream::Stream<Item = Result<Vec<u8>>> + Send + Unpin + 'static,
-{
-    tokio::spawn(async move {
-        let mut reassembler = Reassembler::new(limits);
-        // `Reassembler::expire` only runs from inside `accept`, so a peer
-        // that sends half a message and then goes quiet would otherwise pin
-        // its partial sets for the life of the link — `reassembly_timeout`
-        // would silently never fire. Ticking here is what makes the
-        // configured timeout real on an idle connection.
-        let tick = (limits.reassembly_timeout / 4).max(Duration::from_secs(1));
-        loop {
-            tokio::select! {
-                incoming = fragments.next() => {
-                    let Some(raw) = incoming else {
-                        // Fragment source ended: the link is gone. Dropping
-                        // `out` here is what makes `recv()` return `None`.
-                        return;
-                    };
-                    // A gap reported by the driver — payloads the peer was
-                    // told were delivered but that never reached us. Surface
-                    // it rather than letting the affected message expire
-                    // unexplained, and discard partial sets, since any of
-                    // them may be missing the fragment that was lost.
-                    let raw = match raw {
-                        Ok(raw) => raw,
-                        Err(_) => {
-                            log::warn!(
-                                "reassembly: driver reported dropped notifications from {}; \
-                                 discarding partial messages",
+impl Reassembler {
+    fn spawn<S>(
+        mut fragments: S,
+        limits: ReassemblyLimits,
+        out: mpsc::Sender<Result<Vec<u8>>>,
+        overflow: Arc<OverflowSignal>,
+        peer: PeerAddress,
+        ended: tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        S: tokio_stream::Stream<Item = Result<Vec<u8>>> + Send + Unpin + 'static,
+    {
+        let ended = ended.drop_guard();
+        tokio::spawn(async move {
+            let _ended = ended;
+            let mut reassembler = Reassembler::new(limits);
+            // `Reassembler::expire` only runs from inside `accept`, so a peer
+            // that sends half a message and then goes quiet would otherwise pin
+            // its partial sets for the life of the link — `reassembly_timeout`
+            // would silently never fire. Ticking here is what makes the
+            // configured timeout real on an idle connection.
+            let tick = (limits.reassembly_timeout / 4).max(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    incoming = fragments.next() => {
+                        let Some(raw) = incoming else {
+                            // Fragment source ended: the link is gone. Dropping
+                            // `out` here is what makes `recv()` return `None`.
+                            return;
+                        };
+                        // A gap reported by the driver — payloads the peer was
+                        // told were delivered but that never reached us. Surface
+                        // it rather than letting the affected message expire
+                        // unexplained, and discard partial sets, since any of
+                        // them may be missing the fragment that was lost.
+                        let raw = match raw {
+                            Ok(raw) => raw,
+                            Err(BleError::ReceiveGap(_)) => {
+                                log::warn!(
+                                    "reassembly: driver reported dropped notifications from {}; \
+                                     discarding partial messages",
+                                    peer.0
+                                );
+                                overflow.raise();
+                                reassembler = Reassembler::new(limits);
+                                continue;
+                            }
+                            Err(error) => {
+                                log::warn!("reassembly: notification source for {} failed: {error}", peer.0);
+                                // Never wait for application capacity to publish termination.
+                                let _ = out.try_send(Err(error));
+                                return;
+                            }
+                        };
+                        let Some((header, payload)) = FragmentHeader::parse(&raw) else {
+                            // Too short to be ours — a foreign write to our
+                            // characteristic, not a reason to kill the channel.
+                            log::trace!(
+                                "reassembly: ignoring {}-byte write from {} — too short for a \
+                                 fragment header",
+                                raw.len(),
                                 peer.0
                             );
-                            overflow.raise();
-                            reassembler = Reassembler::new(limits);
                             continue;
-                        }
-                    };
-                    let Some((header, payload)) = FragmentHeader::parse(&raw) else {
-                        // Too short to be ours — a foreign write to our
-                        // characteristic, not a reason to kill the channel.
-                        log::trace!(
-                            "reassembly: ignoring {}-byte write from {} — too short for a \
-                             fragment header",
-                            raw.len(),
-                            peer.0
-                        );
-                        continue;
-                    };
-                    match reassembler.accept(header, payload, Instant::now()) {
-                        Accept::Complete(message) => {
-                            log::trace!(
-                                "reassembly: msg_id={} complete from {} ({} bytes)",
-                                header.msg_id,
-                                peer.0,
-                                message.len()
-                            );
-                            // Bounded, and awaited rather than dropped: an
-                            // unbounded queue let a peer sending valid
-                            // single-fragment messages faster than the
-                            // consumer reads grow memory without limit.
-                            // Blocking here pushes back through the BLE
-                            // stack, which is where backpressure belongs.
-                            if out.send(Ok(message)).await.is_err() {
-                                return; // receiver dropped; stop reassembling
+                        };
+                        match reassembler.accept(header, payload, Instant::now()) {
+                            Accept::Complete(message) => {
+                                log::trace!(
+                                    "reassembly: msg_id={} complete from {} ({} bytes)",
+                                    header.msg_id,
+                                    peer.0,
+                                    message.len()
+                                );
+                                // Awaiting bounds complete-message storage. The
+                                // separate fragment queue reports overflow without
+                                // blocking lifecycle handling.
+                                if out.send(Ok(message)).await.is_err() {
+                                    return; // receiver dropped; stop reassembling
+                                }
+                            }
+                            Accept::Pending => {}
+                            Accept::Rejected(reason) => {
+                                // Dropped by policy (bounds breach or malformed).
+                                // The channel stays usable: one bad message must
+                                // not deny service for the rest of the session.
+                                log::warn!(
+                                    "reassembly: dropped fragment {} of msg_id={} from {}: {reason:?}",
+                                    header.index,
+                                    header.msg_id,
+                                    peer.0
+                                );
                             }
                         }
-                        Accept::Pending => {}
-                        Accept::Rejected(reason) => {
-                            // Dropped by policy (bounds breach or malformed).
-                            // The channel stays usable: one bad message must
-                            // not deny service for the rest of the session.
-                            log::warn!(
-                                "reassembly: dropped fragment {} of msg_id={} from {}: {reason:?}",
-                                header.index,
-                                header.msg_id,
-                                peer.0
-                            );
-                        }
+                    }
+                    _ = tokio::time::sleep(tick) => {
+                        reassembler.expire(Instant::now());
                     }
                 }
-                _ = tokio::time::sleep(tick) => {
-                    reassembler.expire(Instant::now());
-                }
             }
-        }
-    })
+        })
+    }
 }
 
 /// Holds a freshly established connection until datagram setup succeeds.
@@ -901,6 +1035,7 @@ where
 struct PendingConnection {
     connection: Option<Box<dyn GattConnection>>,
     peer: PeerAddress,
+    managed_cleanup: bool,
 }
 
 impl Drop for PendingConnection {
@@ -908,6 +1043,10 @@ impl Drop for PendingConnection {
         let Some(mut connection) = self.connection.take() else {
             return; // setup succeeded; ownership moved on
         };
+        if self.managed_cleanup {
+            drop(connection);
+            return;
+        }
         let peer = self.peer.clone();
         tokio::spawn(async move {
             log::info!("connect: tearing down {} after abandoned setup", peer.0);
@@ -924,177 +1063,11 @@ impl Drop for PendingConnection {
 /// Central role: connect to `peer` and bring up a channel over `config`'s
 /// service.
 pub async fn connect(
-    adapter: &Adapter, peer: &PeerAddress, config: &DatagramConfig,
+    adapter: &Adapter,
+    peer: &PeerAddress,
+    config: &DatagramConfig,
 ) -> Result<DatagramChannel> {
-    connect_driver(adapter.driver(), peer, config).await
-}
-
-/// [`connect`] over a driver directly, for `PeerLink`, which holds one.
-pub(crate) async fn connect_driver(
-    driver: Arc<dyn Driver>, peer: &PeerAddress, config: &DatagramConfig,
-) -> Result<DatagramChannel> {
-    config.validate()?;
-    log::info!("connect: dialling {} service={}", peer.0, config.service.0);
-    // Subscribe before connecting, for the same reason `serve` subscribes
-    // before advertising: `events()` is a broadcast, so a disconnect landing
-    // between `connect`/`subscribe` succeeding and this call is lost. The
-    // driver contract explicitly does not promise that a notification
-    // stream closes with the link, so losing it leaves `recv()` pending
-    // forever with nothing left to wake it.
-    let events = driver.events();
-    // Past this point the platform connection exists, so *every* way out has
-    // to tear it down — including the caller dropping this future mid-setup,
-    // where no code on this path runs at all. Dropping the `GattConnection`
-    // cleans up nothing: on Android it leaves `ConnectionState.live` set and
-    // the Kotlin GATT open, after which every retry to that address is
-    // refused as "already open". A retryable setup failure, or a plain
-    // timeout, would otherwise kill the address permanently.
-    let mut pending = PendingConnection {
-        connection: Some(driver.connect(peer).await?),
-        peer: peer.clone(),
-    };
-
-    log::debug!("connect: link up to {}, subscribing", peer.0);
-
-    let setup = async {
-        let connection = pending.connection.as_mut().expect("armed above");
-        let notifications = connection.subscribe(config.characteristic).await?;
-        let budget = connection
-            .max_write_len()
-            .checked_sub(FRAGMENT_HEADER_LEN)
-            .filter(|budget| *budget > 0)
-            .ok_or_else(|| {
-                BleError::Gatt(format!(
-                    "negotiated MTU leaves no room for payload after the \
-                     {FRAGMENT_HEADER_LEN}-byte fragment header"
-                ))
-            })?;
-        Ok::<_, BleError>((notifications, budget))
-    }
-    .await;
-
-    let (notifications, budget) = match setup {
-        Ok(ready) => ready,
-        // Returning here drops `pending`, which disconnects.
-        Err(err) => {
-            log::warn!("connect: setup failed for {}: {err}", peer.0);
-            return Err(err);
-        }
-    };
-    // Setup succeeded: take ownership back so the guard becomes inert.
-    let connection = pending.connection.take().expect("armed above");
-    // Captured before the connection is moved into the channel: this is what
-    // lets the link-loss watcher tell our own disconnect from one belonging
-    // to a previous connection to the same address.
-    let session = connection.session();
-
-    let (tx, rx) = mpsc::channel(config.inbound_queue_depth);
-    let overflow = Arc::new(OverflowSignal::default());
-    let reassembly =
-        spawn_reassembly(notifications, config.limits(), tx, overflow.clone(), peer.clone());
-    // The watcher gets an *AbortHandle*, not the JoinHandle. Handing over
-    // the JoinHandle meant aborting the watcher merely dropped it — and
-    // dropping a Tokio JoinHandle detaches its task rather than cancelling
-    // it, so reassembly outlived the channel that owned it.
-    let watcher = spawn_link_loss_watch(
-        events,
-        peer.clone(),
-        reassembly.abort_handle(),
-        overflow.clone(),
-        connection.session(),
-    );
-
-    log::info!(
-        "connect: channel ready to {} session={session:?} fragment_budget={budget} \
-         max_message_len={}",
-        peer.0,
-        effective_max_message_len(config.max_message_len, budget)
-    );
-
-    Ok(DatagramChannel {
-        peer: peer.clone(),
-        characteristic: config.characteristic,
-        sink: Arc::new(Mutex::new(Sink::Connection {
-            connection: Some(connection),
-            write_type: config.write_type,
-        })),
-        inbound: ReceiverStream::new(rx),
-        // Central channels are not held in anyone's slot, so nothing needs
-        // telling when this one goes away.
-        release: None,
-        keep_peer: false,
-        session,
-        // Set when the driver reports it dropped notifications — the
-        // central-side equivalent of `serve`'s fragment-queue overflow.
-        overflow,
-        next_msg_id: Arc::default(),
-        max_message_len: effective_max_message_len(config.max_message_len, budget),
-        fragment_budget: budget,
-        tasks: vec![reassembly, watcher],
-    })
-}
-
-/// Turn link loss into `recv() -> None` by aborting the reassembly task,
-/// which drops the only sender on the inbound channel.
-///
-/// No error is delivered — "the peer walked away" is not a fault of the
-/// caller, and a closed channel already says everything it needs to. The
-/// notification stream itself cannot be relied on to end here: on a real
-/// driver a subscription outlives the link, so waiting for it to close
-/// would be waiting forever.
-fn spawn_link_loss_watch(
-    mut events: BoxStream<GattEvent>, peer: PeerAddress, reassembly: tokio::task::AbortHandle,
-    overflow: Arc<OverflowSignal>, session: Option<u64>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        while let Some(event) = events.next().await {
-            match &event {
-                // Address *and* session must match. Subscribing happens
-                // before the connection is established (a disconnect landing
-                // in that gap would otherwise be lost), so this stream can
-                // legitimately carry a loss event belonging to a *previous*
-                // connection to the same address — and acting on it would
-                // tear down a channel that is working. When the driver
-                // cannot distinguish sessions it reports `None`, and address
-                // matching alone is the best available.
-                GattEvent::Disconnected {
-                    peer: lost,
-                    local_role: Role::Central,
-                    session: lost_session,
-                } if *lost == peer
-                    && (lost_session.is_none() || session.is_none() || *lost_session == session) =>
-                {
-                    log::info!(
-                        "link-loss watch: {} session={session:?} disconnected; closing channel",
-                        peer.0
-                    );
-                    reassembly.abort();
-                    return;
-                }
-                // Lag is terminal here for the same reason it is in `serve`:
-                // the discarded events may include this peer's
-                // `Disconnected`, and the notification stream is explicitly
-                // not guaranteed to close with the link — so a caller parked
-                // in `recv()` would wait forever on a peer that is gone.
-                // Report the gap first so that wait ends with an error
-                // rather than a silent close.
-                GattEvent::Lagged { dropped } => {
-                    log::warn!(
-                        "link-loss watch: lifecycle stream lagged by {dropped} events; \
-                         ending the channel to {}, since its disconnect may have been lost",
-                        peer.0
-                    );
-                    overflow.raise();
-                    reassembly.abort();
-                    return;
-                }
-                _ => {}
-            }
-        }
-        // Event stream ended: nothing more can arrive, so the reassembly
-        // task would otherwise linger for the life of the process.
-        reassembly.abort();
-    })
+    DatagramChannel::connect_driver(adapter.driver(), peer, config).await
 }
 
 /// Peripheral role: advertise `config`'s service and serve **one** central
@@ -1119,8 +1092,11 @@ fn spawn_link_loss_watch(
 /// this needs a per-peer notify on the `Driver` port: straightforward on
 /// Android (`notifyCharacteristicChanged` already takes a device),
 /// unresolved on BlueZ.
-pub async fn serve(adapter: &Adapter, config: &DatagramConfig) -> Result<BoxStream<DatagramChannel>> {
-    serve_driver(adapter.driver(), config).await
+pub async fn serve(
+    adapter: &Adapter,
+    config: &DatagramConfig,
+) -> Result<BoxStream<DatagramChannel>> {
+    config.serve_driver(adapter.driver()).await
 }
 
 /// Change what a running [`serve`] advertises (`config`'s manufacturer data
@@ -1134,9 +1110,7 @@ pub async fn serve(adapter: &Adapter, config: &DatagramConfig) -> Result<BoxStre
 /// caller that needs to be discoverable falls back to [`serve`]. See
 /// `Driver::update_advertisement`.
 pub async fn update_advertisement(adapter: &Adapter, config: &DatagramConfig) -> Result<()> {
-    config.validate()?;
-    log::info!("serve: updating the advertisement for {}", config.service.0);
-    adapter.driver().update_advertisement(config.service_spec()).await
+    config.update_advertisement(adapter).await
 }
 
 /// Stop a running [`serve`]: its advertisement and its GATT server, which
@@ -1151,450 +1125,786 @@ pub async fn update_advertisement(adapter: &Adapter, config: &DatagramConfig) ->
 /// and BlueZ's dropped `AdvertisementHandle` plus `ApplicationHandle` do:
 /// on Android an open server still accepts a central that knows the address.
 pub async fn stop_serving(adapter: &Adapter) -> Result<()> {
-    log::info!("serve: stopping");
-    let stopped = adapter.driver().stop_advertising().await;
-    match &stopped {
-        Ok(()) => log::info!("serve: stopped"),
-        Err(err) => log::warn!("serve: stopping failed: {err}"),
+    adapter.stop_datagram_server().await
+}
+
+impl Adapter {
+    async fn stop_datagram_server(&self) -> Result<()> {
+        log::info!("serve: stopping");
+        let stopped = self.driver().stop_advertising().await;
+        match &stopped {
+            Ok(()) => log::info!("serve: stopped"),
+            Err(err) => log::warn!("serve: stopping failed: {err}"),
+        }
+        stopped
     }
-    stopped
+}
+
+#[derive(Debug, Clone)]
+pub struct DatagramConfig {
+    pub service: ServiceUuid,
+    pub characteristic: CharacteristicUuid,
+    pub max_message_len: usize,
+    pub reassembly_timeout: Duration,
+    pub max_concurrent_reassemblies: usize,
+    /// Defaults to `WithResponse`: ATT write
+    /// requests are acknowledged. `WithoutResponse` trades that for
+    /// throughput and will silently drop under load — opt in only where the
+    /// layer above tolerates loss.
+    pub write_type: WriteType,
+    /// How many *completed* messages may sit unread before the reassembler
+    /// stops accepting more. The reassembly limits bound only partial
+    /// messages, so without this a slow or stalled consumer is a memory
+    /// exhaustion vector.
+    pub inbound_queue_depth: usize,
+    /// Maximum raw fragments buffered per peer. A full queue drops arriving
+    /// fragments and reports `ReceiveGap` without delaying lifecycle handling.
+    /// Complete-message bounds alone do not bound pending fragments.
+    pub fragment_queue_depth: usize,
+    /// Accepted-but-not-yet-taken peripheral channels buffered by [`serve`]
+    /// before further centrals are refused. Each queued channel pins a
+    /// driver `Arc`, its reassembly buffers and a live task, so an
+    /// unbounded queue lets a peer that connects and disconnects in a loop
+    /// grow the process without limit while the caller is slow to accept.
+    pub accept_queue_depth: usize,
+    /// Merged into [`service_spec`](Self::service_spec)'s `GattServiceSpec.manufacturer_data`.
+    /// Empty by default — [`serve`] otherwise has no way to carry anything
+    /// beyond the bare service UUID in its advertisement, since it builds
+    /// the spec internally from this config. A caller that needs the
+    /// advertised payload to change between `serve` calls (e.g. a
+    /// discoverability flag toggled on and off) re-advertises by ending the
+    /// current `serve` stream and calling it again with an updated config.
+    pub advertised_manufacturer_data: BTreeMap<u16, Vec<u8>>,
+    /// Service data included in the initial radio and readable advertisements.
+    /// Empty by default.
+    pub advertised_service_data: BTreeMap<ServiceUuid, Vec<u8>>,
+    /// Becomes [`service_spec`](Self::service_spec)'s
+    /// `GattServiceSpec.local_name`: a short name scanners read from the
+    /// scan response without connecting. `None` by default.
+    pub advertised_local_name: Option<String>,
+    /// The company identifier the managed profile (`PeerLink`) sends its
+    /// fast advertisement under, and a managed scanner looks for it under:
+    /// the endpoint and the hash of the readable metadata, plus this
+    /// config's `advertised_manufacturer_data[company]` (at most 6 bytes),
+    /// which the record replaces and a scanner restores (ADR-0012 §2).
+    /// `None` by default: no fast advertisement. Both sides must agree.
+    /// Only the managed profile emits it; [`serve`] does not.
+    pub fast_advertisement_company: Option<u16>,
+    /// Becomes `GattServiceSpec.advertising_mode`. `Balanced` by default;
+    /// [`PowerProfile::advertising_mode`](crate::power::PowerProfile::advertising_mode)
+    /// suggests one per power profile.
+    pub advertising_mode: AdvertisingMode,
+}
+
+impl DatagramConfig {
+    pub fn new(service: ServiceUuid, characteristic: CharacteristicUuid) -> Self {
+        Self {
+            service,
+            characteristic,
+            max_message_len: DEFAULT_MAX_MESSAGE_LEN,
+            reassembly_timeout: DEFAULT_REASSEMBLY_TIMEOUT,
+            max_concurrent_reassemblies: DEFAULT_MAX_CONCURRENT_REASSEMBLIES,
+            write_type: WriteType::WithResponse,
+            inbound_queue_depth: DEFAULT_INBOUND_QUEUE_DEPTH,
+            fragment_queue_depth: DEFAULT_FRAGMENT_QUEUE_DEPTH,
+            accept_queue_depth: DEFAULT_ACCEPT_QUEUE_DEPTH,
+            advertised_manufacturer_data: BTreeMap::new(),
+            advertised_service_data: BTreeMap::new(),
+            advertised_local_name: None,
+            fast_advertisement_company: None,
+            advertising_mode: AdvertisingMode::Balanced,
+        }
+    }
+
+    /// `mpsc::channel(0)` panics, and `inbound_queue_depth` is a public
+    /// field with no non-zero invariant — validate rather than letting a
+    /// caller's zero crash `connect`, or worse, panic `serve`'s detached
+    /// background task where nothing observes it.
+    fn validate(&self) -> Result<()> {
+        if self.inbound_queue_depth == 0 {
+            return Err(BleError::Gatt(
+                "inbound_queue_depth must be at least 1".to_string(),
+            ));
+        }
+        if self.fragment_queue_depth == 0 {
+            return Err(BleError::Gatt(
+                "fragment_queue_depth must be at least 1".to_string(),
+            ));
+        }
+        if self.accept_queue_depth == 0 {
+            return Err(BleError::Gatt(
+                "accept_queue_depth must be at least 1".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn limits(&self) -> ReassemblyLimits {
+        ReassemblyLimits {
+            max_message_len: self.max_message_len,
+            reassembly_timeout: self.reassembly_timeout,
+            max_concurrent_reassemblies: self.max_concurrent_reassemblies,
+        }
+    }
+
+    /// The GATT service this tier expects on the wire. Both roles must agree,
+    /// so both derive it from here rather than hand-rolling a spec.
+    ///
+    /// Include a readable GATT advertisement characteristic for scanners that receive no advertisement data over the radio
+    /// (`profile::advertisement`, ADR-0012).
+    pub fn service_spec(&self) -> GattServiceSpec {
+        let mut spec = GattServiceSpec::new(
+            self.service,
+            vec![GattCharacteristicSpec {
+                uuid: self.characteristic,
+                readable: true,
+                writable: true,
+                notifiable: true,
+                initial_value: Vec::new(),
+            }],
+        );
+        spec.manufacturer_data = self.advertised_manufacturer_data.clone();
+        spec.service_data = self.advertised_service_data.clone();
+        spec.local_name = self.advertised_local_name.clone();
+        spec.advertising_mode = self.advertising_mode;
+        let gatt_advertisement = crate::profile::advertisement::characteristic_spec(&spec);
+        spec.characteristics.push(gatt_advertisement);
+        spec
+    }
+
+    async fn update_advertisement(&self, adapter: &Adapter) -> Result<()> {
+        self.validate()?;
+        log::info!("serve: updating the advertisement for {}", self.service.0);
+        let spec = self.service_spec();
+        let driver = adapter.driver();
+        Self::update_spec(driver.as_ref(), spec).await
+    }
+
+    pub(crate) async fn update_spec(driver: &dyn Driver, spec: GattServiceSpec) -> Result<()> {
+        let advertisement_value = spec
+            .characteristics
+            .iter()
+            .find(|value| value.uuid == crate::advertisement::GATT_ADVERTISEMENT_CHARACTERISTIC)
+            .expect("datagram metadata characteristic")
+            .initial_value
+            .clone();
+        // Install the readable value before the new advertisement goes out, so
+        // a scanner that reads after seeing the new hash gets the new value.
+        driver
+            .set_characteristic_value(
+                crate::profile::advertisement::GATT_ADVERTISEMENT_CHARACTERISTIC,
+                advertisement_value,
+            )
+            .await?;
+        driver.update_advertisement(spec).await
+    }
 }
 
 /// [`serve`] over a driver directly, for `PeerLink`, which holds one.
-pub(crate) async fn serve_driver(
-    driver: Arc<dyn Driver>, config: &DatagramConfig,
-) -> Result<BoxStream<DatagramChannel>> {
-    config.validate()?;
-    // Subscribe *before* advertising. `events()` is a broadcast subscription,
-    // so anything emitted before this call is lost — and both drivers can
-    // emit a peripheral-role `Connected` during `advertise`: Android can
-    // accept a central before its advertise callback returns, and Linux
-    // starts its inbound watcher inside `advertise`. With a central that
-    // waits for the server to speak first there is no later write to
-    // recreate the event, so losing it hangs `serve` forever.
-    let mut events = driver.events();
-    log::info!("serve: advertising service {}", config.service.0);
-    if let Err(err) = driver.advertise(config.service_spec()).await {
-        log::warn!("serve: advertise failed for {}: {err}", config.service.0);
-        return Err(err);
+impl DatagramConfig {
+    pub(crate) async fn serve_driver(
+        &self,
+        driver: Arc<dyn Driver>,
+    ) -> Result<BoxStream<DatagramChannel>> {
+        self.serve_spec(driver, self.service_spec(), true).await
     }
-    log::info!("serve: advertising accepted, awaiting centrals");
 
-    let (channels_tx, channels_rx) = mpsc::channel(config.accept_queue_depth);
-    let (release_tx, mut release_rx) = mpsc::unbounded_channel::<Released>();
-    let config = config.clone();
-    // Fallback when the driver cannot report a peer's notification size
-    // (`Driver::notify_max_len`): the spec-minimum. Conservative on purpose:
-    // undersized fragments always fit, oversized ones would be truncated by
-    // the stack with no error.
-    let default_peripheral_budget = crate::hal::DEFAULT_ATT_MTU as usize
-        - crate::hal::ATT_HEADER_LEN
-        - FRAGMENT_HEADER_LEN;
+    pub(crate) async fn serve_spec(
+        &self,
+        driver: Arc<dyn Driver>,
+        spec: GattServiceSpec,
+        recover_radio: bool,
+    ) -> Result<BoxStream<DatagramChannel>> {
+        self.validate()?;
+        // Subscribe *before* advertising. `events()` is a broadcast subscription,
+        // so anything emitted before this call is lost — and both drivers can
+        // emit a peripheral-role `Connected` during `advertise`: Android can
+        // accept a central before its advertise callback returns, and Linux
+        // starts its inbound watcher inside `advertise`. With a central that
+        // waits for the server to speak first there is no later write to
+        // recreate the event, so losing it hangs `serve` forever.
+        let mut lifecycle = driver.lifecycle_events();
+        let mut events = driver.events().filter(|event| {
+            matches!(
+                event,
+                GattEvent::CharacteristicWritten { .. } | GattEvent::Lagged { .. }
+            )
+        });
+        enum Source {
+            Lifecycle,
+            Payload,
+        }
+        log::info!("serve: advertising service {}", self.service.0);
+        if let Err(err) = driver.advertise(spec).await {
+            log::warn!("serve: advertise failed for {}: {err}", self.service.0);
+            return Err(err);
+        }
+        log::info!("serve: advertising accepted, awaiting centrals");
 
-    tokio::spawn(async move {
-        // At most one entry: see the doc comment on why concurrent centrals
-        // are refused rather than served.
-        let mut inbound: HashMap<PeerAddress, ServedPeer> = HashMap::new();
-        // Monotonic across every channel this task hands out, so no two
-        // channels for the same address ever share an identity.
-        let mut next_generation: u64 = 0;
+        let (channels_tx, channels_rx) = mpsc::channel(self.accept_queue_depth);
+        let (release_tx, mut release_rx) = mpsc::unbounded_channel::<Released>();
+        let config = self.clone();
+        // Fallback when the driver cannot report a peer's notification size
+        // (`Driver::notify_max_len`): the spec-minimum. Conservative on purpose:
+        // undersized fragments always fit, oversized ones would be truncated by
+        // the stack with no error.
+        let default_peripheral_budget =
+            crate::hal::DEFAULT_ATT_MTU as usize - crate::hal::ATT_HEADER_LEN - FRAGMENT_HEADER_LEN;
 
-        // Dropping the accept stream means "no more *new* peers" — it does
-        // not abandon the ones already handed over, which still need this
-        // loop to deliver their inbound fragments. So the task ends only
-        // once the stream is closed *and* no channel is still being served;
-        // until then it would otherwise sit on `events.next()` forever,
-        // holding the driver `Arc` and the event subscription alive with
-        // nothing able to wake it (`stop_advertising` does not close the
-        // event stream).
-        let mut accept_closed = false;
+        tokio::spawn(async move {
+            // At most one entry: see the doc comment on why concurrent centrals
+            // are refused rather than served.
+            let mut inbound: HashMap<PeerAddress, ServedPeer> = HashMap::new();
+            // Monotonic across every channel this task hands out, so no two
+            // channels for the same address ever share an identity.
+            let mut next_generation: u64 = 0;
+            // close() may release the raw channel while retaining its native
+            // session. Isolated lifecycle streams correctly suppress redundant
+            // Connected reports; a later write can reopen only this known session.
+            let mut last_session: Option<(PeerAddress, Option<u64>)> = None;
+            let mut pending_write = None;
 
-        loop {
-            let event = if accept_closed {
-                tokio::select! {
-                    released = release_rx.recv() => {
-                        let Some(released) = released else { return };
-                        release_peer(&mut inbound, released, driver.as_ref()).await;
-                        if inbound.is_empty() {
-                            return;
+            // Dropping the accept stream means "no more *new* peers" — it does
+            // not abandon the ones already handed over, which still need this
+            // loop to deliver their inbound fragments. So the task ends only
+            // once the stream is closed *and* no channel is still being served;
+            // until then it would otherwise sit on `events.next()` forever,
+            // holding the driver `Arc` and the event subscription alive with
+            // nothing able to wake it (`stop_advertising` does not close the
+            // event stream).
+            let mut accept_closed = false;
+
+            loop {
+                let event = if let Some(event) = pending_write.take() {
+                    (Source::Payload, event)
+                } else if accept_closed {
+                    tokio::select! {
+                        released = release_rx.recv() => {
+                            let Some(released) = released else { return };
+                            if let Some(session) = released.release_peer(&mut inbound, driver.as_ref()).await {
+                                last_session = Some(session);
+                            }
+                            if inbound.is_empty() {
+                                return;
+                            }
+                            continue;
                         }
-                        continue;
+                        event = async {
+                            tokio::select! {
+                                biased;
+                                event = lifecycle.next() => event.map(|event| (Source::Lifecycle, event)),
+                                event = events.next() => event.map(|event| (Source::Payload, event)),
+                            }
+                        } => match event {
+                            Some(event) => event,
+                            None => return,
+                        },
                     }
-                    event = events.next() => match event {
-                        Some(event) => event,
-                        None => return,
-                    },
-                }
-            } else {
-                tokio::select! {
-                    _ = channels_tx.closed() => {
-                        accept_closed = true;
-                        if inbound.is_empty() {
-                            return;
-                        }
-                        continue;
-                    }
-                    // The caller dropped a channel it had accepted. Without
-                    // this the peer stayed in `inbound` forever, holding the
-                    // single-central slot against everyone else.
-                    released = release_rx.recv() => {
-                        if let Some(released) = released {
-                            release_peer(&mut inbound, released, driver.as_ref()).await;
-                        }
-                        continue;
-                    }
-                    event = events.next() => match event {
-                        Some(event) => event,
-                        None => return,
-                    },
-                }
-            };
-            match event {
-                // Only inbound connections belong to the peripheral role.
-                // Without the role check, this driver's own *outbound*
-                // `connect` calls also surface here — yielding a phantom
-                // channel for a remote peripheral and, worse, occupying the
-                // single-central slot so the genuine inbound central is
-                // refused.
-                GattEvent::Connected {
-                    peer,
-                    local_role: Role::Peripheral,
-                    session: driver_session,
-                } => {
-                    // Drain releases first. A caller that drops a channel and
-                    // immediately accepts the next peer would otherwise race:
-                    // if this event is processed before the queued release,
-                    // the arriving central is refused *and disconnected* on
-                    // behalf of a peer that is already gone, and the caller
-                    // never learns why.
-                    while let Ok(released) = release_rx.try_recv() {
-                        release_peer(&mut inbound, released, driver.as_ref()).await;
-                    }
-
-                    // `Connected` is NOT once-per-connection. Both real
-                    // drivers re-emit it ahead of every characteristic
-                    // write, because neither has a true server-side
-                    // connection signal to key off (see `Driver::events`).
-                    // Rebuilding the channel each time would drop the
-                    // previous fragment sender, killing the channel already
-                    // handed to the caller and making any multi-fragment
-                    // message impossible to reassemble.
-                    if inbound.contains_key(&peer) {
-                        continue;
-                    }
-                    // Shutting down: service what we still hold, but take on
-                    // nothing new — and in particular do not refuse-and-
-                    // disconnect, which would evict a peer belonging to a
-                    // newer generation on this same driver.
-                    if accept_closed {
-                        continue;
-                    }
-                    if let Some(active) = inbound.keys().next() {
-                        log::warn!(
-                            "serve: refusing central {} — already serving {} \
-                             and notify is a broadcast, so serving both would corrupt \
-                             each other's messages",
-                            peer.0,
-                            active.0
-                        );
-                        // Refusing to allocate state is NOT refusing service.
-                        // The peer subscribed without needing our consent, so
-                        // until it is disconnected every `Sink::Notify`
-                        // broadcast still reaches it — handing it the served
-                        // peer's fragments, interleaved into its own stream.
-                        // Disconnecting is the only portable exclusion: BlueZ
-                        // cannot address a notification to one peer at all.
-                        disconnect_refused(driver.as_ref(), &peer, driver_session).await;
-                        continue;
-                    }
-                    let generation = next_generation;
-                    next_generation += 1;
-                    // A central usually subscribes before its first write, so
-                    // the driver can normally size notifications to this
-                    // peer's real MTU by now — 537 bytes as 2 notifications
-                    // instead of 45 at the spec-minimum.
-                    let peripheral_budget = driver
-                        .notify_max_len(&peer, driver_session)
-                        .await
-                        .and_then(|len| len.checked_sub(FRAGMENT_HEADER_LEN))
-                        .filter(|budget| *budget > 0)
-                        .unwrap_or(default_peripheral_budget);
-                    let active = Arc::new(AtomicBool::new(true));
-                    let (frag_tx, frag_rx) = mpsc::channel(config.fragment_queue_depth);
-                    let (msg_tx, msg_rx) = mpsc::channel(config.inbound_queue_depth);
-                    let overflow = Arc::new(OverflowSignal::default());
-                    let reassembly = spawn_reassembly(
-                        ReceiverStream::new(frag_rx).map(Ok),
-                        config.limits(),
-                        msg_tx,
-                        overflow.clone(),
-                        peer.clone(),
-                    );
-
-                    let channel = DatagramChannel {
-                        peer: peer.clone(),
-                        characteristic: config.characteristic,
-                        sink: Arc::new(Mutex::new(Sink::Notify {
-                            driver: driver.clone(),
-                            active: active.clone(),
-                        })),
-                        inbound: ReceiverStream::new(msg_rx),
-                        release: Some((release_tx.clone(), generation)),
-                        keep_peer: false,
-                        session: driver_session,
-                        overflow: overflow.clone(),
-                        next_msg_id: Arc::default(),
-                        max_message_len: effective_max_message_len(
-                            config.max_message_len,
-                            peripheral_budget,
-                        ),
-                        fragment_budget: peripheral_budget,
-                        tasks: vec![reassembly],
-                    };
-                    // try_send, not send: awaiting here would stall the one
-                    // loop that also delivers writes and disconnects, so a
-                    // caller slow to accept would freeze the peers it has
-                    // already accepted. `inbound` is only populated once the
-                    // channel is safely handed over — a refused central must
-                    // not occupy the single-central slot.
-                    match channels_tx.try_send(channel) {
-                        Ok(()) => {
-                            log::info!(
-                                "serve: accepted central {} session={driver_session:?} \
-                                 generation={generation} fragment_budget={peripheral_budget}",
-                                peer.0
-                            );
-                            inbound.insert(
-                                peer.clone(),
-                                ServedPeer {
-                                    driver_session,
-                                    fragments: frag_tx,
-                                    active,
-                                    overflow: overflow.clone(),
-                                    generation,
-                                },
-                            );
-                        }
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            log::warn!(
-                                "serve: accept queue full, refusing central {} \
-                                 — the caller is not draining `serve`'s stream",
-                                peer.0
-                            );
-                            // Same exclusion as the already-serving branch,
-                            // and for the same reason: leaving this peer
-                            // connected leaves it *subscribed*, so once the
-                            // queue drains and another central is accepted,
-                            // every broadcast notification reaches this one
-                            // too.
-                            disconnect_refused(driver.as_ref(), &peer, driver_session).await;
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            // Do NOT disconnect here. A generation that is
-                            // shutting down must not touch peers it is not
-                            // serving: the same driver may already have a
-                            // *newer* `serve` that legitimately owns this
-                            // peer, and disconnecting it would kill the new
-                            // session on behalf of a dead one.
+                } else {
+                    tokio::select! {
+                        _ = channels_tx.closed() => {
                             accept_closed = true;
                             if inbound.is_empty() {
                                 return;
                             }
+                            continue;
+                        }
+                        // The caller dropped a channel it had accepted. Without
+                        // this the peer stayed in `inbound` forever, holding the
+                        // single-central slot against everyone else.
+                        released = release_rx.recv() => {
+                            if let Some(released) = released {
+                                if let Some(session) = released.release_peer(&mut inbound, driver.as_ref()).await {
+                                last_session = Some(session);
+                            }
+                            }
+                            continue;
+                        }
+                        event = async {
+                            tokio::select! {
+                                biased;
+                                event = lifecycle.next() => event.map(|event| (Source::Lifecycle, event)),
+                                event = events.next() => event.map(|event| (Source::Payload, event)),
+                            }
+                        } => match event {
+                            Some(event) => event,
+                            None => return,
+                        },
+                    }
+                };
+                let (source, mut event) = event;
+                if let GattEvent::CharacteristicWritten {
+                    peer,
+                    session: written_session,
+                    ..
+                } = &event
+                {
+                    while let Ok(released) = release_rx.try_recv() {
+                        if let Some(session) =
+                            released.release_peer(&mut inbound, driver.as_ref()).await
+                        {
+                            last_session = Some(session);
+                        }
+                    }
+                    if !accept_closed && !inbound.contains_key(peer) {
+                        // Only a write on the retained session reopens it. A
+                        // write from an earlier connection is dropped below.
+                        if let Some((known, session)) =
+                            last_session.as_ref().filter(|(known, session)| {
+                                known == peer
+                                    && (session.is_none()
+                                        || written_session.is_none()
+                                        || session == written_session)
+                            })
+                        {
+                            let connected = GattEvent::Connected {
+                                peer: known.clone(),
+                                local_role: Role::Peripheral,
+                                session: *session,
+                            };
+                            pending_write = Some(event);
+                            event = connected;
+                            last_session = None;
                         }
                     }
                 }
-                GattEvent::CharacteristicWritten {
-                    peer,
-                    characteristic,
-                    value,
-                } => {
-                    if characteristic != config.characteristic {
-                        continue;
+                match event {
+                    GattEvent::Lagged { dropped } if matches!(source, Source::Payload) => {
+                        // Only writes are consumed from this legacy subscription.
+                        // A third-party fallback still sees the same unknown lag
+                        // independently on lifecycle_events and fails closed there.
+                        log::warn!("serve: payload event stream lost {dropped} events");
+                        for served in inbound.values() {
+                            served.overflow.raise();
+                        }
                     }
-                    let Some(served) = inbound.get(&peer) else {
-                        // Every other drop path in this loop logs — this one
-                        // didn't, making it indistinguishable from "nothing
-                        // happened" for a peer whose write is silently going
-                        // nowhere. Genuinely reachable, not just defensive:
-                        // a write from a peer this task never accepted (its
-                        // `Connected` was refused or hasn't been processed
-                        // yet), or from one it already released (`inbound`
-                        // entry removed on disconnect/generation release)
-                        // but whose sender doesn't know that yet and keeps
-                        // writing/resending to the same address.
-                        log::warn!(
-                            "serve: dropping a write from {} — not a peer this task is \
-                             currently serving",
-                            peer.0
-                        );
-                        continue;
-                    };
-                    let (tx, overflow) = (&served.fragments, &served.overflow);
-                    // Try first, then apply real backpressure before
-                    // considering a drop. The sender's ATT write has
-                    // already been acknowledged by the stack by the time
-                    // this event exists, so a dropped fragment is loss
-                    // that the *sender* cannot be told about — worth
-                    // waiting to avoid.
-                    //
-                    // The wait is bounded because this loop also carries
-                    // disconnects: blocking it indefinitely on a peer
-                    // that has stopped draining would stall cleanup for
-                    // everyone, including the peer that is stuck.
-                    match tx.try_send(value) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            // The reassembly task for this peer already
-                            // ended (its `DatagramChannel` was dropped),
-                            // but `inbound` hasn't been cleaned up yet —
-                            // a real window: cleanup happens when this
-                            // same loop later processes the release/
-                            // disconnect notification, not synchronously
-                            // with the drop. Every write arriving in
-                            // that window vanished with no trace before
-                            // this log line existed.
+                    // Only inbound connections belong to the peripheral role.
+                    // Without the role check, this driver's own *outbound*
+                    // `connect` calls also surface here — yielding a phantom
+                    // channel for a remote peripheral and, worse, occupying the
+                    // single-central slot so the genuine inbound central is
+                    // refused.
+                    GattEvent::Connected {
+                        peer,
+                        local_role: Role::Peripheral,
+                        session: driver_session,
+                    } => {
+                        // Drain releases first. A caller that drops a channel and
+                        // immediately accepts the next peer would otherwise race:
+                        // if this event is processed before the queued release,
+                        // the arriving central is refused *and disconnected* on
+                        // behalf of a peer that is already gone, and the caller
+                        // never learns why.
+                        while let Ok(released) = release_rx.try_recv() {
+                            if let Some(session) =
+                                released.release_peer(&mut inbound, driver.as_ref()).await
+                            {
+                                last_session = Some(session);
+                            }
+                        }
+
+                        // `Connected` is NOT once-per-connection. Both real
+                        // drivers re-emit it ahead of every characteristic
+                        // write, because neither has a true server-side
+                        // connection signal to key off (see `Driver::events`).
+                        // Rebuilding the channel each time would drop the
+                        // previous fragment sender, killing the channel already
+                        // handed to the caller and making any multi-fragment
+                        // message impossible to reassemble.
+                        if inbound.contains_key(&peer) {
+                            continue;
+                        }
+                        // Shutting down: service what we still hold, but take on
+                        // nothing new — and in particular do not refuse-and-
+                        // disconnect, which would evict a peer belonging to a
+                        // newer generation on this same driver.
+                        if accept_closed {
+                            continue;
+                        }
+                        if let Some(active) = inbound.keys().next() {
                             log::warn!(
-                                "serve: dropping a write from {} — its channel was \
-                                 already closed, awaiting this task's own cleanup",
+                                "serve: refusing central {} — already serving {} \
+                             and notify is a broadcast, so serving both would corrupt \
+                             each other's messages",
+                                peer.0,
+                                active.0
+                            );
+                            // Refusing to allocate state is NOT refusing service.
+                            // The peer subscribed without needing our consent, so
+                            // until it is disconnected every `Sink::Notify`
+                            // broadcast still reaches it — handing it the served
+                            // peer's fragments, interleaved into its own stream.
+                            // Disconnecting is the only portable exclusion: BlueZ
+                            // cannot address a notification to one peer at all.
+                            ServedPeer::refuse(driver.as_ref(), &peer, driver_session).await;
+                            continue;
+                        }
+                        let generation = next_generation;
+                        next_generation += 1;
+                        // A central usually subscribes before its first write, so
+                        // the driver can normally size notifications to this
+                        // peer's real MTU by now — 537 bytes as 2 notifications
+                        // instead of 45 at the spec-minimum.
+                        let peripheral_budget = driver
+                            .notify_max_len(&peer, driver_session)
+                            .await
+                            .and_then(|len| len.checked_sub(FRAGMENT_HEADER_LEN))
+                            .filter(|budget| *budget > 0)
+                            .unwrap_or(default_peripheral_budget);
+                        let active = Arc::new(AtomicBool::new(true));
+                        let (frag_tx, frag_rx) = mpsc::channel(config.fragment_queue_depth);
+                        let (msg_tx, msg_rx) = mpsc::channel(config.inbound_queue_depth);
+                        let overflow = Arc::new(OverflowSignal::default());
+                        let ended = tokio_util::sync::CancellationToken::new();
+                        let reassembly = Reassembler::spawn(
+                            ReceiverStream::new(frag_rx).map(Ok),
+                            config.limits(),
+                            msg_tx,
+                            overflow.clone(),
+                            peer.clone(),
+                            ended.clone(),
+                        );
+
+                        let channel = DatagramChannel {
+                            peer: peer.clone(),
+                            characteristic: config.characteristic,
+                            sink: Arc::new(Mutex::new(Sink::Notify {
+                                driver: driver.clone(),
+                                active: active.clone(),
+                            })),
+                            inbound: ReceiverStream::new(msg_rx),
+                            ended: ended.clone(),
+                            release: Some((release_tx.clone(), generation)),
+                            keep_peer: false,
+                            session: driver_session,
+                            overflow: overflow.clone(),
+                            next_msg_id: Arc::default(),
+                            max_message_len: DatagramChannel::message_limit(
+                                config.max_message_len,
+                                peripheral_budget,
+                            ),
+                            fragment_budget: peripheral_budget,
+                            tasks: vec![reassembly],
+                            managed_cleanup: false,
+                        };
+                        // try_send, not send: awaiting here would stall the one
+                        // loop that also delivers writes and disconnects, so a
+                        // caller slow to accept would freeze the peers it has
+                        // already accepted. `inbound` is only populated once the
+                        // channel is safely handed over — a refused central must
+                        // not occupy the single-central slot.
+                        match channels_tx.try_send(channel) {
+                            Ok(()) => {
+                                last_session = None;
+                                log::info!(
+                                    "serve: accepted central {} session={driver_session:?} \
+                                 generation={generation} fragment_budget={peripheral_budget}",
+                                    peer.0
+                                );
+                                inbound.insert(
+                                    peer.clone(),
+                                    ServedPeer {
+                                        driver_session,
+                                        fragments: frag_tx,
+                                        active,
+                                        overflow: overflow.clone(),
+                                        generation,
+                                        ended,
+                                    },
+                                );
+                            }
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                log::warn!(
+                                    "serve: accept queue full, refusing central {} \
+                                 — the caller is not draining `serve`'s stream",
+                                    peer.0
+                                );
+                                // Same exclusion as the already-serving branch,
+                                // and for the same reason: leaving this peer
+                                // connected leaves it *subscribed*, so once the
+                                // queue drains and another central is accepted,
+                                // every broadcast notification reaches this one
+                                // too.
+                                ServedPeer::refuse(driver.as_ref(), &peer, driver_session).await;
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                // Do NOT disconnect here. A generation that is
+                                // shutting down must not touch peers it is not
+                                // serving: the same driver may already have a
+                                // *newer* `serve` that legitimately owns this
+                                // peer, and disconnecting it would kill the new
+                                // session on behalf of a dead one.
+                                accept_closed = true;
+                                if inbound.is_empty() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    GattEvent::CharacteristicWritten {
+                        peer,
+                        characteristic,
+                        value,
+                        session: written_session,
+                    } => {
+                        if characteristic != config.characteristic {
+                            continue;
+                        }
+                        let Some(served) = inbound.get(&peer) else {
+                            // Every other drop path in this loop logs — this one
+                            // didn't, making it indistinguishable from "nothing
+                            // happened" for a peer whose write is silently going
+                            // nowhere. Genuinely reachable, not just defensive:
+                            // a write from a peer this task never accepted (its
+                            // `Connected` was refused or hasn't been processed
+                            // yet), or from one it already released (`inbound`
+                            // entry removed on disconnect/generation release)
+                            // but whose sender doesn't know that yet and keeps
+                            // writing/resending to the same address.
+                            log::warn!(
+                                "serve: dropping a write from {} — not a peer this task is \
+                             currently serving",
                                 peer.0
                             );
+                            continue;
+                        };
+                        // Writes and lifecycle events arrive on separate
+                        // streams, so this loop can process a reconnect before
+                        // a write from the connection it replaced. Delivering
+                        // that write would put the old session's fragment into
+                        // the new session's channel.
+                        if !served.owns_session(written_session) {
+                            log::warn!(
+                                "serve: dropping a write from {} session={written_session:?} \
+                             — the channel serves session={:?}",
+                                peer.0,
+                                served.driver_session
+                            );
+                            continue;
                         }
-                        Err(mpsc::error::TrySendError::Full(value)) => {
-                            let queued = tokio::time::timeout(
-                                FRAGMENT_BACKPRESSURE_TIMEOUT,
-                                tx.send(value),
-                            )
-                            .await;
-                            if queued.is_err() {
-                                // Report the loss to the receiver rather
-                                // than letting the message quietly time
-                                // out. It is the only endpoint that can
-                                // still be told.
+                        let (tx, overflow) = (&served.fragments, &served.overflow);
+                        // Native acknowledgement precedes this event. A full
+                        // payload queue is known local loss, not permission to
+                        // stop reading the shared lifecycle stream.
+                        match tx.try_send(value) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                // The reassembly task for this peer already
+                                // ended (its `DatagramChannel` was dropped),
+                                // but `inbound` hasn't been cleaned up yet —
+                                // a real window: cleanup happens when this
+                                // same loop later processes the release/
+                                // disconnect notification, not synchronously
+                                // with the drop. Every write arriving in
+                                // that window vanished with no trace before
+                                // this log line existed.
+                                log::warn!(
+                                    "serve: dropping a write from {} — its channel was \
+                                 already closed, awaiting this task's own cleanup",
+                                    peer.0
+                                );
+                            }
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                // This reader also owns lifecycle events. Data admission must
+                                // never park it: the acknowledged fragment is already lost,
+                                // so report that bounded loss out of band to the receiver.
                                 overflow.raise();
                                 log::warn!(
-                                    "serve: fragment queue full for {} after \
-                                     backpressure; dropping fragment and reporting loss",
+                                    "serve: fragment queue full for {}; reporting receive gap",
                                     peer.0
                                 );
                             }
                         }
                     }
-                }
-                GattEvent::Disconnected {
-                    peer,
-                    local_role: Role::Peripheral,
-                    session: lost_session,
-                } => {
-                    // Same reasoning as the central watcher: a loss event
-                    // from a previous session for this address must not
-                    // evict the peer that replaced it.
-                    let stale = match (lost_session, inbound.get(&peer)) {
-                        (Some(lost), Some(served)) => match served.driver_session {
-                            Some(current) => lost != current,
-                            None => false,
-                        },
-                        _ => false,
-                    };
-                    if stale {
-                        continue;
-                    }
-                    // Dropping the fragment sender ends that peer's
-                    // reassembly task, which closes its channel's `recv()`.
-                    // Clearing the flag closes the *send* half: without it
-                    // the caller could still push fragments into a broadcast
-                    // that the next accepted central would receive.
-                    if let Some(served) = inbound.remove(&peer) {
-                        log::info!(
-                            "serve: central {} session={lost_session:?} disconnected; \
-                             slot released",
-                            peer.0
-                        );
-                        served.active.store(false, Ordering::SeqCst);
-                    }
-                    if accept_closed && inbound.is_empty() {
-                        return;
-                    }
-                }
-                // Events were dropped before this task could read them. Any
-                // of them could have been an acknowledged write, so every
-                // served peer's inbound stream may now have a hole — and
-                // which ones is unknowable, since the events are gone.
-                // Reporting to all of them is the only sound response.
-                GattEvent::Lagged { dropped } => {
-                    // Terminal for every served session, not merely a
-                    // payload-loss report. One of the discarded events may
-                    // have been the active peer's `Disconnected` — and this
-                    // very loop blocking for up to two seconds on fragment
-                    // backpressure is what makes lag likely in the first
-                    // place. Since no later disconnect need ever arrive,
-                    // treating it as recoverable leaves the peer in
-                    // `inbound` forever with its channel live, refusing every
-                    // replacement central. Ending the sessions is
-                    // recoverable; wrongly keeping one is not.
-                    log::warn!(
-                        "serve: lifecycle stream lagged by {dropped} events; \
-                         ending every served session, since a disconnect may have been lost"
-                    );
-                    let served: Vec<PeerAddress> = inbound.keys().cloned().collect();
-                    for peer in served {
-                        let session = if let Some(state) = inbound.remove(&peer) {
-                            // Report the gap first, so a receiver parked in
-                            // `recv()` gets an error rather than a silent
-                            // close, then invalidate the channel.
-                            state.overflow.raise();
-                            state.active.store(false, Ordering::SeqCst);
-                            state.driver_session
-                        } else {
-                            None
+                    GattEvent::Disconnected {
+                        peer,
+                        local_role: Role::Peripheral,
+                        session: lost_session,
+                    } => {
+                        if last_session.as_ref().is_some_and(|(known, session)| {
+                            *known == peer
+                                && (session.is_none()
+                                    || lost_session.is_none()
+                                    || *session == lost_session)
+                        }) {
+                            last_session = None;
+                        }
+                        // Same reasoning as the central watcher: a loss event
+                        // from a previous session for this address must not
+                        // evict the peer that replaced it.
+                        let stale = match (lost_session, inbound.get(&peer)) {
+                            (Some(lost), Some(served)) => match served.driver_session {
+                                Some(current) => lost != current,
+                                None => false,
+                            },
+                            _ => false,
                         };
-                        disconnect_refused(driver.as_ref(), &peer, session).await;
+                        if stale {
+                            continue;
+                        }
+                        // Dropping the fragment sender ends that peer's
+                        // reassembly task, which closes its channel's `recv()`.
+                        // Clearing the flag closes the *send* half: without it
+                        // the caller could still push fragments into a broadcast
+                        // that the next accepted central would receive.
+                        if let Some(served) = inbound.remove(&peer) {
+                            log::info!(
+                                "serve: central {} session={lost_session:?} disconnected; \
+                             slot released",
+                                peer.0
+                            );
+                            served.active.store(false, Ordering::SeqCst);
+                        }
+                        if accept_closed && inbound.is_empty() {
+                            return;
+                        }
                     }
-                    if accept_closed && inbound.is_empty() {
-                        return;
+                    // Events were dropped before this task could read them. Any
+                    // of them could have been an acknowledged write, so every
+                    // served peer's inbound stream may now have a hole — and
+                    // which ones is unknowable, since the events are gone.
+                    // Reporting to all of them is the only sound response.
+                    GattEvent::Lagged { dropped } => {
+                        last_session = None;
+                        // Terminal for every served session, not merely a
+                        // payload-loss report. One of the discarded events may
+                        // have been the active peer's `Disconnected`. Since no
+                        // later disconnect need ever arrive, treating this as
+                        // recoverable could leave a dead generation live forever,
+                        // refusing every replacement central. Known payload-queue
+                        // loss is reported separately through OverflowSignal.
+                        log::warn!(
+                            "serve: lifecycle stream lagged by {dropped} events; \
+                         ending every served session, since a disconnect may have been lost"
+                        );
+                        let served: Vec<PeerAddress> = inbound.keys().cloned().collect();
+                        for peer in served {
+                            let session = if let Some(state) = inbound.remove(&peer) {
+                                // Report the gap first, so a receiver parked in
+                                // `recv()` gets an error rather than a silent
+                                // close, then invalidate the channel.
+                                state.overflow.raise();
+                                state.active.store(false, Ordering::SeqCst);
+                                state.driver_session
+                            } else {
+                                None
+                            };
+                            ServedPeer::refuse(driver.as_ref(), &peer, session).await;
+                        }
+                        if accept_closed && inbound.is_empty() {
+                            return;
+                        }
                     }
+                    // A radio loss ends every served session. Per-peer
+                    // `Disconnected` events cannot be relied on here: when
+                    // bluetoothd itself dies, nothing is left to emit them, and a
+                    // peer kept in `inbound` would refuse every central after
+                    // recovery.
+                    GattEvent::RadioChanged {
+                        status: RadioStatus::Off | RadioStatus::Unsupported,
+                    } => {
+                        last_session = None;
+                        for (peer, served) in inbound.drain() {
+                            log::info!("serve: radio lost; ending session with central {}", peer.0);
+                            served.active.store(false, Ordering::SeqCst);
+                        }
+                        if accept_closed {
+                            return;
+                        }
+                    }
+                    // The platform forgot the GATT application and advertisement
+                    // along with the radio (an adapter power-cycle, or a
+                    // bluetoothd restart), and nothing else re-registers them.
+                    GattEvent::RadioChanged {
+                        status: RadioStatus::On,
+                    } => {
+                        if accept_closed || !recover_radio {
+                            continue;
+                        }
+                        // With the latest `update_advertisement`'s data, not the
+                        // data `serve` started with: an update must survive a
+                        // power cycle. Nothing served: `stop_serving` ran, and a
+                        // device stopped to be unreachable stays so.
+                        let Some(spec) = driver
+                            .served_service()
+                            .filter(|served| served.same_service(&config.service_spec()))
+                        else {
+                            log::info!(
+                                "serve: radio back; service {} was stopped, not re-advertising",
+                                config.service.0
+                            );
+                            continue;
+                        };
+                        log::info!(
+                            "serve: radio back; re-advertising service {}",
+                            config.service.0
+                        );
+                        if let Err(err) = driver.advertise(spec).await {
+                            log::warn!("serve: re-advertising after radio recovery failed: {err}");
+                        }
+                    }
+                    // Central-role lifecycle belongs to `connect`, not here.
+                    GattEvent::Connected { .. } | GattEvent::Disconnected { .. } => {}
                 }
-                // A radio loss ends every served session. Per-peer
-                // `Disconnected` events cannot be relied on here: when
-                // bluetoothd itself dies, nothing is left to emit them, and a
-                // peer kept in `inbound` would refuse every central after
-                // recovery.
-                GattEvent::RadioChanged { status: RadioStatus::Off | RadioStatus::Unsupported } => {
-                    for (peer, served) in inbound.drain() {
-                        log::info!("serve: radio lost; ending session with central {}", peer.0);
-                        served.active.store(false, Ordering::SeqCst);
-                    }
-                    if accept_closed {
-                        return;
-                    }
-                }
-                // The platform forgot the GATT application and advertisement
-                // along with the radio (an adapter power-cycle, or a
-                // bluetoothd restart), and nothing else re-registers them.
-                GattEvent::RadioChanged { status: RadioStatus::On } => {
-                    if accept_closed {
-                        continue;
-                    }
-                    // With the latest `update_advertisement`'s data, not the
-                    // data `serve` started with: an update must survive a
-                    // power cycle. Nothing served: `stop_serving` ran, and a
-                    // device stopped to be unreachable stays so.
-                    let Some(spec) = driver
-                        .served_service()
-                        .filter(|served| served.same_service(&config.service_spec()))
-                    else {
-                        log::info!("serve: radio back; service {} was stopped, not re-advertising", config.service.0);
-                        continue;
-                    };
-                    log::info!("serve: radio back; re-advertising service {}", config.service.0);
-                    if let Err(err) = driver.advertise(spec).await {
-                        log::warn!("serve: re-advertising after radio recovery failed: {err}");
-                    }
-                }
-                // Central-role lifecycle belongs to `connect`, not here.
-                GattEvent::Connected { .. } | GattEvent::Disconnected { .. } => {}
             }
-        }
-    });
+        });
 
-    Ok(Box::pin(ReceiverStream::new(channels_rx)))
+        Ok(Box::pin(ReceiverStream::new(channels_rx)))
+    }
+}
+
+#[cfg(test)]
+mod inbound_error_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fatal_notification_error_ends_reassembly_without_a_receive_gap() {
+        check_fatal_notification_termination(false).await;
+    }
+
+    #[tokio::test]
+    async fn fatal_notification_error_does_not_wait_for_a_full_application_queue() {
+        check_fatal_notification_termination(true).await;
+    }
+
+    async fn check_fatal_notification_termination(buffered: bool) {
+        let (fragments, input) = mpsc::channel(1);
+        let (output, mut received) = mpsc::channel(1);
+        if buffered {
+            output.send(Ok(vec![1])).await.unwrap();
+        }
+        let overflow = Arc::new(OverflowSignal::default());
+        let ended = tokio_util::sync::CancellationToken::new();
+        let config = DatagramConfig::new(
+            ServiceUuid(uuid::Uuid::from_u128(101)),
+            CharacteristicUuid(uuid::Uuid::from_u128(102)),
+        );
+        let task = Reassembler::spawn(
+            ReceiverStream::new(input),
+            config.limits(),
+            output,
+            overflow.clone(),
+            PeerAddress("fatal-notification".into()),
+            ended.clone(),
+        );
+        fragments
+            .send(Err(BleError::Gatt("notification source failed".into())))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(300), ended.cancelled())
+            .await
+            .expect("a native failure must terminate, not report recoverable loss");
+        assert!(
+            !overflow.take(),
+            "a native failure is not a known payload gap"
+        );
+        let first = received.recv().await;
+        if buffered {
+            assert!(matches!(first, Some(Ok(payload)) if payload == vec![1]));
+        } else {
+            assert!(matches!(first, Some(Err(BleError::Gatt(_)))));
+        }
+        assert!(received.recv().await.is_none());
+        task.await.unwrap();
+    }
 }

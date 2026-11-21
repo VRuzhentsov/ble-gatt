@@ -6,6 +6,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 ble-gatt = { path = "../ble-gatt" }
 # `unstable-custom-transports` is iroh's own label: the trait this crate
@@ -21,6 +24,7 @@ noq-udp = { version = "1.3", default-features = false }
 tokio.workspace = true
 
 [dev-dependencies]
+env_logger = "0.11"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "io-util"] }
 tokio-stream.workspace = true
 uuid.workspace = true

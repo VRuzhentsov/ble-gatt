@@ -1,10 +1,9 @@
 //! A driver built on first use rather than at plugin setup.
 //!
-//! - **Android.** `.setup()` runs inside `tao`'s own Android context
-//!   bring-up, before the JNI handles the driver needs exist; reading
-//!   `ndk_context::android_context()` there panics with "android context was
-//!   not initialized" (seen on hardware). The first command runs after the
-//!   Activity is up.
+//! - **Android.** The registered Kotlin plugin installs the Application
+//!   context during setup. Building the driver on first use keeps BLE
+//!   feature probing and bridge construction out of plugin setup, and lets
+//!   callers grant permissions before accessing Bluetooth.
 //! - **Linux.** BlueZ needs a powered adapter. Building on first use means a
 //!   machine with Bluetooth off or missing still starts the app.
 //!
@@ -17,8 +16,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ble_gatt::{
-    Driver, BleError, BoxStream, CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattConnection,
-    GattEvent, GattServiceSpec, PeerAddress, Result, ServiceUuid,
+    BleError, BoxStream, CapabilityReport, CharacteristicUuid, DiscoveredPeer, Driver,
+    GattConnection, GattEvent, GattServiceSpec, PeerAddress, Result, ServiceUuid,
 };
 use tokio::sync::{broadcast, OnceCell};
 use tokio_stream::wrappers::BroadcastStream;
@@ -37,6 +36,7 @@ pub struct LazyDriver {
     /// driver's stream directly meant an early `events()` got a stream that
     /// never yielded anything.
     events_tx: broadcast::Sender<GattEvent>,
+    lifecycle_tx: broadcast::Sender<GattEvent>,
 }
 
 impl LazyDriver {
@@ -46,10 +46,12 @@ impl LazyDriver {
         Fut: Future<Output = Result<Arc<dyn Driver>>> + Send + 'static,
     {
         let (events_tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let (lifecycle_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
             build: Box::new(move || Box::pin(build())),
             cell: OnceCell::new(),
             events_tx,
+            lifecycle_tx,
         }
     }
 
@@ -60,13 +62,28 @@ impl LazyDriver {
                 // Pump the real driver's events into our channel, so
                 // subscriptions taken out before this point keep working.
                 let mut source = driver.events();
+                let mut lifecycle = driver.lifecycle_events();
                 let sink = self.events_tx.clone();
+                let critical_sink = self.lifecycle_tx.clone();
                 tokio::spawn(async move {
-                    while let Some(event) = source.next().await {
-                        // `send` errors only while nobody is subscribed,
-                        // which is normal; stopping here would leave every
-                        // later subscriber with a silent stream.
-                        let _ = sink.send(event);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            event = lifecycle.next() => match event {
+                                Some(event) => { let _ = critical_sink.send(event); }
+                                None => {
+                                    let _ = critical_sink.send(GattEvent::Lagged { dropped: 0 });
+                                    break;
+                                }
+                            },
+                            event = source.next() => match event {
+                                Some(event) => { let _ = sink.send(event); }
+                                None => {
+                                    let _ = critical_sink.send(GattEvent::Lagged { dropped: 0 });
+                                    break;
+                                }
+                            },
+                        }
                     }
                 });
                 Ok::<_, BleError>(driver)
@@ -107,6 +124,21 @@ impl Driver for LazyDriver {
         self.cell.get()?.served_service()
     }
 
+    async fn set_characteristic_value(
+        &self,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
+    ) -> Result<()> {
+        self.inner()
+            .await?
+            .set_characteristic_value(characteristic, value)
+            .await
+    }
+
+    async fn set_advertising_enabled(&self, enabled: bool) -> Result<()> {
+        self.inner().await?.set_advertising_enabled(enabled).await
+    }
+
     async fn stop_advertising(&self) -> Result<()> {
         self.inner().await?.stop_advertising().await
     }
@@ -125,7 +157,10 @@ impl Driver for LazyDriver {
     }
 
     async fn notify_peer(
-        &self, peer: &PeerAddress, session: Option<u64>, characteristic: CharacteristicUuid,
+        &self,
+        peer: &PeerAddress,
+        session: Option<u64>,
+        characteristic: CharacteristicUuid,
         value: Vec<u8>,
     ) -> Result<()> {
         self.inner()
@@ -152,6 +187,17 @@ impl Driver for LazyDriver {
             }
         }))
     }
+
+    fn lifecycle_events(&self) -> BoxStream<GattEvent> {
+        Box::pin(
+            BroadcastStream::new(self.lifecycle_tx.subscribe()).map(|item| match item {
+                Ok(event) => event,
+                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(dropped)) => {
+                    GattEvent::Lagged { dropped }
+                }
+            }),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -159,6 +205,87 @@ mod tests {
     use super::*;
     use ble_gatt::drivers::mock::{MockDriver, MockNetwork};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn early_lifecycle_subscription_survives_payload_flood() {
+        let network = MockNetwork::new();
+        let caps = CapabilityReport {
+            central: true,
+            peripheral: true,
+        };
+        let driver = Arc::new(MockDriver::new(
+            PeerAddress("server".into()),
+            network.clone(),
+            caps,
+        ));
+        let inner = driver.clone();
+        let lazy = LazyDriver::new(move || {
+            let driver = inner.clone();
+            async move { Ok(driver as Arc<dyn Driver>) }
+        });
+        let mut events = lazy.lifecycle_events();
+        let characteristic = CharacteristicUuid(uuid::Uuid::new_v4());
+        lazy.advertise(GattServiceSpec::new(
+            ServiceUuid(uuid::Uuid::new_v4()),
+            vec![ble_gatt::GattCharacteristicSpec {
+                uuid: characteristic,
+                readable: true,
+                writable: true,
+                notifiable: false,
+                initial_value: vec![],
+            }],
+        ))
+        .await
+        .unwrap();
+        let central = MockDriver::new(PeerAddress("client".into()), network, caps);
+        let mut connection = central
+            .connect(&PeerAddress("server".into()))
+            .await
+            .unwrap();
+        for _ in 0..512 {
+            connection.write(characteristic, vec![1]).await.unwrap();
+        }
+        connection.disconnect().await.unwrap();
+        let first = events.next().await.unwrap();
+        assert!(matches!(first, GattEvent::Connected { .. }), "{first:?}");
+        let second = events.next().await.unwrap();
+        assert!(
+            matches!(second, GattEvent::Disconnected { .. }),
+            "{second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn visibility_is_forwarded_without_replacing_the_server() {
+        let network = MockNetwork::new();
+        let driver = Arc::new(MockDriver::new(
+            PeerAddress("visibility".into()),
+            network.clone(),
+            CapabilityReport {
+                central: true,
+                peripheral: true,
+            },
+        ));
+        let inner = driver.clone();
+        let lazy = LazyDriver::new(move || {
+            let driver = inner.clone();
+            async move { Ok(driver as Arc<dyn Driver>) }
+        });
+        let service = ServiceUuid(uuid::Uuid::new_v4());
+        lazy.advertise(GattServiceSpec::new(service, vec![]))
+            .await
+            .unwrap();
+        lazy.set_advertising_enabled(false).await.unwrap();
+        assert!(lazy.served_service().is_some());
+        let scanner = MockDriver::new(
+            PeerAddress("scanner".into()),
+            network,
+            CapabilityReport::default(),
+        );
+        assert!(scanner.scan(service).await.unwrap().next().await.is_none());
+        lazy.set_advertising_enabled(true).await.unwrap();
+        assert!(scanner.scan(service).await.unwrap().next().await.is_some());
+    }
 
     #[tokio::test]
     async fn retries_after_a_failed_build_and_then_keeps_the_driver() {
@@ -172,7 +299,11 @@ mod tests {
                 if attempt == 0 {
                     return Err(BleError::AdapterUnavailable("off".into()));
                 }
-                let driver = MockDriver::new(PeerAddress("AA".into()), network, CapabilityReport::default());
+                let driver = MockDriver::new(
+                    PeerAddress("AA".into()),
+                    network,
+                    CapabilityReport::default(),
+                );
                 Ok(Arc::new(driver) as Arc<dyn Driver>)
             }
         });

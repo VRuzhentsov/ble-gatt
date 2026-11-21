@@ -7,19 +7,19 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::drivers::event_bus::EventBus;
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::{TcpStream, ToSocketAddrs};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
-use crate::hal::BoxStream;
 use crate::entities::error::{BleError, Result};
 use crate::entities::models::{
-    CharacteristicUuid, DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress, ServiceUuid,
-    WriteType,
+    CharacteristicUuid, DiscoveredPeer, GattServiceSpec, PeerAddress, ServiceUuid, WriteType,
 };
+use crate::hal::BoxStream;
 
-use super::wire::{read_frame, write_frame, Envelope, Frame, Push, Request, Response};
+use super::wire::{Envelope, Frame, Push, Request, Response};
 
 /// `closed` lives under the *same* lock as the waiter map, not as a
 /// separate flag — see `RemoteClient::call`'s doc comment for why that
@@ -32,7 +32,7 @@ struct PendingState {
     closed: bool,
 }
 type PendingMap = Arc<Mutex<PendingState>>;
-type EventsMap = Arc<Mutex<HashMap<PeerAddress, broadcast::Sender<GattEvent>>>>;
+type EventsMap = Arc<Mutex<HashMap<PeerAddress, EventBus>>>;
 type SubscriptionsMap = Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Result<Vec<u8>>>>>>;
 
 pub(crate) struct RemoteClient {
@@ -62,7 +62,9 @@ impl Drop for RemoteClient {
 
 impl RemoteClient {
     pub(crate) async fn dial(endpoint: impl ToSocketAddrs) -> Result<Self> {
-        let stream = TcpStream::connect(endpoint).await.map_err(|e| BleError::Transport(e.to_string()))?;
+        let stream = TcpStream::connect(endpoint)
+            .await
+            .map_err(|e| BleError::Transport(e.to_string()))?;
         // See the broker's `handle_connection`: small request/response
         // frames, so no Nagle.
         let _ = stream.set_nodelay(true);
@@ -74,7 +76,12 @@ impl RemoteClient {
         let subscriptions = Arc::new(Mutex::new(HashMap::new()));
 
         let writer_handle = tokio::spawn(Self::writer_loop(write_half, outbox_rx));
-        let reader_handle = tokio::spawn(Self::reader_loop(read_half, pending.clone(), events.clone(), subscriptions.clone()));
+        let reader_handle = tokio::spawn(Self::reader_loop(
+            read_half,
+            pending.clone(),
+            events.clone(),
+            subscriptions.clone(),
+        ));
 
         Ok(Self {
             outbox: outbox_tx,
@@ -88,19 +95,25 @@ impl RemoteClient {
         })
     }
 
-    async fn writer_loop(mut write_half: WriteHalf<TcpStream>, mut rx: mpsc::UnboundedReceiver<Envelope>) {
+    async fn writer_loop(
+        mut write_half: WriteHalf<TcpStream>,
+        mut rx: mpsc::UnboundedReceiver<Envelope>,
+    ) {
         while let Some(env) = rx.recv().await {
-            if write_frame(&mut write_half, &env).await.is_err() {
+            if env.write_frame(&mut write_half).await.is_err() {
                 break;
             }
         }
     }
 
     async fn reader_loop(
-        mut read_half: ReadHalf<TcpStream>, pending: PendingMap, events: EventsMap, subscriptions: SubscriptionsMap,
+        mut read_half: ReadHalf<TcpStream>,
+        pending: PendingMap,
+        events: EventsMap,
+        subscriptions: SubscriptionsMap,
     ) {
         loop {
-            let env = match read_frame(&mut read_half).await {
+            let env = match Envelope::read_frame(&mut read_half).await {
                 Ok(env) => env,
                 Err(_) => break,
             };
@@ -112,10 +125,18 @@ impl RemoteClient {
                 }
                 Frame::Push(Push::Event { address, event }) => {
                     if let Some(tx) = events.lock().unwrap().get(&address) {
-                        let _ = tx.send(event);
+                        let _ = tx.send_legacy(event);
                     }
                 }
-                Frame::Push(Push::NotifyItem { subscription_id, item }) => {
+                Frame::Push(Push::LifecycleEvent { address, event }) => {
+                    if let Some(tx) = events.lock().unwrap().get(&address) {
+                        tx.send_lifecycle(event);
+                    }
+                }
+                Frame::Push(Push::NotifyItem {
+                    subscription_id,
+                    item,
+                }) => {
                     if let Some(tx) = subscriptions.lock().unwrap().get(&subscription_id) {
                         let _ = tx.send(item);
                     }
@@ -133,7 +154,9 @@ impl RemoteClient {
         let mut state = pending.lock().unwrap();
         state.closed = true;
         for (_, tx) in state.calls.drain() {
-            let _ = tx.send(Response::Err(BleError::Transport("broker connection closed".to_string())));
+            let _ = tx.send(Response::Err(BleError::Transport(
+                "broker connection closed".to_string(),
+            )));
         }
         drop(state);
         // Every live `subscribe()` stream must end, not hang forever: with
@@ -146,6 +169,11 @@ impl RemoteClient {
         // already sees `pending`'s `closed` flag and fails fast, and
         // `subscribe()`'s own error path removes the entry it just added.
         subscriptions.lock().unwrap().clear();
+        // The transport disappeared, not merely a notification. Its lost
+        // lifecycle history is unknown, so fail closed on the critical port.
+        for bus in events.lock().unwrap().values() {
+            bus.send_lifecycle(crate::entities::models::GattEvent::Lagged { dropped: 0 });
+        }
     }
 
     /// `closed` and the waiter map share one lock (`PendingState`) so this
@@ -164,131 +192,311 @@ impl RemoteClient {
             }
             state.calls.insert(correlation_id, tx);
         }
-        if self.outbox.send(Envelope { correlation_id, frame: Frame::Req(request) }).is_err() {
+        if self
+            .outbox
+            .send(Envelope {
+                correlation_id,
+                frame: Frame::Req(request),
+            })
+            .is_err()
+        {
             self.pending.lock().unwrap().calls.remove(&correlation_id);
             return Err(BleError::Transport("broker connection closed".to_string()));
         }
         match rx.await {
             Ok(Response::Err(e)) => Err(e),
             Ok(resp) => Ok(resp),
-            Err(_) => Err(BleError::Transport("broker connection closed before responding".to_string())),
+            Err(_) => Err(BleError::Transport(
+                "broker connection closed before responding".to_string(),
+            )),
         }
     }
 
-    pub(crate) fn register_events_sender(&self, address: PeerAddress, sender: broadcast::Sender<GattEvent>) {
+    pub(crate) fn register_events_sender(&self, address: PeerAddress, sender: EventBus) {
         self.events.lock().unwrap().insert(address.clone(), sender);
         // Fire-and-forget (correlation_id 0: no one is waiting on a
         // response). Always the first frame sent by this client — the
         // shared outbox queue preserves that ordering on the wire. See
         // `Request::RegisterAddress`'s doc comment for why no ack is needed.
-        let _ = self.outbox.send(Envelope { correlation_id: 0, frame: Frame::Req(Request::RegisterAddress { address }) });
+        let _ = self.outbox.send(Envelope {
+            correlation_id: 0,
+            frame: Frame::Req(Request::RegisterAddress { address }),
+        });
     }
 
-    pub(crate) async fn scan(&self, requester: &PeerAddress, service: ServiceUuid) -> Result<(Vec<DiscoveredPeer>, Option<String>)> {
-        match self.call(Request::Scan { requester: requester.clone(), service }).await? {
-            Response::ScanSnapshot { peers, armed_failure } => Ok((peers, armed_failure)),
-            _ => Err(BleError::Transport("unexpected response to Scan".to_string())),
+    pub(crate) async fn scan(
+        &self,
+        requester: &PeerAddress,
+        service: ServiceUuid,
+    ) -> Result<(Vec<DiscoveredPeer>, Option<String>)> {
+        match self
+            .call(Request::Scan {
+                requester: requester.clone(),
+                service,
+            })
+            .await?
+        {
+            Response::ScanSnapshot {
+                peers,
+                armed_failure,
+            } => Ok((peers, armed_failure)),
+            _ => Err(BleError::Transport(
+                "unexpected response to Scan".to_string(),
+            )),
         }
     }
 
     pub(crate) async fn connect(&self, central: &PeerAddress, peer: &PeerAddress) -> Result<u64> {
-        match self.call(Request::Connect { central: central.clone(), peer: peer.clone() }).await? {
+        match self
+            .call(Request::Connect {
+                central: central.clone(),
+                peer: peer.clone(),
+            })
+            .await?
+        {
             Response::Session(session) => Ok(session),
-            _ => Err(BleError::Transport("unexpected response to Connect".to_string())),
+            _ => Err(BleError::Transport(
+                "unexpected response to Connect".to_string(),
+            )),
         }
     }
 
-    pub(crate) async fn advertise(&self, address: &PeerAddress, service: GattServiceSpec) -> Result<()> {
-        match self.call(Request::Advertise { address: address.clone(), service }).await? {
-            Response::Unit => Ok(()),
-            _ => Err(BleError::Transport("unexpected response to Advertise".to_string())),
-        }
-    }
-
-    pub(crate) async fn update_advertisement(&self, address: &PeerAddress, service: GattServiceSpec) -> Result<()> {
-        match self.call(Request::UpdateAdvertisement { address: address.clone(), service }).await? {
-            Response::Unit => Ok(()),
-            _ => Err(BleError::Transport("unexpected response to UpdateAdvertisement".to_string())),
-        }
-    }
-
-    pub(crate) async fn stop_advertising(&self, address: &PeerAddress) -> Result<()> {
-        match self.call(Request::StopAdvertising { address: address.clone() }).await? {
-            Response::Unit => Ok(()),
-            _ => Err(BleError::Transport("unexpected response to StopAdvertising".to_string())),
-        }
-    }
-
-    pub(crate) async fn notify(&self, address: &PeerAddress, characteristic: CharacteristicUuid, value: Vec<u8>) -> Result<()> {
-        match self.call(Request::Notify { address: address.clone(), characteristic, value }).await? {
-            Response::Unit => Ok(()),
-            _ => Err(BleError::Transport("unexpected response to Notify".to_string())),
-        }
-    }
-
-    pub(crate) async fn notify_peer(
-        &self, address: &PeerAddress, peer: &PeerAddress, session: Option<u64>,
-        characteristic: CharacteristicUuid, value: Vec<u8>,
+    pub(crate) async fn advertise(
+        &self,
+        address: &PeerAddress,
+        service: GattServiceSpec,
     ) -> Result<()> {
         match self
-            .call(Request::NotifyPeer { address: address.clone(), peer: peer.clone(), session, characteristic, value })
-            .await?
-        {
-            Response::Unit => Ok(()),
-            _ => Err(BleError::Transport("unexpected response to NotifyPeer".to_string())),
-        }
-    }
-
-    pub(crate) async fn disconnect_peer(&self, address: &PeerAddress, peer: &PeerAddress, session: Option<u64>) -> Result<()> {
-        match self.call(Request::DisconnectPeer { address: address.clone(), peer: peer.clone(), session }).await? {
-            Response::Unit => Ok(()),
-            _ => Err(BleError::Transport("unexpected response to DisconnectPeer".to_string())),
-        }
-    }
-
-    pub(crate) async fn read(
-        &self, session: u64, central: &PeerAddress, peripheral: &PeerAddress, characteristic: CharacteristicUuid,
-    ) -> Result<Vec<u8>> {
-        match self
-            .call(Request::Read { session, central: central.clone(), peripheral: peripheral.clone(), characteristic })
-            .await?
-        {
-            Response::Bytes(bytes) => Ok(bytes),
-            _ => Err(BleError::Transport("unexpected response to Read".to_string())),
-        }
-    }
-
-    pub(crate) async fn write_with_type(
-        &self, session: u64, central: &PeerAddress, peripheral: &PeerAddress, characteristic: CharacteristicUuid,
-        value: Vec<u8>, write_type: WriteType,
-    ) -> Result<()> {
-        match self
-            .call(Request::WriteWithType {
-                session, central: central.clone(), peripheral: peripheral.clone(), characteristic, value, write_type,
+            .call(Request::Advertise {
+                address: address.clone(),
+                service,
             })
             .await?
         {
             Response::Unit => Ok(()),
-            _ => Err(BleError::Transport("unexpected response to WriteWithType".to_string())),
+            _ => Err(BleError::Transport(
+                "unexpected response to Advertise".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) async fn update_advertisement(
+        &self,
+        address: &PeerAddress,
+        service: GattServiceSpec,
+    ) -> Result<()> {
+        match self
+            .call(Request::UpdateAdvertisement {
+                address: address.clone(),
+                service,
+            })
+            .await?
+        {
+            Response::Unit => Ok(()),
+            _ => Err(BleError::Transport(
+                "unexpected response to UpdateAdvertisement".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) async fn set_characteristic_value(
+        &self,
+        address: &PeerAddress,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
+    ) -> Result<()> {
+        let request = Request::SetCharacteristicValue {
+            address: address.clone(),
+            characteristic,
+            value,
+        };
+        match self.call(request).await? {
+            Response::Unit => Ok(()),
+            _ => Err(BleError::Transport(
+                "unexpected response to SetCharacteristicValue".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) async fn set_advertising_enabled(
+        &self,
+        address: &PeerAddress,
+        enabled: bool,
+    ) -> Result<()> {
+        match self
+            .call(Request::SetAdvertisingEnabled {
+                address: address.clone(),
+                enabled,
+            })
+            .await?
+        {
+            Response::Unit => Ok(()),
+            _ => Err(BleError::Transport(
+                "unexpected response to SetAdvertisingEnabled".into(),
+            )),
+        }
+    }
+
+    pub(crate) async fn stop_advertising(&self, address: &PeerAddress) -> Result<()> {
+        match self
+            .call(Request::StopAdvertising {
+                address: address.clone(),
+            })
+            .await?
+        {
+            Response::Unit => Ok(()),
+            _ => Err(BleError::Transport(
+                "unexpected response to StopAdvertising".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) async fn notify(
+        &self,
+        address: &PeerAddress,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
+    ) -> Result<()> {
+        match self
+            .call(Request::Notify {
+                address: address.clone(),
+                characteristic,
+                value,
+            })
+            .await?
+        {
+            Response::Unit => Ok(()),
+            _ => Err(BleError::Transport(
+                "unexpected response to Notify".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) async fn notify_peer(
+        &self,
+        address: &PeerAddress,
+        peer: &PeerAddress,
+        session: Option<u64>,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
+    ) -> Result<()> {
+        match self
+            .call(Request::NotifyPeer {
+                address: address.clone(),
+                peer: peer.clone(),
+                session,
+                characteristic,
+                value,
+            })
+            .await?
+        {
+            Response::Unit => Ok(()),
+            _ => Err(BleError::Transport(
+                "unexpected response to NotifyPeer".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) async fn disconnect_peer(
+        &self,
+        address: &PeerAddress,
+        peer: &PeerAddress,
+        session: Option<u64>,
+    ) -> Result<()> {
+        match self
+            .call(Request::DisconnectPeer {
+                address: address.clone(),
+                peer: peer.clone(),
+                session,
+            })
+            .await?
+        {
+            Response::Unit => Ok(()),
+            _ => Err(BleError::Transport(
+                "unexpected response to DisconnectPeer".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) async fn read(
+        &self,
+        session: u64,
+        central: &PeerAddress,
+        peripheral: &PeerAddress,
+        characteristic: CharacteristicUuid,
+    ) -> Result<Vec<u8>> {
+        match self
+            .call(Request::Read {
+                session,
+                central: central.clone(),
+                peripheral: peripheral.clone(),
+                characteristic,
+            })
+            .await?
+        {
+            Response::Bytes(bytes) => Ok(bytes),
+            _ => Err(BleError::Transport(
+                "unexpected response to Read".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) async fn write_with_type(
+        &self,
+        session: u64,
+        central: &PeerAddress,
+        peripheral: &PeerAddress,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
+        write_type: WriteType,
+    ) -> Result<()> {
+        match self
+            .call(Request::WriteWithType {
+                session,
+                central: central.clone(),
+                peripheral: peripheral.clone(),
+                characteristic,
+                value,
+                write_type,
+            })
+            .await?
+        {
+            Response::Unit => Ok(()),
+            _ => Err(BleError::Transport(
+                "unexpected response to WriteWithType".to_string(),
+            )),
         }
     }
 
     pub(crate) async fn subscribe(
-        &self, session: u64, central: &PeerAddress, peripheral: &PeerAddress, characteristic: CharacteristicUuid,
+        &self,
+        session: u64,
+        central: &PeerAddress,
+        peripheral: &PeerAddress,
+        characteristic: CharacteristicUuid,
     ) -> Result<BoxStream<Result<Vec<u8>>>> {
         // Client-allocated and registered *before* the request is sent — see
         // `Request::Subscribe`'s doc comment for why this ordering matters.
         let subscription_id = self.next_subscription.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
-        self.subscriptions.lock().unwrap().insert(subscription_id, tx);
+        self.subscriptions
+            .lock()
+            .unwrap()
+            .insert(subscription_id, tx);
         let request = Request::Subscribe {
-            session, central: central.clone(), peripheral: peripheral.clone(), characteristic, subscription_id,
+            session,
+            central: central.clone(),
+            peripheral: peripheral.clone(),
+            characteristic,
+            subscription_id,
         };
         match self.call(request).await {
             Ok(Response::Unit) => Ok(Box::pin(UnboundedReceiverStream::new(rx))),
             Ok(_) => {
                 self.subscriptions.lock().unwrap().remove(&subscription_id);
-                Err(BleError::Transport("unexpected response to Subscribe".to_string()))
+                Err(BleError::Transport(
+                    "unexpected response to Subscribe".to_string(),
+                ))
             }
             Err(e) => {
                 self.subscriptions.lock().unwrap().remove(&subscription_id);
@@ -297,10 +505,24 @@ impl RemoteClient {
         }
     }
 
-    pub(crate) async fn disconnect(&self, session: u64, central: &PeerAddress, peripheral: &PeerAddress) -> Result<()> {
-        match self.call(Request::Disconnect { session, central: central.clone(), peripheral: peripheral.clone() }).await? {
+    pub(crate) async fn disconnect(
+        &self,
+        session: u64,
+        central: &PeerAddress,
+        peripheral: &PeerAddress,
+    ) -> Result<()> {
+        match self
+            .call(Request::Disconnect {
+                session,
+                central: central.clone(),
+                peripheral: peripheral.clone(),
+            })
+            .await?
+        {
             Response::Unit => Ok(()),
-            _ => Err(BleError::Transport("unexpected response to Disconnect".to_string())),
+            _ => Err(BleError::Transport(
+                "unexpected response to Disconnect".to_string(),
+            )),
         }
     }
 }

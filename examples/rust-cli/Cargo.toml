@@ -1,0 +1,13 @@
+[workspace]
+
+[package]
+name = "ble-gatt-cli-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ble-gatt = { path = "../../ble-gatt" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio-stream = "0.1"
+uuid = "1"

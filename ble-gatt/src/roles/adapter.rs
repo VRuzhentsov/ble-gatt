@@ -6,7 +6,7 @@ use tokio_stream::StreamExt;
 
 use super::{Central, Peripheral};
 use crate::entities::models::{CapabilityReport, GattEvent, RadioStatus};
-use crate::hal::{Driver, BoxStream};
+use crate::hal::{BoxStream, Driver};
 
 /// The device's Bluetooth adapter: whether it is usable, published as it
 /// changes, and what it can do (ADR-0007 D7). Follows `bluest`'s `Adapter`
@@ -35,9 +35,9 @@ impl Adapter {
     pub async fn new(driver: Arc<dyn Driver>) -> Self {
         // Subscribe before reading the current status, so a change between
         // the two is not lost.
-        let events = driver.events();
+        let events = driver.lifecycle_events();
         let (status_tx, status) = watch::channel(driver.radio_status().await);
-        let watcher = tokio::spawn(publish_status(events, status_tx));
+        let watcher = tokio::spawn(Self::publish_status(events, status_tx));
         Self {
             inner: Arc::new(Inner {
                 driver,
@@ -48,7 +48,7 @@ impl Adapter {
     }
 
     /// The adapter of the platform this program runs on.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
     pub async fn platform() -> crate::Result<Self> {
         Ok(Self::new(crate::drivers::platform().await?).await)
     }
@@ -98,16 +98,19 @@ impl Adapter {
     pub async fn close(&self) -> crate::Result<()> {
         self.inner.driver.close().await
     }
-}
 
-async fn publish_status(mut events: BoxStream<GattEvent>, status_tx: watch::Sender<RadioStatus>) {
-    while let Some(event) = events.next().await {
-        if let GattEvent::RadioChanged { status } = event {
-            status_tx.send_if_modified(|current| {
-                let changed = *current != status;
-                *current = status;
-                changed
-            });
+    async fn publish_status(
+        mut events: BoxStream<GattEvent>,
+        status_tx: watch::Sender<RadioStatus>,
+    ) {
+        while let Some(event) = events.next().await {
+            if let GattEvent::RadioChanged { status } = event {
+                status_tx.send_if_modified(|current| {
+                    let changed = *current != status;
+                    *current = status;
+                    changed
+                });
+            }
         }
     }
 }
