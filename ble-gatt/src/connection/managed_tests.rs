@@ -245,6 +245,7 @@ struct MetadataControl {
     connects: std::sync::atomic::AtomicUsize,
     stops: std::sync::atomic::AtomicUsize,
     startup_blocked: std::sync::atomic::AtomicBool,
+    advertise_failure: std::sync::atomic::AtomicBool,
     blocked: std::sync::atomic::AtomicBool,
     native_failure: std::sync::atomic::AtomicBool,
     value_failure: std::sync::atomic::AtomicBool,
@@ -350,6 +351,12 @@ impl crate::Driver for BlockingVisibility {
             {
                 control.entered.notify_one();
                 control.release.notified().await;
+            }
+            if control
+                .advertise_failure
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(crate::BleError::Gatt("advertise refused".into()));
             }
         }
         let result = self.inner.advertise(spec).await;
@@ -1051,6 +1058,49 @@ async fn managed_metadata_close_cancels_gated_startup_before_native_registration
     assert!(driver.served_service().is_none());
     assert_eq!(control.starts.load(SeqCst), 1);
     assert_eq!(control.stops.load(SeqCst), 1);
+}
+
+#[tokio::test]
+async fn managed_failed_startup_is_stopped_and_a_later_show_starts_again() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (driver, control, owner) =
+        BlockingVisibility::metadata(MockNetwork::new(), "failed-startup");
+    control.advertise_failure.store(true, SeqCst);
+    assert!(matches!(
+        owner.set_advertising(true).await,
+        Err(crate::BleError::Gatt(_))
+    ));
+    assert_eq!(
+        control.stops.load(SeqCst),
+        1,
+        "the failed startup is stopped"
+    );
+    control.advertise_failure.store(false, SeqCst);
+    owner.set_advertising(true).await.unwrap();
+    assert!(driver.served_service().is_some());
+    assert_eq!(control.starts.load(SeqCst), 2);
+    owner.close().await.unwrap();
+    assert!(driver.served_service().is_none());
+    assert_eq!(control.stops.load(SeqCst), 2);
+}
+
+#[tokio::test]
+async fn managed_close_keeps_a_server_the_link_did_not_start() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (driver, control, owner) =
+        BlockingVisibility::metadata(MockNetwork::new(), "caller-server");
+    // The caller serves on the same driver; the link only scans.
+    let spec = managed_codec::ManagedMetadata {
+        endpoint: owner.endpoint_id(),
+    }
+    .service_spec(&config())
+    .unwrap();
+    driver.inner.advertise(spec).await.unwrap();
+    drop(owner.discover().await.unwrap());
+    owner.close().await.unwrap();
+    assert_eq!(control.stops.load(SeqCst), 0);
+    assert!(driver.served_service().is_some());
+    driver.inner.stop_advertising().await.unwrap();
 }
 
 #[tokio::test]

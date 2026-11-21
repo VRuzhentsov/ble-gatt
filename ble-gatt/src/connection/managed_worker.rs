@@ -27,12 +27,18 @@ const MAX_PENDING_OPERATIONS: usize = 64;
 type Teardown = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>;
 enum Operation {
     Cleaned(PeerAddress, u64, Result<()>),
+    /// A visibility change finished: its result, the caller, whether it
+    /// showed, whether it was a startup or a restore, and the loss revision.
     Advertising(
         Result<Option<BoxStream<DatagramChannel>>>,
         Reply<()>,
         bool,
+        bool,
         u64,
     ),
+    /// A failed startup or restore was stopped: the stop result, and the
+    /// advertise error for the caller.
+    Withdrawn(Result<()>, BleError, Reply<()>),
     Metadata(Result<()>, Reply<()>, u64),
     Recovered(Result<()>, u64),
     Discovery(
@@ -215,6 +221,9 @@ impl Worker {
         let mut metadata_uncertain = false;
         let mut metadata_fenced = false;
         let mut native_present = false;
+        // Set once this worker starts its own server: close stops only that,
+        // never a server the caller runs on the same driver.
+        let mut server_acquired = false;
         let mut desired_visible = false;
         let mut recovery_needed = false;
         let mut radio_available = true;
@@ -245,6 +254,7 @@ impl Worker {
                 {
                     Ok(spec) => {
                         advertising_pending = true;
+                        server_acquired = true;
                         let driver = driver.clone();
                         let shutdown = self.shutdown.clone();
                         let revision = loss_revision;
@@ -290,7 +300,7 @@ impl Worker {
                     if let Some(Ok(operation)) = completed {
                         match operation {
                             Operation::Cleaned(peer, generation, result) => self.cleaned(peer, generation, result),
-                            Operation::Advertising(mut result, reply, enabled, revision) => {
+                            Operation::Advertising(mut result, reply, enabled, fresh, revision) => {
                                 if revision != loss_revision { result = Err(AttemptError::PeerLost.into()); }
                                 advertising_pending = false;
                                 if result.is_err() { metadata_uncertain = true; metadata_fenced = false; }
@@ -302,8 +312,16 @@ impl Worker {
                                         if metadata_uncertain { metadata_fenced = true; }
                                     }
                                 }
-                                let result = result.map(|stream| { if let Some(stream) = stream { served = Some(stream); } });
-                                let _ = reply.send(result);
+                                match result {
+                                    Err(error) if fresh && served.is_none() && !native_present => { advertising_pending = true; self.withdraw(driver.clone(), error, reply); }
+                                    result => { let _ = reply.send(result.map(|stream| { if let Some(stream) = stream { served = Some(stream); } })); }
+                                }
+                            }
+                            Operation::Withdrawn(stopped, error, reply) => {
+                                advertising_pending = false;
+                                // Nothing is served now: nothing to recover, and nothing to stop at close.
+                                if stopped.is_ok() { server_acquired = false; metadata_uncertain = false; metadata_fenced = false; recovery_needed = false; }
+                                let _ = reply.send(Err(error));
                             }
                             Operation::Metadata(mut result, reply, revision) => {
                                 if revision != loss_revision { result = Err(AttemptError::PeerLost.into()); }
@@ -449,6 +467,8 @@ impl Worker {
                                 Err(error) => { advertising_pending = false; let _ = reply.send(Err(error)); continue; }
                             };
                             desired_visible = enabled;
+                            let fresh = startup || restore;
+                            server_acquired |= fresh;
                             let driver = driver.clone();
                             let shutdown = self.shutdown.clone();
                             self.operations.spawn(async move {
@@ -461,7 +481,7 @@ impl Worker {
                                         else { driver.set_advertising_enabled(enabled).await.map(|()| None) }
                                     }) => result.unwrap_or(Err(AttemptError::TimedOut.into())),
                                 };
-                                Operation::Advertising(result, reply, enabled, revision)
+                                Operation::Advertising(result, reply, enabled, fresh, revision)
                             });
                         }
                         Command::Request { peer, cancellation, reply } => self.request(driver.clone(), peer, cancellation, reply),
@@ -535,9 +555,13 @@ impl Worker {
                         self.retired(targets, result);
                     }
                     Ok(
-                        Operation::Advertising(_, reply, _, _) | Operation::Metadata(_, reply, _),
+                        Operation::Advertising(_, reply, _, _, _)
+                        | Operation::Metadata(_, reply, _),
                     ) => {
                         let _ = reply.send(Err(AttemptError::Cancelled.into()));
+                    }
+                    Ok(Operation::Withdrawn(_, error, reply)) => {
+                        let _ = reply.send(Err(error));
                     }
                     Ok(Operation::Discovery(_, reply)) => {
                         let _ = reply.send(Err(AttemptError::Cancelled.into()));
@@ -567,9 +591,13 @@ impl Worker {
                 }
             }
         }
-        let stopped = tokio::time::timeout(IO_BOUND, driver.stop_advertising())
-            .await
-            .unwrap_or(Err(AttemptError::TimedOut.into()));
+        let stopped = if server_acquired {
+            tokio::time::timeout(IO_BOUND, driver.stop_advertising())
+                .await
+                .unwrap_or(Err(AttemptError::TimedOut.into()))
+        } else {
+            Ok(())
+        };
         if let Some(reply) = close_reply {
             let _ = reply.send(stopped.and(teardown));
         }
@@ -929,6 +957,23 @@ impl Worker {
             Operation::Probe(generation, address, output, result)
         });
         Ok(())
+    }
+    /// A startup or restore failed with nothing served: stop what it may
+    /// have left behind (a timed-out advertise can still finish), bounded,
+    /// then give the caller `error`. A stopped server is a known state, so
+    /// the next show may start again.
+    fn withdraw(&mut self, driver: Arc<dyn Driver>, error: BleError, reply: Reply<()>) {
+        let shutdown = self.shutdown.clone();
+        self.operations.spawn(async move {
+            let stopped = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => Err(AttemptError::Cancelled.into()),
+                result = tokio::time::timeout(IO_BOUND, driver.stop_advertising()) => {
+                    result.unwrap_or(Err(AttemptError::TimedOut.into()))
+                }
+            };
+            Operation::Withdrawn(stopped, error, reply)
+        });
     }
     fn address_retiring(&self, peer: &PeerAddress) -> bool {
         self.retiring.keys().any(|(address, _)| address == peer)
