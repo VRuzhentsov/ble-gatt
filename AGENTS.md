@@ -6,6 +6,11 @@ A reusable, cross-platform BLE library for Rust applications.
 - What each term means: `docs/glossary.md`. Use its words in code and
   documents; add a term there when you introduce one.
 - Decisions: `docs/adr/`.
+- Code style: `docs/code-style.md`.
+- Dev process (Spike and Stabilize): load the `dev` skill
+  (`.agents/skills/dev/SKILL.md`) first.
+- Testing process: the `testing` skill (`.agents/skills/testing/SKILL.md`),
+  at the stabilize step of `dev`.
 
 ## Design
 

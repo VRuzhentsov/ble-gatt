@@ -1,8 +1,7 @@
 # ble-gatt
 
-Async, transport-agnostic BLE GATT primitives for Rust — **central and
-peripheral role**, no Tauri dependency in the core crate. Built on top of
-established, widely-used crates rather than reinventing plumbing:
+Async BLE GATT primitives for Rust, with **central and peripheral roles** and
+no core Tauri dependency. Uses
 [`bluer`](https://github.com/bluez/bluer) for BlueZ, [`tokio`](https://github.com/tokio-rs/tokio)
 for async/channels, [`thiserror`](https://github.com/dtolnay/thiserror) and
 [`async-trait`](https://github.com/dtolnay/async-trait) for the trait
@@ -10,20 +9,47 @@ surface.
 
 This repo is a Cargo workspace with three crates:
 
-- **`ble-gatt`** — the core library. Scan/advertise, GATT client
+- **[`ble-gatt`](ble-gatt/README.md)** — the core library. Scan/advertise, GATT client
   read/write/subscribe, GATT server characteristics, connection lifecycle as
   an event stream, and a radio-free `MockDriver` for CI-safe protocol
   tests. Depends on nothing Tauri-specific — usable from any Tokio-based
   Rust program (a CLI, a daemon, another GUI framework).
-- **`tauri-plugin-ble-gatt`** — the [Tauri](https://tauri.app) integration:
+- **[`tauri-plugin-ble-gatt`](tauri-plugin-ble-gatt/README.md)** — the [Tauri](https://tauri.app) integration:
   ships the Android Kotlin bridge (an application never copies it), builds
   the platform driver on first use, asks for Android's Bluetooth runtime
   permissions through Tauri's permission mechanism, and exposes both a Rust
   API and JavaScript commands.
-- **`ble-gatt-iroh`** — an [iroh](https://github.com/n0-computer/iroh)
-  custom transport that carries QUIC over `ble-gatt`'s GATT datagram
-  channel. The caller decides when the radio scans and advertises. See
-  ADR-0006.
+- **[`ble-gatt-iroh`](ble-gatt-iroh/README.md)** — an [iroh](https://github.com/n0-computer/iroh)
+  custom transport over core `PeerChannel` messages. It translates packets and
+  addresses and accounts for authenticated QUIC users of a shared carrier.
+
+## Code style
+
+Use object-oriented code as the default. The rules are in
+[docs/code-style.md](docs/code-style.md). Agents apply them through the
+[dev skill](.agents/skills/dev/SKILL.md), which follows Spike and Stabilize;
+tests are brought up to date with the [testing skill](.agents/skills/testing/SKILL.md).
+
+## Managed communication: working-tree implementation
+
+[ADR-0012](docs/adr/0012-discovery-like-nearby.md) now has a core implementation:
+`PeerLink` provides discovery, explicit requests, mutual acceptance, scoped
+channels and endpoint/nonce arbitration. Either peer can initiate. An outgoing
+loser fails; the incoming winner proceeds separately through acceptance.
+The refactor reuses one dedicated core worker, not a second manager.
+Bounded application receive pressure pauses only that generation, within the
+existing I/O deadline. Native/mock lifecycle streams are isolated from payload
+traffic; third-party defaults retain unknown-loss limits. See
+[event and receive contracts](docs/interface.md#driver-event-streams-and-receive-loss).
+
+Raw central/peripheral and datagram APIs remain separate for vendor protocols
+and caller-owned channels. A standalone CLI can use the
+[minimal managed example](docs/interface.md#minimal-outgoing-use) without iroh or Tauri.
+The Tauri plugin supplies host setup; external iroh supplies QUIC and security.
+
+**This PR implements the managed refactor. Software checks do not establish
+native hardware acceptance.** [ADR-0011](docs/adr/0011-windows-winrt-driver.md) owns native
+Windows choices. Neither ADR claims Google Nearby wire interoperability.
 
 ### Using the plugin from a Rust application
 
@@ -43,16 +69,23 @@ let adapter = app.ble_gatt().adapter().await; // ble_gatt::Adapter
 let state = app.ble_gatt().request_permissions()?; // PermissionState::Granted, ...
 ```
 
-On Android, an application that also calls Java through `ndk-context`
-calls `tauri_plugin_ble_gatt::android_context::ensure()` first instead of
-initializing `ndk-context` itself; it may only be initialized once per
-process.
+On Android, plugin registration captures an owned Application context through
+JNI. The default driver never reads or initializes `ndk-context`, so it works
+with both older Tauri runtimes and newer runtimes that already own that global,
+without matching the app's Tao version or retaining an Activity.
 
-This library **carries bytes; it does not encrypt them.** Layering your own
-session protocol or end-to-end encryption on top is expected and
-supported — and staying out of the way is deliberate, so that consumers
-talking to third-party device firmware (which will never speak your
-protocol) can use the raw GATT API directly. See ADR-0003.
+Applications can call `tauri_plugin_ble_gatt::android_context::get()` after
+plugin registration for their own JNI: it returns a JVM handle and an owned
+Application reference. The legacy `android_context::ensure()` remains available
+for applications on older runtimes which explicitly delegate `ndk-context`
+initialization to this plugin (such as existing Fini consumers). Do not call
+that legacy initializer on a runtime that already initializes `ndk-context`;
+`ndk-context` 0.1 has no non-panicking probe for existing ownership. Use `get()`
+for new code instead.
+
+This library **carries bytes; it does not encrypt them.** Supply your own session
+protocol and security layer. Raw GATT remains available for vendor firmware
+without this library's message protocol. See ADR-0003.
 
 The layer map (what each layer and module is responsible for, and how
 platform modules are designed) is in
@@ -77,13 +110,12 @@ over a socket instead of sharing an in-process `Arc`.
 | Platform | Central | Peripheral | Status |
 |---|---|---|---|
 | Linux (BlueZ) | Yes | Yes | **M1 — implemented**, verified against real BlueZ hardware |
-| Android | Yes | Yes (where the chipset/driver allows — see `CapabilityReport`) | **M1 — implemented, not yet verified as a working bridge.** Individual pieces confirmed on a real emulator (real `capabilities()` returning `{central: true, peripheral: true}`, real GATT-server advertise start), but no device-to-device round trip yet — physical-hardware verification is the real bar, planned for after the next minor patch/release. See ADR-0002. |
-| Windows (WinRT) | — | — | M2 — reserved, not implemented |
+| Android | Yes | Yes (where the chipset/driver allows — see `CapabilityReport`) | **M1 — implemented.** Source checks, packaged JNI execution and physical device acceptance are separate evidence levels. See ADR-0002 and the hardware verification guides; no blanket crossed-role or locked-device guarantee is implied. |
+| Windows (WinRT) | Yes | Yes (where the adapter and driver allow — see `CapabilityReport`) | **M2 — first implementation; bidirectional cross-device acceptance pending.** Earlier build/capability/advertising observations are not proof of the new peer protocol. Shared metadata completion is described in ADR-0012; native choices and verification are in ADR-0011. |
 | macOS / iOS | — | — | M3 — reserved, not implemented |
 
-Capability is always discovered at runtime via `Driver::capabilities()`,
-never assumed from the target OS — an Android device whose driver can't do
-peripheral mode reports that honestly instead of failing opaquely later.
+Read capabilities at runtime with `Driver::capabilities()`. Do not infer support
+from the OS name.
 
 ## Architecture
 
@@ -91,12 +123,14 @@ peripheral mode reports that honestly instead of failing opaquely later.
 ble-gatt/src/
 ├── entities/     Entities: types, events, errors
 ├── hal/          Use Cases: the Driver / GattConnection ports (async, Tokio)
-├── connection/   Use Cases: one connection's state machine, PeerLink
+├── roles/        Use Cases: Adapter, Central and Peripheral
+├── connection/   Use Cases: owned Connection, managed PeerLink worker and codec
 ├── profile/      Use Cases: the datagram profile (fragmentation, reassembly)
+├── power/        Use Cases: power-profile advice
 └── drivers/      Frameworks & Drivers: one Driver per platform
-    ├── linux.rs    BlueZ via bluer — central + peripheral       (M1)
-    ├── android.rs  raw jni + ndk-context JNI bridge              (M1)
-    ├── windows.rs  reserved                                      (M2)
+    ├── linux/      BlueZ via bluer — central + peripheral       (M1)
+    ├── android/    JNI driver with explicit context support    (M1)
+    ├── windows/    WinRT via the windows crate — central + peripheral (M2)
     └── mock/       in-process, radio-free — CI-safe protocol tests;
                     optionally a cross-process broker behind the
                     `mock-broker` feature — see ADR-0004
@@ -104,19 +138,10 @@ ble-gatt/src/
 
 ### Roles, published state, handles
 
-```rust
-use ble_gatt::{Adapter, RadioStatus};
-
-let adapter = Adapter::platform().await?;      // or Adapter::new(driver) to inject one
-adapter.wait_available().await;                 // adapter.status(): watch::Receiver<RadioStatus>
-
-let server = adapter.peripheral().serve(spec).await?; // advertising stops when `server` drops
-
-let mut conn = adapter.central().connect(&peer).await?;
-let mut state = conn.state();                   // watch::Receiver<ConnectionState>
-tokio::spawn(conn.cancelled().run_until_cancelled_owned(read_loop()));
-state.wait_for(|s| s.is_disconnected()).await?;
-```
+`Adapter::platform().await` obtains raw role access. `Central::connect` returns
+an owned `Connection`; `Peripheral::serve` returns `ServerHandle`.
+Their state/cleanup contracts differ from managed scoped channels. See
+[API usage](docs/interface.md#raw-apis-and-lifetime-limits).
 
 ### Power profiles
 
@@ -128,9 +153,8 @@ the radio; the application applies it (ADR-0007 D8).
 Layers are named after Clean Architecture and modules after the Bluetooth
 specification (ADR-0007). The short paths `ble_gatt::datagram` and
 `ble_gatt::peer_link` still resolve; `ble_gatt::backend::…` is gone (use
-`ble_gatt::drivers` and `ble_gatt::hal`). Application code takes an
-`Adapter` (`datagram::connect`/`serve`, `ble_gatt_iroh::dial_with`);
-`Driver` is the driver port underneath it.
+`ble_gatt::drivers` and `ble_gatt::hal`). Raw datagram helpers take an `Adapter`;
+`ble_gatt_iroh::dial_with` takes `Arc<PeerLink>`. `Driver` is the native port.
 
 Every driver speaks the same generic GATT vocabulary
 (`ServiceUuid`/`CharacteristicUuid`/`GattEvent`/`GattServiceSpec`/...) —
@@ -139,8 +163,8 @@ crossing the `Driver`/`GattConnection` port boundary.
 
 ### Three tiers, one carrier
 
-`ble-gatt` carries bytes; it does not interpret them (ADR-0003). A consumer
-picks the tier that fits:
+`ble-gatt` carries application bytes without authenticating or encrypting them
+(ADR-0003). Managed channels add control records. Choose the required tier:
 
 | Tier | Use for | Owns the connection? |
 |---|---|---|
@@ -148,8 +172,8 @@ picks the tier that fits:
 | **datagram** (`datagram::connect` / `serve`) | one message pipe, driven by hand | you |
 | **`PeerLink`** | app-to-app links to a set of peers | the library |
 
-See **`docs/interface.md`** for how `PeerLink` is meant to be used, and
-**`docs/adr/0005`** for the owned link-state machine underneath it.
+See [`docs/interface.md`](docs/interface.md) for requests, incoming acceptance,
+scoped release, disconnect and the adapter's terminal-authorization rules.
 
 ### Load-bearing files
 
@@ -157,35 +181,53 @@ Read the doc next to each before changing it:
 
 | File | What it governs | Doc |
 |---|---|---|
-| `src/connection/link_state.rs` | `RadioState` / `CentralLink` / `PeripheralLink` — whether a dial happens, whether a stale record blocks one, whether a consumer is told a link died | `docs/adr/0005` |
-| `src/peer_link.rs` | the tier-3 API and its dedicated-thread driver | `docs/interface.md`, `docs/adr/0005` |
-| `src/drivers/linux.rs` — `LinuxConnectGuard` / `pending_cleanup` | abandoned-connect cleanup, hardware-proven over ~6 review rounds | code comments + `docs/adr/0005` |
-| `src/datagram/mod.rs` | fragmentation, the one-central and one-link-per-peer limits | ADR-0003 |
+| `ble-gatt/src/connection/peer_link.rs` | request/accept and scoped channel API | `docs/interface.md`, ADR-0012 |
+| `ble-gatt/src/connection/managed_worker.rs` | attempt state, arbitration and native channel ownership | ADR-0012 |
+| `ble-gatt/src/connection/managed_codec.rs` | managed metadata and record bytes | ADR-0012 |
+| `ble-gatt/src/drivers/linux/mod.rs` — `LinuxConnectGuard` / `pending_cleanup` | abandoned-connect cleanup and native ownership | code comments, ADR-0009 |
+| `ble-gatt/src/profile/datagram/mod.rs` | complete messages, serving and channel limits | ADR-0003, ADR-0012 |
+
+The unused crate-private `link_state` implementation is retired. ADR-0005 remains
+a historical record, not the current managed state-machine specification.
 
 ## Status
 
-Early, under active development. `ble-gatt`'s Linux driver is real and
-tested against BlueZ hardware. The Android driver is implemented and its
-individual pieces run correctly on a real emulator, but it is **not yet
-verified as a working bridge** — that requires a real device-to-device round
-trip, planned on physical hardware after the next minor patch/release (see
-ADR-0002). Not yet published to crates.io/npm — consume as a git
-dependency, pinned to a release tag:
+Under active development. Implemented APIs, target design and device acceptance
+are separate claims. The architecture does not certify native roles or background scenarios. See
+[hardware verification and current iroh diagnostic checklist](docs/hardware-verification.md).
+Not published to crates.io/npm — consume as a git dependency, pinned to a
+release tag (Fini pins it this way):
 
 ```toml
-ble-gatt = { git = "https://github.com/VRuzhentsov/ble-gatt", tag = "v0.1.0" }
+ble-gatt = { git = "https://github.com/VRuzhentsov/ble-gatt", tag = "v0.2.0" }
 ```
+
+## Contributing
+
+Turn on the pre-commit hook once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+When a commit has staged `.rs` files, the hook (`.githooks/pre-commit`) runs
+the same checks as CI: `cargo fmt --all --check` and
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`. It
+needs the Rust toolchain with the `clippy` and `rustfmt` components. Skip it
+one time with `git commit --no-verify`.
 
 ## Releasing
 
-1. In a pull request, set `[workspace.package] version` in `Cargo.toml` to
-   the new version, and merge it.
-2. Actions → **Release Button** → Run workflow, on `main`.
+[release-plz](https://release-plz.dev) (`release-plz.toml`,
+`.github/workflows/release-plz.yml`) runs on every push to `main`. When the
+`[workspace.package] version` is not tagged yet, it tags that commit `vX.Y.Z`
+and publishes a GitHub release with the `CHANGELOG.md` entry. Otherwise it
+opens or updates a release pull request with the next version (from the
+commits and cargo-semver-checks) and the changelog; merging that pull request
+releases it. Nothing is uploaded to crates.io.
 
-The button refuses a version that is already tagged, and refuses if main
-moves while it runs. It runs CI on main's last commit, tags that commit
-`vX.Y.Z` (annotated, unsigned) and publishes a GitHub release with generated
-notes.
+**Release Button** (Actions → Run workflow, on `main`) stays as a manual
+fallback: it runs CI and tags an untagged version the same way.
 
 ## License
 

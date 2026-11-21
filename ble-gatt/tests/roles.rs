@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use ble_gatt::drivers::mock::{MockDriver, MockNetwork};
 use ble_gatt::{
-    Adapter, Driver, BoxStream, CapabilityReport, CharacteristicUuid, ConnectionState, DiscoveredPeer,
-    GattCharacteristicSpec, GattConnection, GattEvent, GattServiceSpec, PeerAddress, RadioStatus,
-    ServiceUuid,
+    Adapter, BoxStream, CapabilityReport, CharacteristicUuid, ConnectionState, DiscoveredPeer,
+    Driver, GattCharacteristicSpec, GattConnection, GattEvent, GattServiceSpec, PeerAddress,
+    RadioStatus, ServiceUuid,
 };
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
@@ -38,7 +38,11 @@ fn service() -> GattServiceSpec {
 }
 
 fn device(network: &Arc<MockNetwork>, name: &str) -> Arc<MockDriver> {
-    Arc::new(MockDriver::new(PeerAddress(name.into()), network.clone(), capabilities()))
+    Arc::new(MockDriver::new(
+        PeerAddress(name.into()),
+        network.clone(),
+        capabilities(),
+    ))
 }
 
 #[tokio::test]
@@ -50,7 +54,10 @@ async fn adapter_publishes_the_radio_status() {
     assert_eq!(*status.borrow(), RadioStatus::On);
 
     driver.simulate_radio(RadioStatus::Off);
-    timeout(WAIT, status.wait_for(|s| *s == RadioStatus::Off)).await.unwrap().unwrap();
+    timeout(WAIT, status.wait_for(|s| *s == RadioStatus::Off))
+        .await
+        .unwrap()
+        .unwrap();
 
     driver.simulate_radio(RadioStatus::On);
     timeout(WAIT, adapter.wait_available()).await.unwrap();
@@ -61,13 +68,20 @@ async fn a_connection_publishes_disconnected_when_the_peer_goes_away() {
     let network = MockNetwork::new();
     let peripheral_driver = device(&network, "peripheral");
     let central_driver = device(&network, "central");
-    let peripheral = Adapter::new(peripheral_driver.clone() as Arc<dyn Driver>).await.peripheral();
+    let peripheral = Adapter::new(peripheral_driver.clone() as Arc<dyn Driver>)
+        .await
+        .peripheral();
     let spec = service();
     let characteristic = spec.characteristics[0].uuid;
     let _server = peripheral.serve(spec).await.unwrap();
 
-    let central = Adapter::new(central_driver.clone() as Arc<dyn Driver>).await.central();
-    let mut connection = central.connect(&PeerAddress("peripheral".into())).await.unwrap();
+    let central = Adapter::new(central_driver.clone() as Arc<dyn Driver>)
+        .await
+        .central();
+    let mut connection = central
+        .connect(&PeerAddress("peripheral".into()))
+        .await
+        .unwrap();
     assert_eq!(connection.read(characteristic).await.unwrap(), b"hi");
 
     let mut state = connection.state();
@@ -76,8 +90,42 @@ async fn a_connection_publishes_disconnected_when_the_peer_goes_away() {
 
     // The mock reports a lost link from the server's side.
     peripheral_driver.simulate_peer_loss(&PeerAddress("central".into()));
-    timeout(WAIT, state.wait_for(|s| s.is_disconnected())).await.unwrap().unwrap();
+    timeout(WAIT, state.wait_for(|s| s.is_disconnected()))
+        .await
+        .unwrap()
+        .unwrap();
     timeout(WAIT, token.cancelled()).await.unwrap();
+}
+
+#[tokio::test]
+async fn critical_lifecycle_loss_ends_an_owned_connection() {
+    let network = MockNetwork::new();
+    let peripheral = device(&network, "lag-peripheral");
+    let central = device(&network, "lag-central");
+    let _server = Adapter::new(peripheral as Arc<dyn Driver>)
+        .await
+        .peripheral()
+        .serve(service())
+        .await
+        .unwrap();
+    let connection = Adapter::new(central as Arc<dyn Driver>)
+        .await
+        .central()
+        .connect(&PeerAddress("lag-peripheral".into()))
+        .await
+        .unwrap();
+    let mut state = connection.state();
+    let token = connection.cancelled();
+
+    network.simulate_event_lag(&PeerAddress("lag-central".into()), 1);
+    timeout(Duration::from_millis(300), token.cancelled())
+        .await
+        .expect("unknown lifecycle loss must end the owned connection");
+    assert!(state
+        .wait_for(|state| state.is_disconnected())
+        .await
+        .unwrap()
+        .is_disconnected());
 }
 
 #[tokio::test]
@@ -99,7 +147,11 @@ async fn dropping_a_connection_cancels_its_token() {
         .unwrap();
 
     let token = connection.cancelled();
-    let task = tokio::spawn(token.clone().run_until_cancelled_owned(std::future::pending::<()>()));
+    let task = tokio::spawn(
+        token
+            .clone()
+            .run_until_cancelled_owned(std::future::pending::<()>()),
+    );
     drop(connection);
     assert_eq!(timeout(WAIT, task).await.unwrap().unwrap(), None);
 }
@@ -128,7 +180,10 @@ async fn dropping_a_connection_disconnects_it() {
     })
     .await
     .expect("a dropped connection disconnects its driver");
-    assert_eq!(network.disconnected_peers(), vec![PeerAddress("peripheral".into())]);
+    assert_eq!(
+        network.disconnected_peers(),
+        vec![PeerAddress("peripheral".into())]
+    );
 }
 
 #[tokio::test]
@@ -166,7 +221,9 @@ async fn dropping_the_server_handle_stops_advertising() {
         .serve(spec)
         .await
         .unwrap();
-    let central = Adapter::new(central_driver as Arc<dyn Driver>).await.central();
+    let central = Adapter::new(central_driver as Arc<dyn Driver>)
+        .await
+        .central();
 
     let mut scan = central.scan(service_uuid).await.unwrap();
     let found = timeout(WAIT, scan.next()).await.unwrap().unwrap().unwrap();
@@ -178,7 +235,10 @@ async fn dropping_the_server_handle_stops_advertising() {
 
     let mut scan = central.scan(service_uuid).await.unwrap();
     assert!(
-        !matches!(timeout(Duration::from_millis(300), scan.next()).await, Ok(Some(_))),
+        !matches!(
+            timeout(Duration::from_millis(300), scan.next()).await,
+            Ok(Some(_))
+        ),
         "the peripheral is still advertising after its handle was dropped"
     );
 }
@@ -200,7 +260,10 @@ impl Driver for CountingDriver {
         self.inner.capabilities().await
     }
 
-    async fn scan(&self, service: ServiceUuid) -> ble_gatt::Result<BoxStream<ble_gatt::Result<DiscoveredPeer>>> {
+    async fn scan(
+        &self,
+        service: ServiceUuid,
+    ) -> ble_gatt::Result<BoxStream<ble_gatt::Result<DiscoveredPeer>>> {
         self.inner.scan(service).await
     }
 
@@ -222,22 +285,45 @@ impl Driver for CountingDriver {
         self.inner.served_service()
     }
 
+    async fn set_characteristic_value(
+        &self,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
+    ) -> ble_gatt::Result<()> {
+        self.inner
+            .set_characteristic_value(characteristic, value)
+            .await
+    }
+
     async fn stop_advertising(&self) -> ble_gatt::Result<()> {
         self.inner.stop_advertising().await
     }
 
-    async fn notify(&self, characteristic: CharacteristicUuid, value: Vec<u8>) -> ble_gatt::Result<()> {
+    async fn notify(
+        &self,
+        characteristic: CharacteristicUuid,
+        value: Vec<u8>,
+    ) -> ble_gatt::Result<()> {
         self.inner.notify(characteristic, value).await
     }
 
     async fn notify_peer(
-        &self, peer: &PeerAddress, session: Option<u64>, characteristic: CharacteristicUuid,
+        &self,
+        peer: &PeerAddress,
+        session: Option<u64>,
+        characteristic: CharacteristicUuid,
         value: Vec<u8>,
     ) -> ble_gatt::Result<()> {
-        self.inner.notify_peer(peer, session, characteristic, value).await
+        self.inner
+            .notify_peer(peer, session, characteristic, value)
+            .await
     }
 
-    async fn disconnect_peer(&self, peer: &PeerAddress, session: Option<u64>) -> ble_gatt::Result<()> {
+    async fn disconnect_peer(
+        &self,
+        peer: &PeerAddress,
+        session: Option<u64>,
+    ) -> ble_gatt::Result<()> {
         self.inner.disconnect_peer(peer, session).await
     }
 
@@ -261,8 +347,17 @@ async fn a_radio_recovery_re_registers_the_service() {
         last_advertised: Arc::default(),
     });
 
-    let _server = Adapter::new(counting as Arc<dyn Driver>).await.peripheral().serve(service()).await.unwrap();
-    assert_eq!(advertise_calls.load(Ordering::SeqCst), 1, "serve's own initial advertise");
+    let _server = Adapter::new(counting as Arc<dyn Driver>)
+        .await
+        .peripheral()
+        .serve(service())
+        .await
+        .unwrap();
+    assert_eq!(
+        advertise_calls.load(Ordering::SeqCst),
+        1,
+        "serve's own initial advertise"
+    );
 
     peripheral_driver.simulate_radio(RadioStatus::Off);
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -301,11 +396,18 @@ where
     });
     let mut spec = service();
     spec.manufacturer_data.insert(0xABCD, vec![0x01]);
-    let _server = start(Adapter::new(counting.clone() as Arc<dyn Driver>).await, spec.clone()).await;
+    let _server = start(
+        Adapter::new(counting.clone() as Arc<dyn Driver>).await,
+        spec.clone(),
+    )
+    .await;
     // `datagram::serve` builds its own characteristic from its config.
     spec = counting.served_service().expect("served");
     spec.manufacturer_data.insert(0xABCD, vec![0x02]);
-    counting.update_advertisement(spec).await.expect("the advertisement should update");
+    counting
+        .update_advertisement(spec)
+        .await
+        .expect("the advertisement should update");
 
     peripheral.simulate_radio(RadioStatus::Off);
     peripheral.simulate_radio(RadioStatus::On);
@@ -335,9 +437,11 @@ async fn a_radio_recovery_keeps_an_advertisement_update() {
 #[tokio::test]
 async fn a_radio_recovery_keeps_a_datagram_advertisement_update() {
     let advertised = re_advertised_after_an_update(|adapter, spec| async move {
-        let mut config = ble_gatt::datagram::DatagramConfig::new(spec.uuid, spec.characteristics[0].uuid);
+        let mut config =
+            ble_gatt::datagram::DatagramConfig::new(spec.uuid, spec.characteristics[0].uuid);
         config.advertised_manufacturer_data = spec.manufacturer_data.clone();
-        Box::new(ble_gatt::datagram::serve(&adapter, &config).await.unwrap()) as Box<dyn std::any::Any>
+        Box::new(ble_gatt::datagram::serve(&adapter, &config).await.unwrap())
+            as Box<dyn std::any::Any>
     })
     .await;
     assert_eq!(advertised.manufacturer_data.get(&0xABCD), Some(&vec![0x02]));
@@ -364,5 +468,9 @@ async fn a_radio_recovery_does_not_restart_a_stopped_server() {
     peripheral.simulate_radio(RadioStatus::Off);
     peripheral.simulate_radio(RadioStatus::On);
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(advertise_calls.load(Ordering::SeqCst), 1, "only serve's own advertise");
+    assert_eq!(
+        advertise_calls.load(Ordering::SeqCst),
+        1,
+        "only serve's own advertise"
+    );
 }

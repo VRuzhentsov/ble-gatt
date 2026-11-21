@@ -1,0 +1,3 @@
+/target/
+# Keep the standalone binary project's lock file.
+!Cargo.lock

@@ -64,6 +64,20 @@ pub struct DiscoveredPeer {
     pub rssi: Option<i16>,
 }
 
+impl DiscoveredPeer {
+    pub(crate) fn advertised_name(
+        service: ServiceUuid,
+        service_data: &BTreeMap<ServiceUuid, Vec<u8>>,
+        platform_name: Option<String>,
+    ) -> Option<String> {
+        service_data
+            .get(&service)
+            .filter(|bytes| !bytes.is_empty())
+            .and_then(|bytes| String::from_utf8(bytes.clone()).ok())
+            .or(platform_name)
+    }
+}
+
 /// How a characteristic write should be delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "mock-broker", derive(serde::Serialize, serde::Deserialize))]
@@ -138,6 +152,12 @@ pub enum GattEvent {
         peer: PeerAddress,
         characteristic: CharacteristicUuid,
         value: Vec<u8>,
+        /// The connection the write arrived on; see
+        /// [`GattEvent::Connected::session`]. Writes travel on a different
+        /// stream from lifecycle events, so a consumer can process a
+        /// reconnect before an earlier write. Matching on this stops that
+        /// write reaching the replacement connection.
+        session: Option<u64>,
     },
     /// This subscriber fell behind and `dropped` events were discarded
     /// before it could read them.
@@ -243,6 +263,134 @@ pub struct GattServiceSpec {
     /// A spec with a name may not also put `service_data` under its own
     /// `uuid`: that is where the name travels.
     pub local_name: Option<String>,
+    /// A record for drivers that can put manufacturer data in a packet of its
+    /// own (the Android scan response; the mock). Placed where it fits;
+    /// where placed it replaces `manufacturer_data[company_id]`, and a
+    /// scanner restores that entry from it. `None` by default. The managed
+    /// profile fills it (ADR-0012 §2).
+    #[cfg_attr(feature = "mock-broker", serde(default))]
+    pub fast_advertisement: Option<FastAdvertisement>,
+    /// How often the advertisement is sent: the latency/power trade-off of
+    /// discovery by others. `Balanced` by default.
+    #[cfg_attr(feature = "mock-broker", serde(default))]
+    pub advertising_mode: AdvertisingMode,
+}
+
+/// Most bytes of [`FastAdvertisement::data`]: one manufacturer data AD
+/// structure alone in a legacy packet holds 31, less the 2-byte AD header
+/// and the 2-byte company identifier. Google Nearby's fast advertisement
+/// has the same limit (`ble_advertisement.h`, "leaves 27").
+pub const FAST_ADVERTISEMENT_MAX_LEN: usize = 27;
+
+/// Manufacturer data a driver places in a packet of its own when it can
+/// (see [`GattServiceSpec::fast_advertisement`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "mock-broker", derive(serde::Serialize, serde::Deserialize))]
+pub struct FastAdvertisement {
+    /// The company identifier the record travels under.
+    pub company_id: u16,
+    /// At most [`FAST_ADVERTISEMENT_MAX_LEN`] bytes.
+    pub data: Vec<u8>,
+}
+
+/// How often a peripheral advertises. The names mirror Android's
+/// `AdvertiseSettings` modes, as [`ConnectionPriority`] mirrors
+/// `requestConnectionPriority`.
+///
+/// Android sets the mode; BlueZ gets the matching interval (LowLatency
+/// 100 ms, Balanced 250 ms, LowPower 1000 ms); Windows has no API for it
+/// and ignores it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "mock-broker", derive(serde::Serialize, serde::Deserialize))]
+pub enum AdvertisingMode {
+    /// About once a second: least battery, slowest to be found.
+    LowPower,
+    /// About four times a second. The platform default on Android.
+    #[default]
+    Balanced,
+    /// About ten times a second: fastest to be found, most battery. For a
+    /// short time while a user is waiting, for example an open Add Device.
+    LowLatency,
+}
+
+impl AdvertisingMode {
+    /// The advertising interval BlueZ is asked for.
+    pub fn interval(self) -> std::time::Duration {
+        std::time::Duration::from_millis(match self {
+            Self::LowPower => 1000,
+            Self::Balanced => 250,
+            Self::LowLatency => 100,
+        })
+    }
+}
+
+impl FastAdvertisement {
+    /// The first byte of a managed fast advertisement, version 1 (ADR-0012 §5).
+    pub const TAG: u8 = 0xFC;
+    /// The company a scanner admits fast advertisements under until this
+    /// device advertises a spec with a fast advertisement of its own: the one
+    /// Fini uses.
+    pub const DEFAULT_SCAN_COMPANY: u16 = 0xFFFF;
+}
+
+/// Whether `manufacturer_data` holds a managed fast advertisement under
+/// `company`: tag [`FastAdvertisement::TAG`], 21 to 27 bytes (ADR-0012 §5).
+/// Scanners let such a result through even without the service UUID: a
+/// Windows peer publishes it in an advertisement of its own, next to its
+/// GATT provider's. Another company's data of the same shape is not one.
+/// Android's `AdvertisePlacement.isFastAdvertisement` is the same rule.
+pub fn carries_fast_advertisement(
+    company: u16,
+    manufacturer_data: &BTreeMap<u16, Vec<u8>>,
+) -> bool {
+    manufacturer_data.get(&company).is_some_and(|data| {
+        (21..=FAST_ADVERTISEMENT_MAX_LEN).contains(&data.len()) && data[0] == FastAdvertisement::TAG
+    })
+}
+
+/// Bytes of one legacy advertising packet (Core Specification Vol 6 Part B
+/// 2.3.1.1: 31 bytes of advertising data).
+pub const LEGACY_ADVERTISING_DATA_LEN: usize = 31;
+
+/// Where a legacy advertiser with a scan response puts each part of a spec:
+/// the Android placement (ADR-0012 §2). The mock uses it too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyPlacement {
+    /// Manufacturer data in the advertising packet.
+    pub manufacturer_data: BTreeMap<u16, Vec<u8>>,
+    /// Service data in the advertising packet: every entry except the one
+    /// under the spec's own `uuid`.
+    pub service_data: BTreeMap<ServiceUuid, Vec<u8>>,
+    /// What the scan response carries.
+    pub scan_response: ScanResponse,
+}
+
+/// The one thing a legacy scan response carries (31 bytes hold one of them).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanResponse {
+    /// The fast advertisement, as manufacturer data.
+    Fast(FastAdvertisement),
+    /// Service data under the spec's `uuid`: the caller's (the managed
+    /// advertisement header) or the local name.
+    ServiceData(Vec<u8>),
+    None,
+}
+
+impl LegacyPlacement {
+    /// Bytes of the advertising packet: see
+    /// [`GattServiceSpec::legacy_advertising_len`].
+    pub fn advertising_len(&self) -> usize {
+        GattServiceSpec::legacy_len(&self.manufacturer_data, &self.service_data)
+    }
+
+    /// Bytes of the scan response.
+    pub fn scan_response_len(&self) -> usize {
+        match &self.scan_response {
+            ScanResponse::Fast(fast) => 2 + 2 + fast.data.len(),
+            ScanResponse::ServiceData(data) => 2 + 16 + data.len(),
+            ScanResponse::None => 0,
+        }
+    }
 }
 
 impl GattServiceSpec {
@@ -258,11 +406,14 @@ impl GattServiceSpec {
             manufacturer_data: BTreeMap::new(),
             service_data: BTreeMap::new(),
             local_name: None,
+            fast_advertisement: None,
+            advertising_mode: AdvertisingMode::Balanced,
         }
     }
 
     /// Refuses a spec whose name would collide with its own service data:
-    /// both would travel as service data under `uuid`.
+    /// both would travel as service data under `uuid`. Refuses a fast
+    /// advertisement longer than [`FAST_ADVERTISEMENT_MAX_LEN`].
     pub fn validate(&self) -> crate::Result<()> {
         if self.local_name.is_some() && self.service_data.contains_key(&self.uuid) {
             return Err(crate::BleError::Gatt(format!(
@@ -271,22 +422,102 @@ impl GattServiceSpec {
                 self.uuid.0
             )));
         }
+        if let Some(fast) = &self.fast_advertisement {
+            if fast.data.len() > FAST_ADVERTISEMENT_MAX_LEN {
+                return Err(crate::BleError::Gatt(format!(
+                    "fast advertisement of {} bytes exceeds {FAST_ADVERTISEMENT_MAX_LEN}",
+                    fast.data.len()
+                )));
+            }
+        }
         Ok(())
     }
 
-    /// Whether `other` describes the same GATT service: the same UUID and
-    /// characteristics, whatever its advertisement data. What
-    /// `Driver::update_advertisement` requires of its spec.
+    /// Bytes this spec's advertisement data takes in one legacy advertising
+    /// packet: flags (3), the 128-bit service UUID list (18), each
+    /// manufacturer data AD structure (4 + data) and each 128-bit service
+    /// data AD structure (18 + data). The name and the fast advertisement
+    /// are not counted: they travel in the scan response. At most
+    /// [`LEGACY_ADVERTISING_DATA_LEN`] fits.
+    pub fn legacy_advertising_len(&self) -> usize {
+        Self::legacy_len(&self.manufacturer_data, &self.service_data)
+    }
+
+    fn legacy_len(
+        manufacturer_data: &BTreeMap<u16, Vec<u8>>,
+        service_data: &BTreeMap<ServiceUuid, Vec<u8>>,
+    ) -> usize {
+        3 + 18
+            + manufacturer_data
+                .values()
+                .map(|value| 4 + value.len())
+                .sum::<usize>()
+            + service_data
+                .values()
+                .map(|value| 18 + value.len())
+                .sum::<usize>()
+    }
+
+    /// The Android placement of this spec (ADR-0012 §2): the fast
+    /// advertisement, if any, goes in the scan response and replaces
+    /// `manufacturer_data[company_id]`; otherwise the scan response carries
+    /// the service data under `uuid`, otherwise the local name (truncated to
+    /// [`NAME_SERVICE_DATA_MAX_LEN`]). `with_fast: false` is the placement
+    /// without the fast advertisement, for an advertiser that refused it.
+    pub fn legacy_placement(&self, with_fast: bool) -> LegacyPlacement {
+        let mut manufacturer_data = self.manufacturer_data.clone();
+        let mut service_data = self.service_data.clone();
+        let own = service_data.remove(&self.uuid);
+        let fast = self
+            .fast_advertisement
+            .as_ref()
+            .filter(|fast| with_fast && fast.data.len() <= FAST_ADVERTISEMENT_MAX_LEN);
+        let scan_response = if let Some(fast) = fast {
+            manufacturer_data.remove(&fast.company_id);
+            ScanResponse::Fast(fast.clone())
+        } else if let Some(own) = own {
+            ScanResponse::ServiceData(own)
+        } else if let Some(name) = self.local_name.as_deref().filter(|name| !name.is_empty()) {
+            ScanResponse::ServiceData(
+                truncate_name(name, NAME_SERVICE_DATA_MAX_LEN)
+                    .as_bytes()
+                    .to_vec(),
+            )
+        } else {
+            ScanResponse::None
+        };
+        LegacyPlacement {
+            manufacturer_data,
+            service_data,
+            scan_response,
+        }
+    }
+
+    /// Compare service UUIDs and characteristic properties in their listed order, as `Driver::update_advertisement` requires.
+    /// Ignore advertisement data and characteristic values, which can change while serving (`Driver::set_characteristic_value`, ADR-0012).
     pub(crate) fn same_service(&self, other: &GattServiceSpec) -> bool {
         self.uuid == other.uuid
             && self.characteristics.len() == other.characteristics.len()
-            && self.characteristics.iter().zip(&other.characteristics).all(|(a, b)| {
-                a.uuid == b.uuid
-                    && a.readable == b.readable
-                    && a.writable == b.writable
-                    && a.notifiable == b.notifiable
-                    && a.initial_value == b.initial_value
-            })
+            && self
+                .characteristics
+                .iter()
+                .zip(&other.characteristics)
+                .all(|(current, proposed)| {
+                    current.uuid == proposed.uuid
+                        && current.readable == proposed.readable
+                        && current.writable == proposed.writable
+                        && current.notifiable == proposed.notifiable
+                })
+    }
+    pub(crate) fn truncate_name(name: &str, max: usize) -> &str {
+        if name.len() <= max {
+            return name;
+        }
+        let mut end = max;
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        &name[..end]
     }
 }
 
@@ -300,14 +531,7 @@ pub const LOCAL_NAME_MAX_LEN: usize = 29;
 
 /// `name` cut to at most `max` bytes without splitting a UTF-8 character.
 pub fn truncate_name(name: &str, max: usize) -> &str {
-    if name.len() <= max {
-        return name;
-    }
-    let mut end = max;
-    while !name.is_char_boundary(end) {
-        end -= 1;
-    }
-    &name[..end]
+    GattServiceSpec::truncate_name(name, max)
 }
 
 /// The name a scanner reports for a peer advertising `service`: the
@@ -320,13 +544,11 @@ pub fn truncate_name(name: &str, max: usize) -> &str {
 /// device (a phone's system name), and reports that until the scan
 /// response arrives.
 pub fn advertised_name(
-    service: ServiceUuid, service_data: &BTreeMap<ServiceUuid, Vec<u8>>, platform_name: Option<String>,
+    service: ServiceUuid,
+    service_data: &BTreeMap<ServiceUuid, Vec<u8>>,
+    platform_name: Option<String>,
 ) -> Option<String> {
-    service_data
-        .get(&service)
-        .filter(|bytes| !bytes.is_empty())
-        .and_then(|bytes| String::from_utf8(bytes.clone()).ok())
-        .or(platform_name)
+    DiscoveredPeer::advertised_name(service, service_data, platform_name)
 }
 
 #[cfg(test)]
@@ -336,19 +558,129 @@ mod tests {
     #[test]
     fn a_name_is_truncated_on_a_character_boundary() {
         assert_eq!(truncate_name("short", NAME_SERVICE_DATA_MAX_LEN), "short");
-        assert_eq!(truncate_name("Living room desktop", NAME_SERVICE_DATA_MAX_LEN), "Living room d");
+        assert_eq!(
+            truncate_name("Living room desktop", NAME_SERVICE_DATA_MAX_LEN),
+            "Living room d"
+        );
         // "é" is two bytes; cutting at 13 would split the one at 12..14.
-        assert_eq!(truncate_name("aaaaaaaaaaaaé", NAME_SERVICE_DATA_MAX_LEN), "aaaaaaaaaaaa");
+        assert_eq!(
+            truncate_name("aaaaaaaaaaaaé", NAME_SERVICE_DATA_MAX_LEN),
+            "aaaaaaaaaaaa"
+        );
+    }
+
+    fn fini_shaped_spec() -> GattServiceSpec {
+        let mut spec = GattServiceSpec::new(ServiceUuid(uuid::Uuid::from_u128(1)), vec![]);
+        spec.manufacturer_data
+            .insert(0xFFFF, vec![0x01, 0xAA, 0xBB, 0xCC, 0xDD]);
+        spec
+    }
+
+    #[test]
+    fn the_legacy_length_counts_flags_uuid_and_each_structure() {
+        let mut spec = fini_shaped_spec();
+        // flags 3 + UUID list 18 + manufacturer data 2 + 2 + 5.
+        assert_eq!(spec.legacy_advertising_len(), 30);
+        spec.service_data.insert(spec.uuid, vec![0xF8; 9]);
+        // + service data 2 + 16 + 9: the header does not fit next to it.
+        assert_eq!(spec.legacy_advertising_len(), 57);
+        assert!(spec.legacy_advertising_len() > LEGACY_ADVERTISING_DATA_LEN);
+    }
+
+    #[test]
+    fn the_android_placement_moves_the_fast_record_to_the_scan_response() {
+        let mut spec = fini_shaped_spec();
+        spec.service_data.insert(spec.uuid, vec![0xF8; 9]);
+        spec.fast_advertisement = Some(FastAdvertisement {
+            company_id: 0xFFFF,
+            data: vec![0xFC; 26],
+        });
+        let placement = spec.legacy_placement(true);
+        assert!(
+            placement.manufacturer_data.is_empty(),
+            "folded into the record"
+        );
+        assert!(placement.service_data.is_empty(), "superseded header");
+        assert_eq!(placement.advertising_len(), 21);
+        assert_eq!(placement.scan_response_len(), 30);
+        assert!(placement.advertising_len() <= LEGACY_ADVERTISING_DATA_LEN);
+
+        let fallback = spec.legacy_placement(false);
+        assert_eq!(fallback.advertising_len(), 30);
+        assert_eq!(
+            fallback.scan_response,
+            ScanResponse::ServiceData(vec![0xF8; 9])
+        );
+        assert_eq!(fallback.scan_response_len(), 27);
+    }
+
+    #[test]
+    fn an_oversized_fast_advertisement_is_refused() {
+        let mut spec = fini_shaped_spec();
+        spec.fast_advertisement = Some(FastAdvertisement {
+            company_id: 0xFFFF,
+            data: vec![0; FAST_ADVERTISEMENT_MAX_LEN + 1],
+        });
+        assert!(spec.validate().is_err());
+        spec.fast_advertisement.as_mut().unwrap().data.pop();
+        assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn only_a_tagged_record_under_the_fast_company_is_a_fast_advertisement() {
+        let fast = vec![FastAdvertisement::TAG; 26];
+        let company = FastAdvertisement::DEFAULT_SCAN_COMPANY;
+        assert!(carries_fast_advertisement(
+            company,
+            &[(company, fast.clone())].into()
+        ));
+        assert!(carries_fast_advertisement(
+            0x1234,
+            &[(0x1234, fast.clone())].into()
+        ));
+        // Another company's data shaped like a fast record.
+        assert!(!carries_fast_advertisement(
+            company,
+            &[(0x004C, fast.clone())].into()
+        ));
+        // A first byte 0xFD to 0xFF is not the v1 tag.
+        for first in [0xFD, 0xFE, 0xFF] {
+            let mut foreign = fast.clone();
+            foreign[0] = first;
+            assert!(!carries_fast_advertisement(
+                company,
+                &[(company, foreign)].into()
+            ));
+        }
+        assert!(!carries_fast_advertisement(
+            company,
+            &[(company, vec![0xFC; 20])].into()
+        ));
+        assert!(!carries_fast_advertisement(
+            company,
+            &[(company, vec![0xFC; 28])].into()
+        ));
+        assert!(!carries_fast_advertisement(company, &BTreeMap::new()));
     }
 
     #[test]
     fn the_service_data_name_wins_over_the_platform_name() {
         let service = ServiceUuid(uuid::Uuid::from_u128(1));
         let mut data = BTreeMap::new();
-        assert_eq!(advertised_name(service, &data, Some("cached".into())), Some("cached".into()));
+        assert_eq!(
+            advertised_name(service, &data, Some("cached".into())),
+            Some("cached".into())
+        );
         data.insert(service, b"Phone".to_vec());
-        assert_eq!(advertised_name(service, &data, Some("cached".into())), Some("Phone".into()));
+        assert_eq!(
+            advertised_name(service, &data, Some("cached".into())),
+            Some("Phone".into())
+        );
         data.insert(service, vec![0xFF, 0xFE]);
-        assert_eq!(advertised_name(service, &data, None), None, "not UTF-8: not a name");
+        assert_eq!(
+            advertised_name(service, &data, None),
+            None,
+            "not UTF-8: not a name"
+        );
     }
 }

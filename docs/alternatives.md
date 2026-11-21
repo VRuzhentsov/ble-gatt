@@ -130,10 +130,9 @@ reading:
 
 ## What to borrow
 
-- **Windows and Apple drivers (M2, M3):** read btleplug's WinRT and
-  CoreBluetooth code before writing ours. bluest is a second reference even
-  without Android. Both are permissively licensed and mature on the central
-  side.
+- **Windows and Apple drivers (M2, M3):** write them from the platforms' own
+  API documentation (WinRT, CoreBluetooth). bluest is a design reference for
+  the central side even without Android.
 - **Android bridge robustness:** Nordic's Android-BLE-Library and
   RxAndroidBle document many Android GATT quirks: operation queueing, status
   133, bonding, MTU. Check ours against their lists.

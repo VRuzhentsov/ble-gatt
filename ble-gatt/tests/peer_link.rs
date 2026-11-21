@@ -1,293 +1,277 @@
-//! Tier-3 `PeerLink` against the mock driver — CI-safe, no radio.
-//!
-//! Proves the consumer-facing contract in `docs/interface.md`: track a peer
-//! and get a channel + status, one wedged peer does not stall the others,
-//! the radio going off tears links down and coming back re-establishes them,
-//! and `max_links` queues the overflow.
-
-use std::sync::Arc;
-use std::time::Duration;
-
-use ble_gatt::drivers::mock::{MockDriver, MockNetwork};
-use ble_gatt::datagram::DatagramConfig;
+//! Scoped managed channel tests replace the removed tracking/retry-mode contract.
+//! Raw driver and datagram regression tests remain separate.
 use ble_gatt::{
-    Driver, BleError, CapabilityReport, ConnectionPriority, GattCharacteristicSpec, GattServiceSpec,
-    LinkRole, MaxLinks, PeerAddress, PeerLink, PeerLinkConfig, PeerLinkEvent, PeerStatus, RadioStatus,
-    RetryBudget,
+    datagram::DatagramConfig,
+    drivers::mock::{MockDriver, MockNetwork},
+    CapabilityReport, CharacteristicUuid, PeerAddress, PeerChannel, PeerLink, PeerLinkConfig,
+    ServiceUuid,
 };
+use std::{sync::Arc, time::Duration};
 use tokio_stream::StreamExt;
 use uuid::Uuid;
-
-const SERVICE: Uuid = Uuid::from_u128(0xb1e6a000_f101_4000_8000_00805f9b34fb);
-const CHARACTERISTIC: Uuid = Uuid::from_u128(0xb1e6a001_f101_4000_8000_00805f9b34fb);
-
-fn caps() -> CapabilityReport {
-    CapabilityReport { central: true, peripheral: true }
+fn pair() -> (Arc<PeerLink>, Arc<PeerLink>) {
+    let (a, b, _) = pair_network();
+    (a, b)
 }
-
-fn datagram_config() -> DatagramConfig {
-    DatagramConfig::new(
-        ble_gatt::ServiceUuid(SERVICE),
-        ble_gatt::CharacteristicUuid(CHARACTERISTIC),
-    )
-}
-
-fn peer_link_config(retry: RetryBudget, max_links: usize) -> PeerLinkConfig {
-    PeerLinkConfig {
-        datagram: datagram_config(),
-        role: LinkRole::DialOnly,
-        retry_budget: retry,
-        max_links: MaxLinks(max_links),
-    }
-}
-
-fn tight_budget() -> RetryBudget {
-    RetryBudget {
-        backoff: vec![Duration::from_millis(50), Duration::from_millis(100)],
-        give_up_after: Duration::from_millis(400),
-        acceptor_deadline: Duration::from_millis(400),
-    }
-}
-
-async fn advertise_peripheral(network: &Arc<MockNetwork>, address: &str) -> MockDriver {
-    let peripheral = MockDriver::new(PeerAddress(address.to_string()), network.clone(), caps());
-    peripheral
-        .advertise(GattServiceSpec::new(
-            ble_gatt::ServiceUuid(SERVICE),
-            vec![GattCharacteristicSpec {
-                uuid: ble_gatt::CharacteristicUuid(CHARACTERISTIC),
-                readable: true,
-                writable: true,
-                notifiable: true,
-                initial_value: vec![],
-            }],
-        ))
-        .await
-        .expect("advertise");
-    peripheral
-}
-
-/// Poll `f` until it returns `true`, or panic after ~2s. For asserting a
-/// value the worker thread updates asynchronously just after an event.
-async fn assert_eventually<F: FnMut() -> bool>(mut f: F) {
-    for _ in 0..200 {
-        if f() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("condition never became true");
-}
-
-/// Wait for the first `PeerLinkEvent` matching `pred`, or panic after 5s.
-async fn wait_for<F>(
-    events: &mut ble_gatt::BoxStream<PeerLinkEvent>, mut pred: F,
-) -> PeerLinkEvent
-where
-    F: FnMut(&PeerLinkEvent) -> bool,
-{
-    let fut = async {
-        loop {
-            let ev = events.next().await.expect("event stream ended");
-            if pred(&ev) {
-                return ev;
-            }
-        }
+fn pair_network() -> (Arc<PeerLink>, Arc<PeerLink>, Arc<MockNetwork>) {
+    let network = MockNetwork::new();
+    let make = |address: &str| {
+        PeerLink::with_driver(
+            Arc::new(MockDriver::new(
+                PeerAddress(address.into()),
+                network.clone(),
+                CapabilityReport {
+                    central: true,
+                    peripheral: true,
+                },
+            )),
+            PeerLinkConfig::new(DatagramConfig::new(
+                ServiceUuid(Uuid::from_u128(11)),
+                CharacteristicUuid(Uuid::from_u128(12)),
+            )),
+        )
     };
-    tokio::time::timeout(Duration::from_secs(5), fut)
-        .await
-        .expect("timed out waiting for a PeerLinkEvent")
+    (make("a"), make("b"), network)
+}
+async fn establish(a: &PeerLink, b: &PeerLink) -> (PeerChannel, PeerChannel) {
+    let mut incoming = b.incoming().unwrap();
+    b.set_advertising(true).await.unwrap();
+    let outgoing = a.request(&PeerAddress("b".into())).await.unwrap();
+    let request = incoming.next().await.unwrap();
+    let (left, right) = tokio::join!(outgoing.accept(), request.accept());
+    (left.unwrap(), right.unwrap())
+}
+#[tokio::test]
+async fn visibility_toggle_preserves_established_messages() {
+    let (a, b) = pair();
+    let (left, right) = establish(&a, &b).await;
+    b.set_advertising(false).await.unwrap();
+    left.send(b"hidden".to_vec()).await.unwrap();
+    assert_eq!(right.recv().await.unwrap().unwrap(), b"hidden");
+    b.set_advertising(true).await.unwrap();
+    right.send(b"visible".to_vec()).await.unwrap();
+    assert_eq!(left.recv().await.unwrap().unwrap(), b"visible");
+    a.close().await.unwrap();
+    b.close().await.unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn tracking_a_peer_yields_a_working_channel() {
-    let network = MockNetwork::new();
-    let _peripheral = advertise_peripheral(&network, "peer-a").await;
-    let central = Arc::new(MockDriver::new(PeerAddress("me".into()), network.clone(), caps()));
-
-    let link = PeerLink::with_driver(central, peer_link_config(tight_budget(), 4));
-    let mut events = link.events();
-
-    link.track(PeerAddress("peer-a".into()), "peer-a".into());
-
-    let up = wait_for(&mut events, |ev| matches!(ev, PeerLinkEvent::Up { peer, .. } if peer.0 == "peer-a")).await;
-    let PeerLinkEvent::Up { channel, .. } = up else { unreachable!() };
-    assert_eventually(|| link.status(&PeerAddress("peer-a".into())) == PeerStatus::Connected).await;
-
-    channel.send(b"hello".to_vec()).await.expect("send");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn one_wedged_peer_does_not_stall_the_others() {
-    let network = MockNetwork::new();
-    let _a = advertise_peripheral(&network, "stuck").await;
-    let _b = advertise_peripheral(&network, "fine").await;
-    let central = Arc::new(MockDriver::new(PeerAddress("me".into()), network.clone(), caps()));
-    // "stuck" hangs its dial for far longer than the test.
-    central.stall_connect(&PeerAddress("stuck".into()), Duration::from_secs(30));
-
-    let link = PeerLink::with_driver(central, peer_link_config(tight_budget(), 4));
-    let mut events = link.events();
-
-    link.track(PeerAddress("stuck".into()), "stuck".into());
-    link.track(PeerAddress("fine".into()), "fine".into());
-
-    // "fine" connects while "stuck" is still hanging.
-    wait_for(&mut events, |ev| matches!(ev, PeerLinkEvent::Up { peer, .. } if peer.0 == "fine")).await;
-    assert_eventually(|| link.status(&PeerAddress("fine".into())) == PeerStatus::Connected).await;
-    assert_ne!(link.status(&PeerAddress("stuck".into())), PeerStatus::Connected);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn untracking_drops_the_link() {
-    let network = MockNetwork::new();
-    let _peripheral = advertise_peripheral(&network, "peer-u").await;
-    let central = Arc::new(MockDriver::new(PeerAddress("me".into()), network.clone(), caps()));
-
-    let link = PeerLink::with_driver(central, peer_link_config(tight_budget(), 4));
-    let mut events = link.events();
-
-    link.track(PeerAddress("peer-u".into()), "peer-u".into());
-    wait_for(&mut events, |ev| matches!(ev, PeerLinkEvent::Up { peer, .. } if peer.0 == "peer-u")).await;
-
-    link.untrack(PeerAddress("peer-u".into()));
-    wait_for(&mut events, |ev| matches!(ev, PeerLinkEvent::Down { peer } if peer.0 == "peer-u")).await;
-    assert_eventually(|| {
-        link.status(&PeerAddress("peer-u".into())) == PeerStatus::Untracked
-    })
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_radio_toggle_drops_links_and_re_establishes_them() {
-    let network = MockNetwork::new();
-    let _peripheral = advertise_peripheral(&network, "peer-r").await;
-    let central = Arc::new(MockDriver::new(PeerAddress("me".into()), network.clone(), caps()));
-
-    let link = PeerLink::with_driver(central.clone(), peer_link_config(tight_budget(), 4));
-    let mut events = link.events();
-
-    link.track(PeerAddress("peer-r".into()), "peer-r".into());
-    wait_for(&mut events, |ev| matches!(ev, PeerLinkEvent::Up { peer, .. } if peer.0 == "peer-r")).await;
-
-    central.simulate_radio(RadioStatus::Off);
-    wait_for(&mut events, |ev| matches!(ev, PeerLinkEvent::Down { peer } if peer.0 == "peer-r")).await;
-    assert_eventually(|| link.radio() == RadioStatus::Off).await;
-    assert_eventually(|| {
-        link.status(&PeerAddress("peer-r".into())) == PeerStatus::Unavailable
-    })
-    .await;
-
-    central.simulate_radio(RadioStatus::On);
-    wait_for(&mut events, |ev| matches!(ev, PeerLinkEvent::Up { peer, .. } if peer.0 == "peer-r")).await;
-    assert_eventually(|| link.radio() == RadioStatus::On).await;
-    assert_eventually(|| {
-        link.status(&PeerAddress("peer-r".into())) == PeerStatus::Connected
-    })
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn max_links_queues_the_overflow_and_promotes_on_a_free_slot() {
-    let network = MockNetwork::new();
-    let _a = advertise_peripheral(&network, "aaa").await;
-    let _b = advertise_peripheral(&network, "bbb").await;
-    let central = Arc::new(MockDriver::new(PeerAddress("me".into()), network.clone(), caps()));
-
-    let link = PeerLink::with_driver(central, peer_link_config(tight_budget(), 1));
-    let mut events = link.events();
-
-    link.track(PeerAddress("aaa".into()), "aaa".into());
-    link.track(PeerAddress("bbb".into()), "bbb".into());
-
-    // Deterministic slot order: "aaa" sorts first, so it gets the one slot.
-    wait_for(&mut events, |ev| matches!(ev, PeerLinkEvent::Up { peer, .. } if peer.0 == "aaa")).await;
-    assert_eventually(|| {
-        link.status(&PeerAddress("bbb".into())) == PeerStatus::Queued
-    })
-    .await;
-
-    link.untrack(PeerAddress("aaa".into()));
-    wait_for(&mut events, |ev| matches!(ev, PeerLinkEvent::Up { peer, .. } if peer.0 == "bbb")).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_role_the_driver_cannot_do_reports_unsupported() {
-    let network = MockNetwork::new();
-    // Central-only driver (like most Android devices).
-    let central_only = CapabilityReport { central: true, peripheral: false };
-    let driver = Arc::new(MockDriver::new(PeerAddress("me".into()), network, central_only));
-
-    let link = PeerLink::with_driver(
-        driver,
-        PeerLinkConfig {
-            datagram: datagram_config(),
-            role: LinkRole::AcceptOnly, // needs peripheral, which the driver lacks
-            retry_budget: tight_budget(),
-            max_links: MaxLinks(4),
-        },
+#[tokio::test]
+async fn explicit_disconnect_records_terminal_reasons_before_receive_closes() {
+    let (a, b) = pair();
+    let (left, right) = establish(&a, &b).await;
+    assert_eq!(left.close_reason(), None);
+    left.disconnect().await.unwrap();
+    assert!(right.recv().await.is_none());
+    assert_eq!(
+        left.close_reason(),
+        Some(ble_gatt::PeerChannelCloseReason::LocalDisconnect)
     );
+    assert_eq!(
+        right.close_reason(),
+        Some(ble_gatt::PeerChannelCloseReason::PeerDisconnect)
+    );
+    a.close().await.unwrap();
+    b.close().await.unwrap();
+}
 
-    assert_eventually(|| link.radio() == RadioStatus::Unsupported).await;
-    link.track(PeerAddress("someone".into()), "someone".into());
-    // The peer is unreachable, not "gave up" — the radio can't do this role.
-    assert_eventually(|| {
-        link.status(&PeerAddress("someone".into())) == PeerStatus::Unavailable
+#[tokio::test]
+async fn stale_channel_disconnect_cannot_disconnect_replacement() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (a, b) = pair();
+        let mut incoming = b.incoming().unwrap();
+        b.set_advertising(true).await.unwrap();
+        let outgoing = a.request(&PeerAddress("b".into())).await.unwrap();
+        let (left, right) =
+            tokio::join!(outgoing.accept(), incoming.next().await.unwrap().accept());
+        let stale = left.unwrap();
+        let right = right.unwrap();
+        a.disconnect(b.endpoint_id()).await.unwrap();
+        assert!(right.recv().await.is_none());
+        let outgoing = a.request(&PeerAddress("b".into())).await.unwrap();
+        let (left, right) =
+            tokio::join!(outgoing.accept(), incoming.next().await.unwrap().accept());
+        let left = left.unwrap();
+        let right = right.unwrap();
+        stale.disconnect().await.unwrap();
+        left.send(b"replacement".to_vec()).await.unwrap();
+        assert_eq!(right.recv().await.unwrap().unwrap(), b"replacement");
+        a.disconnect(b.endpoint_id()).await.unwrap();
+        assert!(left.send(vec![1]).await.is_err());
+        assert!(a.channel(&PeerAddress("b".into())).is_none());
+        a.close().await.unwrap();
+        b.close().await.unwrap();
     })
-    .await;
+    .await
+    .unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn two_symmetric_peers_connect_one_dialing_one_accepting() {
-    let network = MockNetwork::new();
-    let low = Arc::new(MockDriver::new(PeerAddress("aaa".into()), network.clone(), caps()));
-    let high = Arc::new(MockDriver::new(PeerAddress("zzz".into()), network.clone(), caps()));
+#[tokio::test]
+async fn dropping_last_use_closes_remote_receive() {
+    let (a, b) = pair();
+    let (left, right) = establish(&a, &b).await;
+    drop(left);
+    assert!(tokio::time::timeout(Duration::from_secs(1), right.recv())
+        .await
+        .unwrap()
+        .is_none());
+    a.close().await.unwrap();
+    b.close().await.unwrap();
+}
 
-    let cfg = |id: &str| PeerLinkConfig {
-        datagram: datagram_config(),
-        role: LinkRole::Symmetric { local_id: id.into() },
-        retry_budget: tight_budget(),
-        max_links: MaxLinks(4),
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_acquisition_and_releases_linearize_last_use() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for _ in 0..32 {
+            let (a, b) = pair();
+            let (left, right) = establish(&a, &b).await;
+            let clone = left.clone();
+            let acquire = {
+                let a = a.clone();
+                tokio::spawn(async move { a.channel(&PeerAddress("b".into())) })
+            };
+            let release = tokio::spawn(async move { left.release().await });
+            clone.release().await.unwrap();
+            release.await.unwrap().unwrap();
+            if let Some(acquired) = acquire.await.unwrap() {
+                acquired.send(b"concurrent use".to_vec()).await.unwrap();
+                assert_eq!(right.recv().await.unwrap().unwrap(), b"concurrent use");
+                acquired.release().await.unwrap();
+            }
+            assert!(a.channel(&PeerAddress("b".into())).is_none());
+            assert!(right.recv().await.is_none());
+            a.close().await.unwrap();
+            b.close().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn healthy_idle_channel_survives_the_whole_loss_interval() {
+    let (a, b) = pair();
+    let (left, right) = establish(&a, &b).await;
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    left.send(b"still idle healthy".to_vec()).await.unwrap();
+    assert_eq!(right.recv().await.unwrap().unwrap(), b"still idle healthy");
+    a.close().await.unwrap();
+    b.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn stale_request_cancellation_cannot_close_the_next_generation() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (a, b) = pair();
+        let mut incoming = b.incoming().unwrap();
+        b.set_advertising(true).await.unwrap();
+        let stale = a.request(&PeerAddress("b".into())).await.unwrap();
+        let stale_remote = incoming.next().await.unwrap();
+        a.disconnect(b.endpoint_id()).await.unwrap();
+        let outgoing = a.request(&PeerAddress("b".into())).await.unwrap();
+        let remote = incoming.next().await.unwrap();
+        let (left, right) = tokio::join!(outgoing.accept(), remote.accept());
+        let left = left.unwrap();
+        let right = right.unwrap();
+        drop(stale);
+        drop(stale_remote);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        left.send(b"new generation".to_vec()).await.unwrap();
+        assert_eq!(right.recv().await.unwrap().unwrap(), b"new generation");
+        a.close().await.unwrap();
+        b.close().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn last_release_awaits_observed_native_disconnect() {
+    use ble_gatt::Driver;
+    use futures::FutureExt;
+    let network = MockNetwork::new();
+    let caps = CapabilityReport {
+        central: true,
+        peripheral: true,
     };
-
-    // "aaa" < "zzz", so the "aaa" side dials and the "zzz" side accepts.
-    let link_low = PeerLink::with_driver(low, cfg("aaa"));
-    let link_high = PeerLink::with_driver(high, cfg("zzz"));
-    let mut ev_low = link_low.events();
-    let mut ev_high = link_high.events();
-
-    link_low.track(PeerAddress("zzz".into()), "zzz".into());
-    link_high.track(PeerAddress("aaa".into()), "aaa".into());
-
-    wait_for(&mut ev_low, |ev| matches!(ev, PeerLinkEvent::Up { peer, .. } if peer.0 == "zzz")).await;
-    wait_for(&mut ev_high, |ev| matches!(ev, PeerLinkEvent::Up { peer, .. } if peer.0 == "aaa")).await;
-    assert_eventually(|| link_low.status(&PeerAddress("zzz".into())) == PeerStatus::Connected).await;
-    assert_eventually(|| link_high.status(&PeerAddress("aaa".into())) == PeerStatus::Connected).await;
+    let central = Arc::new(MockDriver::new(
+        PeerAddress("a".into()),
+        network.clone(),
+        caps,
+    ));
+    let make_config = || {
+        PeerLinkConfig::new(DatagramConfig::new(
+            ServiceUuid(Uuid::from_u128(11)),
+            CharacteristicUuid(Uuid::from_u128(12)),
+        ))
+    };
+    let a = PeerLink::with_driver(central.clone(), make_config());
+    let b = PeerLink::with_driver(
+        Arc::new(MockDriver::new(PeerAddress("b".into()), network, caps)),
+        make_config(),
+    );
+    let mut events = central.events();
+    let (left, right) = establish(&a, &b).await;
+    left.release().await.unwrap();
+    let mut disconnected = false;
+    while let Some(Some(event)) = events.next().now_or_never() {
+        if matches!(event, ble_gatt::GattEvent::Disconnected { .. }) {
+            disconnected = true;
+        }
+    }
+    assert!(
+        disconnected,
+        "release returned before any native disconnect effect"
+    );
+    assert!(right.recv().await.is_none());
+    a.close().await.unwrap();
+    b.close().await.unwrap();
 }
 
-/// A priority request crosses to the worker's pump and returns the link's
-/// real error — here the mock's `Unsupported`, as on Linux — not a
-/// flattened one; once the link is gone it is `NotConnected`.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_priority_request_returns_the_links_real_error() {
-    let network = MockNetwork::new();
-    let _peripheral = advertise_peripheral(&network, "peer-p").await;
-    let central = Arc::new(MockDriver::new(PeerAddress("me".into()), network.clone(), caps()));
+#[tokio::test]
+async fn cancelled_accept_cancels_only_that_attempt() {
+    let (a, b) = pair();
+    let mut incoming = b.incoming().unwrap();
+    b.set_advertising(true).await.unwrap();
+    let request = a.request(&PeerAddress("b".into())).await.unwrap();
+    let remote = incoming.next().await.unwrap();
+    let accept = tokio::spawn(request.accept());
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    accept.abort();
+    let _ = accept.await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(remote.accept().await.is_err());
+    let request = a.request(&PeerAddress("b".into())).await.unwrap();
+    let (left, right) = tokio::join!(request.accept(), incoming.next().await.unwrap().accept());
+    let left = left.unwrap();
+    let right = right.unwrap();
+    left.send(b"fresh attempt".to_vec()).await.unwrap();
+    assert_eq!(right.recv().await.unwrap().unwrap(), b"fresh attempt");
+    a.close().await.unwrap();
+    b.close().await.unwrap();
+}
 
-    let link = PeerLink::with_driver(central, peer_link_config(tight_budget(), 4));
-    let mut events = link.events();
-
-    link.track(PeerAddress("peer-p".into()), "peer-p".into());
-    let up = wait_for(&mut events, |ev| matches!(ev, PeerLinkEvent::Up { peer, .. } if peer.0 == "peer-p")).await;
-    let PeerLinkEvent::Up { channel, .. } = up else { unreachable!() };
-
-    let result = channel.request_connection_priority(ConnectionPriority::LowPower).await;
-    assert!(matches!(result, Err(BleError::Unsupported(_))), "got {result:?}");
-    // The link is still usable afterwards.
-    channel.send(b"still here".to_vec()).await.expect("send");
-
-    link.untrack(PeerAddress("peer-p".into()));
-    wait_for(&mut events, |ev| matches!(ev, PeerLinkEvent::Down { peer } if peer.0 == "peer-p")).await;
-    let result = channel.request_connection_priority(ConnectionPriority::High).await;
-    assert!(matches!(result, Err(BleError::NotConnected(_))), "got {result:?}");
+#[tokio::test]
+async fn last_scoped_release_retires_generation_but_one_release_preserves_other_uses() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (a, b) = pair();
+        let (left, right) = establish(&a, &b).await;
+        let clone = left.clone();
+        let acquired = a.channel(&PeerAddress("b".into())).unwrap();
+        left.release().await.unwrap();
+        clone.send(b"shared".to_vec()).await.unwrap();
+        assert_eq!(right.recv().await.unwrap().unwrap(), b"shared");
+        clone.release().await.unwrap();
+        assert!(a.channel(&PeerAddress("b".into())).is_some());
+        acquired.release().await.unwrap();
+        assert!(a.channel(&PeerAddress("b".into())).is_none());
+        assert!(tokio::time::timeout(Duration::from_secs(1), right.recv())
+            .await
+            .unwrap()
+            .is_none());
+        a.close().await.unwrap();
+        b.close().await.unwrap();
+    })
+    .await
+    .unwrap();
 }

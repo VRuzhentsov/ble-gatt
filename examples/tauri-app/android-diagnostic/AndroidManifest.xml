@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <!-- This isolated byte-transport diagnostic never derives physical
+         location. Without this assertion, API 31+ can silently filter every
+         scan result while the inherited fine-location permission ends at 30.
+         Keep the assertion app-owned: arbitrary library consumers may use BLE
+         for location and must choose their own permission policy. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+    <application>
+        <service android:name="dev.blegatt.example.DiagnosticService"
+            android:exported="false" android:foregroundServiceType="connectedDevice" />
+    </application>
+</manifest>

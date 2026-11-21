@@ -1,13 +1,44 @@
 # Glossary
 
-What the words in `ble-gatt` mean. This library is meant for many projects and
-developers, and Bluetooth words are used loosely across the industry, so this
-file fixes one meaning for each. When the code or a document disagrees with
-this file, this file wins.
+This file separates writing rules from the project's technical vocabulary.
+Use one term for each concept. Report conflicts between definitions and code;
+a definition does not change implemented behavior.
 
 **Synonyms.** Where another library or platform uses a different word for the
 same thing, it is listed as *Also called*. Use the first word in code and
 documents.
+
+The working-tree API follows [ADR-0012](adr/0012-discovery-like-nearby.md).
+Implementation, integrated verification and hardware acceptance are separate claims.
+
+## Writing and naming rules
+
+Apply these STE-based rules to new or touched names, comments, logs, documents
+and pull request text. The technical terms below define meaning, not sentence structure.
+
+- Use active voice, American English and complete words. Do not use contractions.
+- Give one instruction per sentence. Aim for at most 20 words in procedures
+  and 25 words in descriptions. Use lists for complex conditions.
+- Remove repetition. State the decision, owner, contract and evidence limit.
+- Split a proposed name into words. Use established English and glossary terms
+  with one meaning. Explain new technical terms before adding them below.
+- Keep existing Rust/module naming conventions. Do not import another application's
+  role suffixes or directory layout.
+- Preserve public APIs, protocol fields, foreign names, quoted errors and source
+  identifiers. A writing pass does not authorize compatibility changes.
+- Separate current behavior, target requirements and verification. Preserve
+  accepted historical ADRs and third-party attribution.
+
+These are local writing rules, not verified ASD-STE100 dictionary compliance or
+certification. Do not copy the copyrighted ASD dictionary into this repository.
+
+## Code design terms
+
+### Object-oriented programming (OOP)
+
+Code organized around objects that own state and behavior. A class defines
+such objects. Rust uses structs or enums with `impl` blocks for this purpose.
+See [the code rule](code-style.md#object-oriented-code).
 
 ## Bluetooth basics
 
@@ -75,8 +106,9 @@ served (`Driver::served_service`), and nothing if serving was stopped
 ### Scan response
 A second packet of up to 31 bytes that an advertiser sends only when a
 scanner asks for it. Scanners ask during an *active* scan, which is how both
-Android and BlueZ scan. This library puts a peer's local name there, because
-the advertisement itself is full. *Also called:* SCAN_RSP.
+Android and BlueZ scan. This library puts there what does not fit the
+advertisement: on Android the fast advertisement, otherwise the advertisement
+header or the local name. *Also called:* SCAN_RSP.
 
 ### Local name
 A short, human-readable name a peripheral advertises so a scanner can show
@@ -139,7 +171,87 @@ A Bluetooth address a phone makes up and changes from time to time so it
 cannot be tracked. Android does this, which is why a peer cannot be
 recognised by its address alone.
 
+### Connectable advertisement
+An advertisement a central can answer by connecting. A non-connectable
+advertisement only carries data. The current Windows driver uses its GATT
+provider advertisement and a readable GATT advertisement characteristic; it
+does not publish a second manufacturer-data radio advertisement. ADR-0012
+defines shared discovery; ADR-0011 defines Windows-native behavior.
+
+### Peripheral role support
+Whether a Bluetooth adapter and its driver can run a GATT server and
+advertise it. Not every adapter can. Windows reports it as
+`BluetoothAdapter.IsPeripheralRoleSupported`, Android as
+`isMultipleAdvertisementSupported`; the driver reports it as
+`CapabilityReport::peripheral`.
+
+### Excluded central
+A central that `disconnect_peer` refused but the platform cannot drop.
+Windows has no call that disconnects a central from a GATT server, so the
+Windows driver stops notifying it and refuses its writes until it leaves by
+itself (ADR-0011, native events and cleanup limits).
+
+### Request deferral
+A Windows promise to answer an inbound GATT read or write later, after the
+event handler has returned. The handler must take it (`GetDeferral`) before
+it returns; the answer is final only once the deferral is completed. The
+Windows driver takes it in the handler and completes it after its request
+task has answered.
+
 ## This library's concepts
+
+### Fast advertisement
+A radio record of at most 27 bytes that carries a managed peer's endpoint,
+its metadata hash and up to 6 bytes of the caller's manufacturer data, so a
+scanner lists the peer without connecting (`GattServiceSpec::fast_advertisement`,
+`DatagramConfig::fast_advertisement_company`). It travels as manufacturer data
+under a company the application chooses (Fini: `0xFFFF`) and replaces the
+caller's entry there; the scanner restores it. Android sends it in the scan
+response, Windows in a publisher advertisement of its own next to the GATT
+provider (from another address; scanners join the two by endpoint), and Linux
+cannot. The term comes from Google Nearby, whose
+fast advertisement is the same idea in its own format (ADR-0012 §2, §5).
+
+### Advertisement header
+A 9-byte radio record, service data under the managed service: the metadata
+hash and the endpoint tag. A scanner that has read the value it names reports
+the peer from its cache; otherwise it reads once. Nearby's BLE medium
+advertises a header with a hash for the same purpose (ADR-0012 §2, §5).
+
+### Metadata hash
+FNV-1a-32 of the complete readable advertisement value (the GATT
+advertisement). It changes when the name or any advertised field changes, so
+a scanner knows when to read again. A cache key, not a security check.
+
+### Endpoint tag
+The first four bytes of an endpoint identifier, as the advertisement header
+carries them. It narrows which endpoint a header belongs to; the read checks it.
+
+### Completion read
+The one read a scanner makes after a fast advertisement whose radio fields do
+not have the advertised hash (on Android the name does not fit). It runs at
+most once per endpoint and hash, waits while a dial or another read holds the
+address, and gives way to a dial (ADR-0012 §2).
+
+### Advertising mode
+How often a peripheral advertises (`AdvertisingMode`: `LowPower`, `Balanced`,
+`LowLatency`, named after Android's `AdvertiseSettings`). More often is found
+sooner and costs more battery. BlueZ gets 1000, 250 or 100 ms; Windows has no
+setting.
+
+### Scan parameters
+How long and how often a scanner listens (scan window, scan interval). Windows
+11 24H2 lets a watcher ask for presets (`BluetoothLEAdvertisementScanParameters`
+`LowLatency`, `CoexistenceOptimized`); the Windows driver asks for `LowLatency`
+where the API exists (ADR-0011).
+
+### GATT advertisement
+The same advertisement data, served in a readable characteristic
+(`advertisement::GATT_ADVERTISEMENT_CHARACTERISTIC`) of every datagram
+service. A scanner reads it when a peer's radio advertisement carries no
+profile data (`advertisement::complete`, ADR-0012), and a managed scanner when
+the radio records do not name a value it has read already. Select completion
+from received information, not the OS name.
 
 ### Peer
 Another device this library talks to.
@@ -154,10 +266,16 @@ What recognises a peer across address changes: a fingerprint the peer puts in
 its advertisement.
 
 ### Link
-This library's handle on one connection, which tracks whether it is
-connecting, connected or gone (`PeerLink`, ADR-0005). The code still uses
-the word; the module it moves into is `connection/` (ADR-0007 D13). *Not the
-same as* OSI L2 (data link) or the BLE link layer.
+A managed communication relationship coordinated by `PeerLink`.
+`PeerChannel` is a scoped use of one established generation, not the coordinator.
+The unused crate-private `link_state` implementation is retired; ADR-0005 records
+its historical design. *Not the same as* OSI L2 or the BLE link layer.
+
+### Driver session
+The optional connection-generation identifier in `GattEvent` and
+`GattConnection::session()`. It distinguishes successive GATT connections to
+the same address and protects a replacement from stale events. It does not
+mean an authenticated QUIC connection or an application conversation.
 
 ### GAP (Generic Access Profile)
 The part of the Bluetooth Core Specification that defines the roles
@@ -205,7 +323,7 @@ In this library: the `hal/` module.
 ### Driver
 The code that implements the `hal/` traits for one platform, or the mock
 (`drivers/`): the `hal::Driver` trait, implemented by `LinuxDriver`,
-`AndroidDriver` and `MockDriver`. Layer: Frameworks & Drivers. *Also
+`AndroidDriver`, `WindowsDriver` and `MockDriver`. Layer: Frameworks & Drivers. *Also
 called:* backend (the code's old word, and SimpleBLE's and Qt's), platform
 implementation, executor (Nordic). Not the operating system's kernel driver
 for the Bluetooth chip, which sits several levels lower.
@@ -271,7 +389,19 @@ idea.
 ### Broadcast stream
 Pub/sub for a *sequence of events* (`tokio::sync::broadcast` behind a
 stream), where every subscriber receives every event published after it
-subscribed.
+subscribed, unless its bounded buffer overflows. `GattEvent::Lagged` reports
+discarded events; it does not identify which transitions were lost.
+
+### Lifecycle event stream
+`Driver::lifecycle_events()`: connection/radio events without characteristic writes.
+Native/mock drivers isolate its bounded storage from payload traffic. The default
+third-party implementation only filters the legacy stream and retains unknown lag.
+Critical loss must not be treated as recoverable payload loss.
+
+### Receive gap
+`BleError::ReceiveGap`: known loss on a payload receive path. A channel can
+report a gap and then deliver later complete messages. Managed application queue
+pressure alone pauses that generation; it does not create a gap.
 
 ### Cancellation token
 `tokio_util::sync::CancellationToken`: a one-shot signal that tasks can wait
@@ -301,15 +431,59 @@ One transport address an iroh connection can use to reach the peer
 Both devices dialling each other at the same moment, so two links or two
 connections come up where one was wanted.
 
+### Symmetric initiation
+Either peer can request communication without permanent identity ordering.
+Core `PeerLink` implements one behavior, independent of iroh. Both sides must
+accept. Role capabilities do not prove simultaneous-role hardware support.
+
+### Initiation policy
+A retired caller-selected initiator mode. The managed API has no
+`InitiationPolicy`, `LinkRole` or identity-ranking switch. Application acceptance
+and authenticated identity remain separate concerns.
+
+### Candidate link
+One possible BLE attempt before core arbitration selects the survivor.
+The iroh adapter no longer retains competing native candidates. Multiple QUIC
+users can share the established core carrier; ending one user preserves others.
+
 ### Redial yield
-After a link the peer dialled drops, the time (`REDIAL_YIELD`, 30 s) for
-which `ble-gatt-iroh` does not dial that peer, so that the peer, which re-dials
-for its still-open iroh connection, does not cross with it. It starts only
-when such a connection may still be open: not after this side closed the
-link, nor after every connection on it had started to close.
+The retired adapter delay that gave the previous initiator time to redial.
+Managed communication uses core attempt arbitration, not a public yield mode.
 
 ### Adapter crate
 A crate that connects `ble-gatt` to something outside it, such as iroh
 (`ble-gatt-iroh`) or Tauri (`tauri-plugin-ble-gatt`). Layer: Interface
 Adapters. Not to be
 confused with a [Bluetooth adapter](#bluetooth-adapter).
+
+### Core endpoint identifier
+`ble_gatt::EndpointId`: a fresh 128-bit identifier for one worker lifetime.
+It correlates discovery and incoming/outgoing attempts. It is not an iroh
+`EndpointId`, native address or authenticated identity.
+
+### Attempt nonce
+A fresh signed 32-bit value for one outgoing request. Core arbitration compares
+it numerically: larger wins; equal values fail both. It is not an encryption
+key, endpoint identifier or native session generation.
+
+### Attempt outcome
+The result of one establishment attempt, distinct from an established peer's
+connection state. `BleError::Attempt(AttemptError)` reports typed failures.
+An outgoing loser fails while the incoming winner proceeds separately.
+An attempt failure is not global disconnection of a healthy channel.
+
+### Control record
+A tagged managed record for establishment, acceptance, disconnect or liveness.
+Application data has a separate tag. The bounded encoding is defined in
+`connection/managed_codec.rs` and ADR-0012, without QUIC or payload-prefix guessing.
+
+### Scoped channel use
+One `PeerChannel` handle. Clones share a receive queue. `release` releases one
+use; the last use retires the generation. Explicit disconnect invalidates all
+uses of that generation, not a later replacement.
+
+### Channel close reason
+`PeerChannelCloseReason`, set before receive ends. It distinguishes explicit
+local/peer disconnect, unexpected loss, protocol failure, release and shutdown.
+The iroh adapter blocks automatic acquisition after terminal closure until a
+fresh application action authorizes replacement. Old packets do not authorize it.

@@ -67,11 +67,9 @@ async fn main() -> ExitCode {
     // unless a logger is installed. Defaulting to `debug` for `ble_gatt`
     // means a plain run shows the whole pipeline without the caller having
     // to know the target name; `RUST_LOG` still overrides it.
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("ble_gatt=debug"),
-    )
-    .format_timestamp_millis()
-    .init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("ble_gatt=debug"))
+        .format_timestamp_millis()
+        .init();
 
     let mut role = None;
     let mut target: Option<String> = None;
@@ -129,7 +127,10 @@ async fn adapter() -> Result<Adapter, String> {
 async fn run_peripheral() -> Result<(), String> {
     let adapter = adapter().await?;
     let caps = adapter.capabilities().await;
-    println!("HWVERIFY: INFO capabilities central={} peripheral={}", caps.central, caps.peripheral);
+    println!(
+        "HWVERIFY: INFO capabilities central={} peripheral={}",
+        caps.central, caps.peripheral
+    );
     if !caps.peripheral {
         return Err("adapter reports no peripheral support".to_string());
     }
@@ -166,12 +167,16 @@ async fn run_peripheral() -> Result<(), String> {
 async fn run_central(target: Option<String>) -> Result<(), String> {
     let adapter = adapter().await?;
     let caps = adapter.capabilities().await;
-    println!("HWVERIFY: INFO capabilities central={} peripheral={}", caps.central, caps.peripheral);
+    println!(
+        "HWVERIFY: INFO capabilities central={} peripheral={}",
+        caps.central, caps.peripheral
+    );
 
     let peer = match target {
         Some(address) => PeerAddress(address),
         None => {
             println!("HWVERIFY: INFO scanning for {SERVICE}");
+            let scan_started = std::time::Instant::now();
             let mut found = adapter
                 .central()
                 .scan(ServiceUuid(SERVICE))
@@ -183,10 +188,11 @@ async fn run_central(target: Option<String>) -> Result<(), String> {
                 .ok_or_else(|| "scan stream ended without a result".to_string())?
                 .map_err(|err| format!("scan failed: {err}"))?;
             println!(
-                "HWVERIFY: INFO discovered {} rssi={:?} services={}",
+                "HWVERIFY: INFO discovered {} rssi={:?} services={} after_ms={}",
                 discovered.address.0,
                 discovered.rssi,
-                discovered.services.len()
+                discovered.services.len(),
+                scan_started.elapsed().as_millis()
             );
             discovered.address
         }

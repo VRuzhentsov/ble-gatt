@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use ble_gatt::drivers::mock::{MockDriver, MockNetwork};
 use ble_gatt::{
-    Driver, CapabilityReport, CharacteristicUuid, GattCharacteristicSpec, GattEvent,
+    CapabilityReport, CharacteristicUuid, Driver, GattCharacteristicSpec, GattEvent,
     GattServiceSpec, PeerAddress, ServiceUuid, WriteType,
 };
 use tokio_stream::StreamExt;
@@ -45,9 +45,16 @@ async fn central_discovers_and_reads_the_peripherals_advertised_service() {
         .await
         .expect("advertise should succeed");
 
-    let central = MockDriver::new(PeerAddress("central-1".to_string()), network.clone(), full_capabilities());
+    let central = MockDriver::new(
+        PeerAddress("central-1".to_string()),
+        network.clone(),
+        full_capabilities(),
+    );
 
-    let mut discovered = central.scan(service_uuid).await.expect("scan should succeed");
+    let mut discovered = central
+        .scan(service_uuid)
+        .await
+        .expect("scan should succeed");
     let peer = discovered
         .next()
         .await
@@ -55,8 +62,14 @@ async fn central_discovers_and_reads_the_peripherals_advertised_service() {
         .expect("discovery should not error");
     assert_eq!(peer.address, PeerAddress("peripheral-1".to_string()));
 
-    let mut connection = central.connect(&peer.address).await.expect("connect should succeed");
-    let value = connection.read(characteristic_uuid).await.expect("read should succeed");
+    let mut connection = central
+        .connect(&peer.address)
+        .await
+        .expect("connect should succeed");
+    let value = connection
+        .read(characteristic_uuid)
+        .await
+        .expect("read should succeed");
     assert_eq!(value, b"hello");
 }
 
@@ -67,7 +80,11 @@ async fn write_from_central_is_readable_back_and_fires_a_lifecycle_event() {
     let characteristic_uuid = CharacteristicUuid(Uuid::new_v4());
     let peripheral_addr = PeerAddress("peripheral-2".to_string());
 
-    let peripheral = MockDriver::new(peripheral_addr.clone(), network.clone(), full_capabilities());
+    let peripheral = MockDriver::new(
+        peripheral_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    );
     peripheral
         .advertise(GattServiceSpec::new(
             service_uuid,
@@ -83,8 +100,15 @@ async fn write_from_central_is_readable_back_and_fires_a_lifecycle_event() {
         .expect("advertise should succeed");
     let mut events = peripheral.events();
 
-    let central = MockDriver::new(PeerAddress("central-2".to_string()), network.clone(), full_capabilities());
-    let mut connection = central.connect(&peripheral_addr).await.expect("connect should succeed");
+    let central = MockDriver::new(
+        PeerAddress("central-2".to_string()),
+        network.clone(),
+        full_capabilities(),
+    );
+    let mut connection = central
+        .connect(&peripheral_addr)
+        .await
+        .expect("connect should succeed");
 
     connection
         .write(characteristic_uuid, b"updated".to_vec())
@@ -102,14 +126,21 @@ async fn write_from_central_is_readable_back_and_fires_a_lifecycle_event() {
         }
     };
     match written_event {
-        ble_gatt::GattEvent::CharacteristicWritten { characteristic, value, .. } => {
+        ble_gatt::GattEvent::CharacteristicWritten {
+            characteristic,
+            value,
+            ..
+        } => {
             assert_eq!(characteristic, characteristic_uuid);
             assert_eq!(value, b"updated");
         }
         other => panic!("expected CharacteristicWritten, got {other:?}"),
     }
 
-    let read_back = connection.read(characteristic_uuid).await.expect("read should succeed");
+    let read_back = connection
+        .read(characteristic_uuid)
+        .await
+        .expect("read should succeed");
     assert_eq!(read_back, b"updated");
 }
 
@@ -120,7 +151,11 @@ async fn server_initiated_notify_is_delivered_to_a_subscribed_central() {
     let characteristic_uuid = CharacteristicUuid(Uuid::new_v4());
     let peripheral_addr = PeerAddress("peripheral-3".to_string());
 
-    let peripheral = MockDriver::new(peripheral_addr.clone(), network.clone(), full_capabilities());
+    let peripheral = MockDriver::new(
+        peripheral_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    );
     peripheral
         .advertise(GattServiceSpec::new(
             service_uuid,
@@ -135,9 +170,19 @@ async fn server_initiated_notify_is_delivered_to_a_subscribed_central() {
         .await
         .expect("advertise should succeed");
 
-    let central = MockDriver::new(PeerAddress("central-3".to_string()), network.clone(), full_capabilities());
-    let mut connection = central.connect(&peripheral_addr).await.expect("connect should succeed");
-    let mut notifications = connection.subscribe(characteristic_uuid).await.expect("subscribe should succeed");
+    let central = MockDriver::new(
+        PeerAddress("central-3".to_string()),
+        network.clone(),
+        full_capabilities(),
+    );
+    let mut connection = central
+        .connect(&peripheral_addr)
+        .await
+        .expect("connect should succeed");
+    let mut notifications = connection
+        .subscribe(characteristic_uuid)
+        .await
+        .expect("subscribe should succeed");
 
     peripheral
         .notify(characteristic_uuid, b"push".to_vec())
@@ -155,9 +200,15 @@ async fn server_initiated_notify_is_delivered_to_a_subscribed_central() {
 #[tokio::test]
 async fn connect_to_a_peer_that_is_not_advertising_fails() {
     let network = MockNetwork::new();
-    let central = MockDriver::new(PeerAddress("central-4".to_string()), network.clone(), full_capabilities());
+    let central = MockDriver::new(
+        PeerAddress("central-4".to_string()),
+        network.clone(),
+        full_capabilities(),
+    );
 
-    let result = central.connect(&PeerAddress("nobody-home".to_string())).await;
+    let result = central
+        .connect(&PeerAddress("nobody-home".to_string()))
+        .await;
     assert!(result.is_err());
 }
 
@@ -168,13 +219,20 @@ async fn advertise_on_a_peripheral_incapable_driver_is_rejected_honestly() {
         central: true,
         peripheral: false,
     };
-    let driver = MockDriver::new(PeerAddress("central-only".to_string()), network, central_only);
+    let driver = MockDriver::new(
+        PeerAddress("central-only".to_string()),
+        network,
+        central_only,
+    );
 
     let result = driver
         .advertise(GattServiceSpec::new(ServiceUuid(Uuid::new_v4()), vec![]))
         .await;
 
-    assert!(matches!(result, Err(ble_gatt::BleError::PeripheralUnsupported)));
+    assert!(matches!(
+        result,
+        Err(ble_gatt::BleError::PeripheralUnsupported)
+    ));
 }
 
 // ---------------------------------------------------------------------
@@ -197,21 +255,40 @@ async fn advertise_carries_its_own_manufacturer_and_service_data_to_a_scanner() 
     let peripheral_addr = PeerAddress("peripheral-spec-adv".to_string());
 
     let mut spec = GattServiceSpec::new(service_uuid, vec![]);
-    spec.manufacturer_data.insert(0x5678u16, vec![0x01, 0x02, 0x03]);
-    spec.service_data.insert(service_uuid, b"from-the-spec".to_vec());
+    spec.manufacturer_data
+        .insert(0x5678u16, vec![0x01, 0x02, 0x03]);
+    spec.service_data
+        .insert(service_uuid, b"from-the-spec".to_vec());
 
-    let peripheral = MockDriver::new(peripheral_addr.clone(), network.clone(), full_capabilities());
-    peripheral.advertise(spec).await.expect("advertise should succeed");
+    let peripheral = MockDriver::new(
+        peripheral_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    );
+    peripheral
+        .advertise(spec)
+        .await
+        .expect("advertise should succeed");
 
-    let central = MockDriver::new(PeerAddress("central-spec-adv".to_string()), network.clone(), full_capabilities());
-    let mut discovered = central.scan(service_uuid).await.expect("scan should succeed");
+    let central = MockDriver::new(
+        PeerAddress("central-spec-adv".to_string()),
+        network.clone(),
+        full_capabilities(),
+    );
+    let mut discovered = central
+        .scan(service_uuid)
+        .await
+        .expect("scan should succeed");
     let peer = discovered
         .next()
         .await
         .expect("peripheral should be discovered")
         .expect("discovery should not error");
 
-    assert_eq!(peer.manufacturer_data.get(&0x5678), Some(&vec![0x01, 0x02, 0x03]));
+    assert_eq!(
+        peer.manufacturer_data.get(&0x5678),
+        Some(&vec![0x01, 0x02, 0x03])
+    );
     assert_eq!(
         peer.service_data.get(&service_uuid).map(|v| v.as_slice()),
         Some(b"from-the-spec".as_slice())
@@ -224,7 +301,11 @@ async fn advertisement_payload_identifies_a_specific_peer_before_connecting() {
     let service_uuid = ServiceUuid(Uuid::new_v4());
     let peripheral_addr = PeerAddress("peripheral-adv".to_string());
 
-    let peripheral = MockDriver::new(peripheral_addr.clone(), network.clone(), full_capabilities());
+    let peripheral = MockDriver::new(
+        peripheral_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    );
     peripheral
         .advertise(GattServiceSpec::new(service_uuid, vec![]))
         .await
@@ -238,15 +319,17 @@ async fn advertisement_payload_identifies_a_specific_peer_before_connecting() {
     manufacturer_data.insert(0x1234u16, device_eui.clone());
     let mut service_data = BTreeMap::new();
     service_data.insert(service_uuid, b"peer-id-payload".to_vec());
-    network.set_advertisement_data(
-        &peripheral_addr,
-        manufacturer_data,
-        service_data,
-        Some(-55),
-    );
+    network.set_advertisement_data(&peripheral_addr, manufacturer_data, service_data, Some(-55));
 
-    let central = MockDriver::new(PeerAddress("central-adv".to_string()), network.clone(), full_capabilities());
-    let mut discovered = central.scan(service_uuid).await.expect("scan should succeed");
+    let central = MockDriver::new(
+        PeerAddress("central-adv".to_string()),
+        network.clone(),
+        full_capabilities(),
+    );
+    let mut discovered = central
+        .scan(service_uuid)
+        .await
+        .expect("scan should succeed");
     let peer = discovered
         .next()
         .await
@@ -267,14 +350,25 @@ async fn connection_reports_an_mtu_that_bounds_a_single_write() {
     let service_uuid = ServiceUuid(Uuid::new_v4());
     let peripheral_addr = PeerAddress("peripheral-mtu".to_string());
 
-    let peripheral = MockDriver::new(peripheral_addr.clone(), network.clone(), full_capabilities());
+    let peripheral = MockDriver::new(
+        peripheral_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    );
     peripheral
         .advertise(GattServiceSpec::new(service_uuid, vec![]))
         .await
         .expect("advertise should succeed");
 
-    let central = MockDriver::new(PeerAddress("central-mtu".to_string()), network.clone(), full_capabilities());
-    let connection = central.connect(&peripheral_addr).await.expect("connect should succeed");
+    let central = MockDriver::new(
+        PeerAddress("central-mtu".to_string()),
+        network.clone(),
+        full_capabilities(),
+    );
+    let connection = central
+        .connect(&peripheral_addr)
+        .await
+        .expect("connect should succeed");
 
     // The point of exposing this at all: a caller chunking a bulk transfer
     // must derive the chunk size from the connection rather than hardcoding
@@ -293,7 +387,11 @@ async fn write_without_response_is_accepted_and_still_delivers() {
     let characteristic_uuid = CharacteristicUuid(Uuid::new_v4());
     let peripheral_addr = PeerAddress("peripheral-wnr".to_string());
 
-    let peripheral = MockDriver::new(peripheral_addr.clone(), network.clone(), full_capabilities());
+    let peripheral = MockDriver::new(
+        peripheral_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    );
     peripheral
         .advertise(GattServiceSpec::new(
             service_uuid,
@@ -308,15 +406,29 @@ async fn write_without_response_is_accepted_and_still_delivers() {
         .await
         .expect("advertise should succeed");
 
-    let central = MockDriver::new(PeerAddress("central-wnr".to_string()), network.clone(), full_capabilities());
-    let mut connection = central.connect(&peripheral_addr).await.expect("connect should succeed");
+    let central = MockDriver::new(
+        PeerAddress("central-wnr".to_string()),
+        network.clone(),
+        full_capabilities(),
+    );
+    let mut connection = central
+        .connect(&peripheral_addr)
+        .await
+        .expect("connect should succeed");
 
     connection
-        .write_with_type(characteristic_uuid, b"bulk-chunk".to_vec(), WriteType::WithoutResponse)
+        .write_with_type(
+            characteristic_uuid,
+            b"bulk-chunk".to_vec(),
+            WriteType::WithoutResponse,
+        )
         .await
         .expect("unacknowledged write should succeed");
 
-    let read_back = connection.read(characteristic_uuid).await.expect("read should succeed");
+    let read_back = connection
+        .read(characteristic_uuid)
+        .await
+        .expect("read should succeed");
     assert_eq!(read_back, b"bulk-chunk");
 }
 
@@ -327,7 +439,11 @@ async fn central_learns_about_unsolicited_peer_loss_through_the_event_stream() {
     let peripheral_addr = PeerAddress("peripheral-drop".to_string());
     let central_addr = PeerAddress("central-drop".to_string());
 
-    let peripheral = MockDriver::new(peripheral_addr.clone(), network.clone(), full_capabilities());
+    let peripheral = MockDriver::new(
+        peripheral_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    );
     peripheral
         .advertise(GattServiceSpec::new(service_uuid, vec![]))
         .await
@@ -337,7 +453,10 @@ async fn central_learns_about_unsolicited_peer_loss_through_the_event_stream() {
     // Subscribe before connecting: a central-only consumer must be able to
     // observe events without ever advertising.
     let mut events = central.events();
-    let _connection = central.connect(&peripheral_addr).await.expect("connect should succeed");
+    let _connection = central
+        .connect(&peripheral_addr)
+        .await
+        .expect("connect should succeed");
 
     let connected = events.next().await.expect("connected event");
     assert!(matches!(connected, GattEvent::Connected { .. }));
@@ -346,7 +465,10 @@ async fn central_learns_about_unsolicited_peer_loss_through_the_event_stream() {
     // would otherwise leave a caller hanging mid-transfer.
     peripheral.simulate_peer_loss(&central_addr);
 
-    let lost = events.next().await.expect("disconnect event should reach the central");
+    let lost = events
+        .next()
+        .await
+        .expect("disconnect event should reach the central");
     match lost {
         GattEvent::Disconnected { peer, .. } => assert_eq!(peer, peripheral_addr),
         other => panic!("expected Disconnected, got {other:?}"),
@@ -369,14 +491,23 @@ async fn an_asynchronous_scan_failure_is_reported_instead_of_looking_like_no_pee
         network.clone(),
         full_capabilities(),
     );
-    let mut discovered = central.scan(service_uuid).await.expect("scan starts successfully");
+    let mut discovered = central
+        .scan(service_uuid)
+        .await
+        .expect("scan starts successfully");
 
-    let item = discovered.next().await.expect("the failure must surface as an item");
+    let item = discovered
+        .next()
+        .await
+        .expect("the failure must surface as an item");
     assert!(
         item.is_err(),
         "a failed scan must be distinguishable from an empty one, got {item:?}"
     );
-    assert!(discovered.next().await.is_none(), "an error item ends the scan");
+    assert!(
+        discovered.next().await.is_none(),
+        "an error item ends the scan"
+    );
 }
 
 #[tokio::test]
@@ -386,7 +517,11 @@ async fn a_central_refused_by_a_single_peer_server_stops_receiving_notifications
     let characteristic_uuid = CharacteristicUuid(Uuid::new_v4());
     let peripheral_addr = PeerAddress("peripheral-exclusive".to_string());
 
-    let peripheral = MockDriver::new(peripheral_addr.clone(), network.clone(), full_capabilities());
+    let peripheral = MockDriver::new(
+        peripheral_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    );
     peripheral
         .advertise(GattServiceSpec::new(
             service_uuid,
@@ -403,14 +538,30 @@ async fn a_central_refused_by_a_single_peer_server_stops_receiving_notifications
 
     // Two centrals subscribe. Subscribing needs no server consent, so at
     // this point the server has no say in who receives its broadcasts.
-    let first = MockDriver::new(PeerAddress("central-first".to_string()), network.clone(), full_capabilities());
-    let mut first_conn = first.connect(&peripheral_addr).await.expect("connect should succeed");
-    let mut first_rx = first_conn.subscribe(characteristic_uuid).await.expect("subscribe should succeed");
+    let first = MockDriver::new(
+        PeerAddress("central-first".to_string()),
+        network.clone(),
+        full_capabilities(),
+    );
+    let mut first_conn = first
+        .connect(&peripheral_addr)
+        .await
+        .expect("connect should succeed");
+    let mut first_rx = first_conn
+        .subscribe(characteristic_uuid)
+        .await
+        .expect("subscribe should succeed");
 
     let refused_addr = PeerAddress("central-refused".to_string());
     let refused = MockDriver::new(refused_addr.clone(), network.clone(), full_capabilities());
-    let mut refused_conn = refused.connect(&peripheral_addr).await.expect("connect should succeed");
-    let mut refused_rx = refused_conn.subscribe(characteristic_uuid).await.expect("subscribe should succeed");
+    let mut refused_conn = refused
+        .connect(&peripheral_addr)
+        .await
+        .expect("connect should succeed");
+    let mut refused_rx = refused_conn
+        .subscribe(characteristic_uuid)
+        .await
+        .expect("subscribe should succeed");
 
     // Proof the hazard is real rather than hypothetical: before exclusion, a
     // broadcast reaches the peer the server intends to refuse.
@@ -419,7 +570,11 @@ async fn a_central_refused_by_a_single_peer_server_stops_receiving_notifications
         .await
         .expect("notify should succeed");
     assert_eq!(
-        refused_rx.next().await.and_then(|item| item.ok()).as_deref(),
+        refused_rx
+            .next()
+            .await
+            .and_then(|item| item.ok())
+            .as_deref(),
         Some(b"for-the-served-peer".as_slice()),
         "precondition: notify is a broadcast, so an un-excluded peer does receive it"
     );
@@ -462,7 +617,11 @@ async fn an_addressed_notify_reaches_only_its_peer() {
     let characteristic_uuid = CharacteristicUuid(Uuid::new_v4());
     let peripheral_addr = PeerAddress("peripheral-addressed".to_string());
 
-    let peripheral = MockDriver::new(peripheral_addr.clone(), network.clone(), full_capabilities());
+    let peripheral = MockDriver::new(
+        peripheral_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    );
     peripheral
         .advertise(GattServiceSpec::new(
             service_uuid,
@@ -480,7 +639,10 @@ async fn an_addressed_notify_reaches_only_its_peer() {
     let served_addr = PeerAddress("central-served".to_string());
     let served = MockDriver::new(served_addr.clone(), network.clone(), full_capabilities());
     let mut served_conn = served.connect(&peripheral_addr).await.expect("connect");
-    let mut served_rx = served_conn.subscribe(characteristic_uuid).await.expect("subscribe");
+    let mut served_rx = served_conn
+        .subscribe(characteristic_uuid)
+        .await
+        .expect("subscribe");
 
     // A second central subscribes. It needs no server consent to do so, and
     // disconnecting it is asynchronous — so during that window a *broadcast*
@@ -489,10 +651,18 @@ async fn an_addressed_notify_reaches_only_its_peer() {
     let other_addr = PeerAddress("central-other".to_string());
     let other = MockDriver::new(other_addr.clone(), network.clone(), full_capabilities());
     let mut other_conn = other.connect(&peripheral_addr).await.expect("connect");
-    let mut other_rx = other_conn.subscribe(characteristic_uuid).await.expect("subscribe");
+    let mut other_rx = other_conn
+        .subscribe(characteristic_uuid)
+        .await
+        .expect("subscribe");
 
     peripheral
-        .notify_peer(&served_addr, None, characteristic_uuid, b"for-the-served-peer".to_vec())
+        .notify_peer(
+            &served_addr,
+            None,
+            characteristic_uuid,
+            b"for-the-served-peer".to_vec(),
+        )
         .await
         .expect("addressed notify should succeed");
 
@@ -529,7 +699,11 @@ async fn a_stale_connection_handle_cannot_disturb_the_session_that_replaced_it()
     let characteristic_uuid = CharacteristicUuid(Uuid::new_v4());
     let peripheral_addr = PeerAddress("peripheral-stale-handle".to_string());
 
-    let peripheral = MockDriver::new(peripheral_addr.clone(), network.clone(), full_capabilities());
+    let peripheral = MockDriver::new(
+        peripheral_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    );
     peripheral
         .advertise(GattServiceSpec::new(
             service_uuid,
@@ -580,7 +754,11 @@ async fn a_disconnected_handle_is_actually_closed() {
     let characteristic_uuid = CharacteristicUuid(Uuid::new_v4());
     let peripheral_addr = PeerAddress("peripheral-closed".to_string());
 
-    let peripheral = MockDriver::new(peripheral_addr.clone(), network.clone(), full_capabilities());
+    let peripheral = MockDriver::new(
+        peripheral_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    );
     peripheral
         .advertise(GattServiceSpec::new(
             service_uuid,
@@ -601,7 +779,10 @@ async fn a_disconnected_handle_is_actually_closed() {
         full_capabilities(),
     );
     let mut connection = central.connect(&peripheral_addr).await.expect("connect");
-    connection.read(characteristic_uuid).await.expect("read while open");
+    connection
+        .read(characteristic_uuid)
+        .await
+        .expect("read while open");
     connection.disconnect().await.expect("disconnect");
 
     // Everything must now be refused. A mock that kept accepting these would
@@ -611,7 +792,10 @@ async fn a_disconnected_handle_is_actually_closed() {
         "a closed connection must refuse reads"
     );
     assert!(
-        connection.write(characteristic_uuid, b"x".to_vec()).await.is_err(),
+        connection
+            .write(characteristic_uuid, b"x".to_vec())
+            .await
+            .is_err(),
         "a closed connection must refuse writes"
     );
     assert!(
@@ -632,7 +816,11 @@ async fn simulated_peer_loss_closes_the_link_as_well_as_announcing_it() {
     let peripheral_addr = PeerAddress("peripheral-loss-state".to_string());
     let central_addr = PeerAddress("central-loss-state".to_string());
 
-    let peripheral = MockDriver::new(peripheral_addr.clone(), network.clone(), full_capabilities());
+    let peripheral = MockDriver::new(
+        peripheral_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    );
     peripheral
         .advertise(GattServiceSpec::new(
             service_uuid,
@@ -649,7 +837,10 @@ async fn simulated_peer_loss_closes_the_link_as_well_as_announcing_it() {
 
     let central = MockDriver::new(central_addr.clone(), network.clone(), full_capabilities());
     let mut connection = central.connect(&peripheral_addr).await.expect("connect");
-    connection.read(characteristic_uuid).await.expect("read while connected");
+    connection
+        .read(characteristic_uuid)
+        .await
+        .expect("read while connected");
 
     // The documented link-loss simulation must leave the same state a real
     // drop would: not merely an event, but a connection that no longer works.
@@ -660,7 +851,10 @@ async fn simulated_peer_loss_closes_the_link_as_well_as_announcing_it() {
         "a lost link must refuse reads"
     );
     assert!(
-        connection.write(characteristic_uuid, b"x".to_vec()).await.is_err(),
+        connection
+            .write(characteristic_uuid, b"x".to_vec())
+            .await
+            .is_err(),
         "a lost link must refuse writes"
     );
     assert!(
@@ -680,7 +874,11 @@ async fn writes_to_unknown_or_read_only_characteristics_are_refused() {
     let read_only_uuid = CharacteristicUuid(Uuid::new_v4());
     let peripheral_addr = PeerAddress("peripheral-perms".to_string());
 
-    let peripheral = MockDriver::new(peripheral_addr.clone(), network.clone(), full_capabilities());
+    let peripheral = MockDriver::new(
+        peripheral_addr.clone(),
+        network.clone(),
+        full_capabilities(),
+    );
     peripheral
         .advertise(GattServiceSpec::new(
             service_uuid,
@@ -727,7 +925,10 @@ async fn writes_to_unknown_or_read_only_characteristics_are_refused() {
         "an unknown characteristic must be refused"
     );
     assert!(
-        connection.write(read_only_uuid, b"x".to_vec()).await.is_err(),
+        connection
+            .write(read_only_uuid, b"x".to_vec())
+            .await
+            .is_err(),
         "a characteristic advertised as not writable must be refused"
     );
     assert_eq!(

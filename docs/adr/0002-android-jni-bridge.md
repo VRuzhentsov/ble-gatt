@@ -267,3 +267,52 @@ the pieces are individually sound, not proof of the thing that matters.
   `tauri-plugin-ble-gatt` on Android (new `tao`/`ndk-context` target
   dependencies in its `Cargo.toml`) but changes nothing about `ble-gatt`
   itself — a non-Tauri Android consumer never needs `tao`.
+
+## Revision: app-owned context, independent of the runtime's Tao version
+
+The original bridge above is superseded. The example resolved Tao 0.37.2 for
+Tauri's runtime and 0.35.3 for this plugin. Those crates own separate context
+statics; the plugin reported `tao's Android context is not available yet` on
+both real emulator processes before reaching BLE JNI. Changing sleeps or BLE
+permissions cannot make distinct Rust statics share an Activity.
+
+Tao 0.37.2 additionally initializes `ndk-context` itself with an Application
+reference in `ndk_glue::onCreate`. Unconditionally copying another context into
+that global aborts the app (`previous.is_none()`), as a subsequent packaged
+emulator run demonstrated. Older runtimes do not initialize it. The
+`ndk-context` 0.1 API has no non-panicking `try_get`; probing with a caught panic
+would depend on unwind support, and replacing an independently owned global
+would violate its initialization contract.
+
+Decision: use Tauri's public `PluginApi::register_android_plugin` contract.
+Tauri constructs `BleGattPlugin` with its actual Activity; the Kotlin constructor
+passes `activity.applicationContext` synchronously to a plugin-owned JNI export.
+Rust retains its own process-lifetime `GlobalRef` and JVM handle. Default driver
+construction uses `AndroidDriver::with_context`, an embedding-friendly explicit
+constructor, without reading or writing either Tao or ndk-context statics. The
+existing `AndroidDriver::new` still supports non-Tauri ndk-context runtimes.
+The plugin's direct Tao dependency is removed; no consumer lockfile bump is
+used to force matching versions. Tauri 2.11.2 and 2.12.5 cached upstream
+`plugin/mobile.rs` both implement this constructor contract.
+
+Alternatives rejected: bumping the direct Tao dependency merely moves the
+version coupling to the next consumer; relying only on the runtime's ndk-context
+would break older runtimes; a process-global panic hook or caught initialization
+panic is not an ownership protocol. An explicit embedding context follows
+jni-rs `JavaVM`/`GlobalRef` ownership and Android's Application-context lifetime
+rather than reaching into a windowing runtime's private state.
+
+Applications doing their own JNI should use `android_context::get()` after
+plugin registration. The old `ensure()` remains an explicit legacy opt-in for
+applications that delegate ndk-context initialization to this plugin (existing
+Fini on its older runtime). It is not called by the default driver. Its original
+cooperative-single-owner precondition still applies: do not call it when a newer
+runtime independently initializes ndk-context. There is no automatic safe
+ownership detection in ndk-context 0.1. No Fini source is changed here.
+
+Verification separates source-contract guards from execution: retained RED
+source regression, actual packaged double-init crash, real JVM tests for null
+retry/reference ownership/repeated registration and both ndk ownership modes,
+then two-emulator JNI execution and the initiation matrix. ARM64 packaging is
+not ARM64/physical execution. The diagnostic's Android 12+ no-location assertion
+is app-owned in its debug manifest, not imposed on arbitrary plugin consumers.

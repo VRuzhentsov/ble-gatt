@@ -1,0 +1,5 @@
+#!/bin/sh
+# Runs rustfmt and clippy when .rs files are staged. Turn on: git config core.hooksPath .githooks
+git diff --cached --quiet --diff-filter=ACMR -- '*.rs' && exit 0
+command -v cargo >/dev/null || { echo "pre-commit: cargo is not on PATH. Install Rust (with clippy and rustfmt), or skip once with git commit --no-verify." >&2; exit 1; }
+cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features -- -D warnings

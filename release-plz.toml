@@ -1,0 +1,31 @@
+# release-plz (https://release-plz.dev): .github/workflows/release-plz.yml runs
+# it on every push to main.
+#
+# - `release` tags the current version `v{version}` and publishes a GitHub
+#   release when that tag does not exist yet.
+# - `release-pr` opens or updates a release pull request with the next
+#   version and CHANGELOG.md; merging it releases that version.
+#
+# The three crates share `[workspace.package] version`, so one tag and one
+# release (owned by `ble-gatt`) cover the whole workspace.
+
+[workspace]
+# Read the last released version from git tags, not from crates.io, and never
+# run `cargo publish`.
+git_only = true
+# Every crate looks up its last release by the same workspace tag.
+git_tag_name = "v{{ version }}"
+git_release_name = "v{{ version }}"
+# Only `ble-gatt` below creates the tag, the release and the changelog.
+git_tag_enable = false
+git_release_enable = false
+changelog_update = false
+
+[[package]]
+name = "ble-gatt"
+git_tag_enable = true
+git_release_enable = true
+changelog_update = true
+changelog_path = "./CHANGELOG.md"
+# Commits to the other two crates are listed in the same changelog.
+changelog_include = ["ble-gatt-iroh", "tauri-plugin-ble-gatt"]

@@ -233,6 +233,8 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     private var gattServer: BluetoothGattServer? = null
     @Volatile
     private var advertiseCallback: AdvertiseCallback? = null
+    private val advertisingResume = AdvertisingResume()
+    private var advertisingStarted = false
     private val serverCharacteristics = ConcurrentHashMap<String, BluetoothGattCharacteristic>()
     /// Values are concurrent sets: a CCCD write and a notify can touch the
     /// same characteristic's subscriber set from different threads.
@@ -272,6 +274,17 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     @Volatile
     private var serverGeneration: Long = 0
 
+    /// The company a scan admits fast advertisements under: that of the last
+    /// advertising call with one, else the default (Rust's `fast_scan_company`).
+    @Volatile
+    private var fastScanCompany: Int = AdvertisePlacement.DEFAULT_SCAN_COMPANY
+
+    private fun noteFastCompany(fastCompanyId: Int) {
+        if (fastCompanyId != AdvertisePlacement.NO_COMPANY) {
+            fastScanCompany = fastCompanyId
+        }
+    }
+
     fun hasCentralSupport(): Boolean = adapter?.bluetoothLeScanner != null
 
     fun hasPeripheralSupport(): Boolean =
@@ -281,7 +294,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     // Central role
     // ---------------------------------------------------------------
 
-    /// Returns false if a scan is already running. There is one
+    /// Returns SCAN_STARTED, SCAN_BUSY or SCAN_UNAVAILABLE. There is one
     /// `scanCallback` and one discovery sender, so a second concurrent scan
     /// would silently replace the first — and dropping either stream would
     /// then cancel the wrong one. Refusing is honest; per-scan ownership can
@@ -290,13 +303,14 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     /// results from a scan it has already replaced. A callback already
     /// executing when a scan is stopped can otherwise land after the next
     /// scan installs itself, and be attributed to it.
-    fun startScan(serviceUuid: String, generation: Long): Boolean {
+    fun startScan(serviceUuid: String, generation: Long): Int {
         if (scanCallback != null) {
             Log.w(TAG, "startScan refused: a scan is already active")
-            return false
+            return SCAN_BUSY
         }
-        val scanner = adapter?.bluetoothLeScanner ?: return false
+        val scanner = adapter?.bluetoothLeScanner ?: return SCAN_UNAVAILABLE
         val target = UUID.fromString(serviceUuid)
+        val fastCompany = fastScanCompany
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
@@ -304,8 +318,20 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             override fun onScanResult(callbackType: Int, result: ScanResult) {
                 val record = result.scanRecord
                 val uuids = record?.serviceUuids
-                Log.d(TAG, "onScanResult: ${result.device.address} name=${record?.deviceName} advertisedUuids=$uuids")
-                if (uuids == null || !uuids.contains(ParcelUuid(target))) {
+                Log.d(
+                    TAG,
+                    "onScanResult: ${result.device.address} name=${record?.deviceName} advertisedUuids=$uuids " +
+                        "connectable=${if (android.os.Build.VERSION.SDK_INT >= 26) result.isConnectable else null} manufacturer=${record?.manufacturerSpecificData?.let { data ->
+                            (0 until data.size()).joinToString(",") { "%04x:%d".format(data.keyAt(it), data.valueAt(it)?.size ?: 0) }
+                        }}",
+                )
+                // The UUID list, or service data under the target: a result can
+                // carry only the latter (ADR-0012 §2). Or a fast advertisement
+                // under the fast company only.
+                val matches = uuids?.contains(ParcelUuid(target)) == true ||
+                    record?.serviceData?.containsKey(ParcelUuid(target)) == true ||
+                    AdvertisePlacement.isFastAdvertisement(record?.getManufacturerSpecificData(fastCompany))
+                if (record == null || !matches) {
                     return
                 }
 
@@ -368,8 +394,14 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         // filter parameters were accepted (status=0); an unfiltered scan
         // with matching done here works identically on real adapters and
         // sidesteps whatever that native-filter gap is. See docs/adr/0002.
-        scanner.startScan(emptyList(), settings, callback)
-        return true
+        try {
+            scanner.startScan(emptyList(), settings, callback)
+        } catch (error: Exception) {
+            // Release only this failed acquisition. JNI must still receive the exception.
+            if (scanCallback === callback) scanCallback = null
+            throw error
+        }
+        return SCAN_STARTED
     }
 
     fun stopScan() {
@@ -1012,9 +1044,14 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         // side would have to walk it back out again either way.
         manufacturerIds: IntArray, manufacturerValues: Array<ByteArray>,
         serviceDataUuids: Array<String>, serviceDataValues: Array<ByteArray>,
-        // The short name, already truncated by Rust, sent as service data
-        // under serviceUuid in the scan response. Null for none.
-        scanResponseName: ByteArray?,
+        // Service data under serviceUuid for the scan response, chosen by
+        // Rust: the advertisement header or the short name (already
+        // truncated). Null for none.
+        scanResponseServiceData: ByteArray?,
+        // The fast advertisement (ADR-0012 §2): -1 and null for none.
+        fastCompanyId: Int, fastData: ByteArray?,
+        // AdvertiseSettings.ADVERTISE_MODE_*.
+        advertiseMode: Int,
     ) {
         // Tear down any predecessor first. This bridge holds a single
         // `gattServer`/`advertiseCallback` pair, so starting without
@@ -1027,6 +1064,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         // would stop the very advertisement that replaced it. Making the
         // retry responsible serialises the two without either racing.
         stopAdvertising()
+        noteFastCompany(fastCompanyId)
 
         val advertiser = adapter?.bluetoothLeAdvertiser
         if (advertiser == null) {
@@ -1074,7 +1112,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                     beginAdvertising(
                         advertiser, serviceUuid, generation,
                         manufacturerIds, manufacturerValues, serviceDataUuids, serviceDataValues,
-                        scanResponseName,
+                        scanResponseServiceData, fastCompanyId, fastData, advertiseMode,
                     )
                 }
             }
@@ -1416,19 +1454,35 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         serviceUuid: String,
         manufacturerIds: IntArray, manufacturerValues: Array<ByteArray>,
         serviceDataUuids: Array<String>, serviceDataValues: Array<ByteArray>,
-        scanResponseName: ByteArray?,
+        scanResponseServiceData: ByteArray?,
+        fastCompanyId: Int, fastData: ByteArray?,
+        advertiseMode: Int,
     ) {
+        noteFastCompany(fastCompanyId)
         val advertiser = adapter?.bluetoothLeAdvertiser
         val started = synchronized(this) {
             if (advertiser == null || gattServer == null) {
                 false
             } else {
+                if (advertiseCallback == null) {
+                    advertisingResume.replace {
+                        beginAdvertising(
+                            advertiser, serviceUuid, serverGeneration,
+                            manufacturerIds, manufacturerValues, serviceDataUuids, serviceDataValues,
+                            scanResponseServiceData, fastCompanyId, fastData, advertiseMode,
+                            keepServerOnFailure = true,
+                        )
+                    }
+                    onAdvertiseResult(nativeHandle, true, 0)
+                    return
+                }
                 advertiseCallback?.let { advertiser.stopAdvertising(it) }
                 advertiseCallback = null
                 beginAdvertising(
                     advertiser, serviceUuid, serverGeneration,
                     manufacturerIds, manufacturerValues, serviceDataUuids, serviceDataValues,
-                    scanResponseName, keepServerOnFailure = true,
+                    scanResponseServiceData, fastCompanyId, fastData, advertiseMode,
+                    keepServerOnFailure = true,
                 )
                 true
             }
@@ -1444,13 +1498,33 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         generation: Long,
         manufacturerIds: IntArray, manufacturerValues: Array<ByteArray>,
         serviceDataUuids: Array<String>, serviceDataValues: Array<ByteArray>,
-        scanResponseName: ByteArray?,
+        scanResponseServiceData: ByteArray?,
+        fastCompanyId: Int, fastData: ByteArray?,
+        advertiseMode: Int,
         // An update's failure must not take the server and its centrals
         // down with the advertisement.
         keepServerOnFailure: Boolean = false,
+        // False once Android refused the fast advertisement as too large.
+        withFast: Boolean = true,
     ) {
+        advertisingResume.begin {
+            beginAdvertising(
+                advertiser, serviceUuid, generation, manufacturerIds, manufacturerValues,
+                serviceDataUuids, serviceDataValues, scanResponseServiceData,
+                fastCompanyId, fastData, advertiseMode, keepServerOnFailure = true, withFast = withFast,
+            )
+        }
+        val placement = AdvertisePlacement.place(
+            manufacturerIds, manufacturerValues, serviceDataUuids, serviceDataValues,
+            scanResponseServiceData, fastCompanyId, fastData, withFast,
+        )
+        val mode = when (advertiseMode) {
+            AdvertiseSettings.ADVERTISE_MODE_LOW_POWER,
+            AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY -> advertiseMode
+            else -> AdvertiseSettings.ADVERTISE_MODE_BALANCED
+        }
         val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
+            .setAdvertiseMode(mode)
             .setConnectable(true)
             .build()
         val dataBuilder = AdvertiseData.Builder()
@@ -1460,24 +1534,32 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         // service UUID above already spends most of that -- callers are
         // responsible for keeping this small (see GattServiceSpec's own
         // doc comment on manufacturer_data/service_data).
-        for (i in manufacturerIds.indices) {
-            dataBuilder.addManufacturerData(manufacturerIds[i], manufacturerValues[i])
+        for (i in placement.manufacturerIds.indices) {
+            dataBuilder.addManufacturerData(placement.manufacturerIds[i], placement.manufacturerValues[i])
         }
-        for (i in serviceDataUuids.indices) {
-            dataBuilder.addServiceData(ParcelUuid(UUID.fromString(serviceDataUuids[i])), serviceDataValues[i])
+        for (i in placement.serviceDataUuids.indices) {
+            dataBuilder.addServiceData(
+                ParcelUuid(UUID.fromString(placement.serviceDataUuids[i])), placement.serviceDataValues[i],
+            )
         }
         val data = dataBuilder.build()
-        // The advertising packet is full (service UUID + manufacturer data),
-        // so the name goes in the scan response, which scanners request
-        // during an active scan. Android cannot set a custom local name per
-        // advertisement, hence service data under our own service UUID.
-        val scanResponse = if (scanResponseName != null && scanResponseName.isNotEmpty()) {
-            AdvertiseData.Builder()
+        // The scan response, which scanners request during an active scan,
+        // holds one structure: the fast advertisement (the endpoint, the
+        // metadata hash and the manufacturer data it replaced), or else
+        // service data under our own service UUID: the advertisement header,
+        // or the name, since Android cannot set a local name per advertisement.
+        val responseManufacturer = placement.scanResponseManufacturerData
+        val responseService = placement.scanResponseServiceData
+        val scanResponse = when {
+            responseManufacturer != null -> AdvertiseData.Builder()
                 .setIncludeDeviceName(false)
-                .addServiceData(ParcelUuid(UUID.fromString(serviceUuid)), scanResponseName)
+                .addManufacturerData(placement.scanResponseCompanyId, responseManufacturer)
                 .build()
-        } else {
-            null
+            responseService != null -> AdvertiseData.Builder()
+                .setIncludeDeviceName(false)
+                .addServiceData(ParcelUuid(UUID.fromString(serviceUuid)), responseService)
+                .build()
+            else -> null
         }
         val callback = object : AdvertiseCallback() {
             override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
@@ -1493,6 +1575,8 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                         return
                     }
                     Log.d(TAG, "advertise onStartSuccess: serviceUuid=$serviceUuid")
+                    advertisingStarted = true
+                    advertisingResume.confirm()
                     onAdvertiseResult(nativeHandle, true, 0)
                 }
             }
@@ -1506,11 +1590,24 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                     Log.d(TAG, "advertise onStartFailure: stale generation, ignoring")
                     return
                 }
+                if (errorCode == ADVERTISE_FAILED_DATA_TOO_LARGE && placement.fastPlaced) {
+                    // Once, without the fast advertisement: the caller's
+                    // manufacturer data and the header, as before ABI 8.
+                    Log.w(TAG, "advertise onStartFailure: fast advertisement too large; advertising without it")
+                    beginAdvertising(
+                        advertiser, serviceUuid, generation, manufacturerIds, manufacturerValues,
+                        serviceDataUuids, serviceDataValues, scanResponseServiceData,
+                        fastCompanyId, fastData, advertiseMode, keepServerOnFailure, withFast = false,
+                    )
+                    return
+                }
                 // Android reports this asynchronously — advertising already
                 // in progress, controller out of resources. Reporting it
                 // back is what stops Rust claiming the service is reachable
                 // when no advertisement exists.
                 Log.e(TAG, "advertise onStartFailure: errorCode=$errorCode serviceUuid=$serviceUuid")
+                advertisingStarted = false
+                advertisingResume.cancel()
                 if (keepServerOnFailure) {
                     advertiseCallback = null
                     onAdvertiseResult(nativeHandle, false, errorCode)
@@ -1521,7 +1618,12 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
             }
         }
         advertiseCallback = callback
-        Log.d(TAG, "startAdvertising: serviceUuid=$serviceUuid advertiser=${advertiser != null} scanResponseName=${scanResponse != null}")
+        advertisingStarted = false
+        Log.d(
+            TAG,
+            "startAdvertising: serviceUuid=$serviceUuid mode=$mode fast=${placement.fastPlaced} " +
+                "advertising=${placement.advertisingLength()}B scanResponse=${placement.scanResponseLength()}B",
+        )
         if (scanResponse != null) {
             advertiser.startAdvertising(settings, data, scanResponse, callback)
         } else {
@@ -1625,8 +1727,28 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     /// out-of-date copy of this file will get. v2: added `onRadioState` /
     /// `isRadioEnabled` / this method (ADR-0005). v3: added
     /// `requestConnectionPriority`. v4: added the local-name byte array to
-    /// `startAdvertising`.
-    fun bridgeAbiVersion(): Int = 4
+    /// `startAdvertising`. v5: added `setCharacteristicValue` (ADR-0012).
+    /// v6: `startScan` returns a scan-start status instead of a boolean.
+    /// v7: add visibility-only `setAdvertisingEnabled`.
+    /// v8: the scan response's service data is Rust's choice (header or
+    /// name), and `startAdvertising`/`updateAdvertising` take the fast
+    /// advertisement and the advertise mode (ADR-0012 §2).
+    fun bridgeAbiVersion(): Int = 8
+
+    /// Replace what reads of a served characteristic return
+    /// (`Driver::set_characteristic_value`). `onCharacteristicReadRequest`
+    /// answers from `characteristic.value`, so setting it is the whole
+    /// change. Returns false when nothing is served or the characteristic
+    /// is not part of the served service.
+    fun setCharacteristicValue(characteristicUuid: String, value: ByteArray): Boolean {
+        synchronized(this) {
+            if (gattServer == null) return false
+            val characteristic = serverCharacteristics[characteristicUuid] ?: return false
+            @Suppress("DEPRECATION")
+            characteristic.value = value
+            return true
+        }
+    }
 
     /// Whether the adapter is present and switched on. Rust's
     /// `Driver::radio_status()` calls this once at startup, so a `PeerLink`
@@ -1666,6 +1788,33 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         stopAdvertising()
     }
 
+    /// Change visibility. Keep the GATT server, callbacks, subscriptions and session generation.
+    fun setAdvertisingEnabled(enabled: Boolean) {
+        synchronized(this) {
+            val advertiser = adapter?.bluetoothLeAdvertiser
+            val resume = advertisingResume.current()
+            if (gattServer == null || advertiser == null || resume == null) {
+                onAdvertiseResult(nativeHandle, false, ADVERTISE_ERROR_UNAVAILABLE)
+                return
+            }
+            if (!enabled) {
+                advertiseCallback?.let { advertiser.stopAdvertising(it) }
+                advertiseCallback = null
+                advertisingStarted = false
+                advertisingResume.cancel()
+                onAdvertiseResult(nativeHandle, true, 0)
+            } else if (advertisingStarted) {
+                onAdvertiseResult(nativeHandle, true, 0)
+            } else {
+                // Replace an unconfirmed start left by a cancelled Rust waiter.
+                advertiseCallback?.let { advertiser.stopAdvertising(it) }
+                advertiseCallback = null
+                advertisingResume.cancel()
+                resume()
+            }
+        }
+    }
+
     fun stopAdvertising() {
         val advertiser = adapter?.bluetoothLeAdvertiser
 
@@ -1677,6 +1826,8 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         // `advertise_tx`, which Rust installs before calling in here.
         val stopping = synchronized(this) {
             ++serverGeneration
+            advertisingResume.clear()
+            advertisingStarted = false
             val previous = advertiseCallback
             advertiseCallback = null
             previous
@@ -1873,6 +2024,11 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     }
 
     companion object {
+        // JNI scan-start status codes, not ScanCallback's asynchronous errors.
+        // Keep in sync with android_scan_start_result in Rust (bridge ABI v6).
+        private const val SCAN_STARTED: Int = 0
+        private const val SCAN_BUSY: Int = 1
+        private const val SCAN_UNAVAILABLE: Int = 2
 
         private val CLIENT_CHARACTERISTIC_CONFIG_UUID: UUID =
             UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
@@ -1880,6 +2036,9 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         /// Largest ATT MTU the Bluetooth spec permits. Requested on every
         /// connection; the peer negotiates it down to whatever it supports.
         private const val MAX_ATT_MTU: Int = 517
+
+        /// `AdvertiseCallback.ADVERTISE_FAILED_DATA_TOO_LARGE`.
+        private const val ADVERTISE_FAILED_DATA_TOO_LARGE: Int = 1
 
         /// Locally-assigned advertise error codes, chosen above the range
         /// Android's AdvertiseCallback uses (1..5) so they cannot be

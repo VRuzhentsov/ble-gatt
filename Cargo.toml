@@ -3,10 +3,12 @@ resolver = "2"
 members = ["ble-gatt", "ble-gatt-iroh", "tauri-plugin-ble-gatt"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/VRuzhentsov/ble-gatt"
+# Released as git tags only (release-plz.toml); never uploaded to crates.io.
+publish = false
 
 [workspace.dependencies]
 async-trait = "0.1"
@@ -16,3 +18,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
 uuid = { version = "1", features = ["v4"] }
+
+# Each crate takes these with `[lints] workspace = true`. CI and the
+# pre-commit hook run clippy with `-D warnings`.
+[workspace.lints.clippy]
+all = "warn"
+too_many_lines = "warn"
