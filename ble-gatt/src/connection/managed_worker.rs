@@ -21,6 +21,11 @@ use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 const ESTABLISHMENT_BOUND: Duration = Duration::from_secs(30);
 const IO_BOUND: Duration = Duration::from_secs(5);
+/// Bound on one native show (a startup, restore or recovery). It is longer
+/// than the drivers' own bounds, so a driver reports its own failure and
+/// cleans up first: Windows creates its provider, then waits
+/// `ADVERTISE_START_TIMEOUT` (5 s) for the start.
+const ADVERTISE_BOUND: Duration = Duration::from_secs(15);
 type DiscoveryOutput = mpsc::Sender<Result<(EndpointId, DiscoveredPeer)>>;
 type DiscoveryScan = (BoxStream<Result<DiscoveredPeer>>, DiscoveryOutput);
 const MAX_PENDING_OPERATIONS: usize = 64;
@@ -36,9 +41,9 @@ enum Operation {
         bool,
         u64,
     ),
-    /// A failed startup or restore was stopped: the stop result, and the
-    /// advertise error for the caller.
-    Withdrawn(Result<()>, BleError, Reply<()>),
+    /// A failed startup, restore or recovery was stopped: the stop result,
+    /// and the advertise error for the caller (none for a recovery).
+    Withdrawn(Result<()>, BleError, Option<Reply<()>>),
     Metadata(Result<()>, Reply<()>, u64),
     Recovered(Result<()>, u64),
     Discovery(
@@ -129,6 +134,31 @@ struct RetirementReply {
     remaining: usize,
     reply: Option<Reply<()>>,
     error: Option<BleError>,
+}
+/// When a failed recovery (the restore after a radio loss) runs again: 1 s
+/// after the first failure, doubling up to 30 s, until one succeeds.
+#[derive(Default)]
+struct RecoveryRetry {
+    at: Option<tokio::time::Instant>,
+    failures: u32,
+}
+impl RecoveryRetry {
+    const FIRST: Duration = Duration::from_secs(1);
+    const LONGEST: Duration = Duration::from_secs(30);
+    fn due(&self) -> bool {
+        !self.at.is_some_and(|at| tokio::time::Instant::now() < at)
+    }
+    fn failed(&mut self, error: &BleError) {
+        let wait = Self::FIRST
+            .saturating_mul(1 << self.failures.min(5))
+            .min(Self::LONGEST);
+        self.failures = self.failures.saturating_add(1);
+        self.at = Some(tokio::time::Instant::now() + wait);
+        log::warn!("advertise: recovery failed ({error}), next try in {wait:?}");
+    }
+    fn succeeded(&mut self) {
+        *self = Self::default();
+    }
 }
 
 pub(super) struct Worker {
@@ -231,6 +261,7 @@ impl Worker {
         let mut server_acquired = false;
         let mut desired_visible = false;
         let mut recovery_needed = false;
+        let mut recovery_retry = RecoveryRetry::default();
         let mut radio_available = true;
         let mut loss_revision = 0u64;
         let mut lifecycle: BoxStream<crate::GattEvent> =
@@ -250,6 +281,7 @@ impl Worker {
                 && !metadata_uncertain
                 && !advertising_pending
                 && self.operation_capacity()
+                && recovery_retry.due()
             {
                 recovery_needed = false;
                 match (ManagedMetadata {
@@ -267,7 +299,7 @@ impl Worker {
                             let result = tokio::select! {
                                 biased;
                                 _ = shutdown.cancelled() => Err(AttemptError::Cancelled.into()),
-                                result = tokio::time::timeout(IO_BOUND, driver.advertise(spec)) => result.unwrap_or(Err(AttemptError::TimedOut.into())),
+                                result = tokio::time::timeout(ADVERTISE_BOUND, driver.advertise(spec)) => result.unwrap_or(Err(AttemptError::TimedOut.into())),
                             };
                             Operation::Recovered(result, revision)
                         });
@@ -310,7 +342,7 @@ impl Worker {
                                 advertising_pending = false;
                                 if result.is_err() { metadata_uncertain = true; metadata_fenced = false; }
                                 else {
-                                    if enabled { native_present = true; recovery_needed = false; }
+                                    if enabled { native_present = true; recovery_needed = false; recovery_retry.succeeded(); }
                                     else {
                                         // Successful hide confirms a retained server and invalidates late callbacks.
                                         native_present = true;
@@ -318,15 +350,16 @@ impl Worker {
                                     }
                                 }
                                 match result {
-                                    Err(error) if fresh && served.is_none() && !native_present => { advertising_pending = true; self.withdraw(driver.clone(), error, reply); }
+                                    Err(error) if fresh && served.is_none() && !native_present => { advertising_pending = true; self.withdraw(driver.clone(), error, Some(reply)); }
                                     result => { let _ = reply.send(result.map(|stream| { if let Some(stream) = stream { served = Some(stream); } })); }
                                 }
                             }
                             Operation::Withdrawn(stopped, error, reply) => {
                                 advertising_pending = false;
-                                // Nothing is served now: nothing to recover, and nothing to stop at close.
-                                if stopped.is_ok() { server_acquired = false; metadata_uncertain = false; metadata_fenced = false; recovery_needed = false; }
-                                let _ = reply.send(Err(error));
+                                // Nothing is served now: nothing to stop at close. A failed startup has
+                                // nothing to recover; a failed recovery (no caller) runs again later.
+                                if stopped.is_ok() { server_acquired = false; metadata_uncertain = false; metadata_fenced = false; recovery_needed &= reply.is_none(); }
+                                if let Some(reply) = reply { let _ = reply.send(Err(error)); }
                             }
                             Operation::Metadata(mut result, reply, revision) => {
                                 if revision != loss_revision { result = Err(AttemptError::PeerLost.into()); }
@@ -337,8 +370,11 @@ impl Worker {
                             }
                             Operation::Recovered(result, revision) => {
                                 advertising_pending = false;
-                                if result.is_ok() && revision == loss_revision { native_present = true; }
-                                else { metadata_uncertain = true; metadata_fenced = false; }
+                                match if revision == loss_revision { result } else { Err(AttemptError::PeerLost.into()) } {
+                                    Ok(()) => { native_present = true; recovery_retry.succeeded(); }
+                                    // Stop what it may have left behind, like a failed startup, then try again.
+                                    Err(error) => { recovery_needed = true; recovery_retry.failed(&error); advertising_pending = true; self.withdraw(driver.clone(), error, None); }
+                                }
                             }
                             Operation::Discovery(result, reply) => {
                                 discovery_pending = false;
@@ -484,7 +520,7 @@ impl Worker {
                                 let result = tokio::select! {
                                     biased;
                                     _ = shutdown.cancelled() => Err(AttemptError::Cancelled.into()),
-                                    result = tokio::time::timeout(IO_BOUND, async {
+                                    result = tokio::time::timeout(ADVERTISE_BOUND, async {
                                         if startup { config.serve_spec(driver.clone(), spec, false).await.map(Some) }
                                         else if restore { driver.advertise(spec).await.map(|()| None) }
                                         else { driver.set_advertising_enabled(enabled).await.map(|()| None) }
@@ -570,7 +606,7 @@ impl Worker {
                     ) => {
                         let _ = reply.send(Err(AttemptError::Cancelled.into()));
                     }
-                    Ok(Operation::Withdrawn(_, error, reply)) => {
+                    Ok(Operation::Withdrawn(_, error, Some(reply))) => {
                         let _ = reply.send(Err(error));
                     }
                     Ok(Operation::Discovery(_, reply)) => {
@@ -1005,11 +1041,11 @@ impl Worker {
         });
         Ok(())
     }
-    /// A startup or restore failed with nothing served: stop what it may
-    /// have left behind (a timed-out advertise can still finish), bounded,
-    /// then give the caller `error`. A stopped server is a known state, so
-    /// the next show may start again.
-    fn withdraw(&mut self, driver: Arc<dyn Driver>, error: BleError, reply: Reply<()>) {
+    /// A startup, restore or recovery failed with nothing served: stop what
+    /// it may have left behind (a timed-out advertise can still finish),
+    /// bounded, then give the caller, if any, `error`. A stopped server is a
+    /// known state, so the next show or recovery may start again.
+    fn withdraw(&mut self, driver: Arc<dyn Driver>, error: BleError, reply: Option<Reply<()>>) {
         let shutdown = self.shutdown.clone();
         self.operations.spawn(async move {
             let stopped = tokio::select! {

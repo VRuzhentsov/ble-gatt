@@ -1116,6 +1116,64 @@ async fn managed_failed_startup_is_stopped_and_a_later_show_starts_again() {
 }
 
 #[tokio::test]
+async fn managed_failed_recovery_is_stopped_then_a_show_or_a_retry_restores_it() {
+    use std::sync::atomic::Ordering::SeqCst;
+    async fn within(limit: Duration, condition: impl Fn() -> bool) -> bool {
+        tokio::time::timeout(limit, async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+    let (driver, control, owner) =
+        BlockingVisibility::metadata(MockNetwork::new(), "failed-recovery");
+    owner.set_advertising(true).await.unwrap();
+    for round in 1..=2 {
+        // Model native server loss, then a recovery the platform refuses.
+        control.advertise_failure.store(true, SeqCst);
+        driver.inner.stop_advertising().await.unwrap();
+        driver.inner.simulate_radio(crate::RadioStatus::Off);
+        driver.inner.simulate_radio(crate::RadioStatus::On);
+        let stopped = || control.stops.load(SeqCst) == round;
+        assert!(
+            within(Duration::from_secs(2), stopped).await,
+            "a failed recovery is stopped"
+        );
+        assert_eq!(control.starts.load(SeqCst), 2 * round);
+        control.advertise_failure.store(false, SeqCst);
+        if round == 1 {
+            // A later show is not refused as uncertain.
+            let started = tokio::time::Instant::now();
+            let shown = loop {
+                match owner.set_advertising(true).await {
+                    Err(crate::BleError::GattBusy(_))
+                        if started.elapsed() < Duration::from_secs(2) =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    other => break other,
+                }
+            };
+            shown.expect("a show after a failed recovery starts the server again");
+        } else {
+            assert!(
+                within(Duration::from_secs(5), || control.starts.load(SeqCst) == 5).await,
+                "a failed recovery runs again after its backoff"
+            );
+        }
+        assert!(
+            within(Duration::from_secs(1), || driver.served_service().is_some()).await,
+            "round {round} serves again"
+        );
+    }
+    assert_eq!(control.starts.load(SeqCst), 5);
+    owner.close().await.unwrap();
+    assert!(driver.served_service().is_none());
+}
+
+#[tokio::test]
 async fn managed_close_keeps_a_server_the_link_did_not_start() {
     use std::sync::atomic::Ordering::SeqCst;
     let (driver, control, owner) =
