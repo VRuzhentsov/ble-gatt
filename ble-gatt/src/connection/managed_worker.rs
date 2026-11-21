@@ -238,10 +238,10 @@ impl Worker {
             Some(driver) => driver,
             None => match tokio::select! {
                 _ = self.shutdown.cancelled() => return,
-                result = tokio::time::timeout(IO_BOUND, crate::drivers::platform()) => result,
+                result = tokio::time::timeout(IO_BOUND, crate::drivers::platform()) => result.unwrap_or(Err(AttemptError::TimedOut.into())),
             } {
-                Ok(Ok(driver)) => driver,
-                _ => return,
+                Ok(driver) => driver,
+                Err(error) => return self.refuse(error).await,
             },
         };
         let mut served: Option<BoxStream<DatagramChannel>> = None;
@@ -646,6 +646,56 @@ impl Worker {
         };
         if let Some(reply) = close_reply {
             let _ = reply.send(stopped.and(teardown));
+        }
+    }
+    /// No platform driver could be built: log `error`, then answer every
+    /// command with it until close, so the caller sees why the link fails.
+    async fn refuse(self, error: BleError) {
+        log::error!("managed link: no platform driver: {error}");
+        let Self {
+            mut receiver,
+            shutdown,
+            incoming,
+            ..
+        } = self;
+        // Nothing will be accepted: end the incoming stream.
+        drop(incoming);
+        loop {
+            let command = tokio::select! {
+                _ = shutdown.cancelled() => return,
+                command = receiver.recv() => command,
+            };
+            let Some(command) = command else { return };
+            match command {
+                #[cfg(test)]
+                Command::SetNonce(_, reply) => {
+                    let _ = reply.send(Err(error.copy_error()));
+                }
+                Command::Advertising(_, reply)
+                | Command::UpdateAdvertisement(_, reply)
+                | Command::Reject(_, reply)
+                | Command::Disconnect(_, reply)
+                | Command::DisconnectGeneration(_, reply)
+                | Command::Retire(_, reply) => {
+                    let _ = reply.send(Err(error.copy_error()));
+                }
+                Command::Request { reply, .. } => {
+                    let _ = reply.send(Err(error.copy_error()));
+                }
+                Command::Discover(reply) => {
+                    let _ = reply.send(Err(error.copy_error()));
+                }
+                Command::Accept(_, reply) => {
+                    let _ = reply.send(Err(error.copy_error()));
+                }
+                // Nothing was started, so nothing is left to stop.
+                Command::Close(reply) => {
+                    let _ = reply.send(Ok(()));
+                    return;
+                }
+                // Only a running link sends these.
+                Command::Dialed(..) | Command::Wire(..) => {}
+            }
         }
     }
     /// One result of a managed scan (ADR-0012 §2): what to report now, if
