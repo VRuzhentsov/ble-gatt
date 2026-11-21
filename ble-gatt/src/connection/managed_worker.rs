@@ -713,7 +713,9 @@ impl Worker {
                 }
                 let read_at = self.metadata_cache.retry_at(key, now);
                 if let Some(entry) = tracked.get_mut(&radio.address) {
+                    // Not cached (expired or evicted): a finished read runs again.
                     entry.update_keyed(radio, key, read_at, false);
+                    entry.rearm(read_at);
                 } else if self.tracked_room(tracked) {
                     tracked.insert(
                         radio.address.clone(),
@@ -753,8 +755,12 @@ impl Worker {
                         return Some(Ok((endpoint, Self::cached_peer(fields, radio))));
                     }
                     let read_at = self.metadata_cache.retry_at(key, now);
+                    let gone = self.metadata_cache.hit(key, now).is_none();
                     if let Some(entry) = tracked.get_mut(&radio.address) {
                         entry.update_keyed(radio, key, read_at, false);
+                        if gone {
+                            entry.rearm(read_at);
+                        }
                     } else if self.tracked_room(tracked) {
                         tracked.insert(
                             radio.address.clone(),

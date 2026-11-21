@@ -719,6 +719,14 @@ impl TrackedPeer {
         self.last_seen = Instant::now();
         self.peer = peer;
     }
+    /// A keyed peer whose cached value is gone: a finished read runs again
+    /// at `read_at`.
+    pub(crate) fn rearm(&mut self, read_at: Instant) {
+        if self.read_done {
+            self.read_done = false;
+            self.next_read_at = read_at;
+        }
+    }
     pub(crate) fn managed_due(&self, now: Instant, scan_active: bool) -> bool {
         !self.read_done && (!self.has_been_reported || scan_active) && self.next_read_at <= now
     }

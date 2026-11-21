@@ -2740,6 +2740,35 @@ async fn a_header_is_read_once_per_hash_across_scans() {
     advertiser.close().await.unwrap();
 }
 
+#[test]
+fn a_read_header_is_read_again_once_its_cached_value_is_gone() {
+    use crate::advertisement::{MetadataKey, TrackedPeer};
+    let now = tokio::time::Instant::now();
+    let key = MetadataKey {
+        tag: [1, 2, 3, 4],
+        hash: 5,
+    };
+    let sighting = crate::DiscoveredPeer {
+        address: PeerAddress("expired-peer".into()),
+        name: None,
+        services: Vec::new(),
+        manufacturer_data: Default::default(),
+        service_data: Default::default(),
+        rssi: Some(-50),
+    };
+    let mut tracked = TrackedPeer::header(sighting.clone(), key, now);
+    tracked.managed_result(Some(&sighting), None);
+    tracked.update_keyed(sighting.clone(), key, now, false);
+    assert!(
+        !tracked.managed_due(now, true),
+        "the same header with its value cached is not read again"
+    );
+    // Expired or evicted from the cache: the next sighting reads it again.
+    tracked.update_keyed(sighting, key, now, false);
+    tracked.rearm(now);
+    assert!(tracked.managed_due(now, true));
+}
+
 #[tokio::test]
 async fn a_peer_without_a_record_is_read_once_then_reported_from_that_read() {
     let network = MockNetwork::new();
