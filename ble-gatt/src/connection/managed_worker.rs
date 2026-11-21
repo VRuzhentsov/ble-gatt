@@ -761,6 +761,12 @@ impl Worker {
                 None
             }
             None => {
+                if !radio.services.contains(&service) && !radio.service_data.contains_key(&service)
+                {
+                    // Not a managed peer: another company's data shaped like a
+                    // fast advertisement passed the scanner. Do not read it.
+                    return None;
+                }
                 let own = radio.service_data.get(&service).map(|bytes| {
                     let unknown_record = bytes.first().is_some_and(|tag| tag & 0xF8 == 0xF8);
                     (unknown_record, ManagedMetadata::decode(bytes))

@@ -2867,6 +2867,51 @@ async fn a_peer_without_a_record_is_read_once_then_reported_from_that_read() {
 }
 
 #[tokio::test]
+async fn foreign_data_shaped_like_a_fast_advertisement_is_neither_listed_nor_read() {
+    let network = MockNetwork::new();
+    let (_, control, reader) =
+        BlockingVisibility::metadata_with(network, "foreign-reader", fast_config(None));
+    let (input, receiver) = tokio::sync::mpsc::channel(2);
+    *control.scan_input.lock().unwrap() = Some(receiver);
+    let mut discovery = reader.discover().await.unwrap();
+    // Another company's manufacturer data with a fast advertisement's first
+    // byte and length, and no managed service: a scanner lets it through.
+    let mut foreign = vec![0x5A; 21];
+    foreign[0] = 0xFC;
+    input
+        .send(Ok(crate::DiscoveredPeer {
+            address: PeerAddress("foreign-peer".into()),
+            name: None,
+            services: Vec::new(),
+            manufacturer_data: [(0x0006, foreign)].into(),
+            service_data: Default::default(),
+            rssi: Some(-50),
+        }))
+        .await
+        .unwrap();
+    input
+        .send(Err(crate::BleError::Gatt("sighting barrier".into())))
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_item(&mut discovery, Duration::from_millis(300)).await,
+        Some(Err(crate::BleError::Gatt(message))) if message == "sighting barrier"
+    ));
+    drop(input);
+    assert!(
+        next_item(
+            &mut discovery,
+            crate::advertisement::SCAN_RESPONSE_GRACE + Duration::from_secs(1)
+        )
+        .await
+        .is_none(),
+        "a peer without a record or the service is not tracked"
+    );
+    assert_eq!(connects(&control), 0, "and never read over GATT");
+    reader.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn failed_header_reads_back_off_and_are_reported_once() {
     let network = MockNetwork::new();
     let advertiser = advertiser_with(&network, "backoff-peer", config());
