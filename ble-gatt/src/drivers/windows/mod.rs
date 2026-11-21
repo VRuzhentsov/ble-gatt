@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use windows::core::{IInspectable, Ref};
-use windows::Devices::Bluetooth::{BluetoothAdapter, BluetoothAddressType};
+use windows::Devices::Bluetooth::BluetoothAdapter;
 use windows::Devices::Radios::Radio;
 use windows::Foundation::TypedEventHandler;
 
@@ -76,9 +76,7 @@ struct ScanState {
 struct Inner {
     events_tx: EventBus,
     next_id: AtomicU64,
-    /// Address type per address seen in a scan. Android advertises from a
-    /// random address, and WinRT needs to be told the type to dial it.
-    address_types: StdMutex<HashMap<u64, BluetoothAddressType>>,
+    address_types: StdMutex<watcher::AddressTypes>,
     /// The company a scan admits fast advertisements under: that of the last
     /// spec advertised with one, else [`FastAdvertisement::DEFAULT_SCAN_COMPANY`].
     fast_scan_company: AtomicU16,
@@ -135,7 +133,7 @@ impl WindowsDriver {
         let inner = Arc::new(Inner {
             events_tx,
             next_id: AtomicU64::new(1),
-            address_types: StdMutex::new(HashMap::new()),
+            address_types: StdMutex::default(),
             fast_scan_company: AtomicU16::new(FastAdvertisement::DEFAULT_SCAN_COMPANY),
             scan: StdMutex::new(ScanState {
                 generation: 0,
@@ -290,13 +288,7 @@ impl Driver for WindowsDriver {
             armed: true,
         };
 
-        let address_type = self
-            .inner
-            .address_types
-            .lock()
-            .unwrap()
-            .get(&address)
-            .copied();
+        let address_type = self.inner.address_types.lock().unwrap().get(address);
         let link = match tokio::time::timeout(
             CONNECT_TIMEOUT,
             device::OpenedLink::open(address, address_type),

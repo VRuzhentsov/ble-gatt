@@ -45,6 +45,14 @@ const ATT_WRITE_NOT_PERMITTED: u8 = 0x03;
 /// ATT error "Invalid Offset": a long read past the end of the value.
 const ATT_INVALID_OFFSET: u8 = 0x07;
 
+/// ATT error "Insufficient Resources": the reply to a request that arrives
+/// while [`SERVER_REQUEST_QUEUE_DEPTH`] requests wait.
+const ATT_INSUFFICIENT_RESOURCES: u8 = 0x11;
+
+/// Inbound reads and writes queued for the answering task before new ones
+/// are refused. Same depth as the notification queue.
+const SERVER_REQUEST_QUEUE_DEPTH: usize = super::NOTIFY_QUEUE_DEPTH;
+
 /// `E_ILLEGAL_METHOD_CALL` (0x8000000E): "A method was called at an unexpected time."
 const E_ILLEGAL_METHOD_CALL: windows::core::HRESULT = windows::core::HRESULT(0x8000000E_u32 as i32);
 
@@ -310,7 +318,7 @@ impl Inner {
             .Service()
             .map_err(|err| BleError::windows_error("GattServiceProvider::Service", err))?;
 
-        let (requests_tx, requests_rx) = mpsc::unbounded_channel::<ServerRequest>();
+        let (requests_tx, requests_rx) = mpsc::channel::<ServerRequest>(SERVER_REQUEST_QUEUE_DEPTH);
         let values = Arc::new(StdMutex::new(HashMap::new()));
         let generation = self.next_id();
         *self.server_generation.lock().unwrap() = generation;
@@ -384,7 +392,7 @@ impl Inner {
                           args: Ref<GattReadRequestedEventArgs>| {
                         let args = args.ok()?;
                         let deferral = RequestDeferral(args.GetDeferral()?);
-                        let _ = requests_tx.send(ServerRequest::Read(uuid, args.clone(), deferral));
+                        ServerRequest::Read(uuid, args.clone(), deferral).submit(&requests_tx);
                         Ok(())
                     },
                 );
@@ -405,8 +413,7 @@ impl Inner {
                         // the fragments of a datagram stay in order.
                         let args = args.ok()?;
                         let deferral = RequestDeferral(args.GetDeferral()?);
-                        let _ =
-                            requests_tx.send(ServerRequest::Write(uuid, args.clone(), deferral));
+                        ServerRequest::Write(uuid, args.clone(), deferral).submit(&requests_tx);
                         Ok(())
                     },
                 );
@@ -704,11 +711,52 @@ impl Drop for RequestDeferral {
 /// Answers inbound reads and writes in the order they arrived; writes are
 /// published as `CharacteristicWritten`.
 impl ServerRequest {
+    /// Queue the request for the answering task. When
+    /// [`SERVER_REQUEST_QUEUE_DEPTH`] requests already wait, or the task has
+    /// ended, refuse it here instead; dropping it then completes its deferral.
+    fn submit(self, queue: &mpsc::Sender<ServerRequest>) {
+        let Err(err) = queue.try_send(self) else {
+            return;
+        };
+        let request = err.into_inner();
+        if let Err(err) = request.refuse() {
+            log::warn!("server: refusing a request failed: {err}");
+        }
+    }
+
+    /// Answer with Insufficient Resources; a write without response gets no
+    /// answer. Runs in the WinRT handler, so it waits for the request object
+    /// rather than awaiting it.
+    fn refuse(&self) -> windows::core::Result<()> {
+        match self {
+            Self::Write(characteristic, args, _) => {
+                log::warn!(
+                    "server: request queue full, refusing a write on {}",
+                    characteristic.0
+                );
+                let request = args.GetRequestAsync()?.join()?;
+                if request.Option()? == GattWriteOption::WriteWithResponse {
+                    request.RespondWithProtocolError(ATT_INSUFFICIENT_RESOURCES)?;
+                }
+            }
+            Self::Read(characteristic, args, _) => {
+                log::warn!(
+                    "server: request queue full, refusing a read on {}",
+                    characteristic.0
+                );
+                args.GetRequestAsync()?
+                    .join()?
+                    .RespondWithProtocolError(ATT_INSUFFICIENT_RESOURCES)?;
+            }
+        }
+        Ok(())
+    }
+
     async fn drain_requests(
         inner: Weak<Inner>,
         generation: u64,
         values: Arc<StdMutex<HashMap<CharacteristicUuid, Vec<u8>>>>,
-        mut requests: mpsc::UnboundedReceiver<ServerRequest>,
+        mut requests: mpsc::Receiver<ServerRequest>,
     ) {
         while let Some(request) = requests.recv().await {
             let Some(inner) = inner.upgrade() else { return };

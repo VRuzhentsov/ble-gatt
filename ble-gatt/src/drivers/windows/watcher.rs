@@ -23,7 +23,7 @@ use windows::Devices::Bluetooth::Advertisement::{
     BluetoothLEAdvertisementType, BluetoothLEAdvertisementWatcher,
     BluetoothLEAdvertisementWatcherStoppedEventArgs, BluetoothLEScanningMode,
 };
-use windows::Devices::Bluetooth::BluetoothError;
+use windows::Devices::Bluetooth::{BluetoothAddressType, BluetoothError};
 use windows::Foundation::TypedEventHandler;
 
 use super::utils::WindowsCodec;
@@ -160,6 +160,40 @@ impl ScanPeers {
     }
 }
 
+/// The address type of each address scans admitted, for `connect`: Android
+/// advertises from a random address, and WinRT needs to be told the type to
+/// dial it. Outlives one scan, so a peer found by the last scan can be
+/// dialled. Holds at most [`MAX_SCAN_PEERS`] addresses, and forgets the
+/// least recently seen one to take a new one, like [`ScanPeers`].
+#[derive(Default)]
+pub(super) struct AddressTypes {
+    /// Each address's type and the [`AddressTypes::events`] count when it
+    /// was last recorded.
+    types: HashMap<u64, (BluetoothAddressType, u64)>,
+    events: u64,
+}
+
+impl AddressTypes {
+    pub(super) fn record(&mut self, address: u64, kind: BluetoothAddressType) {
+        if !self.types.contains_key(&address) && self.types.len() >= MAX_SCAN_PEERS {
+            let oldest = self
+                .types
+                .iter()
+                .min_by_key(|(_, (_, seen))| *seen)
+                .map(|(address, _)| *address);
+            if let Some(oldest) = oldest {
+                self.types.remove(&oldest);
+            }
+        }
+        self.events += 1;
+        self.types.insert(address, (kind, self.events));
+    }
+
+    pub(super) fn get(&self, address: u64) -> Option<BluetoothAddressType> {
+        self.types.get(&address).map(|(kind, _)| *kind)
+    }
+}
+
 pub(super) struct ScanStream {
     inner: Arc<Inner>,
     rx: ReceiverStream<Result<DiscoveredPeer>>,
@@ -283,7 +317,7 @@ impl ScanStream {
                         return Ok(());
                     };
                     if let (Some(inner), Ok(kind)) = (weak.upgrade(), args.BluetoothAddressType()) {
-                        inner.address_types.lock().unwrap().insert(address, kind);
+                        inner.address_types.lock().unwrap().record(address, kind);
                     }
                     // Report new or changed peer data, including a later scan
                     // response, and data the full queue refused before; a
@@ -575,5 +609,21 @@ mod tests {
         // A new address still needs an event for the service.
         assert!(scan.record_for(new + 1, false, true).is_none());
         assert_eq!(scan.peers.len(), MAX_SCAN_PEERS);
+    }
+
+    #[test]
+    fn address_types_keep_the_most_recently_seen_addresses() {
+        let mut types = AddressTypes::default();
+        for address in 0..MAX_SCAN_PEERS as u64 {
+            types.record(address, BluetoothAddressType::Public);
+        }
+        // Address 0 is seen again, so address 1 is now the oldest.
+        types.record(0, BluetoothAddressType::Random);
+        let new = MAX_SCAN_PEERS as u64;
+        types.record(new, BluetoothAddressType::Random);
+        assert_eq!(types.types.len(), MAX_SCAN_PEERS);
+        assert_eq!(types.get(0), Some(BluetoothAddressType::Random));
+        assert_eq!(types.get(1), None);
+        assert_eq!(types.get(new), Some(BluetoothAddressType::Random));
     }
 }
