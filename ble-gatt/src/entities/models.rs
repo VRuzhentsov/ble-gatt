@@ -152,6 +152,12 @@ pub enum GattEvent {
         peer: PeerAddress,
         characteristic: CharacteristicUuid,
         value: Vec<u8>,
+        /// The connection the write arrived on; see
+        /// [`GattEvent::Connected::session`]. Writes travel on a different
+        /// stream from lifecycle events, so a consumer can process a
+        /// reconnect before an earlier write. Matching on this stops that
+        /// write reaching the replacement connection.
+        session: Option<u64>,
     },
     /// This subscriber fell behind and `dropped` events were discarded
     /// before it could read them.

@@ -107,6 +107,7 @@ impl GattDemo<'_> {
                         peer,
                         characteristic,
                         value,
+                        ..
                     } if characteristic == VALUE && written.is_none() => {
                         println!("Write from {}: {:?}", peer.0, value);
                         peripheral

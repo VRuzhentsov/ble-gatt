@@ -2254,6 +2254,7 @@ impl Driver for LinuxDriver {
                                 peer,
                                 characteristic: uuid,
                                 value,
+                                session: Some(session),
                             });
                             drop(current);
 

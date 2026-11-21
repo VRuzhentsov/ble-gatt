@@ -472,7 +472,7 @@ impl Inner {
             }
             return Ok(());
         }
-        let Some((address, _)) = self.note_server_peer(&session, generation) else {
+        let Some((address, driver_session)) = self.note_server_peer(&session, generation) else {
             if with_response {
                 request.RespondWithProtocolError(ATT_WRITE_NOT_PERMITTED)?;
             }
@@ -499,6 +499,7 @@ impl Inner {
             peer: PeerAddress(address),
             characteristic,
             value,
+            session: Some(driver_session),
         });
         Ok(())
     }

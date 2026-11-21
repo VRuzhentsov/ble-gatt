@@ -159,7 +159,9 @@ Drivers publish bounded lifecycle events separately from characteristic writes.
 Native/mock drivers, the broker and wrappers preserve this separation through
 `Driver::lifecycle_events()`. The third-party default filters the legacy stream;
 it cannot isolate loss. Critical lag remains terminal for an affected raw channel,
-unlike known payload gaps. The managed advertisement owner treats its lifecycle
+unlike known payload gaps. The two streams share no order, so each
+`CharacteristicWritten` carries its driver session, and `serve` drops a write
+whose session is not the one its channel serves. The managed advertisement owner treats its lifecycle
 lag as unknown native state, not confirmed radio loss. It guards updates and show
 until hide and a full hidden retry succeed. This guard does not stop a surviving channel.
 See [event-stream limits](interface.md#driver-event-streams-and-receive-loss).

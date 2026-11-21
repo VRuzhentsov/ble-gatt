@@ -711,6 +711,7 @@ impl LocalRadio {
                 peer: central.clone(),
                 characteristic,
                 value,
+                session: Some(session),
             },
         );
         Ok(())

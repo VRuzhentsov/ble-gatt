@@ -180,6 +180,7 @@ impl From<GattEvent> for GattEventDto {
                 peer,
                 characteristic,
                 value,
+                ..
             } => Self::CharacteristicWritten {
                 address: peer.0,
                 characteristic_uuid: characteristic.0.to_string(),

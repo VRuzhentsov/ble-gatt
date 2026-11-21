@@ -2466,6 +2466,7 @@ impl Inner {
                 peer: PeerAddress(address),
                 characteristic: CharacteristicUuid(uuid),
                 value: bytes,
+                session: Some(session),
             });
     }
     fn subscribed<'local>(

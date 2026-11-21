@@ -843,6 +843,16 @@ impl ServedPeer {
             );
         }
     }
+
+    /// Whether an event naming `session` belongs to the connection this peer
+    /// is served on. A driver that cannot tell sessions apart reports `None`,
+    /// which matches any session.
+    fn owns_session(&self, session: Option<u64>) -> bool {
+        match (self.driver_session, session) {
+            (Some(current), Some(event)) => current == event,
+            _ => true,
+        }
+    }
 }
 
 /// A served peer's fragment sender, channel-liveness flag, and overflow
@@ -1423,7 +1433,12 @@ impl DatagramConfig {
                     }
                 };
                 let (source, mut event) = event;
-                if let GattEvent::CharacteristicWritten { peer, .. } = &event {
+                if let GattEvent::CharacteristicWritten {
+                    peer,
+                    session: written_session,
+                    ..
+                } = &event
+                {
                     while let Ok(released) = release_rx.try_recv() {
                         if let Some(session) =
                             released.release_peer(&mut inbound, driver.as_ref()).await
@@ -1432,8 +1447,15 @@ impl DatagramConfig {
                         }
                     }
                     if !accept_closed && !inbound.contains_key(peer) {
+                        // Only a write on the retained session reopens it. A
+                        // write from an earlier connection is dropped below.
                         if let Some((known, session)) =
-                            last_session.as_ref().filter(|(known, _)| known == peer)
+                            last_session.as_ref().filter(|(known, session)| {
+                                known == peer
+                                    && (session.is_none()
+                                        || written_session.is_none()
+                                        || session == written_session)
+                            })
                         {
                             let connected = GattEvent::Connected {
                                 peer: known.clone(),
@@ -1623,6 +1645,7 @@ impl DatagramConfig {
                         peer,
                         characteristic,
                         value,
+                        session: written_session,
                     } => {
                         if characteristic != config.characteristic {
                             continue;
@@ -1645,6 +1668,20 @@ impl DatagramConfig {
                             );
                             continue;
                         };
+                        // Writes and lifecycle events arrive on separate
+                        // streams, so this loop can process a reconnect before
+                        // a write from the connection it replaced. Delivering
+                        // that write would put the old session's fragment into
+                        // the new session's channel.
+                        if !served.owns_session(written_session) {
+                            log::warn!(
+                                "serve: dropping a write from {} session={written_session:?} \
+                             — the channel serves session={:?}",
+                                peer.0,
+                                served.driver_session
+                            );
+                            continue;
+                        }
                         let (tx, overflow) = (&served.fragments, &served.overflow);
                         // Native acknowledgement precedes this event. A full
                         // payload queue is known local loss, not permission to

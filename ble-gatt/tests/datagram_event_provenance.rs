@@ -10,12 +10,28 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::sync::mpsc;
-use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+use tokio::sync::{mpsc, watch};
+use tokio_stream::{
+    wrappers::{ReceiverStream, UnboundedReceiverStream},
+    StreamExt,
+};
 
 struct PayloadEvents {
     inner: Arc<MockDriver>,
     injected: Mutex<Option<mpsc::Receiver<GattEvent>>>,
+    /// While `false`, payload events are held back and lifecycle events are
+    /// not, so a test can order a reconnect ahead of an earlier write.
+    payload_open: watch::Sender<bool>,
+}
+
+impl PayloadEvents {
+    fn new(inner: Arc<MockDriver>, injected: mpsc::Receiver<GattEvent>) -> Self {
+        Self {
+            inner,
+            injected: Mutex::new(Some(injected)),
+            payload_open: watch::channel(true).0,
+        }
+    }
 }
 #[async_trait]
 impl Driver for PayloadEvents {
@@ -77,7 +93,18 @@ impl Driver for PayloadEvents {
             .unwrap()
             .take()
             .expect("one payload subscriber");
-        Box::pin(payload.merge(ReceiverStream::new(injected)))
+        let mut payload = Box::pin(payload.merge(ReceiverStream::new(injected)));
+        let mut open = self.payload_open.subscribe();
+        let (forward, forwarded) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(event) = payload.next().await {
+                let opened = open.wait_for(|open| *open).await.is_ok();
+                if !opened || forward.send(event).is_err() {
+                    return;
+                }
+            }
+        });
+        Box::pin(UnboundedReceiverStream::new(forwarded))
     }
 }
 
@@ -91,10 +118,7 @@ async fn payload_lag_is_recoverable_but_critical_lag_ends_the_raw_generation() {
     let address = PeerAddress("provenance-peripheral".into());
     let inner = Arc::new(MockDriver::new(address.clone(), network.clone(), caps));
     let (inject, receiver) = mpsc::channel(1);
-    let driver = Arc::new(PayloadEvents {
-        inner,
-        injected: Mutex::new(Some(receiver)),
-    });
+    let driver = Arc::new(PayloadEvents::new(inner, receiver));
     let peripheral = Adapter::new(driver).await;
     let central = Adapter::new(Arc::new(MockDriver::new(
         PeerAddress("provenance-central".into()),
@@ -141,4 +165,62 @@ async fn payload_lag_is_recoverable_but_critical_lag_ends_the_raw_generation() {
     })
     .await
     .expect("critical lag must invalidate served generation");
+}
+
+#[tokio::test]
+async fn a_write_from_a_replaced_session_does_not_reach_the_replacement_channel() {
+    let network = MockNetwork::new();
+    let caps = CapabilityReport {
+        central: true,
+        peripheral: true,
+    };
+    let address = PeerAddress("stale-write-peripheral".into());
+    let inner = Arc::new(MockDriver::new(address.clone(), network.clone(), caps));
+    let (_inject, receiver) = mpsc::channel(1);
+    let driver = Arc::new(PayloadEvents::new(inner, receiver));
+    let peripheral = Adapter::new(driver.clone()).await;
+    let central = Adapter::new(Arc::new(MockDriver::new(
+        PeerAddress("stale-write-central".into()),
+        network.clone(),
+        caps,
+    )))
+    .await;
+    let config = DatagramConfig::new(
+        ServiceUuid(uuid::Uuid::from_u128(41)),
+        CharacteristicUuid(uuid::Uuid::from_u128(42)),
+    );
+    let mut incoming = datagram::serve(&peripheral, &config).await.unwrap();
+    let mut first = datagram::connect(&central, &address, &config)
+        .await
+        .unwrap();
+    let first_served = tokio::time::timeout(Duration::from_millis(300), incoming.next())
+        .await
+        .expect("the first session is admitted")
+        .unwrap();
+
+    // The first session's write is acknowledged but its event is still in
+    // flight when the central reconnects.
+    driver.payload_open.send_replace(false);
+    first.send(vec![1]).await.unwrap();
+    first.close().await.unwrap();
+    let mut second = datagram::connect(&central, &address, &config)
+        .await
+        .unwrap();
+    let mut served = tokio::time::timeout(Duration::from_millis(300), incoming.next())
+        .await
+        .expect("the reconnected central is admitted")
+        .unwrap();
+    assert_ne!(served.session(), first_served.session());
+    second.send(vec![2]).await.unwrap();
+    driver.payload_open.send_replace(true);
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_millis(300), served.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        vec![2],
+        "the replaced session's write must not be delivered to its replacement"
+    );
 }
