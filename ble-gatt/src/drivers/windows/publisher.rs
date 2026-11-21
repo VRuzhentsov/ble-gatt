@@ -7,25 +7,20 @@
 //! Apache-2.0, ideas only) starts a separate publisher for its fast
 //! advertisement and keeps the GATT server for reads. This publisher does
 //! the same with the fast advertisement as manufacturer data under its
-//! company: a legacy, non-connectable advertisement of 30 bytes. Like Nearby,
-//! it uses an extended advertisement (not anonymous) only when the data does
-//! not fit a legacy one and the adapter supports extended advertising; legacy
-//! scanners cannot see an extended-only advertisement.
+//! company: a legacy, non-connectable advertisement of at most 31 bytes
+//! (`GattServiceSpec::validate` caps the record at
+//! `FAST_ADVERTISEMENT_MAX_LEN`), which every scanner can see.
 
 use windows::core::Ref;
 use windows::Devices::Bluetooth::Advertisement::{
     BluetoothLEAdvertisementPublisher, BluetoothLEAdvertisementPublisherStatus,
     BluetoothLEAdvertisementPublisherStatusChangedEventArgs, BluetoothLEManufacturerData,
 };
-use windows::Devices::Bluetooth::BluetoothAdapter;
 use windows::Foundation::TypedEventHandler;
 
 use super::utils::WindowsCodec;
 use crate::entities::error::{BleError, Result};
-use crate::entities::models::{FastAdvertisement, GattServiceSpec, LEGACY_ADVERTISING_DATA_LEN};
-
-/// Manufacturer data AD structure overhead: length, type, company identifier.
-const MANUFACTURER_AD_OVERHEAD: usize = 4;
+use crate::entities::models::{FastAdvertisement, GattServiceSpec};
 
 pub(super) struct FastPublisher {
     publisher: BluetoothLEAdvertisementPublisher,
@@ -66,25 +61,6 @@ impl FastPublisher {
                 .and_then(|list| list.Append(&data))
                 .map_err(|err| BleError::windows_error("ManufacturerData", err))?;
         }
-        let extended = MANUFACTURER_AD_OVERHEAD + record.data.len() > LEGACY_ADVERTISING_DATA_LEN;
-        if extended {
-            let supported = match BluetoothAdapter::GetDefaultAsync() {
-                Ok(op) => op
-                    .await
-                    .and_then(|adapter| adapter.IsExtendedAdvertisingSupported())
-                    .unwrap_or(false),
-                Err(_) => false,
-            };
-            if !supported {
-                return Err(BleError::Unsupported(
-                    "the record needs an extended advertisement, which this adapter lacks".into(),
-                ));
-            }
-            publisher
-                .SetUseExtendedAdvertisement(true)
-                .and_then(|()| publisher.SetIsAnonymous(false))
-                .map_err(|err| BleError::windows_error("UseExtendedAdvertisement", err))?;
-        }
         let status_token = publisher
             .StatusChanged(&TypedEventHandler::new(
                 |_: Ref<BluetoothLEAdvertisementPublisher>,
@@ -114,10 +90,9 @@ impl FastPublisher {
                 .map_err(|err| BleError::windows_error("Publisher::Start", err))?;
         }
         log::info!(
-            "advertise: fast advertisement published ({} bytes under {:#06x}, {}{})",
+            "advertise: fast advertisement published ({} bytes under {:#06x}, legacy{})",
             record.data.len(),
             record.company_id,
-            if extended { "extended" } else { "legacy" },
             if paused {
                 ", paused while scanning"
             } else {
