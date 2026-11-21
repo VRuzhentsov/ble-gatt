@@ -134,7 +134,7 @@ proves the survivor still transfers round 3 without another dial.
 Correlate both peers' logs:
 
 - `START`, `READY` and authenticated `QUIC` events. Android additionally needs
-  `EitherPeerService READY` and the marker from the current process.
+  `IrohDiagnosticService READY` and the marker from the current process.
 - Native central/client and peripheral/server callbacks and session generations,
   not just requested modes or QUIC incoming/outgoing labels.
 - Initiator `PAYLOAD matched` for rounds 1/2/3, `REUSE`, and `SURVIVOR`.

@@ -19,7 +19,7 @@ class DiagnosticService : Service() {
     private val poll = object : Runnable {
         override fun run() {
             ticks++
-            if (ticks >= 190 || File(filesDir, "either-peer-stop").exists()) {
+            if (ticks >= 190 || File(filesDir, "iroh-diagnostic-stop").exists()) {
                 stopSelf()
             } else handler.postDelayed(this, 1000)
         }
@@ -29,18 +29,18 @@ class DiagnosticService : Service() {
         if (!BuildConfig.DEBUG) { stopSelf(); return }
         try {
             val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(NotificationChannel("either-peer", "BLE diagnostic", NotificationManager.IMPORTANCE_LOW))
-            val notification = Notification.Builder(this, "either-peer")
+            manager.createNotificationChannel(NotificationChannel("iroh-diagnostic", "BLE diagnostic", NotificationManager.IMPORTANCE_LOW))
+            val notification = Notification.Builder(this, "iroh-diagnostic")
                 .setContentTitle("Isolated BLE diagnostic")
                 .setContentText("Synthetic traffic only; stops within 190 seconds")
                 .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
                 .setOngoing(true).build()
             startForeground(1, notification)
-            File(filesDir, "either-peer-foreground").writeText(Process.myPid().toString())
-            Log.i("EitherPeerService", "READY foreground pid=${Process.myPid()} timeout_seconds=190")
+            File(filesDir, "iroh-diagnostic-foreground").writeText(Process.myPid().toString())
+            Log.i("IrohDiagnosticService", "READY foreground pid=${Process.myPid()} timeout_seconds=190")
             handler.postDelayed(poll, 1000)
         } catch (error: Exception) {
-            Log.e("EitherPeerService", "FAIL foreground service prerequisites", error)
+            Log.e("IrohDiagnosticService", "FAIL foreground service prerequisites", error)
             stopSelf()
         }
     }
@@ -48,10 +48,10 @@ class DiagnosticService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
     override fun onDestroy() {
         handler.removeCallbacks(poll)
-        File(filesDir, "either-peer-foreground").delete()
-        File(filesDir, "either-peer-stop").delete()
+        File(filesDir, "iroh-diagnostic-foreground").delete()
+        File(filesDir, "iroh-diagnostic-stop").delete()
         stopForeground(STOP_FOREGROUND_REMOVE)
-        Log.i("EitherPeerService", "STOP foreground pid=${Process.myPid()}")
+        Log.i("IrohDiagnosticService", "STOP foreground pid=${Process.myPid()}")
         super.onDestroy()
     }
 }

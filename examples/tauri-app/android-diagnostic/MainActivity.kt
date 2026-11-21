@@ -10,15 +10,15 @@ class MainActivity : TauriActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         if (BuildConfig.DEBUG) {
-            File(filesDir, "either-peer-foreground").delete()
-            File(filesDir, "either-peer-stop").delete()
+            File(filesDir, "iroh-diagnostic-foreground").delete()
+            File(filesDir, "iroh-diagnostic-stop").delete()
         }
         super.onCreate(savedInstanceState)
         if (BuildConfig.DEBUG && diagnosticMode().isNotEmpty()) {
             try {
                 startForegroundService(Intent(this, DiagnosticService::class.java))
             } catch (error: Exception) {
-                Log.e("EitherPeerService", "FAIL foreground service; approve existing Bluetooth permissions in foreground, then relaunch", error)
+                Log.e("IrohDiagnosticService", "FAIL foreground service; approve existing Bluetooth permissions in foreground, then relaunch", error)
             }
         }
     }

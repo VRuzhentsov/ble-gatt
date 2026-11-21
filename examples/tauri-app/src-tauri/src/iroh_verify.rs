@@ -38,10 +38,10 @@ impl diagnostic::Options {
                 let dir = service_dir.as_ref().map_err(Clone::clone)?;
                 let pid = std::process::id().to_string();
                 tokio::time::timeout(Duration::from_secs(10), async {
-                    while std::fs::read_to_string(dir.join("either-peer-foreground")).ok().as_deref() != Some(&pid) {
+                    while std::fs::read_to_string(dir.join("iroh-diagnostic-foreground")).ok().as_deref() != Some(&pid) {
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
-                }).await.map_err(|_| "foreground service not ready: inspect EitherPeerService logs and existing permission prerequisites")?;
+                }).await.map_err(|_| "foreground service not ready: inspect IrohDiagnosticService logs and existing permission prerequisites")?;
             }
             let key = Self::property("debug.blegatt.iroh.secret").parse().map_err(|_| "invalid diagnostic secret property")?;
             let peer = Self::property("debug.blegatt.iroh.peer").parse().map_err(|_| "invalid peer public-key property")?;
@@ -53,7 +53,7 @@ impl diagnostic::Options {
         }.await;
             #[cfg(target_os = "android")]
             if let Ok(dir) = service_dir {
-                let _ = std::fs::write(dir.join("either-peer-stop"), b"done");
+                let _ = std::fs::write(dir.join("iroh-diagnostic-stop"), b"done");
             }
             match result {
                 Ok(()) => diagnostic::mark("PASS payload-reuse-survivor-cleanup"),

@@ -19,7 +19,7 @@ use std::{
 };
 use tokio_stream::StreamExt;
 
-const ALPN: &[u8] = b"ble-gatt/example/either-peer/1";
+const ALPN: &[u8] = b"ble-gatt/example/iroh-diagnostic/1";
 const COMPANY: u16 = 0xffff;
 
 pub fn mark(line: impl std::fmt::Display) {
@@ -323,7 +323,7 @@ impl Options {
     }
 
     fn mark(line: impl std::fmt::Display) {
-        log::info!("EITHERPEER: {line}");
+        log::info!("IROHDIAG: {line}");
     }
 
     // Five bytes fit alongside flags + 128-bit service UUID in legacy advertising.
