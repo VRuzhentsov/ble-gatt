@@ -241,7 +241,6 @@ struct MetadataControl {
     critical_events: std::sync::Mutex<Option<crate::drivers::event_bus::EventBus>>,
     updates: std::sync::atomic::AtomicUsize,
     values: std::sync::atomic::AtomicUsize,
-    values_written: tokio::sync::Notify,
     starts: std::sync::atomic::AtomicUsize,
     connects: std::sync::atomic::AtomicUsize,
     stops: std::sync::atomic::AtomicUsize,
@@ -412,14 +411,9 @@ impl crate::Driver for BlockingVisibility {
                 return Err(crate::BleError::Gatt("readable update refused".into()));
             }
         }
-        let result = self
-            .inner
+        self.inner
             .set_characteristic_value(characteristic, value)
-            .await;
-        if let Some(control) = &self.metadata {
-            control.values_written.notify_one();
-        }
-        result
+            .await
     }
     async fn set_advertising_enabled(&self, enabled: bool) -> crate::Result<()> {
         if let Some(control) = &self.metadata {
@@ -1111,23 +1105,27 @@ async fn managed_metadata_caller_abort_keeps_admitted_operation_owned() {
     assert!(update.await.unwrap_err().is_cancelled());
     control.blocked.store(false, SeqCst);
     control.release.notify_one();
-    tokio::time::timeout(
-        Duration::from_millis(300),
-        control.values_written.notified(),
-    )
+    tokio::time::timeout(Duration::from_millis(300), async {
+        loop {
+            let spec = driver.served_service().unwrap();
+            let readable = GattAdvertisement::decode(
+                &spec
+                    .characteristics
+                    .iter()
+                    .find(|v| v.uuid == GATT_ADVERTISEMENT_CHARACTERISTIC)
+                    .unwrap()
+                    .initial_value,
+            )
+            .unwrap();
+            if readable.local_name == desired.local_name {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
     .await
-    .unwrap();
-    let spec = driver.served_service().unwrap();
-    let readable = GattAdvertisement::decode(
-        &spec
-            .characteristics
-            .iter()
-            .find(|v| v.uuid == GATT_ADVERTISEMENT_CHARACTERISTIC)
-            .unwrap()
-            .initial_value,
-    )
-    .unwrap();
-    assert_eq!(readable.local_name, desired.local_name);
+    .expect("the admitted update completes after its caller aborted");
+    assert_eq!(control.values.load(SeqCst), 1);
     assert_eq!(control.updates.load(SeqCst), 1);
     owner.close().await.unwrap();
 }
@@ -1365,8 +1363,8 @@ async fn managed_metadata_timeout_fences_real_pending_outcome_and_close_drains_u
     assert_eq!(committed_metadata.local_name, metadata.local_name);
     assert_eq!(
         control.values.load(SeqCst),
-        0,
-        "late native success must not invent the skipped readable write"
+        1,
+        "the readable value is installed once, before the native update it matches"
     );
     assert!(matches!(
         owner.set_advertising(true).await,
@@ -1554,14 +1552,15 @@ async fn managed_metadata_partial_failures_require_hide_and_full_hidden_retry() 
             .find(|value| value.uuid == GATT_ADVERTISEMENT_CHARACTERISTIC)
             .unwrap()
             .initial_value;
-        assert_eq!(snapshot_value == &before, native_failure);
-        assert_eq!(
-            connection
-                .read(GATT_ADVERTISEMENT_CHARACTERISTIC)
-                .await
-                .unwrap(),
-            before
-        );
+        // The readable value is installed before the advertisement is
+        // published: a refused value write publishes nothing, and a refused
+        // publish leaves the new value readable under the old advertisement.
+        assert_eq!(snapshot_value, &before);
+        let readable = connection
+            .read(GATT_ADVERTISEMENT_CHARACTERISTIC)
+            .await
+            .unwrap();
+        assert_eq!(readable == before, !native_failure);
         let blocked = owner.set_advertising(true).await;
         if !matches!(blocked, Err(crate::BleError::GattBusy(_))) {
             connection.disconnect().await.unwrap();
@@ -1605,7 +1604,9 @@ async fn managed_metadata_partial_failures_require_hide_and_full_hidden_retry() 
             .next()
             .await
             .is_none());
-        assert_eq!(control.updates.load(SeqCst), 2);
+        // A refused value write stops the update before it reaches the radio.
+        let expected_updates = if native_failure { 2 } else { 1 };
+        assert_eq!(control.updates.load(SeqCst), expected_updates);
         assert_eq!(control.starts.load(SeqCst), 1);
         assert_eq!(control.stops.load(SeqCst), 0);
         connection.disconnect().await.unwrap();
