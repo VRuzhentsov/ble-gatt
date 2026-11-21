@@ -348,16 +348,18 @@ impl PeerChannel {
         // consume one shared queue and one shared gap report, never broadcast.
         let mut received = self.state.received.lock().await;
         loop {
-            if self.state.ended.is_cancelled() {
-                return None;
-            }
             if self.state.overflow.take() {
                 return Some(Err(BleError::ReceiveGap(
                     "managed inbound payload was lost".into(),
                 )));
             }
+            // An ended generation still yields the messages it admitted before
+            // it ended, then reports the end.
+            if self.state.ended.is_cancelled() {
+                return received.try_recv().ok();
+            }
             tokio::select! { biased;
-                _ = self.state.ended.cancelled() => return None,
+                _ = self.state.ended.cancelled() => continue,
                 _ = self.state.overflow.notified() => continue,
                 item = received.recv() => return item,
             }
@@ -646,6 +648,119 @@ pub(super) mod tests {
             Record::Data { .. }
         ));
         managed.close().await.unwrap();
+    }
+
+    async fn raw_established(
+        attempt: u64,
+    ) -> (Arc<PeerLink>, crate::datagram::DatagramChannel, PeerChannel) {
+        let network = MockNetwork::new();
+        let caps = CapabilityReport {
+            central: true,
+            peripheral: true,
+        };
+        let config = DatagramConfig::new(
+            ServiceUuid(uuid::Uuid::from_u128(11)),
+            CharacteristicUuid(uuid::Uuid::from_u128(12)),
+        );
+        let raw = Arc::new(MockDriver::new(
+            PeerAddress("raw".into()),
+            network.clone(),
+            caps,
+        ));
+        let managed = PeerLink::with_driver(
+            Arc::new(MockDriver::new(
+                PeerAddress("managed".into()),
+                network,
+                caps,
+            )),
+            PeerLinkConfig::new(config.clone()),
+        );
+        let mut incoming = managed.incoming().unwrap();
+        managed.set_advertising(true).await.unwrap();
+        let mut raw = crate::datagram::DatagramChannel::connect_driver(
+            raw,
+            &PeerAddress("managed".into()),
+            &config,
+        )
+        .await
+        .unwrap();
+        raw.send(
+            Record::Request {
+                sender: EndpointId([1; 16]),
+                target: managed.endpoint_id(),
+                attempt,
+                nonce: 7,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+        let _response = raw.recv().await.unwrap().unwrap();
+        let request = incoming.next().await.unwrap();
+        raw.send(Record::Decision { attempt, action: 0 }.encode())
+            .await
+            .unwrap();
+        let channel = request.accept().await.unwrap();
+        let _decision = raw.recv().await.unwrap().unwrap();
+        (managed, raw, channel)
+    }
+
+    #[tokio::test]
+    async fn receive_yields_admitted_message_after_peer_disconnect_then_ends() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (managed, mut raw, channel) = raw_established(29).await;
+            raw.send(
+                Record::Data {
+                    attempt: 29,
+                    payload: b"last words".to_vec(),
+                }
+                .encode(),
+            )
+            .await
+            .unwrap();
+            raw.send(Record::Disconnect { attempt: 29 }.encode())
+                .await
+                .unwrap();
+            channel.state.ended.cancelled().await;
+            assert_eq!(
+                channel.close_reason(),
+                Some(PeerChannelCloseReason::PeerDisconnect)
+            );
+            assert_eq!(channel.recv().await.unwrap().unwrap(), b"last words");
+            assert!(channel.recv().await.is_none());
+            managed.close().await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn receive_yields_admitted_message_after_local_disconnect_then_ends() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (managed, mut raw, channel) = raw_established(31).await;
+            raw.send(
+                Record::Data {
+                    attempt: 31,
+                    payload: b"queued".to_vec(),
+                }
+                .encode(),
+            )
+            .await
+            .unwrap();
+            while channel.state.received.lock().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            channel.disconnect().await.unwrap();
+            assert_eq!(
+                channel.close_reason(),
+                Some(PeerChannelCloseReason::LocalDisconnect)
+            );
+            assert_eq!(channel.recv().await.unwrap().unwrap(), b"queued");
+            assert!(channel.recv().await.is_none());
+            managed.close().await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
