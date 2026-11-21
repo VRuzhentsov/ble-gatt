@@ -91,6 +91,12 @@ pub const DEFAULT_LINK_RELEASE_DELAY: Duration = Duration::ZERO;
 /// no event for it.
 const DRAINED_CHECK_INTERVAL: Duration = Duration::from_millis(10);
 
+/// Replaced or forgotten addresses kept from being dialled. Past this the one
+/// retired longest ago is forgotten, so address rotation does not grow memory.
+/// A phone rotates its address about every 15 minutes: this covers days of
+/// rotations for one peer.
+const RETIRED_ADDRESS_LIMIT: usize = 256;
+
 /// A packet received from a peer.
 type Inbound = (PeerAddress, Vec<u8>);
 
@@ -442,7 +448,7 @@ impl BleGattTransport {
         retired.remove(&address);
         if let Some(old) = peers.insert(endpoint, address) {
             if !peers.values().any(|current| *current == old) {
-                retired.insert(old, endpoint);
+                Inner::retire_address(&mut retired, old, endpoint);
             }
         }
     }
@@ -454,11 +460,11 @@ impl BleGattTransport {
         let mut peers = self.inner.peers.lock().expect("poisoned");
         if let Some(old) = peers.remove(endpoint) {
             if !peers.values().any(|current| *current == old) {
-                self.inner
-                    .retired
-                    .lock()
-                    .expect("poisoned")
-                    .insert(old, *endpoint);
+                Inner::retire_address(
+                    &mut self.inner.retired.lock().expect("poisoned"),
+                    old,
+                    *endpoint,
+                );
             }
         }
     }
@@ -522,9 +528,9 @@ struct Inner {
     /// Where each known endpoint can be reached, for address lookup.
     peers: Mutex<HashMap<EndpointId, PeerAddress>>,
     /// Addresses `set_peer_address` replaced or `forget_peer` removed, and
-    /// not set again since, with the endpoint they were set for: never
-    /// dialled; see `Sender::send`.
-    retired: Mutex<HashMap<PeerAddress, EndpointId>>,
+    /// not set again since, with the endpoint they were set for and when:
+    /// never dialled; see `Sender::send`. At most `RETIRED_ADDRESS_LIMIT`.
+    retired: Mutex<HashMap<PeerAddress, (EndpointId, Instant)>>,
     /// A close signal per running link, replaced ones included; see
     /// [`BleGattTransport::close_link`].
     closers: Mutex<HashMap<PeerAddress, Vec<Arc<Notify>>>>,
@@ -561,6 +567,25 @@ impl Inner {
         acquisition.generation += 1;
         acquisition.terminal = false;
         acquisition.generation
+    }
+
+    /// Records `address`, set for `endpoint`, as retired. Past
+    /// `RETIRED_ADDRESS_LIMIT` the address retired longest ago is forgotten.
+    fn retire_address(
+        retired: &mut HashMap<PeerAddress, (EndpointId, Instant)>,
+        address: PeerAddress,
+        endpoint: EndpointId,
+    ) {
+        retired.insert(address, (endpoint, Instant::now()));
+        if retired.len() > RETIRED_ADDRESS_LIMIT {
+            let oldest = retired
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(address, _)| address.clone());
+            if let Some(oldest) = oldest {
+                retired.remove(&oldest);
+            }
+        }
     }
 }
 
@@ -804,7 +829,7 @@ impl Inner {
             .lock()
             .expect("poisoned")
             .iter()
-            .filter(|(_, owner)| *owner == endpoint)
+            .filter(|(_, (owner, _))| owner == endpoint)
             .map(|(address, _)| address.clone())
             .collect();
         addresses.extend(self.peers.lock().expect("poisoned").get(endpoint).cloned());
@@ -1597,6 +1622,29 @@ mod tests {
             )),
             PeerLinkConfig::new(config.clone()),
         )
+    }
+
+    #[tokio::test]
+    async fn address_rotation_keeps_retired_addresses_bounded_and_forgets_the_oldest() {
+        let transport = BleGattTransport::builder().build();
+        let id = iroh::SecretKey::generate().public();
+        let rotation = |index: usize| PeerAddress(format!("rotation-{index}"));
+        for index in 0..=RETIRED_ADDRESS_LIMIT + 1 {
+            transport.set_peer_address(id, rotation(index));
+            if index == 1 {
+                // The first retired address is strictly the oldest.
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+        let retired = transport.inner.retired.lock().unwrap();
+        assert_eq!(retired.len(), RETIRED_ADDRESS_LIMIT);
+        assert!(!retired.contains_key(&rotation(0)), "oldest is forgotten");
+        assert!(retired.contains_key(&rotation(1)));
+        assert!(retired.contains_key(&rotation(RETIRED_ADDRESS_LIMIT)));
+        assert!(
+            !retired.contains_key(&rotation(RETIRED_ADDRESS_LIMIT + 1)),
+            "the current address is dialled"
+        );
     }
 
     async fn managed_pair(
