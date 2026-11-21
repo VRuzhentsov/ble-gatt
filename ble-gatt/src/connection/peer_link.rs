@@ -348,19 +348,20 @@ impl PeerChannel {
         // consume one shared queue and one shared gap report, never broadcast.
         let mut received = self.state.received.lock().await;
         loop {
+            // The peer's disconnect follows the messages it sent before it, so
+            // those are still yielded before the end. A local end or a lost
+            // link discards what was not read, a pending gap included.
+            let draining = self.state.ended.is_cancelled();
+            if draining && self.close_reason() != Some(PeerChannelCloseReason::PeerDisconnect) {
+                return None;
+            }
             if self.state.overflow.take() {
                 return Some(Err(BleError::ReceiveGap(
                     "managed inbound payload was lost".into(),
                 )));
             }
-            // The peer's disconnect follows the messages it sent before it, so
-            // those are still yielded before the end. A local end or a lost
-            // link discards what was not read.
-            if self.state.ended.is_cancelled() {
-                return match self.close_reason() {
-                    Some(PeerChannelCloseReason::PeerDisconnect) => received.try_recv().ok(),
-                    _ => None,
-                };
+            if draining {
+                return received.try_recv().ok();
             }
             tokio::select! { biased;
                 _ = self.state.ended.cancelled() => continue,
