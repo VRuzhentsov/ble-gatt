@@ -70,19 +70,26 @@ impl AdvertisedData {
 struct SeenPeer {
     /// Keyed by the `BluetoothLEAdvertisementType` value.
     packets: BTreeMap<i32, AdvertisedData>,
+    /// The merged data last put in the result queue. A result the full
+    /// queue refused is not delivered, so the next event tries it again.
+    delivered: Option<AdvertisedData>,
 }
 
 impl SeenPeer {
-    /// Replace the latest packet of `advertisement_type`; returns whether
-    /// the merged data changed.
-    fn record(
-        &mut self,
-        advertisement_type: BluetoothLEAdvertisementType,
-        packet: AdvertisedData,
-    ) -> bool {
-        let before = self.merged();
+    /// Replace the latest packet of `advertisement_type`.
+    fn record(&mut self, advertisement_type: BluetoothLEAdvertisementType, packet: AdvertisedData) {
         self.packets.insert(advertisement_type.0, packet);
-        self.merged() != before
+    }
+
+    /// The merged data, when it differs from the data last delivered.
+    fn undelivered(&self) -> Option<AdvertisedData> {
+        let merged = self.merged();
+        (self.delivered.as_ref() != Some(&merged)).then_some(merged)
+    }
+
+    /// Note that `data` reached the result queue.
+    fn mark_delivered(&mut self, data: AdvertisedData) {
+        self.delivered = Some(data);
     }
 
     /// The latest packets merged, in advertisement type order: the scan
@@ -249,22 +256,25 @@ impl ScanStream {
                         inner.address_types.lock().unwrap().insert(address, kind);
                     }
                     // Report new or changed peer data, including a later scan
-                    // response; a repeated packet changes nothing.
-                    if !entry.record(advertisement_type, packet) {
+                    // response, and data the full queue refused before; a
+                    // repeated packet of delivered data changes nothing.
+                    entry.record(advertisement_type, packet);
+                    let Some(data) = entry.undelivered() else {
                         return Ok(());
-                    }
-                    let data = entry.merged();
+                    };
                     let peer = DiscoveredPeer {
                         address: PeerAddress(WindowsCodec::format_address(address)),
-                        name: advertised_name(service, &data.service_data, data.local_name),
-                        services: data.services,
-                        manufacturer_data: data.manufacturer_data,
-                        service_data: data.service_data,
+                        name: advertised_name(service, &data.service_data, data.local_name.clone()),
+                        services: data.services.clone(),
+                        manufacturer_data: data.manufacturer_data.clone(),
+                        service_data: data.service_data.clone(),
                         rssi: args.RawSignalStrengthInDBm().ok(),
                     };
                     if let Some(tx) = tx.lock().unwrap().as_ref() {
-                        if tx.try_send(Ok(peer)).is_err() {
-                            log::debug!("scan: result queue full, dropping a result");
+                        if tx.try_send(Ok(peer)).is_ok() {
+                            entry.mark_delivered(data);
+                        } else {
+                            log::debug!("scan: result queue full, retrying on the next event");
                         }
                     }
                     Ok(())
@@ -386,6 +396,7 @@ impl Drop for ScanStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Devices::Bluetooth::Advertisement::BluetoothLEAdvertisementType as Type;
 
     #[test]
     fn a_result_matches_by_uuid_list_or_by_service_data() {
@@ -426,6 +437,20 @@ mod tests {
         assert!(!ScanStream::matches_service(service, &[], &none, &fini));
     }
 
+    /// What the `Received` handler does with a queue that has room: record
+    /// the packet, then deliver the merged data if it is undelivered.
+    /// Returns whether a result was delivered.
+    fn deliver(peer: &mut SeenPeer, advertisement_type: Type, packet: AdvertisedData) -> bool {
+        peer.record(advertisement_type, packet);
+        match peer.undelivered() {
+            Some(data) => {
+                peer.mark_delivered(data);
+                true
+            }
+            None => false,
+        }
+    }
+
     fn named(name: &str) -> AdvertisedData {
         AdvertisedData {
             local_name: Some(name.into()),
@@ -443,18 +468,19 @@ mod tests {
             service_data: [(service, vec![2])].into(),
             local_name: Some("old".into()),
         };
-        assert!(peer.record(BluetoothLEAdvertisementType::ConnectableUndirected, first));
+        assert!(deliver(&mut peer, Type::ConnectableUndirected, first));
         let update = AdvertisedData {
             services: vec![service],
             ..AdvertisedData::default()
         };
-        assert!(peer.record(
-            BluetoothLEAdvertisementType::ConnectableUndirected,
+        assert!(deliver(
+            &mut peer,
+            Type::ConnectableUndirected,
             update.clone()
         ));
         assert!(peer.merged() == update);
         // A repeated packet changes nothing.
-        assert!(!peer.record(BluetoothLEAdvertisementType::ConnectableUndirected, update));
+        assert!(!deliver(&mut peer, Type::ConnectableUndirected, update));
     }
 
     #[test]
@@ -466,34 +492,50 @@ mod tests {
             local_name: Some("short".into()),
             ..AdvertisedData::default()
         };
-        assert!(peer.record(
-            BluetoothLEAdvertisementType::ConnectableUndirected,
+        assert!(deliver(
+            &mut peer,
+            Type::ConnectableUndirected,
             provider.clone()
         ));
-        assert!(peer.record(
-            BluetoothLEAdvertisementType::ScanResponse,
-            named("complete")
-        ));
+        assert!(deliver(&mut peer, Type::ScanResponse, named("complete")));
         let fast = AdvertisedData {
             manufacturer_data: [(0xFFFF, vec![0xFC; 26])].into(),
             ..AdvertisedData::default()
         };
-        assert!(peer.record(BluetoothLEAdvertisementType::NonConnectableUndirected, fast));
+        assert!(deliver(&mut peer, Type::NonConnectableUndirected, fast));
         // The provider's advertisement again: still merged with the others.
-        assert!(!peer.record(
-            BluetoothLEAdvertisementType::ConnectableUndirected,
-            provider
-        ));
+        assert!(!deliver(&mut peer, Type::ConnectableUndirected, provider));
         let merged = peer.merged();
         assert_eq!(merged.services, vec![service]);
         assert_eq!(merged.manufacturer_data[&0xFFFF], vec![0xFC; 26]);
         assert_eq!(merged.local_name.as_deref(), Some("complete"));
         // A scan response without the name removes it; the advertisement's
         // name is reported again.
-        assert!(peer.record(
-            BluetoothLEAdvertisementType::ScanResponse,
+        assert!(deliver(
+            &mut peer,
+            Type::ScanResponse,
             AdvertisedData::default()
         ));
         assert_eq!(peer.merged().local_name.as_deref(), Some("short"));
+    }
+
+    #[test]
+    fn a_result_the_full_queue_refused_is_tried_again_by_the_next_event() {
+        let mut peer = SeenPeer::default();
+        peer.record(Type::ConnectableUndirected, named("peer"));
+        // The queue was full: the result is not marked delivered.
+        assert!(peer.undelivered().is_some());
+        // The same advertisement again tries the same data again.
+        assert!(deliver(
+            &mut peer,
+            Type::ConnectableUndirected,
+            named("peer")
+        ));
+        assert!(peer.undelivered().is_none());
+        assert!(!deliver(
+            &mut peer,
+            Type::ConnectableUndirected,
+            named("peer")
+        ));
     }
 }
