@@ -111,7 +111,8 @@ impl Driver for TestDriver {
             tokio_stream::iter([Ok(DiscoveredPeer {
                 address: PeerAddress("probe".into()),
                 name: None,
-                services: vec![],
+                // A scan for the managed service reports it.
+                services: vec![ServiceUuid(uuid::Uuid::from_u128(11))],
                 manufacturer_data: Default::default(),
                 service_data: Default::default(),
                 rssi: None,
