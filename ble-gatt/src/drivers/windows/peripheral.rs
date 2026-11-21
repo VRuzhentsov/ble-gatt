@@ -601,11 +601,17 @@ impl Server {
         if !was_visible {
             return Ok(());
         }
+        Self::stop_provider_advertising(provider)
+    }
+
+    /// Stop the provider's advertisement. A provider that is not advertising
+    /// is already where this leaves it: for example, one whose start did not
+    /// confirm, or one WinRT aborted. WinRT refuses `StopAdvertising` on it
+    /// with `E_ILLEGAL_METHOD_CALL`.
+    pub(super) fn stop_provider_advertising(provider: &GattServiceProvider) -> Result<()> {
         match provider.StopAdvertising() {
-            // The provider is not advertising, which is what hiding asks for:
-            // for example, a start that did not confirm was already stopped.
             Err(err) if err.code() == E_ILLEGAL_METHOD_CALL => {
-                log::info!("advertise: hide: the provider was not advertising");
+                log::info!("advertise: stop: the provider was not advertising");
                 Ok(())
             }
             result => result.map_err(|err| BleError::windows_error("StopAdvertising", err)),

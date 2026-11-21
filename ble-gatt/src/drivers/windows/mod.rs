@@ -376,9 +376,7 @@ impl Driver for WindowsDriver {
         // Restart the provider advertisement only when its service data changes.
         // The GATT advertisement carries manufacturer data on Windows (ADR-0012).
         if desired_visibility && served.provider_service_data() != service.provider_service_data() {
-            provider
-                .StopAdvertising()
-                .map_err(|err| BleError::windows_error("StopAdvertising", err))?;
+            Server::stop_provider_advertising(&provider)?;
             Server::start_provider_advertising(&provider, &service).await?;
         }
         if desired_visibility {
