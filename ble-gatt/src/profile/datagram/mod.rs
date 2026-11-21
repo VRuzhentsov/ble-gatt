@@ -1278,13 +1278,15 @@ impl DatagramConfig {
             .expect("datagram metadata characteristic")
             .initial_value
             .clone();
-        driver.update_advertisement(spec).await?;
+        // Install the readable value before the new advertisement goes out, so
+        // a scanner that reads after seeing the new hash gets the new value.
         driver
             .set_characteristic_value(
                 crate::profile::advertisement::GATT_ADVERTISEMENT_CHARACTERISTIC,
                 advertisement_value,
             )
-            .await
+            .await?;
+        driver.update_advertisement(spec).await
     }
 }
 
