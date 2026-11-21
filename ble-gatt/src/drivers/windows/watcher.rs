@@ -4,8 +4,10 @@
 //! its advertisement and its scan response. Only the advertisement carries
 //! the service UUID. [`ScanPeers`] therefore starts tracking an address when
 //! one of its events is for the service, then also merges that address's
-//! scan responses, and holds at most [`MAX_SCAN_PEERS`] addresses. A peer is
-//! reported again whenever its merged data changes, which is the
+//! scan responses, and holds at most [`MAX_SCAN_PEERS`] addresses. For each
+//! address it keeps the latest packet of each advertisement type and reports
+//! their merge, so a field the peer stops sending leaves the result. A peer
+//! is reported again whenever its merged data changes, which is the
 //! `Driver::scan` contract.
 
 use std::collections::{BTreeMap, HashMap};
@@ -33,37 +35,64 @@ use crate::entities::models::{
 /// [`ScanPeers`] without limit. An address beyond it is not reported.
 const MAX_SCAN_PEERS: usize = 1024;
 
-/// What one tracked address has advertised so far, merged over its
-/// advertisements and scan responses.
+/// The fields of one advertising packet, or of several merged.
 #[derive(Default, Clone, PartialEq)]
-struct SeenPeer {
+struct AdvertisedData {
     services: Vec<ServiceUuid>,
     manufacturer_data: BTreeMap<u16, Vec<u8>>,
     service_data: BTreeMap<ServiceUuid, Vec<u8>>,
     local_name: Option<String>,
 }
 
-impl SeenPeer {
-    /// Add one event's fields; returns whether the merged data changed.
-    fn merge(
-        &mut self,
-        services: Vec<ServiceUuid>,
-        manufacturer_data: BTreeMap<u16, Vec<u8>>,
-        service_data: BTreeMap<ServiceUuid, Vec<u8>>,
-        local_name: String,
-    ) -> bool {
-        let before = self.clone();
-        for uuid in services {
-            if !self.services.contains(&uuid) {
-                self.services.push(uuid);
+impl AdvertisedData {
+    /// Add `packet`'s fields; where both hold one, `packet`'s wins.
+    fn overlay(&mut self, packet: &AdvertisedData) {
+        for uuid in &packet.services {
+            if !self.services.contains(uuid) {
+                self.services.push(*uuid);
             }
         }
-        self.manufacturer_data.extend(manufacturer_data);
-        self.service_data.extend(service_data);
-        if !local_name.is_empty() {
-            self.local_name = Some(local_name);
+        self.manufacturer_data
+            .extend(packet.manufacturer_data.clone());
+        self.service_data.extend(packet.service_data.clone());
+        if packet.local_name.is_some() {
+            self.local_name = packet.local_name.clone();
         }
-        *self != before
+    }
+}
+
+/// What one tracked address advertises now: the latest packet of each
+/// advertisement type it sent. A Windows peer sends two advertisements of
+/// different types (its GATT provider's, connectable, and its fast
+/// advertisement publisher's, non-connectable), and a scan response is a
+/// type of its own, so a newer packet replaces only its own type's fields.
+#[derive(Default)]
+struct SeenPeer {
+    /// Keyed by the `BluetoothLEAdvertisementType` value.
+    packets: BTreeMap<i32, AdvertisedData>,
+}
+
+impl SeenPeer {
+    /// Replace the latest packet of `advertisement_type`; returns whether
+    /// the merged data changed.
+    fn record(
+        &mut self,
+        advertisement_type: BluetoothLEAdvertisementType,
+        packet: AdvertisedData,
+    ) -> bool {
+        let before = self.merged();
+        self.packets.insert(advertisement_type.0, packet);
+        self.merged() != before
+    }
+
+    /// The latest packets merged, in advertisement type order: the scan
+    /// response's fields win over the connectable advertisement's.
+    fn merged(&self) -> AdvertisedData {
+        let mut merged = AdvertisedData::default();
+        for packet in self.packets.values() {
+            merged.overlay(packet);
+        }
+        merged
     }
 }
 
@@ -174,67 +203,74 @@ impl ScanStream {
         let tx = Arc::new(StdMutex::new(Some(tx)));
         let error = Arc::new(StdMutex::new(None));
 
-        let received =
-            {
-                let tx = tx.clone();
-                let weak = Arc::downgrade(inner);
-                let peers = StdMutex::new(ScanPeers::default());
-                TypedEventHandler::new(
-            move |_: Ref<BluetoothLEAdvertisementWatcher>,
-                  args: Ref<BluetoothLEAdvertisementReceivedEventArgs>| {
-                let args = args.ok()?;
-                let address = args.BluetoothAddress()?;
-                let advertisement = args.Advertisement()?;
-                let advertised_uuids: Vec<ServiceUuid> = advertisement
-                    .ServiceUuids()?
-                    .into_iter()
-                    .map(|guid| ServiceUuid(WindowsCodec::from_guid(guid)))
-                    .collect();
-                let service_data = WindowsCodec::service_data_of(advertisement.DataSections()?);
-                let mut manufacturer_data = BTreeMap::new();
-                for data in advertisement.ManufacturerData()? {
-                    manufacturer_data
-                        .insert(data.CompanyId()?, WindowsCodec::from_buffer(&data.Data()?)?);
-                }
-                let local_name = advertisement.LocalName()?.to_string();
-                let for_service = Self::matches_service(
-                    service,
-                    &advertised_uuids,
-                    &service_data,
-                    &manufacturer_data,
-                );
-                let scan_response =
-                    args.AdvertisementType() == Ok(BluetoothLEAdvertisementType::ScanResponse);
-
-                let mut peers = peers.lock().unwrap();
-                let Some(entry) = peers.record_for(address, for_service, scan_response) else {
-                    return Ok(());
-                };
-                if let (Some(inner), Ok(kind)) = (weak.upgrade(), args.BluetoothAddressType()) {
-                    inner.address_types.lock().unwrap().insert(address, kind);
-                }
-                // Report new or changed peer data, including a later scan
-                // response; a repeated packet changes nothing.
-                if !entry.merge(advertised_uuids, manufacturer_data, service_data, local_name) {
-                    return Ok(());
-                }
-                let peer = DiscoveredPeer {
-                    address: PeerAddress(WindowsCodec::format_address(address)),
-                    name: advertised_name(service, &entry.service_data, entry.local_name.clone()),
-                    services: entry.services.clone(),
-                    manufacturer_data: entry.manufacturer_data.clone(),
-                    service_data: entry.service_data.clone(),
-                    rssi: args.RawSignalStrengthInDBm().ok(),
-                };
-                if let Some(tx) = tx.lock().unwrap().as_ref() {
-                    if tx.try_send(Ok(peer)).is_err() {
-                        log::debug!("scan: result queue full, dropping a result");
+        let received = {
+            let tx = tx.clone();
+            let weak = Arc::downgrade(inner);
+            let peers = StdMutex::new(ScanPeers::default());
+            TypedEventHandler::new(
+                move |_: Ref<BluetoothLEAdvertisementWatcher>,
+                      args: Ref<BluetoothLEAdvertisementReceivedEventArgs>| {
+                    let args = args.ok()?;
+                    let address = args.BluetoothAddress()?;
+                    let advertisement = args.Advertisement()?;
+                    let advertised_uuids: Vec<ServiceUuid> = advertisement
+                        .ServiceUuids()?
+                        .into_iter()
+                        .map(|guid| ServiceUuid(WindowsCodec::from_guid(guid)))
+                        .collect();
+                    let service_data = WindowsCodec::service_data_of(advertisement.DataSections()?);
+                    let mut manufacturer_data = BTreeMap::new();
+                    for data in advertisement.ManufacturerData()? {
+                        manufacturer_data
+                            .insert(data.CompanyId()?, WindowsCodec::from_buffer(&data.Data()?)?);
                     }
-                }
-                Ok(())
-            },
-        )
-            };
+                    let local_name = advertisement.LocalName()?.to_string();
+                    let for_service = Self::matches_service(
+                        service,
+                        &advertised_uuids,
+                        &service_data,
+                        &manufacturer_data,
+                    );
+                    let advertisement_type = args.AdvertisementType().unwrap_or_default();
+                    let scan_response =
+                        advertisement_type == BluetoothLEAdvertisementType::ScanResponse;
+                    let packet = AdvertisedData {
+                        services: advertised_uuids,
+                        manufacturer_data,
+                        service_data,
+                        local_name: (!local_name.is_empty()).then_some(local_name),
+                    };
+
+                    let mut peers = peers.lock().unwrap();
+                    let Some(entry) = peers.record_for(address, for_service, scan_response) else {
+                        return Ok(());
+                    };
+                    if let (Some(inner), Ok(kind)) = (weak.upgrade(), args.BluetoothAddressType()) {
+                        inner.address_types.lock().unwrap().insert(address, kind);
+                    }
+                    // Report new or changed peer data, including a later scan
+                    // response; a repeated packet changes nothing.
+                    if !entry.record(advertisement_type, packet) {
+                        return Ok(());
+                    }
+                    let data = entry.merged();
+                    let peer = DiscoveredPeer {
+                        address: PeerAddress(WindowsCodec::format_address(address)),
+                        name: advertised_name(service, &data.service_data, data.local_name),
+                        services: data.services,
+                        manufacturer_data: data.manufacturer_data,
+                        service_data: data.service_data,
+                        rssi: args.RawSignalStrengthInDBm().ok(),
+                    };
+                    if let Some(tx) = tx.lock().unwrap().as_ref() {
+                        if tx.try_send(Ok(peer)).is_err() {
+                            log::debug!("scan: result queue full, dropping a result");
+                        }
+                    }
+                    Ok(())
+                },
+            )
+        };
         let stopped = {
             let tx = tx.clone();
             let error = error.clone();
@@ -388,5 +424,76 @@ mod tests {
         assert!(ScanStream::matches_service(service, &[], &none, &fast));
         let fini: BTreeMap<u16, Vec<u8>> = [(0xFFFF, vec![1, 2, 3, 4, 5])].into();
         assert!(!ScanStream::matches_service(service, &[], &none, &fini));
+    }
+
+    fn named(name: &str) -> AdvertisedData {
+        AdvertisedData {
+            local_name: Some(name.into()),
+            ..AdvertisedData::default()
+        }
+    }
+
+    #[test]
+    fn a_newer_advertisement_replaces_the_fields_it_no_longer_sends() {
+        let service = ServiceUuid(uuid::Uuid::from_u128(0xB1E6));
+        let mut peer = SeenPeer::default();
+        let first = AdvertisedData {
+            services: vec![service],
+            manufacturer_data: [(0x0075, vec![1])].into(),
+            service_data: [(service, vec![2])].into(),
+            local_name: Some("old".into()),
+        };
+        assert!(peer.record(BluetoothLEAdvertisementType::ConnectableUndirected, first));
+        let update = AdvertisedData {
+            services: vec![service],
+            ..AdvertisedData::default()
+        };
+        assert!(peer.record(
+            BluetoothLEAdvertisementType::ConnectableUndirected,
+            update.clone()
+        ));
+        assert!(peer.merged() == update);
+        // A repeated packet changes nothing.
+        assert!(!peer.record(BluetoothLEAdvertisementType::ConnectableUndirected, update));
+    }
+
+    #[test]
+    fn a_scan_response_and_a_second_advertisement_add_to_the_advertisement() {
+        let service = ServiceUuid(uuid::Uuid::from_u128(0xB1E6));
+        let mut peer = SeenPeer::default();
+        let provider = AdvertisedData {
+            services: vec![service],
+            local_name: Some("short".into()),
+            ..AdvertisedData::default()
+        };
+        assert!(peer.record(
+            BluetoothLEAdvertisementType::ConnectableUndirected,
+            provider.clone()
+        ));
+        assert!(peer.record(
+            BluetoothLEAdvertisementType::ScanResponse,
+            named("complete")
+        ));
+        let fast = AdvertisedData {
+            manufacturer_data: [(0xFFFF, vec![0xFC; 26])].into(),
+            ..AdvertisedData::default()
+        };
+        assert!(peer.record(BluetoothLEAdvertisementType::NonConnectableUndirected, fast));
+        // The provider's advertisement again: still merged with the others.
+        assert!(!peer.record(
+            BluetoothLEAdvertisementType::ConnectableUndirected,
+            provider
+        ));
+        let merged = peer.merged();
+        assert_eq!(merged.services, vec![service]);
+        assert_eq!(merged.manufacturer_data[&0xFFFF], vec![0xFC; 26]);
+        assert_eq!(merged.local_name.as_deref(), Some("complete"));
+        // A scan response without the name removes it; the advertisement's
+        // name is reported again.
+        assert!(peer.record(
+            BluetoothLEAdvertisementType::ScanResponse,
+            AdvertisedData::default()
+        ));
+        assert_eq!(peer.merged().local_name.as_deref(), Some("short"));
     }
 }
