@@ -100,8 +100,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::entities::error::{BleError, Result};
 use crate::entities::models::{
     advertised_name, carries_fast_advertisement, truncate_name, CapabilityReport,
-    CharacteristicUuid, DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress, Role, ServiceUuid,
-    WriteType, LEGACY_ADVERTISING_DATA_LEN, LOCAL_NAME_MAX_LEN,
+    CharacteristicUuid, DiscoveredPeer, FastAdvertisement, GattEvent, GattServiceSpec, PeerAddress,
+    Role, ServiceUuid, WriteType, LEGACY_ADVERTISING_DATA_LEN, LOCAL_NAME_MAX_LEN,
 };
 use crate::hal::{BoxStream, Driver, GattConnection};
 
@@ -656,6 +656,9 @@ pub struct LinuxDriver {
     discovery: Arc<DiscoveryBus>,
     /// Services `sweep_leftover_links` already ran for.
     swept: StdMutex<HashSet<ServiceUuid>>,
+    /// The company a scan admits fast advertisements under: that of the last
+    /// spec advertised with one, else [`FastAdvertisement::DEFAULT_SCAN_COMPANY`].
+    fast_scan_company: AtomicU16,
 }
 
 /// Reports bluetoothd itself leaving and rejoining the bus — a crash or a
@@ -803,7 +806,17 @@ impl LinuxDriver {
             )),
             discovery,
             swept: StdMutex::new(HashSet::new()),
+            fast_scan_company: AtomicU16::new(FastAdvertisement::DEFAULT_SCAN_COMPANY),
         })
+    }
+
+    /// Scan for fast advertisements under the company `spec` sends its own
+    /// under, when it has one.
+    fn note_fast_company(&self, spec: &GattServiceSpec) {
+        if let Some(fast) = &spec.fast_advertisement {
+            self.fast_scan_company
+                .store(fast.company_id, Ordering::Relaxed);
+        }
     }
 
     /// The first time a service is scanned for or advertised, before either
@@ -1627,18 +1640,25 @@ impl ScanReports {
 
 impl ScannedPeer {
     /// Whether a device is for `target`: BlueZ lists the target among its
-    /// services, or it carries a managed fast advertisement (a Windows peer
-    /// publishes that in an advertisement of its own, without the service
-    /// UUID; ADR-0011). The Windows watcher admits the same devices.
+    /// services, or it carries a managed fast advertisement under
+    /// `fast_company` (a Windows peer publishes that in an advertisement of
+    /// its own, without the service UUID; ADR-0011). The Windows watcher
+    /// admits the same devices.
     fn is_target(
         uuids: &HashSet<uuid::Uuid>,
         target: uuid::Uuid,
+        fast_company: u16,
         manufacturer_data: &std::collections::BTreeMap<u16, Vec<u8>>,
     ) -> bool {
-        uuids.contains(&target) || carries_fast_advertisement(manufacturer_data.values())
+        uuids.contains(&target) || carries_fast_advertisement(fast_company, manufacturer_data)
     }
 
-    async fn read(adapter: &Adapter, address: bluer::Address, target: uuid::Uuid) -> ScannedPeer {
+    async fn read(
+        adapter: &Adapter,
+        address: bluer::Address,
+        target: uuid::Uuid,
+        fast_company: u16,
+    ) -> ScannedPeer {
         let Ok(device) = adapter.device(address) else {
             return ScannedPeer::Unknown;
         };
@@ -1653,7 +1673,7 @@ impl ScannedPeer {
             .unwrap_or_default()
             .into_iter()
             .collect();
-        if !Self::is_target(&uuids, target, &manufacturer_data) {
+        if !Self::is_target(&uuids, target, fast_company, &manufacturer_data) {
             if uuids.is_empty() {
                 return ScannedPeer::Unknown;
             }
@@ -1746,6 +1766,7 @@ impl Driver for LinuxDriver {
                 ))
             }));
         let target = service.0;
+        let fast_company = self.fast_scan_company.load(Ordering::Relaxed);
 
         // Events are handled in a task that owns the discovery guard and ends
         // when the caller drops the returned stream (the channel closes),
@@ -1794,12 +1815,12 @@ impl Driver for LinuxDriver {
                     // Reported without manufacturer data too, so an advertiser
                     // that never sends any is still found, then again once the
                     // data arrives.
-                    let (peer, complete) = match ScannedPeer::read(&adapter, address, target).await
-                    {
-                        ScannedPeer::Complete(peer) => (peer, true),
-                        ScannedPeer::NoManufacturerData(peer) => (peer, false),
-                        _ => continue,
-                    };
+                    let (peer, complete) =
+                        match ScannedPeer::read(&adapter, address, target, fast_company).await {
+                            ScannedPeer::Complete(peer) => (peer, true),
+                            ScannedPeer::NoManufacturerData(peer) => (peer, false),
+                            _ => continue,
+                        };
                     if !reported.record(address, &peer) {
                         continue;
                     }
@@ -2068,6 +2089,7 @@ impl Driver for LinuxDriver {
             service.characteristics.len()
         );
         service.validate()?;
+        self.note_fast_company(&service);
         // Before anything is registered, so no central can have connected to
         // this process yet.
         self.sweep_leftover_links(service.uuid).await;
@@ -2409,6 +2431,7 @@ impl Driver for LinuxDriver {
 
     async fn update_advertisement(&self, service: GattServiceSpec) -> Result<()> {
         service.validate()?;
+        self.note_fast_company(&service);
         let _serialise = self.advertise_lock.lock().await;
         let serving = self
             .served_service
@@ -3007,29 +3030,27 @@ mod tests {
     fn a_scanned_device_is_the_target_by_service_or_by_fast_advertisement() {
         let target = uuid::Uuid::from_u128(0xB1E6);
         let other = uuid::Uuid::from_u128(7);
+        let company = FastAdvertisement::DEFAULT_SCAN_COMPANY;
+        let is_target =
+            |uuids: &HashSet<uuid::Uuid>,
+             manufacturer: &std::collections::BTreeMap<u16, Vec<u8>>| {
+                ScannedPeer::is_target(uuids, target, company, manufacturer)
+            };
         let no_company = std::collections::BTreeMap::new();
-        assert!(ScannedPeer::is_target(
-            &[target].into(),
-            target,
-            &no_company
-        ));
-        assert!(!ScannedPeer::is_target(
-            &[other].into(),
-            target,
-            &no_company
-        ));
-        assert!(!ScannedPeer::is_target(
-            &HashSet::new(),
-            target,
-            &no_company
-        ));
+        assert!(is_target(&[target].into(), &no_company));
+        assert!(!is_target(&[other].into(), &no_company));
+        assert!(!is_target(&HashSet::new(), &no_company));
         // A Windows peer's own publisher: no services, only the fast
         // advertisement.
         let fast: std::collections::BTreeMap<u16, Vec<u8>> = [(0xFFFF, vec![0xFC; 26])].into();
-        assert!(ScannedPeer::is_target(&HashSet::new(), target, &fast));
-        assert!(ScannedPeer::is_target(&[other].into(), target, &fast));
+        assert!(is_target(&HashSet::new(), &fast));
+        assert!(is_target(&[other].into(), &fast));
         let fini: std::collections::BTreeMap<u16, Vec<u8>> = [(0xFFFF, vec![1, 2, 3, 4, 5])].into();
-        assert!(!ScannedPeer::is_target(&[other].into(), target, &fini));
+        assert!(!is_target(&[other].into(), &fini));
+        // The same bytes under another company are not admitted.
+        let other_company: std::collections::BTreeMap<u16, Vec<u8>> =
+            [(0x004C, vec![0xFC; 26])].into();
+        assert!(!is_target(&HashSet::new(), &other_company));
     }
 
     #[test]

@@ -324,15 +324,27 @@ impl AdvertisingMode {
     }
 }
 
-/// Whether `manufacturer_data` holds a managed fast advertisement (first
-/// byte `0b1111_11VV`, 21 to 27 bytes; ADR-0012 §5). Scanners let such a
-/// result through even without the service UUID: a Windows peer publishes it
-/// in an advertisement of its own, next to its GATT provider's.
-pub fn carries_fast_advertisement<'a>(
-    mut manufacturer_data: impl Iterator<Item = &'a Vec<u8>>,
+impl FastAdvertisement {
+    /// The first byte of a managed fast advertisement, version 1 (ADR-0012 §5).
+    pub const TAG: u8 = 0xFC;
+    /// The company a scanner admits fast advertisements under until this
+    /// device advertises a spec with a fast advertisement of its own: the one
+    /// Fini uses.
+    pub const DEFAULT_SCAN_COMPANY: u16 = 0xFFFF;
+}
+
+/// Whether `manufacturer_data` holds a managed fast advertisement under
+/// `company`: tag [`FastAdvertisement::TAG`], 21 to 27 bytes (ADR-0012 §5).
+/// Scanners let such a result through even without the service UUID: a
+/// Windows peer publishes it in an advertisement of its own, next to its
+/// GATT provider's. Another company's data of the same shape is not one.
+/// Android's `AdvertisePlacement.isFastAdvertisement` is the same rule.
+pub fn carries_fast_advertisement(
+    company: u16,
+    manufacturer_data: &BTreeMap<u16, Vec<u8>>,
 ) -> bool {
-    manufacturer_data.any(|data| {
-        (21..=FAST_ADVERTISEMENT_MAX_LEN).contains(&data.len()) && data[0] & 0xFC == 0xFC
+    manufacturer_data.get(&company).is_some_and(|data| {
+        (21..=FAST_ADVERTISEMENT_MAX_LEN).contains(&data.len()) && data[0] == FastAdvertisement::TAG
     })
 }
 
@@ -612,6 +624,43 @@ mod tests {
         assert!(spec.validate().is_err());
         spec.fast_advertisement.as_mut().unwrap().data.pop();
         assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn only_a_tagged_record_under_the_fast_company_is_a_fast_advertisement() {
+        let fast = vec![FastAdvertisement::TAG; 26];
+        let company = FastAdvertisement::DEFAULT_SCAN_COMPANY;
+        assert!(carries_fast_advertisement(
+            company,
+            &[(company, fast.clone())].into()
+        ));
+        assert!(carries_fast_advertisement(
+            0x1234,
+            &[(0x1234, fast.clone())].into()
+        ));
+        // Another company's data shaped like a fast record.
+        assert!(!carries_fast_advertisement(
+            company,
+            &[(0x004C, fast.clone())].into()
+        ));
+        // A first byte 0xFD to 0xFF is not the v1 tag.
+        for first in [0xFD, 0xFE, 0xFF] {
+            let mut foreign = fast.clone();
+            foreign[0] = first;
+            assert!(!carries_fast_advertisement(
+                company,
+                &[(company, foreign)].into()
+            ));
+        }
+        assert!(!carries_fast_advertisement(
+            company,
+            &[(company, vec![0xFC; 20])].into()
+        ));
+        assert!(!carries_fast_advertisement(
+            company,
+            &[(company, vec![0xFC; 28])].into()
+        ));
+        assert!(!carries_fast_advertisement(company, &BTreeMap::new()));
     }
 
     #[test]

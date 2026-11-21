@@ -60,6 +60,10 @@ fun main(args: Array<String>) {
     check(!AdvertisePlacement.isFastAdvertisement(fini))
     check(!AdvertisePlacement.isFastAdvertisement(ByteArray(28) { 0xFC.toByte() }))
     check(!AdvertisePlacement.isFastAdvertisement(null))
+    // A first byte 0xFD to 0xFF is not the v1 tag.
+    for (first in 0xFD..0xFF) {
+        check(!AdvertisePlacement.isFastAdvertisement(ByteArray(26) { if (it == 0) first.toByte() else 0xFC.toByte() }))
+    }
     println("AdvertisePlacement: fast fold, too-large fallback, other companies, name, oversize, fast match passed")
 }
 }

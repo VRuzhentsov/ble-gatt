@@ -154,8 +154,16 @@ fn advertising_descriptors_match_the_kotlin_parameters() {
     ));
     let placement = read(&format!("{KOTLIN_DIR}/AdvertisePlacement.kt"));
     assert!(placement.contains("const val FAST_ADVERTISEMENT_MAX_LEN: Int = 27"));
-    assert!(read("../ble-gatt/src/entities/models.rs")
-        .contains("pub const FAST_ADVERTISEMENT_MAX_LEN: usize = 27;"));
+    let models = read("../ble-gatt/src/entities/models.rs");
+    assert!(models.contains("pub const FAST_ADVERTISEMENT_MAX_LEN: usize = 27;"));
+    // The scan filter: the same tag and default company on both sides.
+    assert!(placement.contains("const val FAST_ADVERTISEMENT_TAG: Int = 0xFC"));
+    assert!(models.contains("pub const TAG: u8 = 0xFC;"));
+    assert!(placement.contains("const val DEFAULT_SCAN_COMPANY: Int = 0xFFFF"));
+    assert!(models.contains("pub const DEFAULT_SCAN_COMPANY: u16 = 0xFFFF;"));
+    assert!(kotlin.contains(
+        "AdvertisePlacement.isFastAdvertisement(record?.getManufacturerSpecificData(fastCompany))"
+    ));
 }
 
 /// Source-contract regression for duplicate Tao versions. Runtime acceptance

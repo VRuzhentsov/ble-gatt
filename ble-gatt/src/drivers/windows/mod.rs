@@ -25,7 +25,7 @@ mod utils;
 mod watcher;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -40,8 +40,8 @@ use windows::Foundation::TypedEventHandler;
 
 use crate::entities::error::{BleError, Result};
 use crate::entities::models::{
-    CapabilityReport, CharacteristicUuid, DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress,
-    RadioStatus, Role, ServiceUuid,
+    CapabilityReport, CharacteristicUuid, DiscoveredPeer, FastAdvertisement, GattEvent,
+    GattServiceSpec, PeerAddress, RadioStatus, Role, ServiceUuid,
 };
 use crate::hal::{BoxStream, Driver, GattConnection};
 
@@ -79,6 +79,9 @@ struct Inner {
     /// Address type per address seen in a scan. Android advertises from a
     /// random address, and WinRT needs to be told the type to dial it.
     address_types: StdMutex<HashMap<u64, BluetoothAddressType>>,
+    /// The company a scan admits fast advertisements under: that of the last
+    /// spec advertised with one, else [`FastAdvertisement::DEFAULT_SCAN_COMPANY`].
+    fast_scan_company: AtomicU16,
     scan: StdMutex<ScanState>,
     /// Session of each live or pending central-role link, so a second dial
     /// to the same peer is refused rather than opening a second
@@ -97,6 +100,15 @@ struct Inner {
 impl Inner {
     fn next_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Scan for fast advertisements under the company `spec` sends its own
+    /// under, when it has one.
+    fn note_fast_company(&self, spec: &GattServiceSpec) {
+        if let Some(fast) = &spec.fast_advertisement {
+            self.fast_scan_company
+                .store(fast.company_id, Ordering::Relaxed);
+        }
     }
 }
 
@@ -124,6 +136,7 @@ impl WindowsDriver {
             events_tx,
             next_id: AtomicU64::new(1),
             address_types: StdMutex::new(HashMap::new()),
+            fast_scan_company: AtomicU16::new(FastAdvertisement::DEFAULT_SCAN_COMPANY),
             scan: StdMutex::new(ScanState {
                 generation: 0,
                 active: false,
@@ -321,6 +334,7 @@ impl Driver for WindowsDriver {
 
     async fn advertise(&self, service: GattServiceSpec) -> Result<()> {
         service.validate()?;
+        self.inner.note_fast_company(&service);
         let _server_guard = self.inner.server_lock.lock().await;
         if let Some(old) = self.inner.server.lock().unwrap().take() {
             log::info!("advertise: replacing the served service");
@@ -338,6 +352,7 @@ impl Driver for WindowsDriver {
 
     async fn update_advertisement(&self, service: GattServiceSpec) -> Result<()> {
         service.validate()?;
+        self.inner.note_fast_company(&service);
         let _server_guard = self.inner.server_lock.lock().await;
         let not_advertising =
             || BleError::Gatt("update_advertisement: nothing is being advertised".into());

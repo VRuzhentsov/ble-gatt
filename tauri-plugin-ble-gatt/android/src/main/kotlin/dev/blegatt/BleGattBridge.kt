@@ -274,6 +274,17 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
     @Volatile
     private var serverGeneration: Long = 0
 
+    /// The company a scan admits fast advertisements under: that of the last
+    /// advertising call with one, else the default (Rust's `fast_scan_company`).
+    @Volatile
+    private var fastScanCompany: Int = AdvertisePlacement.DEFAULT_SCAN_COMPANY
+
+    private fun noteFastCompany(fastCompanyId: Int) {
+        if (fastCompanyId != AdvertisePlacement.NO_COMPANY) {
+            fastScanCompany = fastCompanyId
+        }
+    }
+
     fun hasCentralSupport(): Boolean = adapter?.bluetoothLeScanner != null
 
     fun hasPeripheralSupport(): Boolean =
@@ -299,6 +310,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         }
         val scanner = adapter?.bluetoothLeScanner ?: return SCAN_UNAVAILABLE
         val target = UUID.fromString(serviceUuid)
+        val fastCompany = fastScanCompany
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
@@ -314,12 +326,11 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
                         }}",
                 )
                 // The UUID list, or service data under the target: a result can
-                // carry only the latter (ADR-0012 §2).
+                // carry only the latter (ADR-0012 §2). Or a fast advertisement
+                // under the fast company only.
                 val matches = uuids?.contains(ParcelUuid(target)) == true ||
                     record?.serviceData?.containsKey(ParcelUuid(target)) == true ||
-                    record?.manufacturerSpecificData?.let { data ->
-                        (0 until data.size()).any { AdvertisePlacement.isFastAdvertisement(data.valueAt(it)) }
-                    } == true
+                    AdvertisePlacement.isFastAdvertisement(record?.getManufacturerSpecificData(fastCompany))
                 if (record == null || !matches) {
                     return
                 }
@@ -1053,6 +1064,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         // would stop the very advertisement that replaced it. Making the
         // retry responsible serialises the two without either racing.
         stopAdvertising()
+        noteFastCompany(fastCompanyId)
 
         val advertiser = adapter?.bluetoothLeAdvertiser
         if (advertiser == null) {
@@ -1446,6 +1458,7 @@ class BleGattBridge(private val context: Context, private val nativeHandle: Long
         fastCompanyId: Int, fastData: ByteArray?,
         advertiseMode: Int,
     ) {
+        noteFastCompany(fastCompanyId)
         val advertiser = adapter?.bluetoothLeAdvertiser
         val started = synchronized(this) {
             if (advertiser == null || gattServer == null) {

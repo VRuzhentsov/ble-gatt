@@ -12,6 +12,7 @@
 //! `Driver::scan` contract.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::sync::mpsc;
@@ -201,17 +202,18 @@ impl ScanStream {
     /// Whether one advertisement event is for `service`: its UUID list
     /// names it, it carries service data under it (a scan response or an
     /// extended advertisement may hold only that), or it carries a managed
-    /// fast advertisement (a Windows peer publishes that in an advertisement
-    /// of its own; the managed scanner checks the record).
+    /// fast advertisement under `fast_company` (a Windows peer publishes that
+    /// in an advertisement of its own; the managed scanner checks the record).
     fn matches_service(
         service: ServiceUuid,
+        fast_company: u16,
         advertised_uuids: &[ServiceUuid],
         service_data: &BTreeMap<ServiceUuid, Vec<u8>>,
         manufacturer_data: &BTreeMap<u16, Vec<u8>>,
     ) -> bool {
         advertised_uuids.contains(&service)
             || service_data.contains_key(&service)
-            || carries_fast_advertisement(manufacturer_data.values())
+            || carries_fast_advertisement(fast_company, manufacturer_data)
     }
 }
 
@@ -235,6 +237,7 @@ impl ScanStream {
         let (tx, rx) = mpsc::channel(DISCOVERY_QUEUE_DEPTH);
         let tx = Arc::new(StdMutex::new(Some(tx)));
         let error = Arc::new(StdMutex::new(None));
+        let fast_company = inner.fast_scan_company.load(Ordering::Relaxed);
 
         let received = {
             let tx = tx.clone();
@@ -260,6 +263,7 @@ impl ScanStream {
                     let local_name = advertisement.LocalName()?.to_string();
                     let for_service = Self::matches_service(
                         service,
+                        fast_company,
                         &advertised_uuids,
                         &service_data,
                         &manufacturer_data,
@@ -428,39 +432,28 @@ mod tests {
     fn a_result_matches_by_uuid_list_or_by_service_data() {
         let service = ServiceUuid(uuid::Uuid::from_u128(0xB1E6));
         let other = ServiceUuid(uuid::Uuid::from_u128(7));
+        let company = crate::entities::models::FastAdvertisement::DEFAULT_SCAN_COMPANY;
+        let matches = |uuids: &[ServiceUuid],
+                       data: &BTreeMap<ServiceUuid, Vec<u8>>,
+                       manufacturer: &BTreeMap<u16, Vec<u8>>| {
+            ScanStream::matches_service(service, company, uuids, data, manufacturer)
+        };
         let none = BTreeMap::new();
         let no_company = BTreeMap::new();
-        assert!(ScanStream::matches_service(
-            service,
-            &[service],
-            &none,
-            &no_company
-        ));
-        assert!(!ScanStream::matches_service(
-            service,
-            &[other],
-            &none,
-            &no_company
-        ));
+        assert!(matches(&[service], &none, &no_company));
+        assert!(!matches(&[other], &none, &no_company));
         let data: BTreeMap<_, _> = [(service, vec![0xF8; 9])].into();
-        assert!(ScanStream::matches_service(
-            service,
-            &[],
-            &data,
-            &no_company
-        ));
+        assert!(matches(&[], &data, &no_company));
         let foreign: BTreeMap<_, _> = [(other, vec![1])].into();
-        assert!(!ScanStream::matches_service(
-            service,
-            &[],
-            &foreign,
-            &no_company
-        ));
+        assert!(!matches(&[], &foreign, &no_company));
         // A Windows peer's own publisher: only the fast advertisement.
         let fast: BTreeMap<u16, Vec<u8>> = [(0xFFFF, vec![0xFC; 26])].into();
-        assert!(ScanStream::matches_service(service, &[], &none, &fast));
+        assert!(matches(&[], &none, &fast));
         let fini: BTreeMap<u16, Vec<u8>> = [(0xFFFF, vec![1, 2, 3, 4, 5])].into();
-        assert!(!ScanStream::matches_service(service, &[], &none, &fini));
+        assert!(!matches(&[], &none, &fini));
+        // The same bytes under another company are not admitted.
+        let other_company: BTreeMap<u16, Vec<u8>> = [(0x004C, vec![0xFC; 26])].into();
+        assert!(!matches(&[], &none, &other_company));
     }
 
     /// What the `Received` handler does with a queue that has room: record
