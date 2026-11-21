@@ -353,10 +353,14 @@ impl PeerChannel {
                     "managed inbound payload was lost".into(),
                 )));
             }
-            // An ended generation still yields the messages it admitted before
-            // it ended, then reports the end.
+            // The peer's disconnect follows the messages it sent before it, so
+            // those are still yielded before the end. A local end or a lost
+            // link discards what was not read.
             if self.state.ended.is_cancelled() {
-                return received.try_recv().ok();
+                return match self.close_reason() {
+                    Some(PeerChannelCloseReason::PeerDisconnect) => received.try_recv().ok(),
+                    _ => None,
+                };
             }
             tokio::select! { biased;
                 _ = self.state.ended.cancelled() => continue,
@@ -727,35 +731,6 @@ pub(super) mod tests {
                 Some(PeerChannelCloseReason::PeerDisconnect)
             );
             assert_eq!(channel.recv().await.unwrap().unwrap(), b"last words");
-            assert!(channel.recv().await.is_none());
-            managed.close().await.unwrap();
-        })
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn receive_yields_admitted_message_after_local_disconnect_then_ends() {
-        tokio::time::timeout(Duration::from_secs(3), async {
-            let (managed, mut raw, channel) = raw_established(31).await;
-            raw.send(
-                Record::Data {
-                    attempt: 31,
-                    payload: b"queued".to_vec(),
-                }
-                .encode(),
-            )
-            .await
-            .unwrap();
-            while channel.state.received.lock().await.is_empty() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            channel.disconnect().await.unwrap();
-            assert_eq!(
-                channel.close_reason(),
-                Some(PeerChannelCloseReason::LocalDisconnect)
-            );
-            assert_eq!(channel.recv().await.unwrap().unwrap(), b"queued");
             assert!(channel.recv().await.is_none());
             managed.close().await.unwrap();
         })
