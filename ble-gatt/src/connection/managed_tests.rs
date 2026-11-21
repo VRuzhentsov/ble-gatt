@@ -780,6 +780,37 @@ async fn managed_discovery_deferred_capacity_refreshes_without_another_sighting(
 }
 
 #[tokio::test]
+async fn managed_discovery_waits_for_a_slow_application_without_dropping_the_scan() {
+    let (_, control, reader) = BlockingVisibility::metadata(MockNetwork::new(), "slow-reader");
+    // More results than the 32-result output holds.
+    let (input, receiver) = tokio::sync::mpsc::channel(64);
+    for n in 0..48 {
+        input
+            .send(Err(crate::BleError::Gatt(n.to_string())))
+            .await
+            .unwrap();
+    }
+    drop(input);
+    *control.scan_input.lock().unwrap() = Some(receiver);
+    let mut discovery = reader.discover().await.unwrap();
+    // The application is busy while the scan fills the output.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut results = Vec::new();
+    while let Some(item) = next_item(&mut discovery, Duration::from_millis(300)).await {
+        match item {
+            Err(crate::BleError::Gatt(n)) => results.push(n),
+            other => panic!("only the scan's results, yet {other:?}"),
+        }
+    }
+    assert_eq!(
+        results,
+        (0..48).map(|n| n.to_string()).collect::<Vec<_>>(),
+        "every result arrives, in order"
+    );
+    reader.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn managed_metadata_critical_lag_guards_visible_server_until_hidden_retry() {
     use crate::advertisement::{GattAdvertisement, GATT_ADVERTISEMENT_CHARACTERISTIC};
     use std::sync::atomic::Ordering::SeqCst;

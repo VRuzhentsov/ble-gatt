@@ -214,6 +214,9 @@ impl Worker {
         };
         let mut served: Option<BoxStream<DatagramChannel>> = None;
         let mut scan: Option<DiscoveryScan> = None;
+        // A scan result the full output could not take: the scan is not read
+        // again until the application takes one.
+        let mut scan_held: Option<Result<(EndpointId, DiscoveredPeer)>> = None;
         let mut tracked_metadata = HashMap::<PeerAddress, TrackedPeer>::new();
         let mut scan_exhausted = false;
         let mut scan_generation = 0u64;
@@ -398,7 +401,10 @@ impl Worker {
                     }
                 }
                 _ = async { match &scan_output { Some(output) => output.closed().await, None => std::future::pending().await } } => { scan = None; }
-                item = async { match &mut scan { Some((stream, _)) => stream.next().await, None => std::future::pending().await } } => {
+                permit = async { match &scan_output { Some(output) => output.reserve().await, None => std::future::pending().await } }, if scan_held.is_some() => {
+                    match permit { Ok(permit) => permit.send(scan_held.take().expect("held scan result")), Err(_) => scan = None }
+                }
+                item = async { match &mut scan { Some((stream, _)) => stream.next().await, None => std::future::pending().await } }, if scan_held.is_none() => {
                     match item {
                         Some(item) => {
                             let result = match item {
@@ -408,7 +414,14 @@ impl Worker {
                                 },
                                 Err(error) => Err(error),
                             };
-                            if let Some((_, output)) = &scan { if output.try_send(result).is_err() { scan = None; } }
+                            // A full output holds the result (backpressure); only a closed one ends the scan.
+                            if let Some((_, output)) = &scan {
+                                match output.try_send(result) {
+                                    Err(mpsc::error::TrySendError::Full(result)) => scan_held = Some(result),
+                                    Err(mpsc::error::TrySendError::Closed(_)) => scan = None,
+                                    Ok(()) => {}
+                                }
+                            }
                         }
                         None => {
                             scan_exhausted = true;
@@ -509,6 +522,7 @@ impl Worker {
                                 let _ = reply.send(Err(BleError::AdapterBusy("managed discovery already active or operation limit reached".into())));
                             } else {
                                 scan = None;
+                                scan_held = None;
                                 scan_generation += 1;
                                 tracked_metadata.clear();
                                 scan_exhausted = false;
