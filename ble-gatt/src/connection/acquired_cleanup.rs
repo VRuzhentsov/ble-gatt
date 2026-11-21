@@ -127,11 +127,18 @@ impl GattConnection for Owned {
     fn session(&self) -> Option<u64> {
         self.session
     }
+    // The native MTU can grow after connect (Linux reports 23 until
+    // negotiation finishes), so read it live; the snapshot only serves
+    // after the native connection is handed to cleanup.
     fn att_mtu(&self) -> u16 {
-        self.mtu
+        self.native
+            .as_ref()
+            .map_or(self.mtu, |native| native.att_mtu())
     }
     fn max_write_len(&self) -> usize {
-        self.maximum
+        self.native
+            .as_ref()
+            .map_or(self.maximum, |native| native.max_write_len())
     }
     async fn read(&mut self, characteristic: CharacteristicUuid) -> Result<Vec<u8>> {
         self.native
@@ -218,6 +225,50 @@ mod tests {
                 _ => BleError::Gatt("actual native disconnect failure".into()),
             })
         }
+    }
+
+    struct Negotiating(Arc<std::sync::atomic::AtomicU16>);
+    #[async_trait]
+    impl GattConnection for Negotiating {
+        fn peer(&self) -> PeerAddress {
+            PeerAddress("negotiating".into())
+        }
+        fn att_mtu(&self) -> u16 {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        async fn read(&mut self, _: CharacteristicUuid) -> Result<Vec<u8>> {
+            unreachable!()
+        }
+        async fn write_with_type(
+            &mut self,
+            _: CharacteristicUuid,
+            _: Vec<u8>,
+            _: WriteType,
+        ) -> Result<()> {
+            unreachable!()
+        }
+        async fn subscribe(&mut self, _: CharacteristicUuid) -> Result<BoxStream<Result<Vec<u8>>>> {
+            unreachable!()
+        }
+        async fn disconnect(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_reports_the_mtu_negotiated_after_connect() {
+        let mtu = Arc::new(std::sync::atomic::AtomicU16::new(23));
+        let (cleanup, completion) = Cleanup::reserved();
+        let task = tokio::spawn(completion);
+        let mut owned = cleanup.own(Box::new(Negotiating(mtu.clone())));
+        assert_eq!((owned.att_mtu(), owned.max_write_len()), (23, 20));
+        mtu.store(247, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!((owned.att_mtu(), owned.max_write_len()), (247, 244));
+        owned.disconnect().await.unwrap();
+        mtu.store(517, std::sync::atomic::Ordering::SeqCst);
+        // After hand-off to cleanup, the snapshot taken at own() answers.
+        assert_eq!((owned.att_mtu(), owned.max_write_len()), (23, 20));
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
