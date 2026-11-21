@@ -99,9 +99,9 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::entities::error::{BleError, Result};
 use crate::entities::models::{
-    advertised_name, truncate_name, CapabilityReport, CharacteristicUuid, DiscoveredPeer,
-    GattEvent, GattServiceSpec, PeerAddress, Role, ServiceUuid, WriteType,
-    LEGACY_ADVERTISING_DATA_LEN, LOCAL_NAME_MAX_LEN,
+    advertised_name, carries_fast_advertisement, truncate_name, CapabilityReport,
+    CharacteristicUuid, DiscoveredPeer, GattEvent, GattServiceSpec, PeerAddress, Role, ServiceUuid,
+    WriteType, LEGACY_ADVERTISING_DATA_LEN, LOCAL_NAME_MAX_LEN,
 };
 use crate::hal::{BoxStream, Driver, GattConnection};
 
@@ -1575,9 +1575,10 @@ impl Drop for LinuxConnectGuard {
 
 /// What a scan learned about one device at one moment.
 enum ScannedPeer {
-    /// The services BlueZ knows so far do not include the target. More may
-    /// still arrive (a scan response can carry the target UUID after the
-    /// first advertisement listed others).
+    /// The services BlueZ knows so far do not include the target, and it
+    /// carries no fast advertisement. More may still arrive (a scan response
+    /// can carry the target UUID after the first advertisement listed
+    /// others).
     NotTarget,
     /// Matches, with manufacturer data.
     Complete(DiscoveredPeer),
@@ -1589,19 +1590,42 @@ enum ScannedPeer {
 
 /// How often a scan re-reads the devices it has not fully reported yet. Reads
 /// are property gets on BlueZ's cached objects, not radio work, and a device
-/// that does not advertise the target costs one `UUIDs` read per tick.
+/// that does not advertise the target costs a `UUIDs` and a
+/// `ManufacturerData` read per tick.
 const SCAN_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl ScannedPeer {
+    /// Whether a device is for `target`: BlueZ lists the target among its
+    /// services, or it carries a managed fast advertisement (a Windows peer
+    /// publishes that in an advertisement of its own, without the service
+    /// UUID; ADR-0011). The Windows watcher admits the same devices.
+    fn is_target(
+        uuids: &HashSet<uuid::Uuid>,
+        target: uuid::Uuid,
+        manufacturer_data: &std::collections::BTreeMap<u16, Vec<u8>>,
+    ) -> bool {
+        uuids.contains(&target) || carries_fast_advertisement(manufacturer_data.values())
+    }
+
     async fn read(adapter: &Adapter, address: bluer::Address, target: uuid::Uuid) -> ScannedPeer {
         let Ok(device) = adapter.device(address) else {
             return ScannedPeer::Unknown;
         };
         let uuids = device.uuids().await.ok().flatten().unwrap_or_default();
-        if uuids.is_empty() {
-            return ScannedPeer::Unknown;
-        }
-        if !uuids.contains(&target) {
+        // Read before the service check: a fast advertisement admits a
+        // device that lists no services.
+        let manufacturer_data: std::collections::BTreeMap<u16, Vec<u8>> = device
+            .manufacturer_data()
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        if !Self::is_target(&uuids, target, &manufacturer_data) {
+            if uuids.is_empty() {
+                return ScannedPeer::Unknown;
+            }
             log::trace!(
                 "scan: ignoring {address} — advertises {} service(s), none matching",
                 uuids.len()
@@ -1620,14 +1644,6 @@ impl ScannedPeer {
             return ScannedPeer::Unknown;
         };
         let platform_name = device.name().await.ok().flatten();
-        let manufacturer_data: std::collections::BTreeMap<u16, Vec<u8>> = device
-            .manufacturer_data()
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
         let service_data = device
             .service_data()
             .await
@@ -2956,6 +2972,35 @@ mod tests {
             .insert(ServiceUuid(uuid::Uuid::from_u128(2)), vec![7]);
         let advertisement = spec.bluez_advertisement(true);
         assert_eq!(advertisement.service_data.len(), 1);
+    }
+
+    #[test]
+    fn a_scanned_device_is_the_target_by_service_or_by_fast_advertisement() {
+        let target = uuid::Uuid::from_u128(0xB1E6);
+        let other = uuid::Uuid::from_u128(7);
+        let no_company = std::collections::BTreeMap::new();
+        assert!(ScannedPeer::is_target(
+            &[target].into(),
+            target,
+            &no_company
+        ));
+        assert!(!ScannedPeer::is_target(
+            &[other].into(),
+            target,
+            &no_company
+        ));
+        assert!(!ScannedPeer::is_target(
+            &HashSet::new(),
+            target,
+            &no_company
+        ));
+        // A Windows peer's own publisher: no services, only the fast
+        // advertisement.
+        let fast: std::collections::BTreeMap<u16, Vec<u8>> = [(0xFFFF, vec![0xFC; 26])].into();
+        assert!(ScannedPeer::is_target(&HashSet::new(), target, &fast));
+        assert!(ScannedPeer::is_target(&[other].into(), target, &fast));
+        let fini: std::collections::BTreeMap<u16, Vec<u8>> = [(0xFFFF, vec![1, 2, 3, 4, 5])].into();
+        assert!(!ScannedPeer::is_target(&[other].into(), target, &fini));
     }
 
     #[test]
