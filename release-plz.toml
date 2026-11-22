@@ -1,10 +1,10 @@
 # release-plz (https://release-plz.dev): .github/workflows/release-plz.yml runs
 # it on every push to main.
 #
-# - `release` tags the current version `v{version}` and publishes a GitHub
-#   release when that tag does not exist yet.
-# - `release-pr` opens or updates a release pull request with the next
-#   version and CHANGELOG.md; merging it releases that version.
+# - `update` bumps the version and writes CHANGELOG.md; the workflow commits
+#   that to main itself (no release pull request).
+# - `release` tags that commit `v{version}` and publishes a GitHub release
+#   when that tag does not exist yet.
 #
 # The three crates share `[workspace.package] version`, so one tag and one
 # release (owned by `ble-gatt`) cover the whole workspace.
