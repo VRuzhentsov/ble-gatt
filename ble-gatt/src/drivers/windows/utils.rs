@@ -135,6 +135,16 @@ impl WindowsCodec {
             })
             .collect()
     }
+
+    /// Largest notification value for a subscribed client, from its
+    /// `GattSubscribedClient::MaxNotificationSize` (ATT MTU minus the 3-byte
+    /// header: 514 at MTU 517), capped at [`MAX_ATT_ATTRIBUTE_LEN`] as the
+    /// Linux and Android drivers do. A peer drops a longer notification.
+    ///
+    /// [`MAX_ATT_ATTRIBUTE_LEN`]: crate::hal::MAX_ATT_ATTRIBUTE_LEN
+    pub(super) fn notification_len(max_notification_size: u16) -> usize {
+        (max_notification_size as usize).min(crate::hal::MAX_ATT_ATTRIBUTE_LEN)
+    }
 }
 
 impl BleError {
@@ -235,5 +245,14 @@ mod tests {
             WindowsCodec::parse_service_data(0xFF, &[0x01, 0x02, 0x03]).is_none(),
             "not service data"
         );
+    }
+
+    #[test]
+    fn a_notification_is_capped_at_the_att_attribute_limit() {
+        // MTU 517: WinRT reports 514, two more than ATT permits.
+        assert_eq!(WindowsCodec::notification_len(514), 512);
+        assert_eq!(WindowsCodec::notification_len(512), 512);
+        // MTU 247.
+        assert_eq!(WindowsCodec::notification_len(244), 244);
     }
 }

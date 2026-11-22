@@ -675,6 +675,11 @@ impl TrackedPeer {
     pub(crate) fn is_completion(&self) -> bool {
         matches!(self.kind, ReadKind::Completion(_))
     }
+    /// Whether this peer waits for, or runs, a read of `key` that has not
+    /// succeeded yet.
+    pub(crate) fn awaits_read(&self, key: MetadataKey) -> bool {
+        self.key() == Some(key) && !self.read_done
+    }
     pub(crate) fn last_seen(&self) -> Instant {
         self.last_seen
     }

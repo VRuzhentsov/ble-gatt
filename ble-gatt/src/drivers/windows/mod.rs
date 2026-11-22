@@ -555,7 +555,10 @@ impl Driver for WindowsDriver {
                 continue;
             };
             if let Some((_, client)) = clients.into_iter().find(|(address, _)| *address == peer.0) {
-                return client.MaxNotificationSize().ok().map(|len| len as usize);
+                return client
+                    .MaxNotificationSize()
+                    .ok()
+                    .map(WindowsCodec::notification_len);
             }
         }
         None

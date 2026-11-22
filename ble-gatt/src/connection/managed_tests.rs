@@ -2981,6 +2981,47 @@ async fn a_rotated_address_with_the_same_header_is_not_read_again() {
 }
 
 #[tokio::test]
+async fn a_rotated_fast_advertisement_is_read_once() {
+    let network = MockNetwork::new();
+    let advertiser = advertiser_with(&network, "fast-rotated", fast_config(Some("Pixel")));
+    advertiser.set_advertising(true).await.unwrap();
+    let (driver, control, reader) =
+        BlockingVisibility::metadata_with(network, "fast-rotated-reader", fast_config(None));
+    let newest = first_sighting(&driver).await;
+    // Hidden from the mock scan: only the sightings below reach the reader.
+    advertiser.set_advertising(false).await.unwrap();
+    // The address the phone used before it rotated: a read there hangs.
+    let mut old = newest.clone();
+    old.address = PeerAddress("fast-rotated-old".into());
+    driver
+        .inner
+        .stall_connect(&old.address, Duration::from_secs(30));
+    let (input, receiver) = tokio::sync::mpsc::channel(2);
+    input.send(Ok(old)).await.unwrap();
+    input.send(Ok(newest)).await.unwrap();
+    *control.scan_input.lock().unwrap() = Some(receiver);
+    let mut discovery = reader.discover().await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+    let mut endpoints = Vec::new();
+    while let Ok(Some(item)) = tokio::time::timeout_at(deadline, discovery.next()).await {
+        endpoints.push(item.unwrap().0);
+    }
+    assert!(!endpoints.is_empty(), "listed from its fast advertisement");
+    assert!(endpoints
+        .iter()
+        .all(|endpoint| *endpoint == advertiser.endpoint_id()));
+    assert_eq!(
+        connects(&control),
+        1,
+        "one endpoint and hash at two addresses: one read"
+    );
+    drop(input);
+    drop(discovery);
+    reader.close().await.unwrap();
+    advertiser.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn managed_discovery_reads_a_header_named_while_an_earlier_read_ran() {
     let network = MockNetwork::new();
     let address = PeerAddress("renamed-peer".into());

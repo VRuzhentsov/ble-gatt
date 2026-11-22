@@ -769,6 +769,32 @@ impl Worker {
                     );
                     self.metadata_cache
                         .succeeded(key, (endpoint, Self::fields(&radio)), now);
+                } else if let Some(old) = tracked
+                    .iter()
+                    .find(|(address, entry)| **address != radio.address && entry.awaits_read(key))
+                    .map(|(address, _)| address.clone())
+                    .filter(|_| {
+                        !tracked
+                            .get(&radio.address)
+                            .is_some_and(|entry| entry.awaits_read(key))
+                    })
+                {
+                    // The same endpoint and value at another address: the peer
+                    // rotated its address (Android does). One read per value: a
+                    // read in flight at the old address stays the only one, and
+                    // a waiting one moves here, to the newest address. Two reads
+                    // of one phone stalled each other in uncached discovery.
+                    if !self.probing.contains_key(&old) {
+                        log::debug!(
+                            "discover: {} rotated to {}; its read moves",
+                            old.0,
+                            radio.address.0
+                        );
+                        let mut entry = tracked.remove(&old).expect("tracked peer");
+                        let read_at = self.metadata_cache.retry_at(key, now);
+                        entry.update_keyed(radio.clone(), key, read_at, true);
+                        tracked.insert(radio.address.clone(), entry);
+                    }
                 } else if let Some(entry) = tracked.get_mut(&radio.address) {
                     let read_at = self.metadata_cache.retry_at(key, now);
                     entry.update_keyed(radio.clone(), key, read_at, true);
