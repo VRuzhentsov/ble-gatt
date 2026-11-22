@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/VRuzhentsov/ble-gatt/compare/v0.2.0...v0.2.1) - 2026-11-22
+
+### Other
+
+- Cap Windows notifications at 512 bytes and read a rotated peer once ([#40](https://github.com/VRuzhentsov/ble-gatt/pull/40))
+
 ## [0.2.0]
 
 ### Added
