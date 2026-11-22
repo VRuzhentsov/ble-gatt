@@ -1,7 +1,18 @@
 name: Release-plz
 
-# Configured by release-plz.toml. Follows https://release-plz.dev/docs/github/quickstart
-# without crates.io: no CARGO_REGISTRY_TOKEN, git tags and GitHub releases only.
+# Configured by release-plz.toml. Follows https://release-plz.dev without
+# crates.io: no CARGO_REGISTRY_TOKEN, git tags and GitHub releases only.
+#
+# Every push to main releases, with no release pull request (so "Allow GitHub
+# Actions to create and approve pull requests" stays off):
+#   1. `release-plz update` bumps `[workspace.package] version` (from the
+#      commits and cargo-semver-checks) and writes the CHANGELOG.md entry;
+#   2. the job commits that to main as `chore: release vX.Y.Z` with
+#      GITHUB_TOKEN;
+#   3. `release-plz release` tags that commit `vX.Y.Z` and publishes the
+#      GitHub release.
+# It never loops: a GITHUB_TOKEN push starts no workflow, and the job skips
+# its own release commit as well.
 
 on:
   push:
@@ -10,52 +21,34 @@ on:
 permissions:
   contents: read
 
+# One release at a time. A newer push can replace a run that is still waiting
+# here; nothing is lost, because every run releases main's latest commit.
+concurrency:
+  group: release-plz-main
+  cancel-in-progress: false
+
 jobs:
-  # Tags `v{version}` and publishes a GitHub release when the version in
-  # Cargo.toml is not tagged yet. No concurrency group: a cancelled pending
-  # run could skip a release (see the quickstart).
   release:
-    name: Release-plz release
-    if: ${{ github.repository_owner == 'VRuzhentsov' }}
+    name: Release-plz
+    if: >-
+      github.repository_owner == 'VRuzhentsov' &&
+      !(github.actor == 'github-actions[bot]' &&
+        startsWith(github.event.head_commit.message, 'chore: release v'))
     runs-on: ubuntu-latest
     permissions:
-      # Create the tag and the release.
+      # Push the release commit and the tag, create the release.
       contents: write
       # Find the pull request a commit was merged from.
       pull-requests: read
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      # main, not the pushed commit: a newer push may have landed while this
+      # run waited, and the release commit must go on top of it.
       - uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Run release-plz release
-        uses: release-plz/action@v0.5
-        with:
-          command: release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  # Opens or updates the release pull request. Runs after `release`, so on the
-  # commit that was just tagged it sees the new tag and proposes nothing.
-  release-pr:
-    name: Release-plz PR
-    if: ${{ github.repository_owner == 'VRuzhentsov' }}
-    needs: release
-    runs-on: ubuntu-latest
-    permissions:
-      # Push the release branch.
-      contents: write
-      # Create and update the release pull request.
-      pull-requests: write
-    concurrency:
-      group: release-plz-${{ github.ref }}
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       # cargo-semver-checks builds the crates' docs: bluer links against
       # libdbus, Tauri against WebKitGTK (same list as ci.yml).
@@ -63,9 +56,44 @@ jobs:
         run: >-
           sudo apt-get update && sudo apt-get install -y libdbus-1-dev
           libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
-      - name: Run release-plz release-pr
-        uses: release-plz/action@v0.5
+      - name: Install release-plz and cargo-semver-checks
+        uses: taiki-e/install-action@v2
         with:
-          command: release-pr
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          tool: release-plz@0.4.3,cargo-semver-checks@0.51
+      - name: Bump the version and changelog, commit them to main
+        id: update
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          base="$(git rev-parse HEAD)"
+          release-plz update \
+            --git-token "$GITHUB_TOKEN" \
+            --repo-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --forge github
+          if git diff --quiet; then
+            # `release` below still tags the current version if it is untagged.
+            echo "No new version."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git diff --stat
+          version="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "ble-gatt") | .version')"
+          git commit --quiet --all --message "chore: release v$version"
+          if git push origin HEAD:refs/heads/main; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --quiet origin main
+          if [ "$(git rev-parse origin/main)" != "$base" ]; then
+            echo "::notice::main moved during this run; the run for the newer push releases it."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "main refused the release commit." >&2
+          exit 1
+      - name: Tag vX.Y.Z and publish the GitHub release
+        if: steps.update.outputs.release == 'true'
+        run: release-plz release --git-token "$GITHUB_TOKEN" --forge github

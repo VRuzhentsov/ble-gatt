@@ -219,12 +219,11 @@ one time with `git commit --no-verify`.
 ## Releasing
 
 [release-plz](https://release-plz.dev) (`release-plz.toml`,
-`.github/workflows/release-plz.yml`) runs on every push to `main`. When the
-`[workspace.package] version` is not tagged yet, it tags that commit `vX.Y.Z`
-and publishes a GitHub release with the `CHANGELOG.md` entry. Otherwise it
-opens or updates a release pull request with the next version (from the
-commits and cargo-semver-checks) and the changelog; merging that pull request
-releases it. Nothing is uploaded to crates.io.
+`.github/workflows/release-plz.yml`) releases every push to `main`. It bumps
+`[workspace.package] version` (from the commits and cargo-semver-checks),
+writes the `CHANGELOG.md` entry, commits both to `main` as
+`chore: release vX.Y.Z`, tags that commit `vX.Y.Z` and publishes a GitHub
+release. There is no release pull request. Nothing is uploaded to crates.io.
 
 **Release Button** (Actions → Run workflow, on `main`) stays as a manual
 fallback: it runs CI and tags an untagged version the same way.
