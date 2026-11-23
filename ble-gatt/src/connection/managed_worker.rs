@@ -1398,7 +1398,7 @@ impl Worker {
             }));
             for (peer, generation) in owners {
                 self.retiring
-                    .get_mut(&(peer.clone(), generation))
+                    .get_mut(&(peer, generation))
                     .expect("matched retirement owner")
                     .waiters
                     .push(waiter.clone());
