@@ -26,7 +26,7 @@ async fn crossed_retirement_preserves_individual_loser_reply_and_aggregate_owner
             let endpoint = EndpointId::from_bytes([2; 16]);
             for generation in [1, 2] {
                 let mut attempt =
-                    worker.attempt(peer.clone(), generation == 1, CancellationToken::new());
+                    Worker::attempt(peer.clone(), generation == 1, CancellationToken::new());
                 attempt.endpoint = Some(endpoint);
                 worker.attempts.insert(generation, attempt);
             }
@@ -130,7 +130,7 @@ async fn crossed_retirement_counts_cleanup_and_waiter_references_by_owner() {
     worker.acquired.insert(peer.clone(), 1);
     worker.attempts.insert(
         2,
-        worker.attempt(peer.clone(), false, CancellationToken::new()),
+        Worker::attempt(peer.clone(), false, CancellationToken::new()),
     );
     assert_eq!(
         worker.link_count(),
@@ -214,7 +214,7 @@ async fn crossed_retirement_counts_cleanup_and_waiter_references_by_owner() {
         let peer = PeerAddress(format!("budget-{generation}"));
         worker.attempts.insert(
             generation as u64,
-            worker.attempt(peer, true, CancellationToken::new()),
+            Worker::attempt(peer, true, CancellationToken::new()),
         );
     }
     assert!(
@@ -231,7 +231,7 @@ async fn shutdown_answers_every_crossed_retirement_owner_and_shared_aggregate() 
         let endpoint = EndpointId::from_bytes([2; 16]);
         for generation in [1, 2] {
             let mut attempt =
-                worker.attempt(peer.clone(), generation == 1, CancellationToken::new());
+                Worker::attempt(peer.clone(), generation == 1, CancellationToken::new());
             attempt.endpoint = Some(endpoint);
             worker.attempts.insert(generation, attempt);
         }
@@ -282,7 +282,7 @@ async fn crossed_retirement_transfers_one_held_inbound_until_all_address_owners_
         for generation in [1, 2] {
             worker.attempts.insert(
                 generation,
-                worker.attempt(peer.clone(), generation == 1, CancellationToken::new()),
+                Worker::attempt(peer.clone(), generation == 1, CancellationToken::new()),
             );
         }
         worker.retire(vec![1], AttemptError::Superseded, None);
@@ -378,7 +378,7 @@ async fn crossed_retirement_transfers_one_held_inbound_until_all_address_owners_
 async fn retirement_waiters_are_bounded_and_cancelled_slots_are_reclaimed() {
     let mut worker = worker();
     let peer = PeerAddress("bounded-waiters".into());
-    let attempt = worker.attempt(peer.clone(), true, CancellationToken::new());
+    let attempt = Worker::attempt(peer.clone(), true, CancellationToken::new());
     worker.attempts.insert(1, attempt);
     worker.acquired.insert(peer.clone(), 1);
     worker.retire(vec![1], AttemptError::PeerDisconnected, None);
@@ -425,7 +425,7 @@ async fn retirement_waiters_are_bounded_and_cancelled_slots_are_reclaimed() {
 async fn stale_retirement_and_cleanup_cannot_acknowledge_or_remove_another_owner() {
     let mut worker = worker();
     let peer = PeerAddress("stale-owner".into());
-    let attempt = worker.attempt(peer.clone(), true, CancellationToken::new());
+    let attempt = Worker::attempt(peer.clone(), true, CancellationToken::new());
     worker.attempts.insert(2, attempt);
     worker.acquired.insert(peer.clone(), 2);
     worker.retire(vec![2], AttemptError::PeerDisconnected, None);
@@ -459,7 +459,7 @@ async fn shutdown_timeout_answers_pending_retirement_with_typed_timeout() {
     for abort in [false, true] {
         let mut worker = worker();
         let peer = PeerAddress("shutdown-retirement".into());
-        let attempt = worker.attempt(peer.clone(), true, CancellationToken::new());
+        let attempt = Worker::attempt(peer.clone(), true, CancellationToken::new());
         worker.attempts.insert(1, attempt);
         worker.acquired.insert(peer, 1);
         let (reply, result) = oneshot::channel();
@@ -492,7 +492,7 @@ async fn endpoint_disconnect_joins_only_its_known_retirement() {
     let mut worker = worker();
     let endpoint = EndpointId::from_bytes([9; 16]);
     let peer = PeerAddress("endpoint-retirement".into());
-    let mut attempt = worker.attempt(peer.clone(), true, CancellationToken::new());
+    let mut attempt = Worker::attempt(peer.clone(), true, CancellationToken::new());
     attempt.endpoint = Some(endpoint);
     worker.attempts.insert(1, attempt);
     worker.acquired.insert(peer.clone(), 1);
@@ -517,7 +517,7 @@ async fn retirement_reply_preserves_transport_failure() {
     for cleanup_first in [true, false] {
         let mut worker = worker();
         let peer = PeerAddress("transport-refusal".into());
-        let mut attempt = worker.attempt(peer.clone(), true, CancellationToken::new());
+        let mut attempt = Worker::attempt(peer.clone(), true, CancellationToken::new());
         let (transport, mut commands) = mpsc::channel(4);
         attempt.transport = Some(transport);
         worker.attempts.insert(1, attempt);
@@ -568,7 +568,7 @@ async fn retirement_reply_preserves_cleanup_error_in_both_completion_orders() {
     for cleanup_first in [true, false] {
         let mut worker = worker();
         let peer = PeerAddress("typed-cleanup".into());
-        let attempt = worker.attempt(peer.clone(), true, CancellationToken::new());
+        let attempt = Worker::attempt(peer.clone(), true, CancellationToken::new());
         worker.attempts.insert(1, attempt);
         worker.acquired.insert(peer.clone(), 1);
         let (reply, mut result) = oneshot::channel();
@@ -813,7 +813,7 @@ async fn awaited_retirement_reports_native_teardown_failure() {
         Arc::new(Mutex::new(HashMap::new())),
         CancellationToken::new(),
     );
-    let mut attempt = worker.attempt(PeerAddress("peer".into()), true, CancellationToken::new());
+    let mut attempt = Worker::attempt(PeerAddress("peer".into()), true, CancellationToken::new());
     let (transport, mut receiver) = mpsc::channel(4);
     attempt.transport = Some(transport);
     worker.attempts.insert(1, attempt);

@@ -146,7 +146,7 @@ impl RecoveryRetry {
     const FIRST: Duration = Duration::from_secs(1);
     const LONGEST: Duration = Duration::from_secs(30);
     fn due(&self) -> bool {
-        !self.at.is_some_and(|at| tokio::time::Instant::now() < at)
+        self.at.is_none_or(|at| tokio::time::Instant::now() >= at)
     }
     fn failed(&mut self, error: &BleError) {
         let wait = Self::FIRST
@@ -196,7 +196,10 @@ pub(super) struct Worker {
     next_generation: u64,
 }
 impl Worker {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the link gives the worker each part it owns, once, at start"
+    )]
     pub(super) fn new(
         endpoint: EndpointId,
         config: PeerLinkConfig,
@@ -237,7 +240,7 @@ impl Worker {
         let driver = match self.driver.take() {
             Some(driver) => driver,
             None => match tokio::select! {
-                _ = self.shutdown.cancelled() => return,
+                () = self.shutdown.cancelled() => return,
                 result = tokio::time::timeout(IO_BOUND, crate::drivers::platform()) => result.unwrap_or(Err(AttemptError::TimedOut.into())),
             } {
                 Ok(driver) => driver,
@@ -292,17 +295,7 @@ impl Worker {
                     Ok(spec) => {
                         advertising_pending = true;
                         server_acquired = true;
-                        let driver = driver.clone();
-                        let shutdown = self.shutdown.clone();
-                        let revision = loss_revision;
-                        self.operations.spawn(async move {
-                            let result = tokio::select! {
-                                biased;
-                                _ = shutdown.cancelled() => Err(AttemptError::Cancelled.into()),
-                                result = tokio::time::timeout(ADVERTISE_BOUND, driver.advertise(spec)) => result.unwrap_or(Err(AttemptError::TimedOut.into())),
-                            };
-                            Operation::Recovered(result, revision)
-                        });
+                        self.recover(driver.clone(), spec, loss_revision);
                     }
                     Err(_) => {
                         metadata_uncertain = true;
@@ -312,7 +305,7 @@ impl Worker {
             }
             let scan_output = scan.as_ref().map(|(_, output)| output.clone());
             tokio::select! {
-                _ = self.shutdown.cancelled() => break,
+                () = self.shutdown.cancelled() => break,
                 event = lifecycle.next() => {
                     match event {
                         Some(crate::GattEvent::RadioChanged { status: crate::RadioStatus::On }) => { radio_available = true; }
@@ -341,13 +334,11 @@ impl Worker {
                                 if revision != loss_revision { result = Err(AttemptError::PeerLost.into()); }
                                 advertising_pending = false;
                                 if result.is_err() { metadata_uncertain = true; metadata_fenced = false; }
+                                else if enabled { native_present = true; recovery_needed = false; recovery_retry.succeeded(); }
                                 else {
-                                    if enabled { native_present = true; recovery_needed = false; recovery_retry.succeeded(); }
-                                    else {
-                                        // Successful hide confirms a retained server and invalidates late callbacks.
-                                        native_present = true;
-                                        if metadata_uncertain { metadata_fenced = true; }
-                                    }
+                                    // Successful hide confirms a retained server and invalidates late callbacks.
+                                    native_present = true;
+                                    if metadata_uncertain { metadata_fenced = true; }
                                 }
                                 match result {
                                     Err(error) if fresh && served.is_none() && !native_present => { advertising_pending = true; self.withdraw(driver.clone(), error, Some(reply)); }
@@ -401,44 +392,12 @@ impl Worker {
                     let now = tokio::time::Instant::now();
                     if let Some((_, output)) = &scan {
                         let output = output.clone();
-                        let due: Vec<_> = tracked_metadata.iter().filter(|(_, entry)| entry.managed_due(now, !scan_exhausted)).map(|(address, entry)| (address.clone(), entry.radio_peer())).collect();
-                        for (address, peer) in due {
-                            let entry = tracked_metadata.get_mut(&address).expect("tracked peer");
-                            if let Some((endpoint, fields)) = entry.key().and_then(|key| self.metadata_cache.hit(key, now)) {
-                                // Another read (of this address or a rotated one) already has it.
-                                let (endpoint, peer) = (*endpoint, Self::cached_peer(fields, peer));
-                                if entry.managed_result(Some(&peer), None) { let _ = output.try_send(Ok((endpoint, peer))); }
-                                continue;
-                            }
-                            let completion = entry.is_completion();
-                            match self.probe_metadata(driver.clone(), peer, entry.key(), output.clone(), scan_generation, completion) {
-                                Ok(()) => entry.managed_scheduled(),
-                                Err(error) => {
-                                    let initial = entry.managed_initial();
-                                    entry.managed_deferred();
-                                    // A completion read is low priority: it waits, silently, while a
-                                    // dial or another read holds the address. Its peer is listed already.
-                                    if initial && !completion { let _ = output.try_send(Err(error)); }
-                                }
-                            }
-                        }
-                        if scan_exhausted && !tracked_metadata.values().any(|entry| entry.managed_initial()) && !self.probing.values().any(|generation| *generation == scan_generation) { scan = None; }
+                        self.read_due_metadata(&driver, &output, &mut tracked_metadata, scan_exhausted, scan_generation, now);
+                        if scan_exhausted && !tracked_metadata.values().any(TrackedPeer::managed_initial) && !self.probing.values().any(|generation| *generation == scan_generation) { scan = None; }
                     }
-                    let expired: Vec<_> = self.attempts.iter().filter(|(_, a)| a.released.is_cancelled() || (a.channel.is_none() && (a.cancellation.is_cancelled() || now >= a.deadline)) || (a.channel.is_some() && now.duration_since(a.last_received) >= ESTABLISHMENT_BOUND)).map(|(generation, _)| *generation).collect();
-                    for generation in expired {
-                        let attempt = &self.attempts[&generation];
-                        let reason = if attempt.released.is_cancelled() { AttemptError::Released }
-                            else if attempt.channel.is_some() { AttemptError::PeerLost }
-                            else if attempt.cancellation.is_cancelled() { AttemptError::Cancelled }
-                            else { AttemptError::TimedOut };
-                        self.retire(vec![generation], reason, None);
-                    }
-                    for attempt in self.attempts.values_mut().filter(|attempt| attempt.channel.is_some() && now >= attempt.next_ping) {
-                        Self::send(attempt, Record::Ping { attempt: attempt.wire_attempt });
-                        attempt.next_ping = now + IO_BOUND;
-                    }
+                    self.expire_attempts(now);
                 }
-                _ = async { match &scan_output { Some(output) => output.closed().await, None => std::future::pending().await } } => { scan = None; }
+                () = async { match &scan_output { Some(output) => output.closed().await, None => std::future::pending().await } } => { scan = None; }
                 permit = async { match &scan_output { Some(output) => output.reserve().await, None => std::future::pending().await } }, if scan_held.is_some() => {
                     match permit { Ok(permit) => permit.send(scan_held.take().expect("held scan result")), Err(_) => scan = None }
                 }
@@ -484,17 +443,7 @@ impl Worker {
                             self.config.datagram = config;
                             if !native_present { let _ = reply.send(Ok(())); continue; }
                             advertising_pending = true;
-                            let driver = driver.clone();
-                            let shutdown = self.shutdown.clone();
-                            let revision = loss_revision;
-                            self.operations.spawn(async move {
-                                let result = tokio::select! {
-                                    biased;
-                                    _ = shutdown.cancelled() => Err(AttemptError::Cancelled.into()),
-                                    result = tokio::time::timeout(IO_BOUND, datagram::DatagramConfig::update_spec(driver.as_ref(), spec)) => result.unwrap_or(Err(AttemptError::TimedOut.into())),
-                                };
-                                Operation::Metadata(result, reply, revision)
-                            });
+                            self.update_metadata(driver.clone(), spec, reply, loss_revision);
                         }
                         Command::Advertising(enabled, reply) => {
                             if advertising_pending || (enabled && metadata_uncertain) || !self.operation_capacity() {
@@ -519,7 +468,7 @@ impl Worker {
                             self.operations.spawn(async move {
                                 let result = tokio::select! {
                                     biased;
-                                    _ = shutdown.cancelled() => Err(AttemptError::Cancelled.into()),
+                                    () = shutdown.cancelled() => Err(AttemptError::Cancelled.into()),
                                     result = tokio::time::timeout(ADVERTISE_BOUND, async {
                                         if startup { config.serve_spec(driver.clone(), spec, false).await.map(Some) }
                                         else if restore { driver.advertise(spec).await.map(|()| None) }
@@ -535,13 +484,7 @@ impl Worker {
                             let admission = self.wire(generation, record);
                             if let Some(reply) = reply { let _ = reply.send(admission); }
                         },
-                        Command::Accept(generation, reply) => {
-                            if let Some(attempt) = self.attempts.get_mut(&generation) {
-                                attempt.local_accept = true; attempt.accepted = Some(reply);
-                                Self::send(attempt, Record::Decision { attempt: attempt.wire_attempt, action: 0 });
-                                self.establish(generation);
-                            } else { let _ = reply.send(Err(PeerLink::closed_error())); }
-                        }
+                        Command::Accept(generation, reply) => self.accept(generation, reply),
                         Command::Reject(generation, reply) => self.retire(vec![generation], AttemptError::Rejected, Some(reply)),
                         Command::Disconnect(endpoint, reply) => {
                             let generations = self.endpoint_generations(endpoint);
@@ -559,16 +502,7 @@ impl Worker {
                                 tracked_metadata.clear();
                                 scan_exhausted = false;
                                 discovery_pending = true;
-                                let driver = driver.clone();
-                                let service = self.config.datagram.service;
-                                let shutdown = self.shutdown.clone();
-                                self.operations.spawn(async move {
-                                    let result = tokio::select! {
-                                        _ = shutdown.cancelled() => Err(AttemptError::Cancelled.into()),
-                                        result = tokio::time::timeout(IO_BOUND, driver.scan(service)) => result.unwrap_or(Err(AttemptError::TimedOut.into())),
-                                    };
-                                    Operation::Discovery(result, reply)
-                                });
+                                self.discover(driver.clone(), reply);
                             }
                         }
                         Command::Close(reply) => { close_reply = Some(reply); break; }
@@ -582,6 +516,16 @@ impl Worker {
         self.shutdown.cancel();
         drop(scan);
         drop(served);
+        self.shut_down(&driver, server_acquired, close_reply).await;
+    }
+    /// Retire every attempt, drain the operations in flight, and stop the
+    /// server this worker started, all in one bound; then answer close.
+    async fn shut_down(
+        &mut self,
+        driver: &Arc<dyn Driver>,
+        server_acquired: bool,
+        close_reply: Option<Reply<()>>,
+    ) {
         let generations: Vec<_> = self.attempts.keys().copied().collect();
         self.retire(generations, AttemptError::Closed, None);
         let mut teardown = self.cleanup_failure.take().map_or(Ok(()), Err);
@@ -648,6 +592,161 @@ impl Worker {
             let _ = reply.send(stopped.and(teardown));
         }
     }
+    /// Start the recovery show (the restore after a radio loss) of `spec`.
+    fn recover(&mut self, driver: Arc<dyn Driver>, spec: crate::GattServiceSpec, revision: u64) {
+        let shutdown = self.shutdown.clone();
+        self.operations.spawn(async move {
+            let result = tokio::select! {
+                biased;
+                () = shutdown.cancelled() => Err(AttemptError::Cancelled.into()),
+                result = tokio::time::timeout(ADVERTISE_BOUND, driver.advertise(spec)) => result.unwrap_or(Err(AttemptError::TimedOut.into())),
+            };
+            Operation::Recovered(result, revision)
+        });
+    }
+    /// Start the update of the shown readable value and advertisement to `spec`.
+    fn update_metadata(
+        &mut self,
+        driver: Arc<dyn Driver>,
+        spec: crate::GattServiceSpec,
+        reply: Reply<()>,
+        revision: u64,
+    ) {
+        let shutdown = self.shutdown.clone();
+        self.operations.spawn(async move {
+            let result = tokio::select! {
+                biased;
+                () = shutdown.cancelled() => Err(AttemptError::Cancelled.into()),
+                result = tokio::time::timeout(IO_BOUND, datagram::DatagramConfig::update_spec(driver.as_ref(), spec)) => result.unwrap_or(Err(AttemptError::TimedOut.into())),
+            };
+            Operation::Metadata(result, reply, revision)
+        });
+    }
+    /// Start a native scan for the managed service.
+    fn discover(
+        &mut self,
+        driver: Arc<dyn Driver>,
+        reply: Reply<BoxStream<Result<(EndpointId, DiscoveredPeer)>>>,
+    ) {
+        let service = self.config.datagram.service;
+        let shutdown = self.shutdown.clone();
+        self.operations.spawn(async move {
+            let result = tokio::select! {
+                () = shutdown.cancelled() => Err(AttemptError::Cancelled.into()),
+                result = tokio::time::timeout(IO_BOUND, driver.scan(service)) => result.unwrap_or(Err(AttemptError::TimedOut.into())),
+            };
+            Operation::Discovery(result, reply)
+        });
+    }
+    /// The application accepts the attempt `generation`.
+    fn accept(&mut self, generation: u64, reply: Reply<PeerChannel>) {
+        if let Some(attempt) = self.attempts.get_mut(&generation) {
+            attempt.local_accept = true;
+            attempt.accepted = Some(reply);
+            Self::send(
+                attempt,
+                Record::Decision {
+                    attempt: attempt.wire_attempt,
+                    action: 0,
+                },
+            );
+            self.establish(generation);
+        } else {
+            let _ = reply.send(Err(PeerLink::closed_error()));
+        }
+    }
+    /// Retire each attempt that is released, cancelled, past its deadline or
+    /// silent too long, and ping each established attempt that is due.
+    fn expire_attempts(&mut self, now: tokio::time::Instant) {
+        let expired: Vec<_> = self
+            .attempts
+            .iter()
+            .filter(|(_, a)| {
+                a.released.is_cancelled()
+                    || (a.channel.is_none() && (a.cancellation.is_cancelled() || now >= a.deadline))
+                    || (a.channel.is_some()
+                        && now.duration_since(a.last_received) >= ESTABLISHMENT_BOUND)
+            })
+            .map(|(generation, _)| *generation)
+            .collect();
+        for generation in expired {
+            let attempt = &self.attempts[&generation];
+            let reason = if attempt.released.is_cancelled() {
+                AttemptError::Released
+            } else if attempt.channel.is_some() {
+                AttemptError::PeerLost
+            } else if attempt.cancellation.is_cancelled() {
+                AttemptError::Cancelled
+            } else {
+                AttemptError::TimedOut
+            };
+            self.retire(vec![generation], reason, None);
+        }
+        for attempt in self
+            .attempts
+            .values_mut()
+            .filter(|attempt| attempt.channel.is_some() && now >= attempt.next_ping)
+        {
+            Self::send(
+                attempt,
+                Record::Ping {
+                    attempt: attempt.wire_attempt,
+                },
+            );
+            attempt.next_ping = now + IO_BOUND;
+        }
+    }
+    /// Read the metadata of each tracked peer that is due, from the cache when
+    /// another read has it already.
+    fn read_due_metadata(
+        &mut self,
+        driver: &Arc<dyn Driver>,
+        output: &DiscoveryOutput,
+        tracked_metadata: &mut HashMap<PeerAddress, TrackedPeer>,
+        scan_exhausted: bool,
+        scan_generation: u64,
+        now: tokio::time::Instant,
+    ) {
+        let due: Vec<_> = tracked_metadata
+            .iter()
+            .filter(|(_, entry)| entry.managed_due(now, !scan_exhausted))
+            .map(|(address, entry)| (address.clone(), entry.radio_peer()))
+            .collect();
+        for (address, peer) in due {
+            let entry = tracked_metadata.get_mut(&address).expect("tracked peer");
+            if let Some((endpoint, fields)) = entry
+                .key()
+                .and_then(|key| self.metadata_cache.hit(key, now))
+            {
+                // Another read (of this address or a rotated one) already has it.
+                let (endpoint, peer) = (*endpoint, Self::cached_peer(fields, peer));
+                if entry.managed_result(Some(&peer), None) {
+                    let _ = output.try_send(Ok((endpoint, peer)));
+                }
+                continue;
+            }
+            let completion = entry.is_completion();
+            match self.probe_metadata(
+                driver.clone(),
+                peer,
+                entry.key(),
+                output.clone(),
+                scan_generation,
+                completion,
+            ) {
+                Ok(()) => entry.managed_scheduled(),
+                Err(error) => {
+                    let initial = entry.managed_initial();
+                    entry.managed_deferred();
+                    // A completion read is low priority: it waits, silently, while a
+                    // dial or another read holds the address. Its peer is listed already.
+                    if initial && !completion {
+                        let _ = output.try_send(Err(error));
+                    }
+                }
+            }
+        }
+    }
     /// No platform driver could be built: log `error`, then answer every
     /// command with it until close, so the caller sees why the link fails.
     async fn refuse(self, error: BleError) {
@@ -662,7 +761,7 @@ impl Worker {
         drop(incoming);
         loop {
             let command = tokio::select! {
-                _ = shutdown.cancelled() => return,
+                () = shutdown.cancelled() => return,
                 command = receiver.recv() => command,
             };
             let Some(command) = command else { return };
@@ -747,7 +846,7 @@ impl Worker {
                 }
                 if tracked
                     .get(&radio.address)
-                    .is_some_and(|entry| entry.is_unnamed())
+                    .is_some_and(TrackedPeer::is_unnamed)
                 {
                     tracked.remove(&radio.address);
                 }
@@ -1105,9 +1204,9 @@ impl Worker {
         self.operations.spawn(async move {
             let read = tokio::select! {
                 biased;
-                _ = shutdown.cancelled() => Err(AttemptError::Cancelled.into()),
-                _ = output.closed() => Err(AttemptError::Cancelled.into()),
-                _ = yielded.cancelled() => Err(AttemptError::Cancelled.into()),
+                () = shutdown.cancelled() => Err(AttemptError::Cancelled.into()),
+                () = output.closed() => Err(AttemptError::Cancelled.into()),
+                () = yielded.cancelled() => Err(AttemptError::Cancelled.into()),
                 // One read includes the first connection to the peer; bound it like an unmanaged
                 // GATT advertisement read. Windows took 3-5 s and more for a first connection to a
                 // phone, and a read cut at `IO_BOUND` started over after the next scan.
@@ -1132,7 +1231,7 @@ impl Worker {
         self.operations.spawn(async move {
             let stopped = tokio::select! {
                 biased;
-                _ = shutdown.cancelled() => Err(AttemptError::Cancelled.into()),
+                () = shutdown.cancelled() => Err(AttemptError::Cancelled.into()),
                 result = tokio::time::timeout(IO_BOUND, driver.stop_advertising()) => {
                     result.unwrap_or(Err(AttemptError::TimedOut.into()))
                 }
@@ -1339,12 +1438,7 @@ impl Worker {
         self.next_generation += 1;
         self.next_generation
     }
-    fn attempt(
-        &self,
-        peer: PeerAddress,
-        outgoing: bool,
-        cancellation: CancellationToken,
-    ) -> Attempt {
+    fn attempt(peer: PeerAddress, outgoing: bool, cancellation: CancellationToken) -> Attempt {
         let random = uuid::Uuid::new_v4();
         // Bytes 0..4 of a version 4 UUID are all random (its version and
         // variant bits are in bytes 6 and 8): a full 32-bit nonce (ADR-0012).
@@ -1406,7 +1500,7 @@ impl Worker {
         }
         let generation = self.generation();
         let cleanup = self.reserve_cleanup(peer.clone(), generation);
-        let mut attempt = self.attempt(peer.clone(), true, cancellation);
+        let mut attempt = Self::attempt(peer.clone(), true, cancellation);
         #[cfg(test)]
         if let Some(nonce) = self.next_nonce.take() {
             attempt.nonce = nonce;
@@ -1485,7 +1579,7 @@ impl Worker {
             return;
         }
         let generation = self.generation();
-        let mut attempt = self.attempt(channel.peer(), false, CancellationToken::new());
+        let mut attempt = Self::attempt(channel.peer(), false, CancellationToken::new());
         self.transport(generation, &mut attempt, channel);
         self.attempts.insert(generation, attempt);
     }
@@ -1507,12 +1601,12 @@ impl Worker {
                 tokio::select! {
                     // Retirement interrupts application admission, not the pump's
                     // control path: it still owns native confirmation/teardown.
-                    _ = native_ended.cancelled(), if receiving => {
+                    () = native_ended.cancelled(), if receiving => {
                         admission = None;
                         receiving = false;
                         let _ = commands.send(Command::Wire(generation, None, None)).await;
                     }
-                    _ = ended.cancelled(), if receiving => {
+                    () = ended.cancelled(), if receiving => {
                         receiving = false;
                         admission = None;
                     }
@@ -1755,7 +1849,7 @@ impl Worker {
             Some(Ok(Record::Disconnect {
                 attempt: wire_attempt,
             })) if attempt.wire_attempt == wire_attempt => {
-                failure = Some(AttemptError::PeerDisconnected)
+                failure = Some(AttemptError::PeerDisconnected);
             }
             Some(Err(BleError::ReceiveGap(_))) if attempt.channel.is_some() => {
                 log::warn!("managed generation {generation}: forwarding known raw receive gap");
