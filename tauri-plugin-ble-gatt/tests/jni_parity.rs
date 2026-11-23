@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 const KOTLIN_DIR: &str = "android/src/main/kotlin/dev/blegatt";
-const DRIVER: &str = "../ble-gatt/src/drivers/android/mod.rs";
+const DRIVER_DIR: &str = "../ble-gatt/src/drivers/android";
 const JNI_EXPORT_PREFIX: &str = "Java_dev_blegatt_NativeKt_";
 
 /// Methods Rust calls on standard Java classes, not on the bridge.
@@ -18,6 +18,24 @@ const JAVA_STANDARD_METHODS: &[&str] = &["toString", "getClassLoader", "loadClas
 fn read(relative: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
     std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("reading {}: {err}", path.display()))
+}
+
+/// The Android driver's source: every `.rs` file of its module, in name order.
+fn read_driver() -> String {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(DRIVER_DIR);
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|err| panic!("reading {}: {err}", dir.display()))
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
+        .collect();
+    files.sort();
+    files
+        .iter()
+        .map(|path| {
+            std::fs::read_to_string(path)
+                .unwrap_or_else(|err| panic!("reading {}: {err}", path.display()))
+        })
+        .collect()
 }
 
 fn identifier_at(text: &str) -> &str {
@@ -58,7 +76,7 @@ fn called_methods(source: &str) -> BTreeSet<String> {
 #[test]
 fn every_kotlin_external_fun_has_a_rust_export_and_back() {
     let kotlin = read(&format!("{KOTLIN_DIR}/Native.kt"));
-    let rust = read(DRIVER);
+    let rust = read_driver();
     let declared = names_after(&kotlin, "external fun ");
     let exported = names_after(&rust, &format!("fn {JNI_EXPORT_PREFIX}"));
     assert!(!declared.is_empty(), "no external funs found in Native.kt");
@@ -72,7 +90,7 @@ fn every_kotlin_external_fun_has_a_rust_export_and_back() {
 #[test]
 fn scan_start_status_and_abi_match_on_both_sides() {
     let kotlin = read(&format!("{KOTLIN_DIR}/BleGattBridge.kt"));
-    let rust = read(DRIVER);
+    let rust = read_driver();
     assert!(kotlin.contains("fun startScan(serviceUuid: String, generation: Long): Int"));
     assert!(rust.contains("\"(Ljava/lang/String;J)I\""));
     assert!(rust.contains("BleError::android_scan_start_result(status)?"));
@@ -108,7 +126,7 @@ fn scan_start_status_and_abi_match_on_both_sides() {
 #[test]
 fn advertising_descriptors_match_the_kotlin_parameters() {
     let kotlin = read(&format!("{KOTLIN_DIR}/BleGattBridge.kt"));
-    let rust = read(DRIVER);
+    let rust = read_driver();
     let compact = |text: &str| {
         text.chars()
             .filter(|c| !c.is_whitespace())
@@ -193,7 +211,7 @@ fn android_context_is_supplied_by_the_registered_plugin_not_tao_statics() {
     );
     let plugin_rust = read("src/lib.rs");
     assert!(plugin_rust.contains("AndroidDriver::with_context("));
-    let driver = read(DRIVER);
+    let driver = read_driver();
     assert!(driver.contains("pub async fn with_context("));
 }
 
@@ -209,7 +227,7 @@ fn diagnostic_declares_non_location_scanning() {
 #[test]
 fn every_bridge_method_rust_calls_exists_in_kotlin() {
     let kotlin = read(&format!("{KOTLIN_DIR}/BleGattBridge.kt"));
-    let rust = read(DRIVER);
+    let rust = read_driver();
     let defined = names_after(&kotlin, "fun ");
     let called = called_methods(&rust);
     assert!(
