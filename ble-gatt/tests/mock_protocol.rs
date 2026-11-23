@@ -121,7 +121,7 @@ async fn write_from_central_is_readable_back_and_fires_a_lifecycle_event() {
     // repeats, so this skips them rather than asserting a fixed sequence.
     let written_event = loop {
         match events.next().await.expect("write event should arrive") {
-            ble_gatt::GattEvent::Connected { .. } => continue,
+            ble_gatt::GattEvent::Connected { .. } => {}
             other => break other,
         }
     };
@@ -290,7 +290,7 @@ async fn advertise_carries_its_own_manufacturer_and_service_data_to_a_scanner() 
         Some(&vec![0x01, 0x02, 0x03])
     );
     assert_eq!(
-        peer.service_data.get(&service_uuid).map(|v| v.as_slice()),
+        peer.service_data.get(&service_uuid).map(Vec::as_slice),
         Some(b"from-the-spec".as_slice())
     );
 }
@@ -338,7 +338,7 @@ async fn advertisement_payload_identifies_a_specific_peer_before_connecting() {
 
     assert_eq!(peer.manufacturer_data.get(&0x1234), Some(&device_eui));
     assert_eq!(
-        peer.service_data.get(&service_uuid).map(|v| v.as_slice()),
+        peer.service_data.get(&service_uuid).map(Vec::as_slice),
         Some(b"peer-id-payload".as_slice())
     );
     assert_eq!(peer.rssi, Some(-55));
@@ -570,18 +570,14 @@ async fn a_central_refused_by_a_single_peer_server_stops_receiving_notifications
         .await
         .expect("notify should succeed");
     assert_eq!(
-        refused_rx
-            .next()
-            .await
-            .and_then(|item| item.ok())
-            .as_deref(),
+        refused_rx.next().await.and_then(Result::ok).as_deref(),
         Some(b"for-the-served-peer".as_slice()),
         "precondition: notify is a broadcast, so an un-excluded peer does receive it"
     );
     // The served peer received it too — drain so the assertion below reads
     // the notification sent *after* exclusion, not this one.
     assert_eq!(
-        first_rx.next().await.and_then(|item| item.ok()).as_deref(),
+        first_rx.next().await.and_then(Result::ok).as_deref(),
         Some(b"for-the-served-peer".as_slice())
     );
 
@@ -597,15 +593,14 @@ async fn a_central_refused_by_a_single_peer_server_stops_receiving_notifications
         .expect("notify should succeed");
 
     assert_eq!(
-        first_rx.next().await.and_then(|item| item.ok()).as_deref(),
+        first_rx.next().await.and_then(Result::ok).as_deref(),
         Some(b"private-payload".as_slice()),
         "the served central must still receive its own traffic"
     );
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(50), refused_rx.next())
             .await
-            .map(|item| item.is_none())
-            .unwrap_or(true),
+            .map_or(true, |item| item.is_none()),
         "a disconnected central must not receive the served peer's fragments"
     );
 }
@@ -667,7 +662,7 @@ async fn an_addressed_notify_reaches_only_its_peer() {
         .expect("addressed notify should succeed");
 
     assert_eq!(
-        served_rx.next().await.and_then(|item| item.ok()).as_deref(),
+        served_rx.next().await.and_then(Result::ok).as_deref(),
         Some(b"for-the-served-peer".as_slice())
     );
     assert!(

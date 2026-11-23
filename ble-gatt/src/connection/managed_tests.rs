@@ -8,6 +8,13 @@ use crate::{
 };
 use std::{sync::Arc, time::Duration};
 use tokio_stream::StreamExt;
+#[cfg_attr(
+    target_os = "android",
+    allow(
+        clippy::duplicate_mod,
+        reason = "the Android driver builds this file too; the tests use their own copy on every target"
+    )
+)]
 #[path = "../drivers/android/advertisement_outcome.rs"]
 mod advertisement_outcome;
 
@@ -503,7 +510,7 @@ impl crate::Driver for BlockingVisibility {
                     .lock()
                     .unwrap()
                     .as_ref()
-                    .map(|bus| bus.lifecycle_events());
+                    .map(crate::drivers::event_bus::EventBus::lifecycle_events);
                 let events: crate::BoxStream<crate::GattEvent> = match injected {
                     Some(injected) => Box::pin(events.merge(injected)),
                     None => events,
@@ -2011,6 +2018,10 @@ async fn never_completing_visibility_does_not_block_other_peer_or_shutdown() {
     // Release every public use before asserting, so a RED cannot hang Drop on the old worker.
     // The old implementation has an unbounded HAL wait; cancel the probe's OS worker by
     // keeping its Arc alive only on the failing path (the test process reclaims it).
+    #[allow(
+        clippy::mem_forget,
+        reason = "a failed run must not run Drop on the blocked links; see above"
+    )]
     if observed.is_err() {
         pending.abort();
         std::mem::forget(managed);

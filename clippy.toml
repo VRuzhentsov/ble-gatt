@@ -1,1 +1,3 @@
 too-many-lines-threshold = 300
+# Tests may report what they saw to the test output.
+allow-print-in-tests = true

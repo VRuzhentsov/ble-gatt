@@ -37,11 +37,11 @@ jobs:
       - name: cargo test (Tauri plugin, includes the JNI name check)
         run: cargo test -p tauri-plugin-ble-gatt
       # The Android driver and the plugin's Android code compile only for
-      # Android; check them without an NDK (no linking).
-      - name: cargo check (Android)
+      # Android; lint them without an NDK (no linking).
+      - name: cargo clippy (Android)
         run: |
           rustup target add aarch64-linux-android
-          cargo check --target aarch64-linux-android -p tauri-plugin-ble-gatt
+          cargo clippy --target aarch64-linux-android -p ble-gatt -p tauri-plugin-ble-gatt --all-targets -- -D warnings
       - name: cargo test (ble-gatt-iroh)
         run: cargo test -p ble-gatt-iroh
 

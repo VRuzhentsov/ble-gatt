@@ -65,7 +65,7 @@ fn called_methods(source: &str) -> BTreeSet<String> {
             continue;
         }
         let after = rest[name.len() + 1..].trim_start();
-        let after = after.strip_prefix(',').map(str::trim_start).unwrap_or("");
+        let after = after.strip_prefix(',').map_or("", str::trim_start);
         if after.starts_with("\"(") && !JAVA_STANDARD_METHODS.contains(&name) {
             names.insert(name.to_string());
         }

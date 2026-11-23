@@ -695,7 +695,7 @@ impl LinuxDriver {
                 if name != Some("org.bluez") {
                     continue;
                 }
-                if new_owner.is_none_or(|owner| owner.is_empty()) {
+                if new_owner.is_none_or(str::is_empty) {
                     log::warn!("bluez watch: bluetoothd left the bus, reporting radio Off");
                     let _ = events_tx.send(GattEvent::RadioChanged {
                         status: crate::entities::models::RadioStatus::Off,
@@ -1002,7 +1002,10 @@ impl LinuxDriver {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a detached task: it gets its own copy of each shared part of the driver"
+    )]
     async fn watch_notifications(
         mut control: CharacteristicControl,
         uuid: CharacteristicUuid,
@@ -1112,7 +1115,10 @@ impl LinuxDriver {
     /// different roles and different cleanup: `datagram::serve` filters strictly
     /// on `local_role`, so emitting the central variant here would be silently
     /// ignored.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a detached task: it gets its own copy of each shared part of the driver"
+    )]
     fn watch_peripheral_disconnect(
         adapter: Adapter,
         address: bluer::Address,
@@ -1167,8 +1173,8 @@ impl LinuxDriver {
                         }
                     };
                     tokio::select! {
-                        _ = disconnected => break,
-                        _ = tokio::time::sleep(NOTIFY_SESSION_POLL) => {
+                        () = disconnected => break,
+                        () = tokio::time::sleep(NOTIFY_SESSION_POLL) => {
                             let past_acquire_grace =
                                 spawned_at.elapsed() >= NOTIFY_WRITER_ACQUIRE_TIMEOUT;
                             if past_acquire_grace && !LinuxDriver::has_notification_session(&writers, &peer).await {

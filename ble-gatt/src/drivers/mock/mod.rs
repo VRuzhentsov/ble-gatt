@@ -46,7 +46,10 @@ const MOCK_ATT_MTU: u16 = 247;
 // mock operation; boxing it to satisfy `large_enum_variant` would add an
 // indirection to the hot path for a lint about an enum with one small
 // feature-gated sibling.
-#[allow(clippy::large_enum_variant)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a box adds an indirection to each mock operation; see above"
+)]
 enum Radio {
     Local(LocalRadio),
     #[cfg(feature = "mock-broker")]
@@ -141,36 +144,36 @@ impl MockNetwork {
         session: u64,
     ) {
         self.as_local()
-            .simulate_loss_for_session(central, peer, session)
+            .simulate_loss_for_session(central, peer, session);
     }
 
     /// The lifecycle event stream dropped `dropped` events before a
     /// subscriber could read them.
     pub fn simulate_event_lag(&self, to: &PeerAddress, dropped: u64) {
-        self.as_local().simulate_event_lag(to, dropped)
+        self.as_local().simulate_event_lag(to, dropped);
     }
 
     /// The driver reports that it dropped notifications for `central`.
     pub fn simulate_notification_gap(&self, peripheral: &PeerAddress, central: &PeerAddress) {
         self.as_local()
-            .simulate_notification_gap(peripheral, central)
+            .simulate_notification_gap(peripheral, central);
     }
 
     /// A central drops its notify subscription without disconnecting.
     pub fn simulate_unsubscribe(&self, peripheral: &PeerAddress, central: &PeerAddress) {
-        self.as_local().simulate_unsubscribe(peripheral, central)
+        self.as_local().simulate_unsubscribe(peripheral, central);
     }
 
     /// Delay every `subscribe` on this network, so a test can cancel
     /// `datagram::connect` while setup is genuinely in flight.
     pub fn stall_subscribe(&self, delay: std::time::Duration) {
-        self.as_local().stall_subscribe(delay)
+        self.as_local().stall_subscribe(delay);
     }
 
     /// Make the next `scan` on any driver in this network end with an
     /// error item, the way Android's `onScanFailed` does.
     pub fn arm_scan_failure(&self, message: impl Into<String>) {
-        self.as_local().arm_scan_failure(message)
+        self.as_local().arm_scan_failure(message);
     }
 
     /// Attach advertisement payload to an already-advertising peer, so
@@ -183,20 +186,20 @@ impl MockNetwork {
         rssi: Option<i16>,
     ) {
         self.as_local()
-            .set_advertisement_data(peer, manufacturer_data, service_data, rssi)
+            .set_advertisement_data(peer, manufacturer_data, service_data, rssi);
     }
 
     /// Set the signal strength scanners see for an advertising `peer`,
     /// keeping its advertisement data. `None` (the default) is how BlueZ
     /// re-reports a device it cached rather than heard.
     pub fn set_rssi(&self, peer: &PeerAddress, rssi: Option<i16>) {
-        self.as_local().set_rssi(peer, rssi)
+        self.as_local().set_rssi(peer, rssi);
     }
 
     /// Choose what `peer`'s radio advertisement carries from now on, also
     /// for an advertisement already running. See [`RadioCapacity`].
     pub fn set_radio_capacity(&self, peer: &PeerAddress, capacity: RadioCapacity) {
-        self.as_local().set_radio_capacity(peer, capacity)
+        self.as_local().set_radio_capacity(peer, capacity);
     }
 
     // --- Dispatch to Local or Remote, identically ---

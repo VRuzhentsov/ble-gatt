@@ -727,7 +727,7 @@ async fn inbound_overflow_is_reported_to_the_receiver_rather_than_lost_silently(
                 saw_error = true;
                 break;
             }
-            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Ok(_))) => {}
             Ok(None) => break,
             Err(_) => break,
         }
@@ -1322,7 +1322,7 @@ async fn a_central_parked_in_recv_is_released_when_lifecycle_events_lag() {
         .expect("a parked central must be released when lifecycle events lag")
         .expect("receiver task should not panic");
     assert!(
-        outcome.is_none() || outcome.map(|item| item.is_err()).unwrap_or(false),
+        outcome.is_none_or(|item| item.is_err()),
         "the channel must end or report an error, not deliver lag as normal data"
     );
 }

@@ -364,7 +364,7 @@ async fn discovery_recovers_from_a_failed_stop() {
             tokio::time::timeout(wait, events.recv())
                 .await
                 .ok()
-                .and_then(|e| e.ok())
+                .and_then(std::result::Result::ok)
         }
     };
     let off = next(&mut events, 2000);

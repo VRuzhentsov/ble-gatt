@@ -74,14 +74,12 @@ impl ConnHandle {
         });
 
         loop {
-            let env = match Envelope::read_frame(&mut read_half).await {
-                Ok(env) => env,
-                Err(_) => break,
+            let Ok(env) = Envelope::read_frame(&mut read_half).await else {
+                break;
             };
-            let request = match env.frame {
-                Frame::Req(request) => request,
+            let Frame::Req(request) = env.frame else {
                 // A well-behaved client only ever sends `Req` frames.
-                _ => continue,
+                continue;
             };
             let response = conn.dispatch(request, &radio).await;
             if env.correlation_id != 0

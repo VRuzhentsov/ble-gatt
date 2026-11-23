@@ -227,7 +227,7 @@ impl<'local> AdvertisementArgs<'local> {
         let ids: Vec<i32> = service
             .manufacturer_data
             .keys()
-            .map(|id| *id as i32)
+            .map(|id| i32::from(*id))
             .collect();
         let manufacturer_ids = env
             .new_int_array(ids.len() as i32)
@@ -302,7 +302,7 @@ impl<'local> AdvertisementArgs<'local> {
         };
         let (fast_company_id, fast_data) = match &service.fast_advertisement {
             Some(fast) => (
-                fast.company_id as i32,
+                i32::from(fast.company_id),
                 JObject::from(
                     env.byte_array_from_slice(&fast.data)
                         .map_err(|err| BleError::Gatt(err.to_string()))?,
@@ -375,6 +375,8 @@ impl AndroidDriver {
     }
     pub async fn new() -> Result<Self> {
         let ctx = ndk_context::android_context();
+        // SAFETY: the Android runtime sets the process JVM in `ndk_context`
+        // before native code runs, and that JVM lives as long as the process.
         let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }.map_err(|err| {
             BleError::AdapterUnavailable(format!("JavaVM::from_raw failed: {err}"))
         })?;
@@ -387,6 +389,8 @@ impl AndroidDriver {
             let env = vm
                 .attach_current_thread_as_daemon()
                 .map_err(|err| BleError::AdapterUnavailable(format!("JNI attach failed: {err}")))?;
+            // SAFETY: `ndk_context` holds a global reference to the
+            // application context, which stays valid for the process.
             let context_obj = unsafe { JObject::from_raw(ctx.context().cast()) };
             env.new_global_ref(context_obj).map_err(|err| {
                 BleError::AdapterUnavailable(format!("global ref of Context failed: {err}"))
@@ -524,7 +528,7 @@ impl AndroidDriver {
     ) -> Result<JClass<'a>> {
         let class_loader = env
             .call_method(context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
-            .and_then(|v| v.l())
+            .and_then(jni::objects::JValueGen::l)
             .map_err(|err| BleError::Gatt(format!("getClassLoader failed: {err}")))?;
         let name = env
             .new_string(binary_name)
@@ -536,7 +540,7 @@ impl AndroidDriver {
                 "(Ljava/lang/String;)Ljava/lang/Class;",
                 &[JValue::Object(&name)],
             )
-            .and_then(|v| v.l())
+            .and_then(jni::objects::JValueGen::l)
             .map_err(|err| BleError::Gatt(format!("loadClass({binary_name}) failed: {err}")))?;
         Ok(JClass::from(class_obj))
     }
@@ -545,7 +549,7 @@ impl AndroidDriver {
 // Referenced only to keep the `CALLBACK_CLASS` constant documented and
 // grep-discoverable alongside `BRIDGE_CLASS`; the JVM resolves the actual
 // symbol by the exported function names below, not this constant.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "only keeps `CALLBACK_CLASS` in use; see above")]
 impl AndroidDriver {
     fn _callback_class_name() -> &'static str {
         CALLBACK_CLASS
@@ -792,7 +796,7 @@ impl GattConnection for AndroidGattConnection {
                     JValue::Object(&address),
                     JValue::Object(&uuid),
                     JValue::Object(&bytes),
-                    JValue::Bool(without_response as jboolean),
+                    JValue::Bool(jboolean::from(without_response)),
                     JValue::Long(request_id as i64),
                     JValue::Long(self.session.unwrap_or_default() as i64),
                 ],
@@ -1131,7 +1135,7 @@ impl Inner {
         let bridge = self.bridge()?;
         let result = env
             .call_method(bridge.as_obj(), method, sig, &[])
-            .and_then(|v| v.z());
+            .and_then(jni::objects::JValueGen::z);
         match result {
             Ok(value) => Ok(value),
             Err(err) => Err(BleError::jni_error(env, method, err)),
@@ -1152,14 +1156,17 @@ impl Inner {
         let bridge = self.bridge()?;
         let result = env
             .call_method(bridge.as_obj(), method, sig, args)
-            .and_then(|v| v.i());
+            .and_then(jni::objects::JValueGen::i);
         match result {
             Ok(value) => Ok(value),
             Err(err) => Err(BleError::jni_error(env, method, err)),
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the parameters of the Kotlin `onPeerDiscovered` callback, one for one"
+    )]
     fn peer_discovered<'local>(
         self: Arc<Self>,
         mut env: JNIEnv<'local>,
@@ -1419,7 +1426,7 @@ impl Inner {
                 .get(&address)
                 .map(|state| state.session);
             let _ = inner.server_events_tx.send(GattEvent::Connected {
-                peer: PeerAddress(address.clone()),
+                peer: PeerAddress(address),
                 local_role: Role::Central,
                 session,
             });
@@ -2038,7 +2045,10 @@ impl Drop for ConnectGuard {
 // giving the fixed JNI symbol name `Java_dev_blegatt_NativeKt_<name>`.
 // ---------------------------------------------------------------------
 #[no_mangle]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the JNI signature of the Kotlin `onPeerDiscovered` external fun"
+)]
 pub extern "system" fn Java_dev_blegatt_NativeKt_onPeerDiscovered<'local>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
@@ -2053,6 +2063,8 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onPeerDiscovered<'local>(
     service_data_uuids: JObjectArray<'local>,
     service_data_values: JObjectArray<'local>,
 ) {
+    // SAFETY: `native_handle` comes from `Arc::into_raw` in `with_context`,
+    // and that strong count is never released, so the `Inner` is alive.
     unsafe { Inner::from_handle(native_handle) }.peer_discovered(
         env,
         generation,
@@ -2075,6 +2087,8 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onAdvertiseResult<'local>(
     success: jboolean,
     error_code: jint,
 ) {
+    // SAFETY: `native_handle` comes from `Arc::into_raw` in `with_context`,
+    // and that strong count is never released, so the `Inner` is alive.
     unsafe { Inner::from_handle(native_handle) }.advertise_result(_env, success, error_code);
 }
 
@@ -2086,6 +2100,8 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onScanFailed<'local>(
     generation: jlong,
     error_code: jint,
 ) {
+    // SAFETY: `native_handle` comes from `Arc::into_raw` in `with_context`,
+    // and that strong count is never released, so the `Inner` is alive.
     unsafe { Inner::from_handle(native_handle) }.scan_failed(_env, generation, error_code);
 }
 
@@ -2097,6 +2113,8 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onMtuChanged<'local>(
     address: JString<'local>,
     mtu: jint,
 ) {
+    // SAFETY: `native_handle` comes from `Arc::into_raw` in `with_context`,
+    // and that strong count is never released, so the `Inner` is alive.
     unsafe { Inner::from_handle(native_handle) }.mtu_changed(env, address, mtu);
 }
 
@@ -2108,6 +2126,8 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onConnected<'local>(
     address: JString<'local>,
     from_server: jboolean,
 ) {
+    // SAFETY: `native_handle` comes from `Arc::into_raw` in `with_context`,
+    // and that strong count is never released, so the `Inner` is alive.
     unsafe { Inner::from_handle(native_handle) }.connected(env, address, from_server);
 }
 
@@ -2119,6 +2139,8 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onDisconnected<'local>(
     address: JString<'local>,
     from_server: jboolean,
 ) {
+    // SAFETY: `native_handle` comes from `Arc::into_raw` in `with_context`,
+    // and that strong count is never released, so the `Inner` is alive.
     unsafe { Inner::from_handle(native_handle) }.disconnected(env, address, from_server);
 }
 
@@ -2135,6 +2157,8 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onRadioState<'local>(
     native_handle: jlong,
     status: JString<'local>,
 ) {
+    // SAFETY: `native_handle` comes from `Arc::into_raw` in `with_context`,
+    // and that strong count is never released, so the `Inner` is alive.
     unsafe { Inner::from_handle(native_handle) }.radio_state_changed(env, status);
 }
 
@@ -2149,6 +2173,8 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onCharacteristicRead<'local>(
     value: JByteArray<'local>,
     success: jboolean,
 ) {
+    // SAFETY: `native_handle` comes from `Arc::into_raw` in `with_context`,
+    // and that strong count is never released, so the `Inner` is alive.
     unsafe { Inner::from_handle(native_handle) }.characteristic_read(
         env,
         request_id,
@@ -2169,6 +2195,8 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onCharacteristicWriteResult<'lo
     _characteristic_uuid: JString<'local>,
     success: jboolean,
 ) {
+    // SAFETY: `native_handle` comes from `Arc::into_raw` in `with_context`,
+    // and that strong count is never released, so the `Inner` is alive.
     unsafe { Inner::from_handle(native_handle) }.characteristic_written(
         env,
         request_id,
@@ -2187,6 +2215,8 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onCharacteristicChanged<'local>
     characteristic_uuid: JString<'local>,
     value: JByteArray<'local>,
 ) {
+    // SAFETY: `native_handle` comes from `Arc::into_raw` in `with_context`,
+    // and that strong count is never released, so the `Inner` is alive.
     unsafe { Inner::from_handle(native_handle) }.characteristic_changed(
         env,
         address,
@@ -2205,6 +2235,8 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onServerCharacteristicWritten<'
     value: JByteArray<'local>,
     session: jlong,
 ) {
+    // SAFETY: `native_handle` comes from `Arc::into_raw` in `with_context`,
+    // and that strong count is never released, so the `Inner` is alive.
     unsafe { Inner::from_handle(native_handle) }.server_characteristic_written(
         env,
         address,
@@ -2224,6 +2256,8 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onSubscribed<'local>(
     characteristic_uuid: JString<'local>,
     success: jboolean,
 ) {
+    // SAFETY: `native_handle` comes from `Arc::into_raw` in `with_context`,
+    // and that strong count is never released, so the `Inner` is alive.
     unsafe { Inner::from_handle(native_handle) }.subscribed(
         env,
         request_id,
@@ -2248,6 +2282,8 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onServerSubscribed<'local>(
     address: JString<'local>,
     session: jlong,
 ) {
+    // SAFETY: `native_handle` comes from `Arc::into_raw` in `with_context`,
+    // and that strong count is never released, so the `Inner` is alive.
     unsafe { Inner::from_handle(native_handle) }.server_subscribed(env, address, session);
 }
 
@@ -2260,5 +2296,7 @@ pub extern "system" fn Java_dev_blegatt_NativeKt_onNotifySent<'local>(
     request_id: jlong,
     success: jboolean,
 ) {
+    // SAFETY: `native_handle` comes from `Arc::into_raw` in `with_context`,
+    // and that strong count is never released, so the `Inner` is alive.
     unsafe { Inner::from_handle(native_handle) }.notification_sent(_env, request_id, success);
 }

@@ -1549,7 +1549,7 @@ impl Sender {
                         .remove(&peer);
                     inner
                         .run_link(peer, channel, rx, (tx, generation), close, None)
-                        .await
+                        .await;
                 }
                 Err(err) => {
                     log::debug!("dial to {} failed: {err}", peer.0);

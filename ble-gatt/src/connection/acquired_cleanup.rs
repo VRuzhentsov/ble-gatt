@@ -59,7 +59,7 @@ impl Cleanup {
             if let Some(outcome) = result.borrow_and_update().as_ref() {
                 return outcome
                     .as_ref()
-                    .map(|_| ())
+                    .copied()
                     .map_err(|error| error.copy_error());
             }
             result

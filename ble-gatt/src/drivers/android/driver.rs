@@ -79,7 +79,7 @@ impl Driver for AndroidDriver {
                     "(Ljava/lang/String;J)I",
                     &[JValue::Object(&uuid), JValue::Long(generation as i64)],
                 )
-                .and_then(|v| v.i());
+                .and_then(jni::objects::JValueGen::i);
             match started {
                 // Same exception-clearing contract as `call_void`/`call_bool`:
                 // a `startScan` that throws (a missing runtime Bluetooth
@@ -124,7 +124,7 @@ impl Driver for AndroidDriver {
             .lock()
             .unwrap()
             .get(&peer.0)
-            .map(|at| at.elapsed());
+            .map(std::time::Instant::elapsed);
         if let Some(since) = since {
             if let Some(wait) = REDIAL_GAP.checked_sub(since) {
                 log::info!(
@@ -284,14 +284,22 @@ impl Driver for AndroidDriver {
                     .map_err(|err| BleError::Gatt(err.to_string()))?;
                 env.set_object_array_element(&char_uuids, i, &uuid_str)
                     .map_err(|err| BleError::Gatt(err.to_string()))?;
-                env.set_boolean_array_region(&readable, i, &[characteristic.readable as jboolean])
-                    .map_err(|err| BleError::Gatt(err.to_string()))?;
-                env.set_boolean_array_region(&writable, i, &[characteristic.writable as jboolean])
-                    .map_err(|err| BleError::Gatt(err.to_string()))?;
+                env.set_boolean_array_region(
+                    &readable,
+                    i,
+                    &[jboolean::from(characteristic.readable)],
+                )
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
+                env.set_boolean_array_region(
+                    &writable,
+                    i,
+                    &[jboolean::from(characteristic.writable)],
+                )
+                .map_err(|err| BleError::Gatt(err.to_string()))?;
                 env.set_boolean_array_region(
                     &notifiable,
                     i,
-                    &[characteristic.notifiable as jboolean],
+                    &[jboolean::from(characteristic.notifiable)],
                 )
                 .map_err(|err| BleError::Gatt(err.to_string()))?;
                 let value = env
@@ -411,7 +419,7 @@ impl Driver for AndroidDriver {
                 "(Ljava/lang/String;[B)Z",
                 &[JValue::Object(&uuid), JValue::Object(&bytes)],
             )
-            .and_then(|v| v.z());
+            .and_then(jni::objects::JValueGen::z);
         match update_result {
             Ok(true) => Ok(()),
             Ok(false) => Err(BleError::Gatt(format!(
@@ -523,7 +531,7 @@ impl Driver for AndroidDriver {
                 &mut env,
                 "setAdvertisingEnabled",
                 "(Z)V",
-                &[JValue::Bool(enabled as jboolean)],
+                &[JValue::Bool(jboolean::from(enabled))],
             ) {
                 self.inner.advertise_tx.lock().unwrap().take();
                 return Err(err);
@@ -644,7 +652,7 @@ impl Driver for AndroidDriver {
                         JValue::Long(session.unwrap_or(0) as i64),
                     ],
                 )
-                .and_then(|v| v.z());
+                .and_then(jni::objects::JValueGen::z);
             match result {
                 Ok(value) => Ok(value),
                 Err(err) => Err(BleError::jni_error(&mut env, "notifyCharacteristicTo", err)),

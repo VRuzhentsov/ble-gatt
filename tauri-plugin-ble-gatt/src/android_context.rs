@@ -51,7 +51,7 @@ impl Context {
             "Android Application context is not initialized; register the ble-gatt plugin first"
                 .to_string()
         })?;
-        // JavaVM is a non-owning JVM handle. The process JVM outlives this copy.
+        // SAFETY: JavaVM is a non-owning JVM handle. The process JVM outlives this copy.
         let vm = unsafe { JavaVM::from_raw(ctx.vm.get_java_vm_pointer()) }
             .map_err(|err| format!("JavaVM handle unavailable: {err}"))?;
         Ok((vm, ctx.application.clone()))
@@ -60,6 +60,8 @@ impl Context {
     fn ensure() -> Result<(), String> {
         let (vm, application) = get()?;
         static NDK_CONTEXT: OnceLock<()> = OnceLock::new();
+        // SAFETY: both pointers come from live handles: the process JVM and a
+        // global reference to the application context, kept in `APPLICATION`.
         NDK_CONTEXT.get_or_init(|| unsafe {
             ndk_context::initialize_android_context(
                 vm.get_java_vm_pointer().cast(),
@@ -70,7 +72,9 @@ impl Context {
     }
 
     fn initialize(env: &mut JNIEnv<'_>, context: JObject<'_>) -> Result<(), String> {
-        let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if APPLICATION.get().is_some() {
             return Ok(());
         }

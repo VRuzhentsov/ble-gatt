@@ -113,9 +113,8 @@ impl RemoteClient {
         subscriptions: SubscriptionsMap,
     ) {
         loop {
-            let env = match Envelope::read_frame(&mut read_half).await {
-                Ok(env) => env,
-                Err(_) => break,
+            let Ok(env) = Envelope::read_frame(&mut read_half).await else {
+                break;
             };
             match env.frame {
                 Frame::Resp(resp) => {

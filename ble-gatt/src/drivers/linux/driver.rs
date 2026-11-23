@@ -216,21 +216,18 @@ impl Driver for LinuxDriver {
         // cleanup will need this exact capacity, and reserving it only
         // after the fact bounds nothing — a connect this driver cannot
         // guarantee it can ever clean up must not be issued at all.
-        let cleanup_permit = match self.cleanup_permits.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                let mut dialed = self.dialed.lock().unwrap();
-                if dialed.get(peer) == Some(&dial_generation) {
-                    dialed.remove(peer);
-                }
-                return Err(BleError::ConnectFailed {
-                    peer: peer.0.clone(),
-                    reason: format!(
-                        "no cleanup capacity available: {MAX_CONCURRENT_CLEANUP_DISCONNECTS} peers already \
-                         awaiting cleanup"
-                    ),
-                });
+        let Ok(cleanup_permit) = self.cleanup_permits.clone().try_acquire_owned() else {
+            let mut dialed = self.dialed.lock().unwrap();
+            if dialed.get(peer) == Some(&dial_generation) {
+                dialed.remove(peer);
             }
+            return Err(BleError::ConnectFailed {
+                peer: peer.0.clone(),
+                reason: format!(
+                    "no cleanup capacity available: {MAX_CONCURRENT_CLEANUP_DISCONNECTS} peers already \
+                     awaiting cleanup"
+                ),
+            });
         };
         log::info!("connect: dialling {} generation={dial_generation}", peer.0);
         // Cancellation guard, mirroring the Android driver's `ConnectGuard`
@@ -571,8 +568,7 @@ impl Driver for LinuxDriver {
             let (control, control_handle) = spec
                 .notifiable
                 .then(bluer::gatt::local::characteristic_control)
-                .map(|(c, h)| (Some(c), h))
-                .unwrap_or_else(|| (None, Default::default()));
+                .map_or_else(|| (None, Default::default()), |(c, h)| (Some(c), h));
 
             let notify = spec.notifiable.then(|| CharacteristicNotify {
                 notify: true,
@@ -670,10 +666,11 @@ impl Driver for LinuxDriver {
         // peer's disconnect watcher into the same vector — so a drain here
         // would abort a watcher belonging to the new advertisement, leaving
         // that peer stuck in `served_peers` with nothing to report its loss.
-        self.server_watch
-            .lock()
-            .unwrap()
-            .extend(notify_sessions.iter().map(|h| h.abort_handle()));
+        self.server_watch.lock().unwrap().extend(
+            notify_sessions
+                .iter()
+                .map(tokio::task::JoinHandle::abort_handle),
+        );
         // The JoinHandles themselves are dropped here, which detaches rather
         // than cancels — the AbortHandles above are what stop them.
         drop(notify_sessions);
