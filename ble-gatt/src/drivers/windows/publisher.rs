@@ -66,8 +66,8 @@ impl FastPublisher {
                 |_: Ref<BluetoothLEAdvertisementPublisher>,
                  args: Ref<BluetoothLEAdvertisementPublisherStatusChangedEventArgs>| {
                     if let Ok(args) = args.ok() {
-                        let status = args.Status().map(|status| status.0).unwrap_or(-1);
-                        let error = args.Error().map(|error| error.0).unwrap_or(-1);
+                        let status = args.Status().map_or(-1, |status| status.0);
+                        let error = args.Error().map_or(-1, |error| error.0);
                         if status == BluetoothLEAdvertisementPublisherStatus::Aborted.0 {
                             log::warn!("advertise: fast advertisement publisher aborted, error {error}");
                         } else {
@@ -114,7 +114,7 @@ impl FastPublisher {
         match result {
             Ok(()) => log::debug!("advertise: fast advertisement publisher paused={paused}"),
             Err(err) => {
-                log::warn!("advertise: fast advertisement publisher paused={paused} failed: {err}")
+                log::warn!("advertise: fast advertisement publisher paused={paused} failed: {err}");
             }
         }
     }

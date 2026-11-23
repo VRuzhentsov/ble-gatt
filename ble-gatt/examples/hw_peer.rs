@@ -22,6 +22,11 @@
 //! The UUIDs are fixed constants rather than generated, because the two
 //! sides are separate processes on separate machines and must agree without
 //! a channel to negotiate over.
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "a command-line tool: it writes its results to the terminal"
+)]
 
 use std::process::ExitCode;
 use std::time::Duration;

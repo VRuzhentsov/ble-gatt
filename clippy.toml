@@ -1,1 +1,6 @@
-too-many-lines-threshold = 400
+too-many-lines-threshold = 300
+# Tests may report what they saw to the test output.
+allow-print-in-tests = true
+# Lint suggestions must build with Rust 1.91, the oldest toolchain that a
+# consumer builds this library with (an Android build image).
+msrv = "1.91"

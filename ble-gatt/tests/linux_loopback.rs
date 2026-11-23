@@ -71,6 +71,10 @@ async fn peripheral_advertise_and_serve_smoke_test() {
 #[tokio::test]
 #[ignore = "requires two independent Bluetooth adapters (e.g. a USB dongle) or two machines — \
             see the module doc comment; this machine currently has one adapter"]
+#[allow(
+    clippy::unimplemented,
+    reason = "a placeholder until a second adapter is available; the test is ignored"
+)]
 async fn two_adapter_central_to_peripheral_round_trip() {
     unimplemented!(
         "wire this up once a second adapter is available: bring up two LinuxDrivers \

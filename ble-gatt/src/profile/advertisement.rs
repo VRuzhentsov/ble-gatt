@@ -224,11 +224,14 @@ impl GattAdvertisement {
     }
     fn service_data_entry(kind: u8, data: &[u8]) -> Option<(ServiceUuid, Vec<u8>)> {
         let expand_short_uuid =
-            |value: u32| Uuid::from_u128(BLUETOOTH_BASE_UUID | ((value as u128) << 96));
+            |value: u32| Uuid::from_u128(BLUETOOTH_BASE_UUID | (u128::from(value) << 96));
         let (uuid, rest) = match kind {
             AD_SERVICE_DATA_16 => {
                 let (bytes, rest) = data.split_first_chunk::<2>()?;
-                (expand_short_uuid(u16::from_le_bytes(*bytes) as u32), rest)
+                (
+                    expand_short_uuid(u32::from(u16::from_le_bytes(*bytes))),
+                    rest,
+                )
             }
             AD_SERVICE_DATA_32 => {
                 let (bytes, rest) = data.split_first_chunk::<4>()?;
@@ -375,7 +378,7 @@ impl AdvertisementScan {
                     None => { self.scan_active = false; None }
                     Some(item) => self.track_peer(item?),
                 },
-                _ = tokio::time::sleep_until(scheduled_read.as_ref().map(|(_, at)| *at).unwrap_or_else(Instant::now)), if scheduled_read.is_some() => {
+                () = tokio::time::sleep_until(scheduled_read.as_ref().map_or_else(Instant::now, |(_, at)| *at)), if scheduled_read.is_some() => {
                     let (address, _) = scheduled_read.expect("a read is due");
                     let result = tokio::time::timeout(self.policy.timeout, read(driver, &address)).await
                         .unwrap_or_else(|_| Err(BleError::Gatt(format!("no answer in {:?}", self.policy.timeout))));
@@ -892,7 +895,7 @@ mod tests {
         let start = Instant::now();
         let mut cache = MetadataCache::default();
         for n in 0..METADATA_CACHE_CAPACITY as u32 {
-            cache.succeeded(key(n), n, start + Duration::from_millis(n as u64));
+            cache.succeeded(key(n), n, start + Duration::from_millis(u64::from(n)));
         }
         let later = start + Duration::from_secs(1);
         // Seen again, so not the oldest any more.

@@ -254,7 +254,7 @@ async fn either_peer_reuses_incoming_and_the_larger_id_can_reconnect() {
 
     let network = MockNetwork::new();
     let mut keys = [SecretKey::generate(), SecretKey::generate()];
-    keys.sort_by_key(|key| key.public());
+    keys.sort_by_key(iroh::SecretKey::public);
     let enabled = Arc::new(AtomicBool::new(true));
     let higher_dials = Arc::new(AtomicUsize::new(0));
     let mut sides = Vec::new();

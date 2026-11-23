@@ -364,8 +364,8 @@ impl PeerChannel {
                 return received.try_recv().ok();
             }
             tokio::select! { biased;
-                _ = self.state.ended.cancelled() => continue,
-                _ = self.state.overflow.notified() => continue,
+                () = self.state.ended.cancelled() => {}
+                () = self.state.overflow.notified() => {}
                 item = received.recv() => return item,
             }
         }

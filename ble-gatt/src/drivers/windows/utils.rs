@@ -69,7 +69,7 @@ impl WindowsCodec {
         parts.iter().try_fold(0u64, |acc, part| {
             u8::from_str_radix(part, 16)
                 .ok()
-                .map(|byte| (acc << 8) | byte as u64)
+                .map(|byte| (acc << 8) | u64::from(byte))
         })
     }
 
@@ -83,8 +83,7 @@ impl WindowsCodec {
         id.rsplit('-')
             .next()
             .filter(|tail| WindowsCodec::parse_address(tail).is_some())
-            .map(|tail| tail.to_ascii_uppercase())
-            .unwrap_or_else(|| id.to_string())
+            .map_or_else(|| id.to_string(), str::to_ascii_uppercase)
     }
 
     pub(super) fn session_address(session: &GattSession) -> windows::core::Result<String> {

@@ -138,7 +138,7 @@ async fn write_from_central_is_readable_back_and_fires_a_lifecycle_event() {
 
     let written_event = loop {
         match events.next().await.expect("write event should arrive") {
-            GattEvent::Connected { .. } => continue,
+            GattEvent::Connected { .. } => {}
             other => break other,
         }
     };

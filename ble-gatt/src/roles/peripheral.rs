@@ -105,10 +105,12 @@ impl ServerHandle {
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             while let Some(event) = events.next().await {
-                if let GattEvent::RadioChanged {
-                    status: RadioStatus::On,
-                } = event
-                {
+                if matches!(
+                    event,
+                    GattEvent::RadioChanged {
+                        status: RadioStatus::On,
+                    }
+                ) {
                     // With the latest `update_advertisement`'s data, so an update
                     // survives a power cycle; nothing once it was stopped.
                     let Some(spec) = driver
@@ -147,7 +149,7 @@ impl Drop for ServerHandle {
                 });
             }
             Err(_) => {
-                log::warn!("GATT server handle dropped outside a Tokio runtime; it keeps running")
+                log::warn!("GATT server handle dropped outside a Tokio runtime; it keeps running");
             }
         }
     }

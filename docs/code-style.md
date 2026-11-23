@@ -36,11 +36,19 @@ shared contracts.
   documentation when you move it.
 - Separate inherent blocks only when generic bounds or conditions require it.
   Explain that separation in review.
-- Split a module by responsibility when a file goes past about 2,500 lines.
-  Known exceptions to split later: `drivers/linux/mod.rs`,
-  `drivers/android/mod.rs`, `connection/managed_tests.rs`,
-  `ble-gatt-iroh/src/lib.rs`, `connection/managed_worker.rs`.
-- Functions: clippy `too_many_lines` at 400 lines; lower it as long functions are split.
+- Files: at most 2,500 lines for each tracked `.rs` and `.kt` file. CI
+  checks it. Split a module by responsibility before a file goes past it; a
+  large test module goes in a file of its own, next to the module it tests.
+- Functions: at most 300 lines (clippy `too_many_lines`, set in `clippy.toml`).
+
+## Lints
+
+- The workspace lint set is `[workspace.lints.clippy]` in `Cargo.toml`. CI
+  runs clippy with `-D warnings` for Linux, Windows and Android.
+- Fix a lint in the code. When a lint is wrong for one item, put a narrow
+  `#[allow(lint, reason = "...")]` on that item; clippy refuses an `allow`
+  without a reason.
+- Give each `unsafe` block a `// SAFETY:` comment that tells why it is sound.
 
 ## Style-only changes
 

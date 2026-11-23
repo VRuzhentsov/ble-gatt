@@ -277,7 +277,7 @@ pub async fn ble_scan_once(
     tokio::pin!(deadline);
     loop {
         tokio::select! {
-            _ = &mut deadline => break,
+            () = &mut deadline => break,
             item = stream.next() => match item {
                 // A scan failure arriving mid-stream is returned as an error
                 // even though some peers may already have been collected:

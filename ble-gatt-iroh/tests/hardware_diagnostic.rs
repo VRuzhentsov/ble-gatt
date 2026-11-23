@@ -58,17 +58,17 @@ async fn pair(crossed: bool, reverse: bool) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn linux_initiates_payload_reuse_and_cleanup() {
-    pair(false, false).await
+    pair(false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn phone_initiates_payload_reuse_and_cleanup() {
-    pair(false, true).await
+    pair(false, true).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn crossed_start_payload_reuse_and_cleanup() {
-    pair(true, false).await
+    pair(true, false).await;
 }
 
 #[test]

@@ -102,7 +102,7 @@ impl Builder {
             // and Android releases a dead app's links itself.
             .on_event(|_app, _event| {
                 #[cfg(target_os = "linux")]
-                if let tauri::RunEvent::Exit = _event {
+                if matches!(_event, tauri::RunEvent::Exit) {
                     let driver = _app.state::<BleGatt<R>>().driver.clone();
                     // The timeout is built inside the runtime: its timer
                     // needs a reactor when it is created.

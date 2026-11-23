@@ -840,7 +840,7 @@ impl LocalRadio {
             self.emit(
                 &central,
                 GattEvent::Disconnected {
-                    peer: peripheral.clone(),
+                    peer: peripheral,
                     local_role: Role::Central,
                     session: None,
                 },

@@ -346,14 +346,13 @@ impl ScanStream {
             )
         };
         let stopped = {
-            let tx = tx.clone();
             let error = error.clone();
             TypedEventHandler::new(
                 move |_: Ref<BluetoothLEAdvertisementWatcher>,
                       args: Ref<BluetoothLEAdvertisementWatcherStoppedEventArgs>| {
                     let reason = args
                         .ok()
-                        .and_then(|args| args.Error())
+                        .and_then(BluetoothLEAdvertisementWatcherStoppedEventArgs::Error)
                         .unwrap_or(BluetoothError::OtherError);
                     log::warn!("scan: watcher stopped, error {}", reason.0);
                     let err = if reason == BluetoothError::RadioNotAvailable

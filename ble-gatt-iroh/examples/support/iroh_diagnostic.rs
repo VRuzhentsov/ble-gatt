@@ -23,7 +23,7 @@ const ALPN: &[u8] = b"ble-gatt/example/iroh-diagnostic/1";
 const COMPANY: u16 = 0xffff;
 
 pub fn mark(line: impl std::fmt::Display) {
-    Options::mark(line)
+    Options::mark(line);
 }
 
 pub fn payload(sender: EndpointId, round: u8) -> Vec<u8> {
@@ -174,7 +174,7 @@ impl CarrierTasks {
         loop {
             let finished = {
                 let mut handles = self.handles.lock().expect("diagnostic carriers mutex");
-                if transport.linked_peers().is_empty() && handles.iter().all(|h| h.is_finished()) {
+                if transport.linked_peers().is_empty() && handles.iter().all(tokio::task::JoinHandle::is_finished) {
                     Some(std::mem::take(&mut *handles))
                 } else {
                     None

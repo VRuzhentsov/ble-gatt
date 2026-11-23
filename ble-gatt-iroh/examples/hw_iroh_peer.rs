@@ -1,4 +1,9 @@
 //! See docs/hardware-verification.md. No phone or radio is touched by --keygen.
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "a command-line tool: it writes its results to the terminal"
+)]
 #[path = "support/iroh_diagnostic.rs"]
 mod diagnostic;
 use diagnostic::{mark, Options};

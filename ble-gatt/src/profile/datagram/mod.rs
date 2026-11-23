@@ -419,13 +419,13 @@ impl DatagramChannel {
                             "recv: {} bytes from {}", message.len(), self.peer.0
                         ),
                         Some(Err(err)) => {
-                            log::warn!("recv: error from {}: {err}", self.peer.0)
+                            log::warn!("recv: error from {}: {err}", self.peer.0);
                         }
                         None => log::info!("recv: channel to {} closed", self.peer.0),
                     }
                     return item;
                 }
-                _ = notified => continue,
+                () = notified => {}
             }
         }
     }
@@ -853,6 +853,61 @@ impl ServedPeer {
             _ => true,
         }
     }
+
+    /// Give one written fragment from `peer` to this peer's reassembly.
+    fn deliver(&self, peer: &PeerAddress, value: Vec<u8>) {
+        // Native acknowledgement precedes this event. A full
+        // payload queue is known local loss, not permission to
+        // stop reading the shared lifecycle stream.
+        match self.fragments.try_send(value) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                // The reassembly task for this peer already
+                // ended (its `DatagramChannel` was dropped),
+                // but `inbound` hasn't been cleaned up yet —
+                // a real window: cleanup happens when this
+                // same loop later processes the release/
+                // disconnect notification, not synchronously
+                // with the drop. Every write arriving in
+                // that window vanished with no trace before
+                // this log line existed.
+                log::warn!(
+                    "serve: dropping a write from {} — its channel was \
+                 already closed, awaiting this task's own cleanup",
+                    peer.0
+                );
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // This reader also owns lifecycle events. Data admission must
+                // never park it: the acknowledged fragment is already lost,
+                // so report that bounded loss out of band to the receiver.
+                self.overflow.raise();
+                log::warn!(
+                    "serve: fragment queue full for {}; reporting receive gap",
+                    peer.0
+                );
+            }
+        }
+    }
+
+    /// End every served session after the lifecycle stream lagged, and
+    /// disconnect each central.
+    async fn end_all(inbound: &mut HashMap<PeerAddress, Self>, driver: &dyn Driver) {
+        let served: Vec<PeerAddress> = inbound.keys().cloned().collect();
+        for peer in served {
+            let session = if let Some(state) = inbound.remove(&peer) {
+                // Report the gap first, so a receiver parked in
+                // `recv()` gets an error rather than a silent
+                // close, then invalidate the channel.
+                state.overflow.raise();
+                state.active.store(false, Ordering::SeqCst);
+                state.driver_session
+            } else {
+                None
+            };
+            Self::refuse(driver, &peer, session).await;
+        }
+    }
 }
 
 /// A served peer's fragment sender, channel-liveness flag, and overflow
@@ -869,6 +924,21 @@ struct Released {
 /// and, unless the caller closed it first, drop the peer so it is not left
 /// subscribed to a server that is no longer reading from it.
 impl Released {
+    /// Release each queued channel, and keep the last session a release
+    /// kept connected in `last_session`.
+    async fn release_queued(
+        queue: &mut mpsc::UnboundedReceiver<Self>,
+        inbound: &mut HashMap<PeerAddress, ServedPeer>,
+        driver: &dyn Driver,
+        last_session: &mut Option<(PeerAddress, Option<u64>)>,
+    ) {
+        while let Ok(released) = queue.try_recv() {
+            if let Some(session) = released.release_peer(inbound, driver).await {
+                *last_session = Some(session);
+            }
+        }
+    }
+
     async fn release_peer(
         self,
         inbound: &mut HashMap<PeerAddress, ServedPeer>,
@@ -1015,7 +1085,7 @@ impl Reassembler {
                             }
                         }
                     }
-                    _ = tokio::time::sleep(tick) => {
+                    () = tokio::time::sleep(tick) => {
                         reassembler.expire(Instant::now());
                     }
                 }
@@ -1402,7 +1472,7 @@ impl DatagramConfig {
                     }
                 } else {
                     tokio::select! {
-                        _ = channels_tx.closed() => {
+                        () = channels_tx.closed() => {
                             accept_closed = true;
                             if inbound.is_empty() {
                                 return;
@@ -1439,13 +1509,13 @@ impl DatagramConfig {
                     ..
                 } = &event
                 {
-                    while let Ok(released) = release_rx.try_recv() {
-                        if let Some(session) =
-                            released.release_peer(&mut inbound, driver.as_ref()).await
-                        {
-                            last_session = Some(session);
-                        }
-                    }
+                    Released::release_queued(
+                        &mut release_rx,
+                        &mut inbound,
+                        driver.as_ref(),
+                        &mut last_session,
+                    )
+                    .await;
                     if !accept_closed && !inbound.contains_key(peer) {
                         // Only a write on the retained session reopens it. A
                         // write from an earlier connection is dropped below.
@@ -1495,13 +1565,13 @@ impl DatagramConfig {
                         // the arriving central is refused *and disconnected* on
                         // behalf of a peer that is already gone, and the caller
                         // never learns why.
-                        while let Ok(released) = release_rx.try_recv() {
-                            if let Some(session) =
-                                released.release_peer(&mut inbound, driver.as_ref()).await
-                            {
-                                last_session = Some(session);
-                            }
-                        }
+                        Released::release_queued(
+                            &mut release_rx,
+                            &mut inbound,
+                            driver.as_ref(),
+                            &mut last_session,
+                        )
+                        .await;
 
                         // `Connected` is NOT once-per-connection. Both real
                         // drivers re-emit it ahead of every characteristic
@@ -1551,42 +1621,14 @@ impl DatagramConfig {
                             .and_then(|len| len.checked_sub(FRAGMENT_HEADER_LEN))
                             .filter(|budget| *budget > 0)
                             .unwrap_or(default_peripheral_budget);
-                        let active = Arc::new(AtomicBool::new(true));
-                        let (frag_tx, frag_rx) = mpsc::channel(config.fragment_queue_depth);
-                        let (msg_tx, msg_rx) = mpsc::channel(config.inbound_queue_depth);
-                        let overflow = Arc::new(OverflowSignal::default());
-                        let ended = tokio_util::sync::CancellationToken::new();
-                        let reassembly = Reassembler::spawn(
-                            ReceiverStream::new(frag_rx).map(Ok),
-                            config.limits(),
-                            msg_tx,
-                            overflow.clone(),
-                            peer.clone(),
-                            ended.clone(),
+                        let (channel, served) = config.served_channel(
+                            &driver,
+                            &peer,
+                            driver_session,
+                            generation,
+                            peripheral_budget,
+                            &release_tx,
                         );
-
-                        let channel = DatagramChannel {
-                            peer: peer.clone(),
-                            characteristic: config.characteristic,
-                            sink: Arc::new(Mutex::new(Sink::Notify {
-                                driver: driver.clone(),
-                                active: active.clone(),
-                            })),
-                            inbound: ReceiverStream::new(msg_rx),
-                            ended: ended.clone(),
-                            release: Some((release_tx.clone(), generation)),
-                            keep_peer: false,
-                            session: driver_session,
-                            overflow: overflow.clone(),
-                            next_msg_id: Arc::default(),
-                            max_message_len: DatagramChannel::message_limit(
-                                config.max_message_len,
-                                peripheral_budget,
-                            ),
-                            fragment_budget: peripheral_budget,
-                            tasks: vec![reassembly],
-                            managed_cleanup: false,
-                        };
                         // try_send, not send: awaiting here would stall the one
                         // loop that also delivers writes and disconnects, so a
                         // caller slow to accept would freeze the peers it has
@@ -1601,17 +1643,7 @@ impl DatagramConfig {
                                  generation={generation} fragment_budget={peripheral_budget}",
                                     peer.0
                                 );
-                                inbound.insert(
-                                    peer.clone(),
-                                    ServedPeer {
-                                        driver_session,
-                                        fragments: frag_tx,
-                                        active,
-                                        overflow: overflow.clone(),
-                                        generation,
-                                        ended,
-                                    },
-                                );
+                                inbound.insert(peer.clone(), served);
                             }
                             Err(mpsc::error::TrySendError::Full(_)) => {
                                 log::warn!(
@@ -1682,39 +1714,7 @@ impl DatagramConfig {
                             );
                             continue;
                         }
-                        let (tx, overflow) = (&served.fragments, &served.overflow);
-                        // Native acknowledgement precedes this event. A full
-                        // payload queue is known local loss, not permission to
-                        // stop reading the shared lifecycle stream.
-                        match tx.try_send(value) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                // The reassembly task for this peer already
-                                // ended (its `DatagramChannel` was dropped),
-                                // but `inbound` hasn't been cleaned up yet —
-                                // a real window: cleanup happens when this
-                                // same loop later processes the release/
-                                // disconnect notification, not synchronously
-                                // with the drop. Every write arriving in
-                                // that window vanished with no trace before
-                                // this log line existed.
-                                log::warn!(
-                                    "serve: dropping a write from {} — its channel was \
-                                 already closed, awaiting this task's own cleanup",
-                                    peer.0
-                                );
-                            }
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                // This reader also owns lifecycle events. Data admission must
-                                // never park it: the acknowledged fragment is already lost,
-                                // so report that bounded loss out of band to the receiver.
-                                overflow.raise();
-                                log::warn!(
-                                    "serve: fragment queue full for {}; reporting receive gap",
-                                    peer.0
-                                );
-                            }
-                        }
+                        served.deliver(&peer, value);
                     }
                     GattEvent::Disconnected {
                         peer,
@@ -1777,20 +1777,7 @@ impl DatagramConfig {
                             "serve: lifecycle stream lagged by {dropped} events; \
                          ending every served session, since a disconnect may have been lost"
                         );
-                        let served: Vec<PeerAddress> = inbound.keys().cloned().collect();
-                        for peer in served {
-                            let session = if let Some(state) = inbound.remove(&peer) {
-                                // Report the gap first, so a receiver parked in
-                                // `recv()` gets an error rather than a silent
-                                // close, then invalidate the channel.
-                                state.overflow.raise();
-                                state.active.store(false, Ordering::SeqCst);
-                                state.driver_session
-                            } else {
-                                None
-                            };
-                            ServedPeer::refuse(driver.as_ref(), &peer, session).await;
-                        }
+                        ServedPeer::end_all(&mut inbound, driver.as_ref()).await;
                         if accept_closed && inbound.is_empty() {
                             return;
                         }
@@ -1821,27 +1808,7 @@ impl DatagramConfig {
                         if accept_closed || !recover_radio {
                             continue;
                         }
-                        // With the latest `update_advertisement`'s data, not the
-                        // data `serve` started with: an update must survive a
-                        // power cycle. Nothing served: `stop_serving` ran, and a
-                        // device stopped to be unreachable stays so.
-                        let Some(spec) = driver
-                            .served_service()
-                            .filter(|served| served.same_service(&config.service_spec()))
-                        else {
-                            log::info!(
-                                "serve: radio back; service {} was stopped, not re-advertising",
-                                config.service.0
-                            );
-                            continue;
-                        };
-                        log::info!(
-                            "serve: radio back; re-advertising service {}",
-                            config.service.0
-                        );
-                        if let Err(err) = driver.advertise(spec).await {
-                            log::warn!("serve: re-advertising after radio recovery failed: {err}");
-                        }
+                        config.advertise_after_radio_recovery(driver.as_ref()).await;
                     }
                     // Central-role lifecycle belongs to `connect`, not here.
                     GattEvent::Connected { .. } | GattEvent::Disconnected { .. } => {}
@@ -1850,6 +1817,86 @@ impl DatagramConfig {
         });
 
         Ok(Box::pin(ReceiverStream::new(channels_rx)))
+    }
+
+    /// The channel `serve` gives for a central it accepts, and the state
+    /// `serve` keeps for that central while it is served.
+    fn served_channel(
+        &self,
+        driver: &Arc<dyn Driver>,
+        peer: &PeerAddress,
+        driver_session: Option<u64>,
+        generation: u64,
+        fragment_budget: usize,
+        release: &mpsc::UnboundedSender<Released>,
+    ) -> (DatagramChannel, ServedPeer) {
+        let active = Arc::new(AtomicBool::new(true));
+        let (frag_tx, frag_rx) = mpsc::channel(self.fragment_queue_depth);
+        let (msg_tx, msg_rx) = mpsc::channel(self.inbound_queue_depth);
+        let overflow = Arc::new(OverflowSignal::default());
+        let ended = tokio_util::sync::CancellationToken::new();
+        let reassembly = Reassembler::spawn(
+            ReceiverStream::new(frag_rx).map(Ok),
+            self.limits(),
+            msg_tx,
+            overflow.clone(),
+            peer.clone(),
+            ended.clone(),
+        );
+
+        let channel = DatagramChannel {
+            peer: peer.clone(),
+            characteristic: self.characteristic,
+            sink: Arc::new(Mutex::new(Sink::Notify {
+                driver: driver.clone(),
+                active: active.clone(),
+            })),
+            inbound: ReceiverStream::new(msg_rx),
+            ended: ended.clone(),
+            release: Some((release.clone(), generation)),
+            keep_peer: false,
+            session: driver_session,
+            overflow: overflow.clone(),
+            next_msg_id: Arc::default(),
+            max_message_len: DatagramChannel::message_limit(self.max_message_len, fragment_budget),
+            fragment_budget,
+            tasks: vec![reassembly],
+            managed_cleanup: false,
+        };
+        let served = ServedPeer {
+            driver_session,
+            fragments: frag_tx,
+            active,
+            overflow,
+            generation,
+            ended,
+        };
+        (channel, served)
+    }
+
+    /// Advertise the served service again after the radio came back on.
+    async fn advertise_after_radio_recovery(&self, driver: &dyn Driver) {
+        // With the latest `update_advertisement`'s data, not the
+        // data `serve` started with: an update must survive a
+        // power cycle. Nothing served: `stop_serving` ran, and a
+        // device stopped to be unreachable stays so.
+        let Some(spec) = driver
+            .served_service()
+            .filter(|served| served.same_service(&self.service_spec()))
+        else {
+            log::info!(
+                "serve: radio back; service {} was stopped, not re-advertising",
+                self.service.0
+            );
+            return;
+        };
+        log::info!(
+            "serve: radio back; re-advertising service {}",
+            self.service.0
+        );
+        if let Err(err) = driver.advertise(spec).await {
+            log::warn!("serve: re-advertising after radio recovery failed: {err}");
+        }
     }
 }
 
