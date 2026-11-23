@@ -28,6 +28,8 @@ and pull request text. The technical terms below define meaning, not sentence st
   identifiers. A writing pass does not authorize compatibility changes.
 - Separate current behavior, target requirements and verification. Preserve
   accepted historical ADRs and third-party attribution.
+- Refer to the manifest (`Cargo.toml`) for versions. Keep versions, tags and
+  commit hashes out of docs.
 
 These are local writing rules, not verified ASD-STE100 dictionary compliance or
 certification. Do not copy the copyrighted ASD dictionary into this repository.

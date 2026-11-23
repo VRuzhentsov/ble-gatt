@@ -80,7 +80,7 @@ Application reference. The legacy `android_context::ensure()` remains available
 for applications on older runtimes which explicitly delegate `ndk-context`
 initialization to this plugin (such as existing Fini consumers). Do not call
 that legacy initializer on a runtime that already initializes `ndk-context`;
-`ndk-context` 0.1 has no non-panicking probe for existing ownership. Use `get()`
+the `ndk-context` API has no non-panicking probe for existing ownership. Use `get()`
 for new code instead.
 
 This library **carries bytes; it does not encrypt them.** Supply your own session
@@ -196,10 +196,11 @@ Under active development. Implemented APIs, target design and device acceptance
 are separate claims. The architecture does not certify native roles or background scenarios. See
 [hardware verification and current iroh diagnostic checklist](docs/hardware-verification.md).
 Not published to crates.io/npm — consume as a git dependency, pinned to a
-release tag (Fini pins it this way):
+release tag (Fini pins it this way). Replace `vX.Y.Z` with the latest
+[release](https://github.com/VRuzhentsov/ble-gatt/releases) tag:
 
 ```toml
-ble-gatt = { git = "https://github.com/VRuzhentsov/ble-gatt", tag = "v0.2.0" }
+ble-gatt = { git = "https://github.com/VRuzhentsov/ble-gatt", tag = "vX.Y.Z" }
 ```
 
 ## Contributing
