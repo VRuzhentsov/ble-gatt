@@ -246,6 +246,8 @@ struct MetadataControl {
         std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<crate::Result<crate::DiscoveredPeer>>>>,
     scan_drained: tokio::sync::Notify,
     critical_events: std::sync::Mutex<Option<crate::drivers::event_bus::EventBus>>,
+    // The worker reads `critical_events` only after this is notified.
+    critical_open: tokio::sync::Notify,
     updates: std::sync::atomic::AtomicUsize,
     values: std::sync::atomic::AtomicUsize,
     starts: std::sync::atomic::AtomicUsize,
@@ -290,12 +292,33 @@ impl BlockingVisibility {
     ) -> (Arc<Self>, Arc<MetadataControl>, Arc<PeerLink>) {
         Self::metadata_with(network, address, config())
     }
+    /// Injects `critical` into the worker's lifecycle stream. The bus is set
+    /// before the worker thread starts: it subscribes as its first step.
+    fn metadata_critical(
+        network: Arc<MockNetwork>,
+        address: &str,
+        critical: crate::drivers::event_bus::EventBus,
+    ) -> (Arc<Self>, Arc<MetadataControl>, Arc<PeerLink>) {
+        let metadata = MetadataControl {
+            critical_events: std::sync::Mutex::new(Some(critical)),
+            ..MetadataControl::default()
+        };
+        Self::metadata_control(network, address, config(), metadata)
+    }
     fn metadata_with(
         network: Arc<MockNetwork>,
         address: &str,
         config: DatagramConfig,
     ) -> (Arc<Self>, Arc<MetadataControl>, Arc<PeerLink>) {
-        let metadata = Arc::new(MetadataControl::default());
+        Self::metadata_control(network, address, config, MetadataControl::default())
+    }
+    fn metadata_control(
+        network: Arc<MockNetwork>,
+        address: &str,
+        config: DatagramConfig,
+        metadata: MetadataControl,
+    ) -> (Arc<Self>, Arc<MetadataControl>, Arc<PeerLink>) {
+        let metadata = Arc::new(metadata);
         let driver = Arc::new(Self {
             inner: Arc::new(MockDriver::new(
                 PeerAddress(address.into()),
@@ -512,7 +535,19 @@ impl crate::Driver for BlockingVisibility {
                     .as_ref()
                     .map(crate::drivers::event_bus::EventBus::lifecycle_events);
                 let events: crate::BoxStream<crate::GattEvent> = match injected {
-                    Some(injected) => Box::pin(events.merge(injected)),
+                    Some(injected) => {
+                        // Subscribed here, but read only once the test opens
+                        // the gate: the worker runs on its own thread and would
+                        // otherwise drain a burst as it is sent, so the receiver
+                        // would never lag.
+                        let gate = control.clone();
+                        let injected =
+                            futures::StreamExt::flatten(futures::stream::once(async move {
+                                gate.critical_open.notified().await;
+                                injected
+                            }));
+                        Box::pin(events.merge(injected))
+                    }
                     None => events,
                 };
                 let control = control.clone();
@@ -822,9 +857,9 @@ async fn managed_metadata_critical_lag_guards_visible_server_until_hidden_retry(
     use crate::advertisement::{GattAdvertisement, GATT_ADVERTISEMENT_CHARACTERISTIC};
     use std::sync::atomic::Ordering::SeqCst;
     let network = MockNetwork::new();
-    let (driver, control, owner) = BlockingVisibility::metadata(network.clone(), "lag-owner");
     let critical = crate::drivers::event_bus::EventBus::new(2);
-    *control.critical_events.lock().unwrap() = Some(critical.clone());
+    let (driver, control, owner) =
+        BlockingVisibility::metadata_critical(network.clone(), "lag-owner", critical.clone());
     let peer = mock_link(&network, "lag-peer");
     let (left, right) = connect_links(&peer, &owner, "lag-owner").await;
     let observer = MockDriver::new(
@@ -852,6 +887,7 @@ async fn managed_metadata_critical_lag_guards_visible_server_until_hidden_retry(
             session: Some(session),
         });
     }
+    control.critical_open.notify_one();
     tokio::time::timeout(Duration::from_millis(300), control.loss_seen.notified())
         .await
         .unwrap();
@@ -948,10 +984,12 @@ async fn managed_metadata_critical_lag_invalidates_admitted_update_without_losin
     use crate::advertisement::{GattAdvertisement, GATT_ADVERTISEMENT_CHARACTERISTIC};
     use std::sync::atomic::Ordering::SeqCst;
     let network = MockNetwork::new();
-    let (driver, control, owner) =
-        BlockingVisibility::metadata(network.clone(), "pending-lag-owner");
     let critical = crate::drivers::event_bus::EventBus::new(2);
-    *control.critical_events.lock().unwrap() = Some(critical.clone());
+    let (driver, control, owner) = BlockingVisibility::metadata_critical(
+        network.clone(),
+        "pending-lag-owner",
+        critical.clone(),
+    );
     let peer = mock_link(&network, "pending-lag-peer");
     let (left, right) = connect_links(&peer, &owner, "pending-lag-owner").await;
     let observer = MockDriver::new(
@@ -986,6 +1024,7 @@ async fn managed_metadata_critical_lag_invalidates_admitted_update_without_losin
             session: Some(session),
         });
     }
+    control.critical_open.notify_one();
     tokio::time::timeout(Duration::from_millis(300), control.loss_seen.notified())
         .await
         .unwrap();
