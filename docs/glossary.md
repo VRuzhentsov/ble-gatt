@@ -30,6 +30,8 @@ and pull request text. The technical terms below define meaning, not sentence st
   accepted historical ADRs and third-party attribution.
 - Refer to the manifest (`Cargo.toml`) for versions. Keep versions, tags and
   commit hashes out of docs.
+- Keep glossary entries to a short definition of the term. Put examples and
+  usage in the doc that covers the feature.
 
 These are local writing rules, not verified ASD-STE100 dictionary compliance or
 certification. Do not copy the copyrighted ASD dictionary into this repository.
@@ -49,9 +51,8 @@ The low-power part of Bluetooth that this library uses. Classic Bluetooth
 (audio, file transfer) is not used.
 
 ### Radio
-The device's Bluetooth hardware as a physical resource: while it scans or
-advertises it draws battery, so every layer treats it as something to hold
-briefly.
+The device's Bluetooth hardware as a physical resource. It uses battery while
+it scans or advertises.
 
 ### Bluetooth adapter
 The Bluetooth hardware of one device as the operating system exposes it: it
@@ -61,8 +62,7 @@ Not to be confused with an [adapter crate](#adapter-crate).
 
 ### Role
 What a device does in a BLE exchange. One device can hold several roles at
-once. The four roles below are the ones BLE defines; each platform exposes
-them as separate APIs.
+once.
 
 ### Central
 The role that looks for other devices and connects to them. *Also called:*
@@ -80,44 +80,31 @@ find the device. *Also called:* broadcaster. Android:
 `BluetoothLeAdvertiser`; Linux: `LEAdvertisingManager1`.
 
 ### Advertisement
-One of those broadcast packets: up to about 31 bytes carrying service UUIDs
-and small data (for example the manufacturer data where this library puts a
-peer's identity fingerprint). *Also called:* advertising data, adv.
+One of those broadcast packets: up to about 31 bytes that carry service UUIDs
+and small data. *Also called:* advertising data, adv.
 
 ### Advertisement update
-Changing what a peripheral advertises while it keeps serving
-(`datagram::update_advertisement`). Only the advertisement is replaced; the
-GATT server, and every central connected to it with its subscription, stay.
-Advertising again with `serve` replaces the server and drops those centrals.
-An update survives a [radio recovery](#radio-recovery).
+A change to what a peripheral advertises while its GATT server and the
+centrals connected to it stay. See
+[managed advertisement updates](interface.md#managed-advertisement-updates).
 
 ### Stop serving
-Ending a peripheral's advertisement and GATT server together
-(`datagram::stop_serving`), which drops the centrals connected to it.
-Dropping the stream `serve` returned is not stopping: it only ends handing
-out new channels, and the server keeps advertising and accepting. A stopped
-server stays stopped across a [radio recovery](#radio-recovery).
+The end of a peripheral's advertisement and GATT server together, which drops
+the centrals connected to it. See
+[raw APIs](interface.md#raw-apis-and-lifetime-limits).
 
 ### Radio recovery
-The radio coming back on (`RadioChanged { On }`) after it was off or the
-Bluetooth service restarted. The platform has forgotten the advertisement
-and GATT server by then, so serving registers again what the driver last
-served (`Driver::served_service`), and nothing if serving was stopped
-(ADR-0010).
+The radio coming back on after it was off or the Bluetooth service restarted.
+Serving then registers again what it last served (ADR-0010).
 
 ### Scan response
 A second packet of up to 31 bytes that an advertiser sends only when a
-scanner asks for it. Scanners ask during an *active* scan, which is how both
-Android and BlueZ scan. This library puts there what does not fit the
-advertisement: on Android the fast advertisement, otherwise the advertisement
-header or the local name. *Also called:* SCAN_RSP.
+scanner asks for it, during an *active* scan. ADR-0012 §2 gives what this
+library puts in it. *Also called:* SCAN_RSP.
 
 ### Local name
 A short, human-readable name a peripheral advertises so a scanner can show
-it without connecting (`GattServiceSpec::local_name` → `DiscoveredPeer::name`).
-Linux sends it as BlueZ's `LocalName`; Android, which cannot set a name per
-advertisement, sends it as service data under the advertised service UUID.
-Both go in the scan response. Not the OS device name (the phone's model name).
+it without connecting. Not the OS device name (the phone's model name).
 
 ### Scan
 A central listening for advertisements for a while. Scanning is the most
@@ -134,8 +121,7 @@ exposes services, each with characteristics; the central reads, writes and
 subscribes to them.
 
 ### Service
-A group of characteristics, identified by a UUID. This library uses one
-service per purpose (for example its datagram channel).
+A group of characteristics, identified by a UUID.
 
 ### Characteristic
 One value inside a service, identified by a UUID, that can be read, written,
@@ -150,14 +136,11 @@ A central asking to receive a characteristic's notifications or indications.
 
 ### MTU
 The largest single message a connection carries at once, agreed by both sides
-after connecting (23 bytes at minimum, often a few hundred). Anything larger
-is split into fragments.
+after connecting (at least 23 bytes). Anything larger is split into fragments.
 
 ### Attribute value
 The bytes carried by one read, write or notification of a characteristic.
-Bluetooth caps it at 512 bytes, whatever the MTU. With an MTU of 517 the
-largest message would be 514 bytes, so the 512-byte cap applies first, and
-Android refuses a longer write outright (`MAX_ATT_ATTRIBUTE_LEN`).
+Bluetooth caps it at 512 bytes, whatever the MTU.
 
 ### Connection priority
 A request to the phone's Bluetooth stack to trade battery for speed on one
@@ -170,90 +153,60 @@ application's own pairing, which happens over this library's channels.
 
 ### Private address
 A Bluetooth address a phone makes up and changes from time to time so it
-cannot be tracked. Android does this, which is why a peer cannot be
-recognised by its address alone.
+cannot be tracked. A peer therefore cannot be recognized by its address alone.
 
 ### Connectable advertisement
 An advertisement a central can answer by connecting. A non-connectable
-advertisement only carries data. The current Windows driver uses its GATT
-provider advertisement and a readable GATT advertisement characteristic; it
-does not publish a second manufacturer-data radio advertisement. ADR-0012
-defines shared discovery; ADR-0011 defines Windows-native behavior.
+advertisement only carries data.
 
 ### Peripheral role support
 Whether a Bluetooth adapter and its driver can run a GATT server and
-advertise it. Not every adapter can. Windows reports it as
-`BluetoothAdapter.IsPeripheralRoleSupported`, Android as
-`isMultipleAdvertisementSupported`; the driver reports it as
+advertise it. Not every adapter can. The driver reports it as
 `CapabilityReport::peripheral`.
 
 ### Excluded central
-A central that `disconnect_peer` refused but the platform cannot drop.
-Windows has no call that disconnects a central from a GATT server, so the
-Windows driver stops notifying it and refuses its writes until it leaves by
-itself (ADR-0011, native events and cleanup limits).
+A central that the server refused but the platform cannot disconnect. The
+server ignores it until it leaves by itself (Windows; ADR-0011).
 
 ### Request deferral
-A Windows promise to answer an inbound GATT read or write later, after the
-event handler has returned. The handler must take it (`GetDeferral`) before
-it returns; the answer is final only once the deferral is completed. The
-Windows driver takes it in the handler and completes it after its request
-task has answered.
+A Windows promise to answer an inbound GATT read or write after the event
+handler has returned (ADR-0011).
 
 ## This library's concepts
 
 ### Fast advertisement
 A radio record of at most 27 bytes that carries a managed peer's endpoint,
-its metadata hash and up to 6 bytes of the caller's manufacturer data, so a
-scanner lists the peer without connecting (`GattServiceSpec::fast_advertisement`,
-`DatagramConfig::fast_advertisement_company`). It travels as manufacturer data
-under a company the application chooses (Fini: `0xFFFF`) and replaces the
-caller's entry there; the scanner restores it. Android sends it in the scan
-response, Windows in a publisher advertisement of its own next to the GATT
-provider (from another address; scanners join the two by endpoint), and Linux
-cannot. The term comes from Google Nearby, whose
-fast advertisement is the same idea in its own format (ADR-0012 §2, §5).
+its metadata hash and some of the caller's manufacturer data, so a scanner
+lists the peer without connecting. The term comes from Google Nearby
+(ADR-0012 §2, §5).
 
 ### Advertisement header
-A 9-byte radio record, service data under the managed service: the metadata
-hash and the endpoint tag. A scanner that has read the value it names reports
-the peer from its cache; otherwise it reads once. Nearby's BLE medium
-advertises a header with a hash for the same purpose (ADR-0012 §2, §5).
+A 9-byte radio record that carries the metadata hash and the endpoint tag, so
+a scanner can report a peer from its cache (ADR-0012 §2, §5).
 
 ### Metadata hash
-FNV-1a-32 of the complete readable advertisement value (the GATT
-advertisement). It changes when the name or any advertised field changes, so
-a scanner knows when to read again. A cache key, not a security check.
+A hash of the complete readable advertisement value (the GATT advertisement).
+It changes when any advertised field changes. A cache key, not a security check.
 
 ### Endpoint tag
 The first four bytes of an endpoint identifier, as the advertisement header
-carries them. It narrows which endpoint a header belongs to; the read checks it.
+carries them.
 
 ### Completion read
-The one read a scanner makes after a fast advertisement whose radio fields do
-not have the advertised hash (on Android the name does not fit). It runs at
-most once per endpoint and hash, waits while a dial or another read holds the
-address, and gives way to a dial (ADR-0012 §2).
+The one read a scanner makes when a peer's radio records do not carry the
+complete advertised value (ADR-0012 §2).
 
 ### Advertising mode
-How often a peripheral advertises (`AdvertisingMode`: `LowPower`, `Balanced`,
-`LowLatency`, named after Android's `AdvertiseSettings`). More often is found
-sooner and costs more battery. BlueZ gets 1000, 250 or 100 ms; Windows has no
-setting.
+How often a peripheral advertises (`AdvertisingMode`). More often is found
+sooner and costs more battery.
 
 ### Scan parameters
-How long and how often a scanner listens (scan window, scan interval). Windows
-11 24H2 lets a watcher ask for presets (`BluetoothLEAdvertisementScanParameters`
-`LowLatency`, `CoexistenceOptimized`); the Windows driver asks for `LowLatency`
-where the API exists (ADR-0011).
+How long and how often a scanner listens (scan window, scan interval).
 
 ### GATT advertisement
-The same advertisement data, served in a readable characteristic
-(`advertisement::GATT_ADVERTISEMENT_CHARACTERISTIC`) of every datagram
-service. A scanner reads it when a peer's radio advertisement carries no
-profile data (`advertisement::complete`, ADR-0012), and a managed scanner when
-the radio records do not name a value it has read already. Select completion
-from received information, not the OS name.
+The advertisement data, served in a readable characteristic of every datagram
+service, so a scanner can read what the radio advertisement does not carry
+(ADR-0012).
 
 ### Peer
 Another device this library talks to.
@@ -268,16 +221,13 @@ What recognises a peer across address changes: a fingerprint the peer puts in
 its advertisement.
 
 ### Link
-A managed communication relationship coordinated by `PeerLink`.
-`PeerChannel` is a scoped use of one established generation, not the coordinator.
-The unused crate-private `link_state` implementation is retired; ADR-0005 records
-its historical design. *Not the same as* OSI L2 or the BLE link layer.
+A managed communication relationship with a peer, coordinated by `PeerLink`.
+*Not the same as* OSI L2 or the BLE link layer.
 
 ### Driver session
-The optional connection-generation identifier in `GattEvent` and
-`GattConnection::session()`. It distinguishes successive GATT connections to
-the same address and protects a replacement from stale events. It does not
-mean an authenticated QUIC connection or an application conversation.
+An identifier that distinguishes successive GATT connections to the same
+address, so a replacement ignores stale events. Not an authenticated QUIC
+connection or an application conversation.
 
 ### GAP (Generic Access Profile)
 The part of the Bluetooth Core Specification that defines the roles
@@ -286,14 +236,12 @@ connect to each other. The `roles/` module is named after it.
 
 ### Profile
 In the Bluetooth specification, a set of GATT services and the rules for
-using them for one purpose. This library's datagram channel is such a
-profile; it lives in `profile/`. *Not the same as* a
-[power profile](#power-profile).
+using them for one purpose. The `profile/` module is named after it.
+*Not the same as* a [power profile](#power-profile).
 
 ### Datagram channel
 A message channel over a connection: whole messages in, whole messages out,
-however small the MTU (`datagram`). Each message is split into fragments and
-put back together on the other side.
+however small the MTU.
 
 ### Fragment, reassembly
 A *fragment* is one MTU-sized piece of a message; *reassembly* is joining the
@@ -314,8 +262,7 @@ everywhere), **Use Cases** (what the software does), **Interface Adapters**
 (external APIs). This library's layers use these names.
 
 ### Dependency rule
-Clean Architecture's rule that code depends only inwards: Use Cases never
-call a driver directly, they call a trait the driver implements.
+Clean Architecture's rule that code depends only on the rings inside it.
 
 ### HAL (hardware abstraction layer)
 A set of traits that hide the differences between platforms; each platform
@@ -324,24 +271,21 @@ In this library: the `hal/` module.
 
 ### Driver
 The code that implements the `hal/` traits for one platform, or the mock
-(`drivers/`): the `hal::Driver` trait, implemented by `LinuxDriver`,
-`AndroidDriver`, `WindowsDriver` and `MockDriver`. Layer: Frameworks & Drivers. *Also
-called:* backend (the code's old word, and SimpleBLE's and Qt's), platform
-implementation, executor (Nordic). Not the operating system's kernel driver
-for the Bluetooth chip, which sits several levels lower.
+(`drivers/`). Layer: Frameworks & Drivers. *Also called:* backend (the code's
+old word, and SimpleBLE's and Qt's), platform implementation, executor
+(Nordic). Not the operating system's kernel driver for the Bluetooth chip,
+which sits several levels lower.
 
 ### Platform
 One operating system's Bluetooth API: Linux (BlueZ), Android, Windows, Apple.
 
 ### Port
 An interface (a Rust trait) a layer defines for what it needs from outside,
-so that any implementation, real or mock, can be plugged in. The ports
-drivers implement live in `hal/`.
+so that any implementation, real or mock, can be plugged in.
 
 ### Dependency injection
 Passing a component the implementations it needs (its ports) from outside,
-instead of the component creating them itself. This is what lets a test give
-the library a mock radio.
+instead of the component creating them itself.
 
 ### Handle
 A value that represents something running (a scan, an advertisement, a
@@ -351,7 +295,6 @@ RAII handle.
 ### RAII
 "Resource acquisition is initialization": a Rust (and C++) idiom where
 owning a value means owning a resource, and dropping the value releases it.
-A `MutexGuard` unlocking when it goes out of scope is the everyday example.
 
 ### Adapter
 This library's object for the device's [Bluetooth adapter](#bluetooth-adapter):
@@ -360,9 +303,8 @@ Roles are created from it (ADR-0007 D7). *Also called:* `Adapter` in bluest
 and btleplug, `BluetoothAdapter` on Android.
 
 ### Mock radio
-A software stand-in for Bluetooth used in tests: in one process
-(`MockNetwork`), or shared by several processes through the *mock broker*
-(ADR-0004).
+A software stand-in for Bluetooth used in tests, in one process or shared by
+several processes through the *mock broker* (ADR-0004).
 
 ### Power profile
 Advice on how hard to work the radio (how long to scan, how long to pause,
@@ -375,58 +317,43 @@ The standard seven-layer model of network protocols: 1 physical, 2 data link,
 says what a protocol does to the bytes. **`L` with a number always means an
 OSI layer** (L2 = data link), never one of this library's layers. Where this
 library sits on it: [`architecture.md`](architecture.md#how-the-layers-map-onto-osi).
-Fini's `DataLink` is named after OSI L2.
 
 ### Pub/sub (publish/subscribe)
 One side *publishes* events or state; any number of *subscribers* receive
 them and react on their own, without the publisher knowing who they are.
-The style used across `ble-gatt` and Fini for state and events.
 
 ### Watch channel
-`tokio::sync::watch`: pub/sub for a *value that changes*, such as whether the
-adapter is on or a connection's state. It keeps the latest value, so a new
-subscriber sees the current state at once. Kotlin's `StateFlow` is the same
-idea.
+Pub/sub for a *value that changes* (`tokio::sync::watch`). It keeps the latest
+value, so a new subscriber sees the current state at once. *Also called:*
+`StateFlow` (Kotlin).
 
 ### Broadcast stream
 Pub/sub for a *sequence of events* (`tokio::sync::broadcast` behind a
 stream), where every subscriber receives every event published after it
-subscribed, unless its bounded buffer overflows. `GattEvent::Lagged` reports
-discarded events; it does not identify which transitions were lost.
+subscribed, unless its bounded buffer overflows.
 
 ### Lifecycle event stream
-`Driver::lifecycle_events()`: connection/radio events without characteristic writes.
-Native/mock drivers isolate its bounded storage from payload traffic. The default
-third-party implementation only filters the legacy stream and retains unknown lag.
-Critical loss must not be treated as recoverable payload loss.
+A driver's stream of connection and radio events, without characteristic
+writes. See [driver event streams](interface.md#driver-event-streams-and-receive-loss).
 
 ### Receive gap
-`BleError::ReceiveGap`: known loss on a payload receive path. A channel can
-report a gap and then deliver later complete messages. Managed application queue
-pressure alone pauses that generation; it does not create a gap.
+Known loss of messages on a payload receive path (`BleError::ReceiveGap`).
+See [driver event streams](interface.md#driver-event-streams-and-receive-loss).
 
 ### Cancellation token
-`tokio_util::sync::CancellationToken`: a one-shot signal that tasks can wait
-on or be stopped by. A connection hands one out that fires when it
-disconnects.
+A one-shot signal that tasks can wait on or be stopped by
+(`tokio_util::sync::CancellationToken`).
 
 ### Leftover link
-A link BlueZ still holds for a process that exited or crashed: on Linux a
-link belongs to `bluetoothd`, not to the app that dialled it. Android, Apple
-and Windows release a dead app's links themselves. The Linux driver
-disconnects leftover links that offer the app's service before its first
-scan or advertisement, and `Adapter::close` releases the app's own links on
-the way out (ADR-0009).
+A link BlueZ still holds for a process that exited or crashed. On Linux a
+link belongs to `bluetoothd`, not to the app that dialled it (ADR-0009).
 
 ### Endpoint hooks
-Callbacks an application installs on its iroh endpoint
-(`iroh::endpoint::EndpointHooks`). `after_handshake` runs for every
-connection, incoming and outgoing, once TLS has proved the peer's key
-(ADR-0008).
+Callbacks an application installs on its iroh endpoint. They run once TLS has
+proved the peer's key (ADR-0008).
 
 ### Path
-One transport address an iroh connection can use to reach the peer
-(`Connection::paths`). For `ble-gatt-iroh` it is the peer's BLE address.
+One transport address an iroh connection can use to reach the peer.
 *Not the same as* a filesystem path.
 
 ### Crossed dials
@@ -434,23 +361,17 @@ Both devices dialling each other at the same moment, so two links or two
 connections come up where one was wanted.
 
 ### Symmetric initiation
-Either peer can request communication without permanent identity ordering.
-Core `PeerLink` implements one behavior, independent of iroh. Both sides must
-accept. Role capabilities do not prove simultaneous-role hardware support.
+Either peer can request communication, with no permanent ordering of
+identities. Both sides must accept.
 
 ### Initiation policy
-A retired caller-selected initiator mode. The managed API has no
-`InitiationPolicy`, `LinkRole` or identity-ranking switch. Application acceptance
-and authenticated identity remain separate concerns.
+A retired caller-selected initiator mode. The managed API has no such mode.
 
 ### Candidate link
 One possible BLE attempt before core arbitration selects the survivor.
-The iroh adapter no longer retains competing native candidates. Multiple QUIC
-users can share the established core carrier; ending one user preserves others.
 
 ### Redial yield
-The retired adapter delay that gave the previous initiator time to redial.
-Managed communication uses core attempt arbitration, not a public yield mode.
+A retired adapter delay that gave the previous initiator time to redial.
 
 ### Adapter crate
 A crate that connects `ble-gatt` to something outside it, such as iroh
@@ -459,33 +380,27 @@ Adapters. Not to be
 confused with a [Bluetooth adapter](#bluetooth-adapter).
 
 ### Core endpoint identifier
-`ble_gatt::EndpointId`: a fresh 128-bit identifier for one worker lifetime.
-It correlates discovery and incoming/outgoing attempts. It is not an iroh
-`EndpointId`, native address or authenticated identity.
+A fresh 128-bit identifier for one worker lifetime (`ble_gatt::EndpointId`).
+It correlates discovery and attempts. It is not an iroh `EndpointId`, native
+address or authenticated identity.
 
 ### Attempt nonce
-A fresh signed 32-bit value for one outgoing request. Core arbitration compares
-it numerically: larger wins; equal values fail both. It is not an encryption
-key, endpoint identifier or native session generation.
+A fresh signed 32-bit value for one outgoing request, which core arbitration
+compares. It is not an encryption key, endpoint identifier or native session
+generation.
 
 ### Attempt outcome
 The result of one establishment attempt, distinct from an established peer's
-connection state. `BleError::Attempt(AttemptError)` reports typed failures.
-An outgoing loser fails while the incoming winner proceeds separately.
-An attempt failure is not global disconnection of a healthy channel.
+connection state.
 
 ### Control record
-A tagged managed record for establishment, acceptance, disconnect or liveness.
-Application data has a separate tag. The bounded encoding is defined in
-`connection/managed_codec.rs` and ADR-0012, without QUIC or payload-prefix guessing.
+A tagged managed record for establishment, acceptance, disconnect or
+liveness, apart from application data (ADR-0012).
 
 ### Scoped channel use
-One `PeerChannel` handle. Clones share a receive queue. `release` releases one
-use; the last use retires the generation. Explicit disconnect invalidates all
-uses of that generation, not a later replacement.
+One `PeerChannel` handle: one use of an established channel generation. See
+[messages and closure](interface.md#messages-and-closure).
 
 ### Channel close reason
-`PeerChannelCloseReason`, set before receive ends. It distinguishes explicit
-local/peer disconnect, unexpected loss, protocol failure, release and shutdown.
-The iroh adapter blocks automatic acquisition after terminal closure until a
-fresh application action authorizes replacement. Old packets do not authorize it.
+Why a channel ended, set before receive ends. See
+[messages and closure](interface.md#messages-and-closure).
