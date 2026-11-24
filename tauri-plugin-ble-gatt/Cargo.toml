@@ -12,7 +12,7 @@ links = "tauri-plugin-ble-gatt"
 workspace = true
 
 [dependencies]
-ble-gatt = { path = "../ble-gatt", version = "0.2.2" }
+ble-gatt = { path = "../ble-gatt", version = "0.2.3" }
 async-trait.workspace = true
 log.workspace = true
 tauri = { version = "2" }
